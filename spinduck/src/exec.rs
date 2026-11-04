@@ -87,6 +87,12 @@ pub enum TraceEvent {
     },
 }
 
+/// 空埋点（引擎默认 sink；AGENTS §5：日志只经 TraceSink）。
+pub struct TraceNoopSink;
+impl TraceSink for TraceNoopSink {
+    fn on_event(&mut self, _event: TraceEvent) {}
+}
+
 /// 测试用假执行器：记录收到的 SQL 与绑定表，按预置脚本返回结果。
 /// 单元/集成测试验证"改写产物 + 按名绑定"的唯一可信方式（AGENTS §4.2）。
 #[derive(Default)]

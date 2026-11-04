@@ -4,6 +4,8 @@
 //! [`exec::TraceSink`] 两个接缝；DuckDB API 只允许出现在 `sql/exec.rs` 的
 //! 原生实现中。
 
+pub mod catalog;
+pub mod engine;
 pub mod error;
 pub mod exec;
 pub mod ir;
@@ -15,6 +17,10 @@ pub mod value;
 
 pub use ir::{compile_block, compile_stmts, IrExpr, IrProg, IrStmt};
 
+pub use catalog::{
+    CallResult, CompiledRoutine, ParamMode, RoutineCatalog, RoutineKind, RoutineParam,
+};
+pub use engine::Engine;
 pub use error::{EngineError, ErrorCode, FaultDomain};
 pub use exec::{BindMap, ExecOutcome, FakeExecutor, Row, RowStream, SqlExecutor, TraceSink};
 pub use rules::RuleRegistry;

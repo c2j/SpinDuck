@@ -1,7 +1,10 @@
 //! 运行帧：变量作用域 + PL 表达式求值（三值逻辑，NULL 传播）。
 
+use crate::catalog::RoutineCatalog;
 use crate::error::EngineError;
+use crate::exec::SqlExecutor;
 use crate::ir::{AssignTarget, BinOp, IrExpr, VarName};
+use crate::runtime::RunOutcome;
 use crate::value::SpinValue;
 use std::collections::BTreeMap;
 
@@ -152,9 +155,18 @@ impl Frame {
     }
 }
 
+/// 表达式求值环境：PL 上下文函数直调需要例程目录与执行器（§8 分派矩阵）。
+pub struct EvalEnv<'a> {
+    pub frame: &'a Frame,
+    pub ex: &'a dyn SqlExecutor,
+    pub cat: &'a RoutineCatalog,
+    pub depth: usize,
+}
+
 /// 三值逻辑条件求值：Some(bool) 确定性；None = UNKNOWN（EXIT WHEN 按 false）。
-pub fn eval_cond(e: &IrExpr, f: &Frame) -> Result<Option<bool>, EngineError> {
-    match eval(e, f)? {
+pub fn eval_cond(e: &IrExpr, env: &EvalEnv<'_>) -> Result<Option<bool>, EngineError> {
+    let _f = env.frame;
+    match eval(e, env)? {
         SpinValue::Null => Ok(None),
         SpinValue::Bool(b) => Ok(Some(b)),
         other => Err(EngineError::business(
@@ -165,7 +177,8 @@ pub fn eval_cond(e: &IrExpr, f: &Frame) -> Result<Option<bool>, EngineError> {
 }
 
 /// PL 表达式求值（NULL 传播 + 三值逻辑 AND/OR）。
-pub fn eval(e: &IrExpr, f: &Frame) -> Result<SpinValue, EngineError> {
+pub fn eval(e: &IrExpr, env: &EvalEnv<'_>) -> Result<SpinValue, EngineError> {
+    let f = env.frame;
     match e {
         IrExpr::Const(v) => Ok(v.clone()),
         IrExpr::Var(name) => f
@@ -174,10 +187,10 @@ pub fn eval(e: &IrExpr, f: &Frame) -> Result<SpinValue, EngineError> {
             .ok_or_else(|| EngineError::business(122, format!("undefined variable {}", name.0))),
         IrExpr::Field { rec, field } => f.record_field(rec, field).cloned(),
         IrExpr::IsNull(inner) => {
-            let v = eval(inner, f)?;
+            let v = eval(inner, env)?;
             Ok(SpinValue::Bool(matches!(v, SpinValue::Null)))
         }
-        IrExpr::Not(inner) => match eval(inner, f)? {
+        IrExpr::Not(inner) => match eval(inner, env)? {
             SpinValue::Null => Ok(SpinValue::Null),
             SpinValue::Bool(b) => Ok(SpinValue::Bool(!b)),
             other => Err(EngineError::business(
@@ -185,12 +198,56 @@ pub fn eval(e: &IrExpr, f: &Frame) -> Result<SpinValue, EngineError> {
                 format!("NOT requires boolean, got {}", other.display()),
             )),
         },
-        IrExpr::Bin { op, l, r } => eval_bin(*op, &eval(l, f)?, &eval(r, f)?),
+        IrExpr::Bin { op, l, r } => eval_bin(*op, &eval(l, env)?, &eval(r, env)?),
         IrExpr::CursorAttr { cursor, kind } => Ok(f.cursor_attr(cursor, *kind)),
-        IrExpr::FuncCall { name, .. } => Err(EngineError::invariant(
-            29,
-            format!("routine dispatch not yet available (M6): {name}"),
-        )),
+        IrExpr::FuncCall { name, args } => {
+            // §8 分派矩阵：PL 上下文 → 解释器直调（含嵌套；只支持函数）
+            let routine = env
+                .cat
+                .lookup(name)
+                .ok_or_else(|| EngineError::business(152, format!("undefined function: {name}")))?
+                .clone();
+            if routine.kind != crate::catalog::RoutineKind::Function {
+                return Err(EngineError::business(
+                    153,
+                    format!("{name} is a procedure and cannot be used in an expression"),
+                ));
+            }
+            if args.len() != routine.params.len() {
+                return Err(EngineError::business(
+                    151,
+                    format!(
+                        "{} expects {} args, got {}",
+                        name,
+                        routine.params.len(),
+                        args.len()
+                    ),
+                ));
+            }
+            if env.depth > 100 {
+                return Err(EngineError::invariant(63, "call depth exceeded (100)"));
+            }
+            let mut callee = Frame::new();
+            for (p, ir_a) in routine.params.iter().zip(args) {
+                let v = eval(ir_a, env)?;
+                callee.set(&VarName(p.name.to_ascii_lowercase()), v);
+            }
+            let noop = crate::exec::TraceNoopSink;
+            let out = crate::runtime::run_with_catalog(
+                &routine.prog,
+                &mut callee,
+                env.ex,
+                &mut crate::exec::TraceNoopSink,
+                env.cat,
+                env.depth + 1,
+            )?;
+            let _ = noop;
+            match out {
+                RunOutcome::Returned(Some(v)) => Ok(v),
+                RunOutcome::Returned(None) => Ok(SpinValue::Null),
+                RunOutcome::Completed => Ok(SpinValue::Null),
+            }
+        }
     }
 }
 

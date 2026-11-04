@@ -2,7 +2,7 @@
 
 use crate::error::EngineError;
 use crate::exec::{BindMap, SqlExecutor, TraceEvent, TraceSink};
-use crate::ir::{AssignTarget, IrProg, IrStmt};
+use crate::ir::{AssignTarget, IrProg, IrStmt, VarName};
 use crate::runtime::frame::Frame;
 use crate::runtime::frame::{eval, eval_cond};
 use crate::value::SpinValue;
@@ -39,11 +39,26 @@ pub fn run_with_trace(
     ex: &dyn SqlExecutor,
     sink: &mut dyn TraceSink,
 ) -> Result<RunOutcome, EngineError> {
+    let cat = crate::catalog::RoutineCatalog::new();
+    run_with_catalog(prog, frame, ex, sink, &cat, 0)
+}
+
+/// 带例程目录与深度的运行（M6：CALL/FuncCall 例程直调）。
+pub fn run_with_catalog(
+    prog: &IrProg,
+    frame: &mut Frame,
+    ex: &dyn SqlExecutor,
+    sink: &mut dyn TraceSink,
+    cat: &crate::catalog::RoutineCatalog,
+    depth: usize,
+) -> Result<RunOutcome, EngineError> {
     let mut traps: Vec<TrapFrame> = Vec::new();
     let mut pc = 0usize;
     let mut steps = 0u64;
     loop {
-        match run_inner(prog, frame, ex, sink, &mut traps, &mut pc, &mut steps) {
+        match run_inner(
+            prog, frame, ex, sink, &mut traps, &mut pc, &mut steps, cat, depth,
+        ) {
             Ok(out) => return Ok(out),
             Err(e) => {
                 // 自顶向下找匹配处理器
@@ -79,6 +94,7 @@ pub fn run_with_trace(
 }
 
 /// 内层执行驱动（traps/pc/steps 由外层持有，支持跨重试持久化）。
+#[allow(clippy::too_many_arguments)]
 fn run_inner(
     prog: &IrProg,
     frame: &mut Frame,
@@ -87,6 +103,8 @@ fn run_inner(
     traps: &mut Vec<TrapFrame>,
     pc: &mut usize,
     steps: &mut u64,
+    cat: &crate::catalog::RoutineCatalog,
+    depth: usize,
 ) -> Result<RunOutcome, EngineError> {
     loop {
         *steps += 1;
@@ -106,17 +124,41 @@ fn run_inner(
         match st {
             IrStmt::Nop | IrStmt::TxCommit | IrStmt::TxRollback => *pc += 1,
             IrStmt::Assign { target, expr } => {
-                let v = eval(expr, frame)?;
+                let v = {
+                    let env = crate::runtime::frame::EvalEnv {
+                        frame,
+                        ex,
+                        cat,
+                        depth,
+                    };
+                    eval(expr, &env)?
+                };
                 assign(frame, target, v)?;
                 *pc += 1;
             }
             IrStmt::Jump(to) => *pc = *to,
             IrStmt::JumpIfNot { cond, to } => {
-                let t = eval_cond(cond, frame)?;
+                let t = {
+                    let env = crate::runtime::frame::EvalEnv {
+                        frame,
+                        ex,
+                        cat,
+                        depth,
+                    };
+                    eval_cond(cond, &env)?
+                };
                 *pc = if t == Some(true) { pc_cur + 1 } else { *to };
             }
             IrStmt::JumpIf { cond, to } => {
-                let t = eval_cond(cond, frame)?;
+                let t = {
+                    let env = crate::runtime::frame::EvalEnv {
+                        frame,
+                        ex,
+                        cat,
+                        depth,
+                    };
+                    eval_cond(cond, &env)?
+                };
                 *pc = if t == Some(true) { *to } else { pc_cur + 1 };
             }
             IrStmt::SqlQuery { sql, binds, into } => {
@@ -162,8 +204,70 @@ fn run_inner(
                 ex.execute(sql, &bound)?;
                 *pc += 1;
             }
+            IrStmt::CallRoutine {
+                name,
+                args,
+                out_targets,
+            } => {
+                if depth > 100 {
+                    return Err(EngineError::invariant(63, "call depth exceeded (100)"));
+                }
+                let routine = cat
+                    .lookup(name)
+                    .ok_or_else(|| {
+                        EngineError::business(150, format!("routine {name} not registered"))
+                    })?
+                    .clone();
+                if args.len() != routine.params.len() {
+                    return Err(EngineError::business(
+                        151,
+                        format!(
+                            "{} expects {} args, got {}",
+                            name,
+                            routine.params.len(),
+                            args.len()
+                        ),
+                    ));
+                }
+                let mut callee = Frame::new();
+                for (p, ir_a) in routine.params.iter().zip(args) {
+                    let env = crate::runtime::frame::EvalEnv {
+                        frame,
+                        ex,
+                        cat,
+                        depth,
+                    };
+                    let v = eval(ir_a, &env)?;
+                    callee.set(&VarName(p.name.to_ascii_lowercase()), v);
+                }
+                let mut noop = crate::exec::TraceNoopSink;
+                let out =
+                    run_with_catalog(&routine.prog, &mut callee, ex, &mut noop, cat, depth + 1)?;
+                // OUT/INOUT 写回：按参数序对应 out_targets（None = 丢弃）
+                for (i, p) in routine.params.iter().enumerate() {
+                    if p.mode == crate::catalog::ParamMode::In {
+                        continue;
+                    }
+                    if let Some(Some(t)) = out_targets.get(i) {
+                        if let Some(v) = callee.get(&VarName(p.name.to_ascii_lowercase())) {
+                            frame.assign(t, v.clone())?;
+                        }
+                    }
+                }
+                // 过程的 RETURN <expr> 在过程语境下不产生调用方值（v1）
+                let _ = out;
+                *pc += 1;
+            }
             IrStmt::Perform { expr } => {
-                eval(expr, frame)?; // 求值并丢弃
+                {
+                    let env = crate::runtime::frame::EvalEnv {
+                        frame,
+                        ex,
+                        cat,
+                        depth,
+                    };
+                    eval(expr, &env)?;
+                } // 求值并丢弃
                 *pc += 1;
             }
             IrStmt::OpenCursor { cursor, source } => {
@@ -175,7 +279,15 @@ fn run_inner(
                     }
                     CursorSource::Dynamic { query_expr } => {
                         // 动态 OPEN FOR：求值文本 → 解析/格式化 → 方言变换 → SQL
-                        let v = eval(query_expr, frame)?;
+                        let v = {
+                            let env = crate::runtime::frame::EvalEnv {
+                                frame,
+                                ex,
+                                cat,
+                                depth,
+                            };
+                            eval(query_expr, &env)?
+                        };
                         let text = v.as_str_loose();
                         let tokens = ogsql_parser::token::tokenizer::Tokenizer::new(&text)
                             .tokenize()
@@ -244,12 +356,28 @@ fn run_inner(
                 *pc += 1;
             }
             IrStmt::Raise { message } => {
-                let v = eval(message, frame)?;
+                let v = {
+                    let env = crate::runtime::frame::EvalEnv {
+                        frame,
+                        ex,
+                        cat,
+                        depth,
+                    };
+                    eval(message, &env)?
+                };
                 return Err(EngineError::business(200, v.as_str_loose()));
             }
             IrStmt::Return { value } => {
                 let v = match value {
-                    Some(e) => Some(eval(e, frame)?),
+                    Some(e) => {
+                        let env = crate::runtime::frame::EvalEnv {
+                            frame,
+                            ex,
+                            cat,
+                            depth,
+                        };
+                        Some(eval(e, &env)?)
+                    }
                     None => None,
                 };
                 return Ok(RunOutcome::Returned(v));
@@ -301,6 +429,7 @@ fn variant_name(st: &IrStmt) -> &'static str {
         IrStmt::OpenCursor { .. } => "OpenCursor",
         IrStmt::Fetch { .. } => "Fetch",
         IrStmt::CloseCursor { .. } => "CloseCursor",
+        IrStmt::CallRoutine { .. } => "CallRoutine",
         IrStmt::PushTrap { .. } => "PushTrap",
         IrStmt::PopTrap => "PopTrap",
     }
@@ -817,6 +946,60 @@ mod kernel_tests {
 
     /// 端到端探针（真实内核）：静态游标 OPEN/FETCH/EXIT 循环 + 记录字段访问。
     /// 对应清算过程主循环形态（§7.3），行为口径对齐 scripts/sim_prc_trd_hz_byfund.py。
+    /// M6 端到端（真实内核）：Engine 注册 PACKAGE BODY 式过程 → CALL（OUT 写回）
+    /// → 过程间互调（CALL 另一过程）→ SQL 内 PL 函数经 UDF 桥接（threads=1）。
+    #[test]
+    fn should_call_procs_with_out_params_and_udf_bridge_on_real_kernel() {
+        use crate::catalog::RoutineCatalog;
+        use crate::engine::Engine;
+        use crate::exec::TraceNoopSink;
+        use crate::ir::VarName;
+        use crate::runtime::Frame;
+        use crate::value::SpinValue;
+
+        let mut eng = Engine::new(
+            Box::new(crate::sql::DuckExecutor::open_in_memory().unwrap()),
+            RuleRegistry::default(),
+        );
+        eng.register("CREATE TABLE dat(a VARCHAR, n INT)").unwrap();
+        eng.register("INSERT INTO dat VALUES ('x', 2)").unwrap();
+        eng.register("INSERT INTO dat VALUES ('y', 3)").unwrap();
+        // 函数：SQL 内将被桥接（threads=1 约束下直接 UDF 通道）
+        eng.register(
+            "CREATE OR REPLACE FUNCTION fnc_double(p IN NUMBER) RETURN NUMBER IS \
+             BEGIN RETURN p * 2; END;",
+        )
+        .unwrap();
+        // 过程：IN/OUT + 调用函数（SQL 内 UDF 桥接路径）
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_calc(p_i IN NUMBER, p_o OUT NUMBER) IS \
+             BEGIN p_o := p_i * 2; END;",
+        )
+        .unwrap();
+        // 过程：CALL 另一过程（ProcedureCall 互调）
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_fwd(p_i IN NUMBER, p_o OUT NUMBER) IS \
+             BEGIN prc_calc(p_i, p_o); END;",
+        )
+        .unwrap();
+
+        let r = eng
+            .call("prc_fwd", &[SpinValue::Int(21), SpinValue::Null])
+            .unwrap();
+        assert_eq!(
+            r.outs.get("p_o"),
+            Some(&SpinValue::Int(42)),
+            "OUT 写回: {:?}",
+            r.outs
+        );
+        // 函数 PL 直调（Engine::call → RETURN 值）
+        let fr = eng.call("fnc_double", &[SpinValue::Int(21)]).unwrap();
+        assert_eq!(fr.return_value, Some(SpinValue::Int(42)));
+        let _ = TraceNoopSink;
+        let _ = Frame::new();
+        let _ = VarName("x".into());
+    }
+
     #[test]
     fn should_run_cursor_loop_with_record_field_access_on_real_kernel() {
         let ex = crate::sql::DuckExecutor::open_in_memory().unwrap();

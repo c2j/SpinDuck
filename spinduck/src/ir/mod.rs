@@ -132,6 +132,13 @@ pub enum IrStmt {
     },
     /// 撤销当前处理器（正常路径离开 try 体）
     PopTrap,
+    /// CALL 例程（§3.4.1）：OUT/INOUT 按 out_targets 位置写回调用方
+    CallRoutine {
+        name: String,
+        args: Vec<IrExpr>,
+        /// 与 params 序对应：Some = 写回目标，None = 丢弃
+        out_targets: Vec<Option<AssignTarget>>,
+    },
 }
 
 /// 单个处理器：条件列表 + 主体指令区间 [body_start, body_end)。
@@ -187,7 +194,19 @@ pub fn compile_block(block: &PlBlock) -> Result<IrProg, EngineError> {
 
 /// 带规则注册表的块编译。
 pub fn compile_block_with(block: &PlBlock, rules: &RuleRegistry) -> Result<IrProg, EngineError> {
-    let vars = collect_var_names(&block.body);
+    compile_routine_with(block, &[], rules)
+}
+
+/// 例程块编译：额外把参数名加入变量集（M6：CALL 参数即帧变量）。
+pub fn compile_routine_with(
+    block: &PlBlock,
+    extra_vars: &[String],
+    rules: &RuleRegistry,
+) -> Result<IrProg, EngineError> {
+    let mut vars = collect_var_names(&block.body);
+    for v in extra_vars {
+        vars.insert(v.to_ascii_lowercase());
+    }
     let mut c = Compiler {
         vars,
         funcs: rules.functions.clone(),
@@ -295,7 +314,7 @@ fn rewrite_sql(
 }
 
 #[derive(Default)]
-struct Compiler {
+pub(crate) struct Compiler {
     vars: crate::sql::VarScope,
     /// 静态游标声明 → 编译后的 (sql, binds)（compile_block_with 填充，§7.2）
     pending_cursor_sql: BTreeMap<String, (String, Vec<(String, VarName)>)>,
@@ -636,6 +655,21 @@ impl Compiler {
                 self.loop_stack.pop();
                 self.mark(&end);
             }
+            PlStatement::ProcedureCall(pc_stmt) => {
+                let name = ident_path(&pc_stmt.name);
+                let mut args = Vec::new();
+                let mut out_targets = Vec::new();
+                for a in &pc_stmt.arguments {
+                    args.push(self.expr(a)?);
+                    // OUT/INOUT 实参语法位：变量/记录字段可写回；字面量等 None
+                    out_targets.push(self.assign_target_lenient(a));
+                }
+                self.code.push(IrStmt::CallRoutine {
+                    name,
+                    args,
+                    out_targets,
+                });
+            }
             PlStatement::SqlStatement {
                 sql_text,
                 statement,
@@ -783,6 +817,11 @@ impl Compiler {
             .last()
             .map(|(s, _)| s.clone())
             .ok_or_else(|| EngineError::invariant(24, "CONTINUE outside loop"))
+    }
+
+    /// OUT/INOUT 实参的写回目标（宽松版）：非变量/记录字段实参 → None（值传递）。
+    fn assign_target_lenient(&mut self, e: &Expr) -> Option<AssignTarget> {
+        self.assign_target(e).ok()
     }
 
     fn assign_target(&mut self, e: &Expr) -> Result<AssignTarget, EngineError> {
