@@ -6,9 +6,13 @@
 
 pub mod error;
 pub mod exec;
+pub mod ir;
 pub mod rules;
+pub mod runtime;
 pub mod types;
 pub mod value;
+
+pub use ir::{compile_block, compile_stmts, IrExpr, IrProg, IrStmt};
 
 pub use error::{EngineError, ErrorCode, FaultDomain};
 pub use exec::{BindMap, ExecOutcome, FakeExecutor, Row, RowStream, SqlExecutor, TraceSink};
