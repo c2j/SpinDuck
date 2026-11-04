@@ -1,0 +1,32 @@
+[package]
+name = "spinduck"
+version = "0.1.0"
+edition = "2021"
+description = "GaussDB stored-procedure engine on DuckDB kernel"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "spinduck_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spinduck"
+path = "src/bin/spinduck.rs"
+required-features = ["cli"]
+
+[features]
+default = ["native"]
+native = ["dep:duckdb"]
+cli = ["dep:duckdb", "native"]
+golden = ["native"]
+
+[dependencies]
+ogsql-parser = { path = "../lib/ogsql-parser" }
+duckdb = { version = "=1.10505.0", features = ["bundled"], optional = true }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

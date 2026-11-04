@@ -1,0 +1,30 @@
+//! spinduck-core：GaussDB 存储过程引擎（DuckDB 内核）。
+//!
+//! 分层纪律（AGENTS.md §1）：解释器/编译器只依赖 [`exec::SqlExecutor`] 与
+//! [`exec::TraceSink`] 两个接缝；DuckDB API 只允许出现在 `sql/exec.rs` 的
+//! 原生实现中。
+
+pub mod error;
+pub mod exec;
+pub mod rules;
+pub mod types;
+pub mod value;
+
+pub use error::{EngineError, ErrorCode, FaultDomain};
+pub use exec::{BindMap, ExecOutcome, FakeExecutor, Row, RowStream, SqlExecutor, TraceSink};
+pub use rules::RuleRegistry;
+pub use types::SpinType;
+pub use value::{coerce, SpinValue};
+
+/// 引擎版本号。
+pub fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn should_expose_version_from_cargo_metadata() {
+        assert!(!crate::version().is_empty());
+    }
+}
