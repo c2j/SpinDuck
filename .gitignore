@@ -1,0 +1,7 @@
+target/
+.cargo-home/
+.spinduck/
+*.duckdb
+*.wal
+__pycache__/
+.codeweb/
