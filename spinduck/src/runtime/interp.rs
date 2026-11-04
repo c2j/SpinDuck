@@ -111,6 +111,73 @@ pub fn run_with_trace(
                 eval(expr, frame)?; // 求值并丢弃
                 pc += 1;
             }
+            IrStmt::OpenCursor { cursor, source } => {
+                use crate::ir::CursorSource;
+                let (sql, binds) = match source {
+                    CursorSource::Static { sql, binds } => {
+                        let m = resolve_binds(binds, frame)?;
+                        (sql.clone(), m)
+                    }
+                    CursorSource::Dynamic { query_expr } => {
+                        // 动态 OPEN FOR：求值文本 → 解析/格式化 → 方言变换 → SQL
+                        let v = eval(query_expr, frame)?;
+                        let text = v.as_str_loose();
+                        let tokens = ogsql_parser::token::tokenizer::Tokenizer::new(&text)
+                            .tokenize()
+                            .map_err(|e| EngineError::invariant(46, format!("tokenizer: {e}")))?;
+                        let cleaned = ogsql_parser::parser::Parser::new(tokens).parse();
+                        let fmt = ogsql_parser::formatter::SqlFormatter::new();
+                        let sql = cleaned
+                            .iter()
+                            .map(|st| fmt.format_statement(st))
+                            .collect::<Vec<_>>()
+                            .join(";\n");
+                        let sql = crate::sql::apply_ast_transforms(&sql)?;
+                        (sql, BindMap::new())
+                    }
+                };
+                let stream = ex.query(&sql, &binds)?;
+                frame.open_cursor(cursor, crate::runtime::cursor::CursorState::open(stream));
+                sink.on_event(TraceEvent::CursorOpen { schema: Vec::new() });
+                pc += 1;
+            }
+            IrStmt::Fetch { cursor, targets } => {
+                let fetch_schema = frame.cursor_schema(cursor);
+                let row = frame.cursor_mut(cursor)?.fetch()?;
+                match row {
+                    Some(r) => {
+                        // 位置对位写槽；INTO 目标多于列 → 报错
+                        if targets.len() > r.len() {
+                            return Err(EngineError::business(
+                                126,
+                                format!(
+                                    "FETCH INTO targets ({}) exceed columns ({})",
+                                    targets.len(),
+                                    r.len()
+                                ),
+                            ));
+                        }
+                        // %ROWTYPE 记录目标：按结果 schema 建 RECORD（首取时，§7.3.2）
+                        for t in targets {
+                            if let crate::ir::AssignTarget::Field { rec, .. } = t {
+                                frame.ensure_record(rec, &fetch_schema);
+                            }
+                        }
+                        for (i, target) in targets.iter().enumerate() {
+                            assign(frame, target, r[i].clone())?;
+                        }
+                        sink.on_event(TraceEvent::Fetch { row: Some(1) });
+                    }
+                    None => {
+                        sink.on_event(TraceEvent::Fetch { row: None });
+                    }
+                }
+                pc += 1;
+            }
+            IrStmt::CloseCursor { cursor } => {
+                frame.close_cursor(cursor)?;
+                pc += 1;
+            }
             IrStmt::Raise { message } => {
                 let v = eval(message, frame)?;
                 return Err(EngineError::business(200, v.as_str_loose()));
@@ -166,6 +233,9 @@ fn variant_name(st: &IrStmt) -> &'static str {
         IrStmt::SqlQuery { .. } => "SqlQuery",
         IrStmt::SqlExec { .. } => "SqlExec",
         IrStmt::Perform { .. } => "Perform",
+        IrStmt::OpenCursor { .. } => "OpenCursor",
+        IrStmt::Fetch { .. } => "Fetch",
+        IrStmt::CloseCursor { .. } => "CloseCursor",
     }
 }
 
@@ -463,5 +533,160 @@ mod tests {
         let err = compile_stmts(&[PlStatement::Sql("SELECT 1".into())]).unwrap_err();
         assert_eq!(err.domain, crate::error::FaultDomain::Engine);
         assert!(err.message.contains("not yet supported"));
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod kernel_tests {
+    use super::*;
+    use crate::exec::FakeExecutor;
+    use crate::ir::{compile_block_with, VarName};
+    use crate::rules::RuleRegistry;
+    use crate::runtime::Frame;
+    use crate::value::SpinValue;
+    use ogsql_parser::ast::plpgsql::{
+        PlBlock, PlCursorDecl, PlDataType, PlDeclaration, PlStatement, PlVarDecl,
+    };
+    use ogsql_parser::parser::Parser;
+    use ogsql_parser::token::tokenizer::Tokenizer;
+
+    fn parse_statement(sql: &str) -> ogsql_parser::ast::Statement {
+        let tokens = Tokenizer::new(sql).tokenize().unwrap();
+        Parser::new(tokens).parse().remove(0)
+    }
+
+    fn ident(name: &str) -> ogsql_parser::ast::Ident {
+        ogsql_parser::ast::Ident {
+            value: name.to_string(),
+            quote_style: None,
+        }
+    }
+
+    fn var(name: &str) -> ogsql_parser::ast::Expr {
+        ogsql_parser::ast::Expr::PlVariable(vec![ident(name)])
+    }
+
+    fn assign(target: ogsql_parser::ast::Expr, e: ogsql_parser::ast::Expr) -> PlStatement {
+        PlStatement::Assignment {
+            target,
+            expression: e,
+        }
+    }
+
+    /// 端到端探针（真实内核）：静态游标 OPEN/FETCH/EXIT 循环 + 记录字段访问。
+    /// 对应清算过程主循环形态（§7.3），行为口径对齐 scripts/sim_prc_trd_hz_byfund.py。
+    #[test]
+    fn should_run_cursor_loop_with_record_field_access_on_real_kernel() {
+        let ex = crate::sql::DuckExecutor::open_in_memory().unwrap();
+        ex.execute("CREATE TABLE dat(a VARCHAR, n INT)", &BindMap::new())
+            .unwrap();
+        for i in 1..=3 {
+            ex.execute(
+                &format!("INSERT INTO dat VALUES ('row{i}', {i})"),
+                &BindMap::new(),
+            )
+            .unwrap();
+        }
+
+        let sel = parse_statement("SELECT a, n FROM dat ORDER BY n");
+        let block = PlBlock {
+            label: None,
+            declarations: vec![
+                PlDeclaration::Variable(PlVarDecl {
+                    name: "v_sum".into(),
+                    data_type: PlDataType::TypeName("NUMBER".into()),
+                    default: Some(ogsql_parser::ast::Expr::Literal(
+                        ogsql_parser::ast::Literal::Integer(0),
+                    )),
+                    constant: false,
+                    not_null: false,
+                    collate: None,
+                }),
+                PlDeclaration::Cursor(PlCursorDecl {
+                    name: "c_dat".into(),
+                    arguments: vec![],
+                    return_type: None,
+                    query: "SELECT a, n FROM dat ORDER BY n".into(),
+                    parsed_query: Some(Box::new(sel)),
+                    scrollable: false,
+                }),
+            ],
+            body: vec![
+                assign(
+                    var("v_sum"),
+                    ogsql_parser::ast::Expr::Literal(ogsql_parser::ast::Literal::Integer(0)),
+                ),
+                assign(
+                    var("r_n"),
+                    ogsql_parser::ast::Expr::Literal(ogsql_parser::ast::Literal::Integer(0)),
+                ),
+                PlStatement::Open(ogsql_parser::ast::Spanned::new(
+                    ogsql_parser::ast::plpgsql::PlOpenStmt {
+                        cursor: var("c_dat"),
+                        kind: ogsql_parser::ast::plpgsql::PlOpenKind::Simple { arguments: vec![] },
+                    },
+                    None,
+                )),
+                PlStatement::Loop(ogsql_parser::ast::Spanned::new(
+                    ogsql_parser::ast::plpgsql::PlLoopStmt {
+                        label: None,
+                        body: vec![
+                            PlStatement::Fetch(ogsql_parser::ast::Spanned::new(
+                                ogsql_parser::ast::plpgsql::PlFetchStmt {
+                                    cursor: var("c_dat"),
+                                    direction: None,
+                                    bulk_collect: false,
+                                    into: vec![
+                                        ogsql_parser::ast::Expr::ColumnRef(vec![
+                                            ident("r"),
+                                            ident("a"),
+                                        ]),
+                                        ogsql_parser::ast::Expr::ColumnRef(vec![
+                                            ident("r"),
+                                            ident("n"),
+                                        ]),
+                                    ],
+                                },
+                                None,
+                            )),
+                            PlStatement::Exit {
+                                label: None,
+                                condition: Some(ogsql_parser::ast::Expr::CursorAttribute {
+                                    cursor: Box::new(var("c_dat")),
+                                    attribute: ogsql_parser::ast::CursorAttributeKind::NotFound,
+                                }),
+                            },
+                            assign(
+                                var("v_sum"),
+                                ogsql_parser::ast::Expr::BinaryOp {
+                                    left: Box::new(var("v_sum")),
+                                    op: "+".into(),
+                                    right: Box::new(ogsql_parser::ast::Expr::ColumnRef(vec![
+                                        ident("r"),
+                                        ident("n"),
+                                    ])),
+                                },
+                            ),
+                        ],
+                        end_label: None,
+                    },
+                    None,
+                )),
+                PlStatement::Close {
+                    cursor: var("c_dat"),
+                },
+            ],
+            exception_block: None,
+            end_label: None,
+        };
+
+        let prog = compile_block_with(&block, &RuleRegistry::default()).unwrap();
+        let mut frame = Frame::new();
+        let out = run(&prog, &mut frame, &ex).unwrap();
+        assert_eq!(out, RunOutcome::Completed);
+        assert_eq!(
+            frame.get(&VarName("v_sum".into())),
+            Some(&SpinValue::Int(6)) // 1+2+3
+        );
     }
 }

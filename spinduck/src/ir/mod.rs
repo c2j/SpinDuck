@@ -8,6 +8,7 @@ use ogsql_parser::ast::Expr;
 
 use crate::error::EngineError;
 use crate::rules::RuleRegistry;
+use crate::runtime::cursor::CursorAttrKind;
 use crate::value::SpinValue;
 use std::collections::BTreeMap;
 
@@ -46,6 +47,11 @@ pub enum IrExpr {
     FuncCall {
         name: String,
         args: Vec<IrExpr>,
+    },
+    /// 游标属性：cursor%NOTFOUND 等（§7.3.3）
+    CursorAttr {
+        cursor: VarName,
+        kind: CursorAttrKind,
     },
 }
 
@@ -107,6 +113,30 @@ pub enum IrStmt {
     Perform {
         expr: IrExpr,
     },
+    /// OPEN 游标（§7.1：静态已改写 / 动态运行期文本）
+    OpenCursor {
+        cursor: VarName,
+        source: CursorSource,
+    },
+    /// FETCH INTO（位置对位写槽；流尾不覆盖目标）
+    Fetch {
+        cursor: VarName,
+        targets: Vec<AssignTarget>,
+    },
+    CloseCursor {
+        cursor: VarName,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum CursorSource {
+    /// 静态游标：声明段 parsed_query 经改写管线后的文本与绑定
+    Static {
+        sql: String,
+        binds: Vec<(String, VarName)>,
+    },
+    /// 动态 OPEN FOR <变量>（运行期求值文本，M8 前不做人内变量替换）
+    Dynamic { query_expr: IrExpr },
 }
 
 /// 编译产物：线性指令序列。
@@ -136,6 +166,35 @@ pub fn compile_stmts_with(
     Ok(IrProg { code: c.code })
 }
 
+/// 从完整 PL 块编译：声明段静态游标在此编译（§7.2）。
+pub fn compile_block(block: &PlBlock) -> Result<IrProg, EngineError> {
+    compile_block_with(block, &RuleRegistry::default())
+}
+
+/// 带规则注册表的块编译。
+pub fn compile_block_with(block: &PlBlock, rules: &RuleRegistry) -> Result<IrProg, EngineError> {
+    let vars = collect_var_names(&block.body);
+    let mut c = Compiler {
+        vars,
+        funcs: rules.functions.clone(),
+        ..Default::default()
+    };
+    for decl in &block.declarations {
+        if let ogsql_parser::ast::plpgsql::PlDeclaration::Cursor(cd) = decl {
+            let name = cd.name.to_ascii_lowercase();
+            let query_text = match &cd.parsed_query {
+                Some(q) => ogsql_parser::formatter::SqlFormatter::new().format_statement(q),
+                None => cd.query.clone(),
+            };
+            let unit = crate::sql::rewrite_tokens_with_rules(&query_text, &c.vars, &c.funcs)?;
+            let text = crate::sql::apply_ast_transforms(&unit.text)?;
+            c.pending_cursor_sql.insert(name, (text, unit.binds));
+        }
+    }
+    c.stmts(&block.body)?;
+    c.resolve_fixups()?;
+    Ok(IrProg { code: c.code })
+}
 /// 预扫描：赋值目标 + PL 表达式中的 PlVariable 引用（不进入 SQL 语句内部）。
 /// 扩展点（M6）：例程参数与 DECLARE 声明同样入集（GaussDB 语义：声明即变量）。
 fn collect_var_names(stmts: &[PlStatement]) -> crate::sql::VarScope {
@@ -208,12 +267,6 @@ fn collect_expr(e: &Expr, set: &mut crate::sql::VarScope) {
     }
 }
 
-/// 从完整 PL 块编译（声明段 M2 忽略——变量按需在帧中创建）。
-pub fn compile_block(block: &PlBlock) -> Result<IrProg, EngineError> {
-    compile_stmts(&block.body)
-}
-
-/// 改写管线：token 变量替换/函数重命名 → 解析级变换（DECODE/TO_NUMBER/TO_CHAR）。
 fn rewrite_sql(
     sql_text: &str,
     vars: &crate::sql::VarScope,
@@ -230,6 +283,8 @@ fn rewrite_sql(
 #[derive(Default)]
 struct Compiler {
     vars: crate::sql::VarScope,
+    /// 静态游标声明 → 编译后的 (sql, binds)（compile_block_with 填充，§7.2）
+    pending_cursor_sql: BTreeMap<String, (String, Vec<(String, VarName)>)>,
     funcs: BTreeMap<String, String>,
     code: Vec<IrStmt>,
     labels: std::collections::HashMap<String, usize>,
@@ -405,6 +460,168 @@ impl Compiler {
                 let value = expression.as_ref().map(|e| self.expr(e)).transpose()?;
                 self.code.push(IrStmt::Return { value });
             }
+            PlStatement::Open(open_stmt) => {
+                let (cursor, kind) = (&open_stmt.cursor, &open_stmt.kind);
+                let cname = match cursor {
+                    Expr::PlVariable(n) | Expr::ColumnRef(n) => VarName(ident_path(n)),
+                    other => {
+                        return Err(EngineError::invariant(
+                            48,
+                            format!("unsupported cursor reference: {other:?}"),
+                        ));
+                    }
+                };
+                let source = match kind {
+                    ogsql_parser::ast::plpgsql::PlOpenKind::Simple { .. } => {
+                        // 静态游标：声明段 parsed_query 已在 compile_block_with 编译
+                        match self.pending_cursor_sql.get(&cname.0.to_ascii_lowercase()) {
+                            Some((sql, binds)) => CursorSource::Static {
+                                sql: sql.clone(),
+                                binds: binds.clone(),
+                            },
+                            None => {
+                                return Err(EngineError::invariant(
+                                    49,
+                                    format!("cursor {} has no compiled query", cname.0),
+                                ));
+                            }
+                        }
+                    }
+                    ogsql_parser::ast::plpgsql::PlOpenKind::ForQuery { query, .. } => {
+                        let vexpr =
+                            ogsql_parser::ast::Expr::PlVariable(vec![ogsql_parser::ast::Ident {
+                                value: query.clone(),
+                                quote_style: None,
+                            }]);
+                        CursorSource::Dynamic {
+                            query_expr: self.expr(&vexpr)?,
+                        }
+                    }
+                    ogsql_parser::ast::plpgsql::PlOpenKind::ForUsing { .. }
+                    | ogsql_parser::ast::plpgsql::PlOpenKind::ForExecute { .. } => {
+                        return Err(EngineError::invariant(
+                            51,
+                            "OPEN FOR EXECUTE/USING (dynamic with USING) is M8 scope",
+                        ));
+                    }
+                };
+                self.code.push(IrStmt::OpenCursor {
+                    cursor: cname,
+                    source,
+                });
+            }
+            PlStatement::Fetch(fetch_stmt) => {
+                let (cursor, direction, bulk_collect, into) = (
+                    &fetch_stmt.cursor,
+                    &fetch_stmt.direction,
+                    &fetch_stmt.bulk_collect,
+                    &fetch_stmt.into,
+                );
+                if direction.is_some() || *bulk_collect {
+                    return Err(EngineError::invariant(
+                        52,
+                        "scroll fetch / BULK COLLECT is not supported in v1",
+                    ));
+                }
+                let cname = match &cursor {
+                    Expr::PlVariable(n) | Expr::ColumnRef(n) => VarName(ident_path(n)),
+                    other => {
+                        return Err(EngineError::invariant(
+                            53,
+                            format!("unsupported cursor reference: {other:?}"),
+                        ));
+                    }
+                };
+                let targets = into
+                    .iter()
+                    .map(|e| self.assign_target(e))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.code.push(IrStmt::Fetch {
+                    cursor: cname,
+                    targets,
+                });
+            }
+            PlStatement::Close { cursor, .. } => {
+                let cname = match &cursor {
+                    Expr::PlVariable(n) | Expr::ColumnRef(n) => VarName(ident_path(n)),
+                    other => {
+                        return Err(EngineError::invariant(
+                            54,
+                            format!("unsupported cursor reference: {other:?}"),
+                        ));
+                    }
+                };
+                self.code.push(IrStmt::CloseCursor { cursor: cname });
+            }
+            PlStatement::For(f) => {
+                // Range → 计数循环；Query → 隐式游标循环（M4c 打开）
+                use ogsql_parser::ast::plpgsql::PlForKind;
+                let var = VarName(f.variable.to_ascii_lowercase());
+                let start = f
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| self.synth_label("for_start"));
+                let end = f
+                    .end_label
+                    .clone()
+                    .unwrap_or_else(|| format!("{start}__end"));
+                self.loop_stack.push((start.clone(), end.clone()));
+                match &f.kind {
+                    PlForKind::Range {
+                        low,
+                        high,
+                        step,
+                        reverse,
+                    } => {
+                        if *reverse {
+                            return Err(EngineError::invariant(
+                                55,
+                                "FOR REVERSE is not supported in v1",
+                            ));
+                        }
+                        let e_low = self.expr(low)?;
+                        self.code.push(IrStmt::Assign {
+                            target: AssignTarget::Var(var.clone()),
+                            expr: e_low,
+                        });
+                        self.mark(&start);
+                        let cond = IrExpr::Bin {
+                            op: BinOp::Le,
+                            l: Box::new(IrExpr::Var(var.clone())),
+                            r: Box::new(self.expr(high)?),
+                        };
+                        self.jump(&end, Some(cond), false);
+                        self.stmts(&f.body)?;
+                        let step_inc = match step {
+                            Some(s) => self.expr(s)?,
+                            None => IrExpr::Const(SpinValue::Int(1)),
+                        };
+                        self.code.push(IrStmt::Assign {
+                            target: AssignTarget::Var(var.clone()),
+                            expr: IrExpr::Bin {
+                                op: BinOp::Add,
+                                l: Box::new(IrExpr::Var(var.clone())),
+                                r: Box::new(step_inc),
+                            },
+                        });
+                        self.jump(&start, None, true);
+                    }
+                    PlForKind::Query { .. } => {
+                        return Err(EngineError::invariant(
+                            56,
+                            "FOR rec IN query is deferred to M4c (implicit cursor desugar)",
+                        ));
+                    }
+                    PlForKind::Cursor { .. } => {
+                        return Err(EngineError::invariant(
+                            57,
+                            "FOR rec IN cursor is deferred to M4c",
+                        ));
+                    }
+                }
+                self.loop_stack.pop();
+                self.mark(&end);
+            }
             PlStatement::SqlStatement {
                 sql_text,
                 statement,
@@ -570,6 +787,33 @@ impl Compiler {
                     IrExpr::Not(Box::new(IrExpr::IsNull(Box::new(inner))))
                 } else {
                     IrExpr::IsNull(Box::new(inner))
+                })
+            }
+            Expr::CursorAttribute { cursor, attribute } => {
+                let cname = match cursor.as_ref() {
+                    Expr::PlVariable(n) | Expr::ColumnRef(n) => VarName(ident_path(n)),
+                    other => {
+                        return Err(EngineError::invariant(
+                            46,
+                            format!("unsupported cursor reference: {other:?}"),
+                        ));
+                    }
+                };
+                let kind = match attribute {
+                    ogsql_parser::ast::CursorAttributeKind::NotFound => CursorAttrKind::NotFound,
+                    ogsql_parser::ast::CursorAttributeKind::Found => CursorAttrKind::Found,
+                    ogsql_parser::ast::CursorAttributeKind::IsOpen => CursorAttrKind::IsOpen,
+                    ogsql_parser::ast::CursorAttributeKind::RowCount => CursorAttrKind::RowCount,
+                    ogsql_parser::ast::CursorAttributeKind::BulkExceptions => {
+                        return Err(EngineError::invariant(
+                            47,
+                            "BULK_EXCEPTIONS cursor attribute is not supported",
+                        ));
+                    }
+                };
+                Ok(IrExpr::CursorAttr {
+                    cursor: cname,
+                    kind,
                 })
             }
             Expr::FunctionCall { name, args, .. } => Ok(IrExpr::FuncCall {

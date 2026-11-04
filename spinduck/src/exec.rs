@@ -37,6 +37,13 @@ impl RowStream {
     pub fn reset(&mut self) {
         self.pos = 0;
     }
+    /// 已载入的行数（物化快照行数）。
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
 }
 
 /// 执行结果：DML 返回受影响行数。
