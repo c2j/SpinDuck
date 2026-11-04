@@ -126,6 +126,20 @@ pub enum IrStmt {
     CloseCursor {
         cursor: VarName,
     },
+    /// 安装异常处理器表（§3.5；handlers 体在 handlers 区，start/end 已标记）
+    PushTrap {
+        entries: Vec<TrapEntry>,
+    },
+    /// 撤销当前处理器（正常路径离开 try 体）
+    PopTrap,
+}
+
+/// 单个处理器：条件列表 + 主体指令区间 [body_start, body_end)。
+#[derive(Debug, Clone)]
+pub struct TrapEntry {
+    pub conds: Vec<String>,
+    pub body_start: usize,
+    pub body_end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -646,7 +660,41 @@ impl Compiler {
                     .unwrap_or_else(|| IrExpr::Const(SpinValue::Str("EXCEPTION".into())));
                 self.code.push(IrStmt::Raise { message: msg });
             }
-            PlStatement::Block(b) => self.stmts(&b.body)?,
+            PlStatement::Block(b) => match &b.exception_block {
+                None => self.stmts(&b.body)?,
+                // BEGIN..EXCEPTION：PushTrap → try 体 → PopTrap → Jump(resume)
+                // → handlers 区（每臂 Jump(resume)）→ resume:
+                Some(exc) => {
+                    let resume = self.synth_label("trap_resume");
+                    let mut entries = Vec::new();
+                    self.code.push(IrStmt::PushTrap {
+                        entries: Vec::new(),
+                    }); // 占位，回填
+                    let trap_at = self.here() - 1;
+                    self.stmts(&b.body)?;
+                    self.code.push(IrStmt::PopTrap);
+                    self.jump(&resume, None, true);
+                    // handlers 区
+                    for h in &exc.handlers {
+                        let body_start = self.here();
+                        self.stmts(&h.statements)?;
+                        let body_end = self.here();
+                        self.jump(&resume, None, true);
+                        entries.push(TrapEntry {
+                            conds: h
+                                .conditions
+                                .iter()
+                                .map(|c| c.to_ascii_lowercase())
+                                .collect(),
+                            body_start,
+                            body_end,
+                        });
+                    }
+                    self.mark(&resume);
+                    // 回填 PushTrap.entries
+                    self.code[trap_at] = IrStmt::PushTrap { entries };
+                }
+            },
             // —— M2 之后的里程碑纳入（编译期显式拒绝，禁止静默错误翻译）——
             other => {
                 return Err(EngineError::invariant(

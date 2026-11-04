@@ -25,44 +25,99 @@ pub fn run(
     run_with_trace(prog, frame, ex, &mut TraceNoop)
 }
 
+/// 异常处理帧（§3.5）：处理器表 + resume PC（PopTrap 后的 Jump(resume)）。
+struct TrapFrame {
+    entries: Vec<crate::ir::TrapEntry>,
+}
+
 /// 带 trace 的运行（§2.1/§10.5：core 一次埋点，CLI/监控共用）。
+/// 错误模型（§3.5）：指令错误 → 自顶向下找匹配处理器 → pc=处理器体重入主循环；
+/// 无匹配 → 向外层 trap 展开，最终无处理器则返回错误。
 pub fn run_with_trace(
     prog: &IrProg,
     frame: &mut Frame,
     ex: &dyn SqlExecutor,
     sink: &mut dyn TraceSink,
 ) -> Result<RunOutcome, EngineError> {
+    let mut traps: Vec<TrapFrame> = Vec::new();
     let mut pc = 0usize;
     let mut steps = 0u64;
     loop {
-        steps += 1;
-        if steps > MAX_STEPS {
+        match run_inner(prog, frame, ex, sink, &mut traps, &mut pc, &mut steps) {
+            Ok(out) => return Ok(out),
+            Err(e) => {
+                // 自顶向下找匹配处理器
+                let mut handled = false;
+                while !traps.is_empty() {
+                    let hit = traps
+                        .last()
+                        .unwrap()
+                        .entries
+                        .iter()
+                        .find(|en| en.conds.iter().any(|c| crate::error::cond_matches(c, &e)));
+                    match hit {
+                        Some(h) => {
+                            // 消费该 trap（丢弃其上全部未弹出的内层 trap）并重入处理器体
+                            let body_start = h.body_start;
+                            traps.pop();
+                            pc = body_start;
+                            handled = true;
+                            break;
+                        }
+                        None => {
+                            traps.pop(); // 无匹配 → 展开到外层
+                        }
+                    }
+                }
+                if !handled {
+                    return Err(e);
+                }
+                // pc 已指向处理器体；handler 末尾的 Jump(resume) 负责跳回 resume
+            }
+        }
+    }
+}
+
+/// 内层执行驱动（traps/pc/steps 由外层持有，支持跨重试持久化）。
+fn run_inner(
+    prog: &IrProg,
+    frame: &mut Frame,
+    ex: &dyn SqlExecutor,
+    sink: &mut dyn TraceSink,
+    traps: &mut Vec<TrapFrame>,
+    pc: &mut usize,
+    steps: &mut u64,
+) -> Result<RunOutcome, EngineError> {
+    loop {
+        *steps += 1;
+        if *steps > MAX_STEPS {
             return Err(EngineError::invariant(
                 32,
                 format!("step budget exceeded ({MAX_STEPS}): possible infinite loop"),
             ));
         }
-        let st = match prog.code.get(pc) {
+        let pc_cur = *pc;
+        let st = match prog.code.get(pc_cur) {
             Some(st) => st,
             // 程序尾部：隐式完成（无 RETURN 的过程）
             None => return Ok(RunOutcome::Completed),
         };
         sink.on_event(spinduck_trace_event(st));
         match st {
-            IrStmt::Nop | IrStmt::TxCommit | IrStmt::TxRollback => pc += 1,
+            IrStmt::Nop | IrStmt::TxCommit | IrStmt::TxRollback => *pc += 1,
             IrStmt::Assign { target, expr } => {
                 let v = eval(expr, frame)?;
                 assign(frame, target, v)?;
-                pc += 1;
+                *pc += 1;
             }
-            IrStmt::Jump(to) => pc = *to,
+            IrStmt::Jump(to) => *pc = *to,
             IrStmt::JumpIfNot { cond, to } => {
                 let t = eval_cond(cond, frame)?;
-                pc = if t == Some(true) { pc + 1 } else { *to };
+                *pc = if t == Some(true) { pc_cur + 1 } else { *to };
             }
             IrStmt::JumpIf { cond, to } => {
                 let t = eval_cond(cond, frame)?;
-                pc = if t == Some(true) { *to } else { pc + 1 };
+                *pc = if t == Some(true) { *to } else { pc_cur + 1 };
             }
             IrStmt::SqlQuery { sql, binds, into } => {
                 let bound = resolve_binds(binds, frame)?;
@@ -92,7 +147,7 @@ pub fn run_with_trace(
                             let v = row.get(i).cloned().unwrap_or(SpinValue::Null);
                             assign(frame, target, v)?;
                         }
-                        pc += 1;
+                        *pc += 1;
                     }
                     _ => unreachable!(),
                 }
@@ -105,11 +160,11 @@ pub fn run_with_trace(
                     elapsed_us: 0,
                 });
                 ex.execute(sql, &bound)?;
-                pc += 1;
+                *pc += 1;
             }
             IrStmt::Perform { expr } => {
                 eval(expr, frame)?; // 求值并丢弃
-                pc += 1;
+                *pc += 1;
             }
             IrStmt::OpenCursor { cursor, source } => {
                 use crate::ir::CursorSource;
@@ -139,7 +194,7 @@ pub fn run_with_trace(
                 let stream = ex.query(&sql, &binds)?;
                 frame.open_cursor(cursor, crate::runtime::cursor::CursorState::open(stream));
                 sink.on_event(TraceEvent::CursorOpen { schema: Vec::new() });
-                pc += 1;
+                *pc += 1;
             }
             IrStmt::Fetch { cursor, targets } => {
                 let fetch_schema = frame.cursor_schema(cursor);
@@ -172,11 +227,21 @@ pub fn run_with_trace(
                         sink.on_event(TraceEvent::Fetch { row: None });
                     }
                 }
-                pc += 1;
+                *pc += 1;
             }
             IrStmt::CloseCursor { cursor } => {
                 frame.close_cursor(cursor)?;
-                pc += 1;
+                *pc += 1;
+            }
+            IrStmt::PushTrap { entries } => {
+                traps.push(TrapFrame {
+                    entries: entries.clone(),
+                });
+                *pc += 1;
+            }
+            IrStmt::PopTrap => {
+                traps.pop();
+                *pc += 1;
             }
             IrStmt::Raise { message } => {
                 let v = eval(message, frame)?;
@@ -236,6 +301,8 @@ fn variant_name(st: &IrStmt) -> &'static str {
         IrStmt::OpenCursor { .. } => "OpenCursor",
         IrStmt::Fetch { .. } => "Fetch",
         IrStmt::CloseCursor { .. } => "CloseCursor",
+        IrStmt::PushTrap { .. } => "PushTrap",
+        IrStmt::PopTrap => "PopTrap",
     }
 }
 
@@ -533,6 +600,181 @@ mod tests {
         let err = compile_stmts(&[PlStatement::Sql("SELECT 1".into())]).unwrap_err();
         assert_eq!(err.domain, crate::error::FaultDomain::Engine);
         assert!(err.message.contains("not yet supported"));
+    }
+}
+
+#[cfg(test)]
+mod m5 {
+    use super::*;
+    use crate::exec::FakeExecutor;
+    use crate::ir::compile_stmts;
+    use crate::ir::VarName;
+
+    use crate::runtime::{Frame, RunOutcome};
+
+    use ogsql_parser::ast::plpgsql::PlStatement;
+    use ogsql_parser::ast::plpgsql::{PlBlock, PlStatement as PlStmtT};
+    fn ident(name: &str) -> ogsql_parser::ast::Ident {
+        ogsql_parser::ast::Ident {
+            value: name.to_string(),
+            quote_style: None,
+        }
+    }
+    fn var(name: &str) -> ogsql_parser::ast::Expr {
+        ogsql_parser::ast::Expr::PlVariable(vec![ident(name)])
+    }
+    fn lit_str(s: &str) -> ogsql_parser::ast::Expr {
+        ogsql_parser::ast::Expr::Literal(ogsql_parser::ast::Literal::String(s.to_string()))
+    }
+    fn lit_int(i: i64) -> ogsql_parser::ast::Expr {
+        ogsql_parser::ast::Expr::Literal(ogsql_parser::ast::Literal::Integer(i))
+    }
+    fn assign(target: ogsql_parser::ast::Expr, e: ogsql_parser::ast::Expr) -> PlStatement {
+        PlStatement::Assignment {
+            target,
+            expression: e,
+        }
+    }
+    fn run_pl_with(
+        stmts: Vec<PlStatement>,
+        ex: &FakeExecutor,
+    ) -> (Frame, Result<RunOutcome, EngineError>) {
+        let prog = compile_stmts(&stmts).expect("compile");
+        let mut f = Frame::new();
+        let out = run(&prog, &mut f, ex);
+        (f, out)
+    }
+    fn exc_block(body: Vec<PlStmtT>, handlers: Vec<(Vec<&str>, Vec<PlStmtT>)>) -> PlStmtT {
+        use ogsql_parser::ast::plpgsql::{PlExceptionBlock, PlExceptionHandler};
+        use ogsql_parser::ast::Spanned;
+        PlStmtT::Block(Spanned::new(
+            PlBlock {
+                label: None,
+                declarations: vec![],
+                body,
+                exception_block: Some(PlExceptionBlock {
+                    handlers: handlers
+                        .into_iter()
+                        .map(|(conds, stmts)| PlExceptionHandler {
+                            conditions: conds.iter().map(|c| c.to_string()).collect(),
+                            statements: stmts,
+                        })
+                        .collect(),
+                }),
+                end_label: None,
+            },
+            None,
+        ))
+    }
+
+    fn select_into(var_name: &str, cond: &str) -> PlStatement {
+        use ogsql_parser::parser::Parser;
+        use ogsql_parser::token::tokenizer::Tokenizer;
+        let sql = format!("SELECT t.flag INTO {var_name} FROM swh_routing WHERE t.k = {cond}");
+        let parsed = Parser::new(Tokenizer::new(&sql).tokenize().unwrap())
+            .parse()
+            .remove(0);
+        PlStatement::SqlStatement {
+            span: None,
+            sql_text: sql,
+            statement: Box::new(parsed),
+        }
+    }
+
+    #[test]
+    fn should_catch_no_data_found_with_named_handler() {
+        let mut ex = FakeExecutor::default(); // 0 行 → NO_DATA_FOUND
+        let pre = assign(var("p_i_date"), lit_str("20240105"));
+        let block = exc_block(
+            vec![select_into("v_flag", "p_i_date")],
+            vec![(
+                vec!["no_data_found"],
+                vec![assign(var("v_flag"), lit_str("fallback"))],
+            )],
+        );
+        let after = assign(var("v_after"), lit_str("yes"));
+        let (f, out) = run_pl_with(vec![pre, block, after], &ex);
+        assert_eq!(out.unwrap(), RunOutcome::Completed);
+        assert_eq!(
+            f.get(&VarName("v_flag".into())),
+            Some(&SpinValue::Str("fallback".into()))
+        );
+        // 处理器完成后继续块外语句
+        assert_eq!(
+            f.get(&VarName("v_after".into())),
+            Some(&SpinValue::Str("yes".into()))
+        );
+    }
+
+    #[test]
+    fn should_propagate_unmatched_error_to_outer_others() {
+        let ex = FakeExecutor::default();
+        let pre = assign(var("p_i_date"), lit_str("20240105"));
+        // 内层：只声明 too_many_rows；实际是 no_data_found → 不匹配 → 上抛
+        let inner = exc_block(
+            vec![select_into("v_inner", "p_i_date")],
+            vec![(
+                vec!["too_many_rows"],
+                vec![assign(var("v_inner"), lit_str("x"))],
+            )],
+        );
+        // 外层：WHEN OTHERS 兜底
+        let outer = exc_block(
+            vec![inner],
+            vec![(vec!["others"], vec![assign(var("v_handled"), lit_int(1))])],
+        );
+        let (f, out) = run_pl_with(vec![pre, outer], &ex);
+        assert_eq!(out.unwrap(), RunOutcome::Completed);
+        assert_eq!(
+            f.get(&VarName("v_handled".into())),
+            Some(&SpinValue::Int(1))
+        );
+    }
+
+    #[test]
+    fn should_re_raise_from_handler_to_outer_trap() {
+        let ex = FakeExecutor::default();
+        let pre = assign(var("p_i_date"), lit_str("20240105"));
+        // 内层处理器捕获后再次 RAISE → 向外层传播
+        let inner = exc_block(
+            vec![select_into("v_inner", "p_i_date")],
+            vec![(
+                vec!["no_data_found"],
+                vec![PlStatement::Raise(ogsql_parser::ast::Spanned::new(
+                    ogsql_parser::ast::plpgsql::PlRaiseStmt {
+                        level: None,
+                        message: Some("re-raised".into()),
+                        params: vec![],
+                        options: vec![],
+                        condname: None,
+                        sqlstate: None,
+                    },
+                    None,
+                ))],
+            )],
+        );
+        let outer = exc_block(
+            vec![inner],
+            vec![(
+                vec!["others"],
+                vec![assign(var("v_outer"), lit_str("outer_caught"))],
+            )],
+        );
+        let (f, out) = run_pl_with(vec![pre, outer], &ex);
+        assert_eq!(out.unwrap(), RunOutcome::Completed);
+        assert_eq!(
+            f.get(&VarName("v_outer".into())),
+            Some(&SpinValue::Str("outer_caught".into()))
+        );
+    }
+
+    #[test]
+    fn should_stop_propagation_when_no_handler_anywhere() {
+        let ex = FakeExecutor::default();
+        let pre = assign(var("p_i_date"), lit_str("20240105"));
+        let (_, out) = run_pl_with(vec![pre, select_into("v_flag", "p_i_date")], &ex);
+        let err = out.unwrap_err();
+        assert_eq!(err.code.to_string(), "BIZ-0100");
     }
 }
 

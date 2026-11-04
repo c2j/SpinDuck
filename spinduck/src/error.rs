@@ -92,6 +92,26 @@ impl fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
+/// 异常条件匹配（AGENTS §4：错误码表为规则数据；v1 静态表锚定探针）。
+/// cond 归一化小写：`others` 通配；命名条件映射错误码；SQLSTATE 串等值匹配。
+pub fn cond_matches(cond: &str, e: &EngineError) -> bool {
+    let c = cond.trim().to_ascii_lowercase();
+    match c.as_str() {
+        "others" => true,
+        "no_data_found" => e.code.0 == "BIZ-0100",
+        "too_many_rows" => e.code.0 == "BIZ-0101",
+        sqlstate
+            if sqlstate.len() == 5
+                && sqlstate
+                    .chars()
+                    .all(|ch| ch.is_ascii_digit() || ch.is_ascii_uppercase()) =>
+        {
+            e.message.contains(sqlstate) || e.code.0.ends_with(sqlstate)
+        }
+        _ => false,
+    }
+}
+
 fn domain_name(d: FaultDomain) -> &'static str {
     match d {
         FaultDomain::Engine => "ENGINE",
@@ -122,5 +142,24 @@ mod tests {
     fn should_raise_named_exceptions_for_select_into_rowcount() {
         assert_eq!(EngineError::no_data_found().code.to_string(), "BIZ-0100");
         assert_eq!(EngineError::too_many_rows().code.to_string(), "BIZ-0101");
+    }
+}
+
+#[cfg(test)]
+mod cond_tests {
+    use super::*;
+
+    #[test]
+    fn should_match_named_conditions_by_error_code() {
+        let e = EngineError::no_data_found();
+        assert!(cond_matches("no_data_found", &e));
+        assert!(cond_matches("NO_DATA_FOUND", &e));
+        assert!(!cond_matches("too_many_rows", &e));
+    }
+
+    #[test]
+    fn should_match_others_wildcard() {
+        assert!(cond_matches("others", &EngineError::kernel(1, "x")));
+        assert!(cond_matches("OTHERS", &EngineError::no_data_found()));
     }
 }
