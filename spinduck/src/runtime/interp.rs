@@ -463,10 +463,6 @@ mod tests {
         (f, out)
     }
 
-    fn fake() -> FakeExecutor {
-        FakeExecutor::default()
-    }
-
     fn var(name: &str) -> ogsql_parser::ast::Expr {
         ogsql_parser::ast::Expr::PlVariable(vec![ident(name)])
     }
@@ -638,7 +634,7 @@ mod tests {
             sql_text: sql.to_string(),
             statement: Box::new(parsed),
         };
-        let mut ex = FakeExecutor::with_rows(
+        let ex = FakeExecutor::with_rows(
             vec!["fund_code".to_string(), "cjsl".to_string()],
             vec![vec![SpinValue::Str("F0001".into()), SpinValue::Int(100)]],
         );
@@ -812,7 +808,7 @@ mod m5 {
 
     #[test]
     fn should_catch_no_data_found_with_named_handler() {
-        let mut ex = FakeExecutor::default(); // 0 行 → NO_DATA_FOUND
+        let ex = FakeExecutor::default(); // 0 行 → NO_DATA_FOUND
         let pre = assign(var("p_i_date"), lit_str("20240105"));
         let block = exc_block(
             vec![select_into("v_flag", "p_i_date")],
@@ -910,7 +906,6 @@ mod m5 {
 #[cfg(all(test, feature = "native"))]
 mod kernel_tests {
     use super::*;
-    use crate::exec::FakeExecutor;
     use crate::ir::{compile_block_with, VarName};
     use crate::rules::RuleRegistry;
     use crate::runtime::Frame;
@@ -950,7 +945,6 @@ mod kernel_tests {
     /// → 过程间互调（CALL 另一过程）→ SQL 内 PL 函数经 UDF 桥接（threads=1）。
     #[test]
     fn should_call_procs_with_out_params_and_udf_bridge_on_real_kernel() {
-        use crate::catalog::RoutineCatalog;
         use crate::engine::Engine;
         use crate::exec::TraceNoopSink;
         use crate::ir::VarName;

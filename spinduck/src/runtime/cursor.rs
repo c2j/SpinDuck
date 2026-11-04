@@ -127,7 +127,7 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 3);
-        assert!(matches!(c.fetch().unwrap(), None));
+        assert!(c.fetch().unwrap().is_none());
         assert_eq!(c.attr(CursorAttrKind::RowCount), SpinValue::Int(3));
         assert_eq!(c.attr(CursorAttrKind::NotFound), SpinValue::Bool(true));
         assert_eq!(c.attr(CursorAttrKind::Found), SpinValue::Bool(false));

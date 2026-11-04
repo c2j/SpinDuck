@@ -115,3 +115,34 @@ M10 黄金比对的对照基线；目标语料集与样例数据通过项目配�
 症状）。设计 §8.2 约束③由"含 UDF 的语句一律单线程"收窄为："UDF 出现在过滤/
 子查询位置的语句强制 threads=1；SELECT 列表位置放开多线程"。Rust UDF 落地后
 仍需按 M6.5 复测（Python 回调结论不外推）。
+
+## V7. GaussDB 物化/回写实证（M4.5 门禁）
+
+**环境**：本机容器 `opengauss/opengauss:5.0.0`，映射 `15432→5432`。openGauss 默认
+sha256 口令，纯 Rust `postgres` crate 不支持；容器侧改为
+`password_encryption_type=0` + `pg_hba.conf` 追加 `host all all 0.0.0.0/0 md5`
+（直接改 `/var/lib/opengauss/data/*.conf` 后 `docker restart`），并以
+`ALTER USER gaussdb IDENTIFIED BY '…' REPLACE '…'` 重存口令后 md5 认证可用。
+**结论：通道选择 PG 线协议成立；生产对接需在 GaussDB 侧确认 md5 或改用 TLS +
+SCRAM 实现（v1 不支持 sha256，属已知限制）。**
+
+E2E（`cargo test --features gauss gauss_e2e`，`tests/gauss_e2e.rs`）两个用例：
+
+1. `gauss_e2e_materialize_process_sync_back`：GaussDB `sd_dat_in(a,n)` 两行
+   `('x',2),('y',3)` → `materialize` 全量入 DuckDB（2 行，文本承载）→ 过程
+   `prc_agg` 执行 `INSERT INTO sd_dat_out SELECT 'sum', SUM(n)` → `sync_append`
+   回写 → GaussDB 侧 `SELECT` 读回 `('sum','5')`。**物化→处理→回写→校验闭环成立。**
+2. `gauss_e2e_materialize_with_where_clause`：`materialize(.., Some("bcrq = '20240105'"))`
+   只落 1 行（`20240106` 被过滤），**按分区键增量物化成立**（§13.1 增量口径）。
+
+**实证约束（回流设计 §13）**：
+
+- 物化/回写均以**文本值**承载：数值/日期类型由 DuckDB 目标列类型完成转换；
+  文本交接对 `NUMBER`→`DECIMAL` 精度无损（文本原样），但 `CLOB`/`CHAR` 语义
+  损失仍按 §9 规则条目承担。
+- 回写为 **append**（`INSERT`），不做 upsert/delete-then-insert；幂等由调用方
+  （分区重建/`WHERE` 切片）保证，v1 不承诺事务跨端一致性。
+- DuckDB 侧表需**预先建好**（`load` 通道），`materialize` 不推断 schema；列顺序
+  按 `SELECT *` 列序对齐，两侧列名不一致时由调用方在 `load` 阶段对齐。
+- 容器实测显示 openGauss `INT` 读回为文本 `"5"`（`simple_query` 文本协议），
+  物化/回写不依赖二进制协议，故跨版本兼容性风险低。
