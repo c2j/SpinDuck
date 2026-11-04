@@ -90,6 +90,21 @@ pub enum IrStmt {
     /// 事务边界标记（§3.5 延迟事务，顶层统一执行）
     TxCommit,
     TxRollback,
+    /// SELECT [INTO ...]（行数语义：0→NO_DATA_FOUND，≥2→TOO_MANY_ROWS）
+    SqlQuery {
+        sql: String,
+        binds: Vec<(String, VarName)>,
+        into: Vec<AssignTarget>,
+    },
+    /// DML/DDL（Truncate/Insert/Update/Delete/...）
+    SqlExec {
+        sql: String,
+        binds: Vec<(String, VarName)>,
+    },
+    /// PERFORM <expr>：求值并丢弃
+    Perform {
+        expr: IrExpr,
+    },
 }
 
 /// 编译产物：线性指令序列。
@@ -98,12 +113,88 @@ pub struct IrProg {
     pub code: Vec<IrStmt>,
 }
 
-/// 编译器：AST 语句列表 → IR。
+/// 编译器：AST 语句列表 → IR。预扫描收集 PL 变量名集合（SQL 改写用）。
 pub fn compile_stmts(stmts: &[PlStatement]) -> Result<IrProg, EngineError> {
-    let mut c = Compiler::default();
+    let vars = collect_var_names(stmts);
+    let mut c = Compiler {
+        vars,
+        ..Default::default()
+    };
     c.stmts(stmts)?;
     c.resolve_fixups()?;
     Ok(IrProg { code: c.code })
+}
+
+/// 预扫描：赋值目标 + PL 表达式中的 PlVariable 引用（不进入 SQL 语句内部）。
+/// 扩展点（M6）：例程参数与 DECLARE 声明同样入集（GaussDB 语义：声明即变量）。
+fn collect_var_names(stmts: &[PlStatement]) -> crate::sql::VarScope {
+    let mut set = crate::sql::VarScope::new();
+    for st in stmts {
+        collect_stmt(st, &mut set);
+    }
+    set
+}
+
+fn collect_slice(stmts: &[PlStatement], set: &mut crate::sql::VarScope) {
+    for st in stmts {
+        collect_stmt(st, set);
+    }
+}
+
+fn collect_stmt(st: &PlStatement, set: &mut crate::sql::VarScope) {
+    match st {
+        PlStatement::Assignment { target, expression } => {
+            collect_expr(target, set);
+            collect_expr(expression, set);
+        }
+        PlStatement::If(i) => {
+            collect_expr(&i.condition, set);
+            collect_slice(&i.then_stmts, set);
+            for ei in &i.elsifs {
+                collect_expr(&ei.condition, set);
+                collect_slice(&ei.stmts, set);
+            }
+            collect_slice(&i.else_stmts, set);
+        }
+        PlStatement::Loop(l) => collect_slice(&l.body, set),
+        PlStatement::While(w) => {
+            collect_expr(&w.condition, set);
+            collect_slice(&w.body, set);
+        }
+        PlStatement::Exit { condition, .. } | PlStatement::Continue { condition, .. } => {
+            if let Some(c) = condition {
+                collect_expr(c, set);
+            }
+        }
+        PlStatement::Return {
+            expression: Some(e),
+        } => collect_expr(e, set),
+        PlStatement::Block(b) => collect_slice(&b.body, set),
+        _ => {}
+    }
+}
+
+fn collect_expr(e: &Expr, set: &mut crate::sql::VarScope) {
+    match e {
+        Expr::PlVariable(name) => {
+            set.insert(ident_path(name).to_ascii_lowercase());
+        }
+        Expr::ColumnRef(name) if name.len() == 2 => {
+            set.insert(ident0(name).to_ascii_lowercase());
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_expr(left, set);
+            collect_expr(right, set);
+        }
+        Expr::UnaryOp { expr, .. } => collect_expr(expr, set),
+        Expr::IsNull { expr, .. } => collect_expr(expr, set),
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_expr(a, set);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 从完整 PL 块编译（声明段 M2 忽略——变量按需在帧中创建）。
@@ -113,6 +204,7 @@ pub fn compile_block(block: &PlBlock) -> Result<IrProg, EngineError> {
 
 #[derive(Default)]
 struct Compiler {
+    vars: crate::sql::VarScope,
     code: Vec<IrStmt>,
     labels: std::collections::HashMap<String, usize>,
     fixups: Vec<(usize, String)>,
@@ -287,6 +379,22 @@ impl Compiler {
                 let value = expression.as_ref().map(|e| self.expr(e)).transpose()?;
                 self.code.push(IrStmt::Return { value });
             }
+            PlStatement::SqlStatement {
+                sql_text,
+                statement,
+                ..
+            } => {
+                self.sql_statement(sql_text, statement)?;
+            }
+            PlStatement::Perform { query, .. } => {
+                // PERFORM expr → SELECT expr 求值丢弃（M3 简化实现）
+                let unit =
+                    crate::sql::rewrite_tokens(&format!("SELECT {}", query.trim()), &self.vars)?;
+                self.code.push(IrStmt::SqlExec {
+                    sql: unit.text,
+                    binds: unit.binds,
+                });
+            }
             PlStatement::Raise(ra) => {
                 let msg = ra
                     .message
@@ -301,6 +409,64 @@ impl Compiler {
                 return Err(EngineError::invariant(
                     22,
                     format!("statement not yet supported in M2 compiler: {other:?}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// SqlStatement 编译：SELECT INTO → SqlQuery（AST 摘除 INTO 后经 formatter
+    /// 重建文本）；DML/DDL → SqlExec（原始 sql_text token 改写）。
+    fn sql_statement(
+        &mut self,
+        sql_text: &str,
+        statement: &ogsql_parser::ast::Statement,
+    ) -> Result<(), EngineError> {
+        use ogsql_parser::ast::Statement as S;
+        match statement {
+            S::Select(sel) => {
+                let into_targets = sel.into_targets.clone();
+                // 摘除 INTO 后经 formatter 重建 SQL 文本（DuckDB 不支持 INTO 子句）
+                let mut cleaned = sel.node.clone();
+                cleaned.into_targets = None;
+                let formatted = ogsql_parser::formatter::SqlFormatter::new().format_statement(
+                    &ogsql_parser::ast::Statement::Select(ogsql_parser::ast::Spanned::new(
+                        cleaned, None,
+                    )),
+                );
+                let unit = crate::sql::rewrite_tokens(&formatted, &self.vars)?;
+                let into = match into_targets {
+                    None => Vec::new(),
+                    Some(targets) => {
+                        let mut out = Vec::new();
+                        for t in targets {
+                            match t {
+                                ogsql_parser::ast::SelectTarget::Expr(e, _) => {
+                                    out.push(self.assign_target(&e)?);
+                                }
+                                ogsql_parser::ast::SelectTarget::Star(_) => {
+                                    return Err(EngineError::invariant(
+                                        42,
+                                        "SELECT * INTO is not supported",
+                                    ));
+                                }
+                            }
+                        }
+                        out
+                    }
+                };
+                let (sql, binds) = (unit.text, unit.binds);
+                self.code.push(IrStmt::SqlQuery { sql, binds, into });
+            }
+            S::Insert(_) | S::Update(_) | S::Delete(_) | S::Truncate(_) => {
+                let unit = crate::sql::rewrite_tokens(sql_text, &self.vars)?;
+                let (sql, binds) = (unit.text, unit.binds);
+                self.code.push(IrStmt::SqlExec { sql, binds });
+            }
+            other => {
+                return Err(EngineError::invariant(
+                    43,
+                    format!("SQL statement kind not yet supported (M8/M9 scope): {other:?}"),
                 ));
             }
         }

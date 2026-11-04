@@ -9,6 +9,7 @@ pub mod exec;
 pub mod ir;
 pub mod rules;
 pub mod runtime;
+pub mod sql;
 pub mod types;
 pub mod value;
 
