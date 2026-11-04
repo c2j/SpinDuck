@@ -18,12 +18,12 @@ version = 1
 [functions]
 # 简单映射（同名参数序）；verified@1.5.5 除非另注
 DECODE_NESTED = "@case"   # verified@1.5.5：decode 缺失，嵌套形式→CASE 语法变换
-TO_CHAR = "@strftime"     # verified@1.5.5：to_char 连同 Oracle 格式串均缺失 → strftime（V6）
+TO_CHAR = "@to_char"   # verified@1.5.5：缺失，解析级 strftime+格式串转换
 NVL     = "coalesce"     # verified@1.5.5：nvl 仍缺失（V6）
-DECODE  = "@case"        # 特殊：DECODE(a,b,x,c,y,z) → CASE a WHEN b THEN x WHEN c THEN y ELSE z END（语法变换，非重命名）
-SYSDATE = "now()"
-SUBSTR  = "substring"
-LISTAGG = "string_agg"
+DECODE  = "@case"   # verified@1.5.5：缺失，解析级 CASE 变换        # 特殊：DECODE(a,b,x,c,y,z) → CASE a WHEN b THEN x WHEN c THEN y ELSE z END（语法变换，非重命名）
+SYSDATE = "CURRENT_TIMESTAMP"  # 探针@1.5.5：now() 需括号，CURRENT_TIMESTAMP 免括号可直接 token 重命名
+SUBSTR  = "SUBSTRING"
+LISTAGG = "@unsupported"  # WITHIN GROUP 语法不兼容，运行时报错并给出迁移指引（M8 处理）
 TO_NUMBER = "@cast_decimal"  # verified@1.5.5：仍无原生实现（V6）
 
 # ── 日期运算与格式串 ─────────────────────────────────────────────

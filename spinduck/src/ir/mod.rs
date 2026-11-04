@@ -7,7 +7,9 @@ use ogsql_parser::ast::plpgsql::{PlBlock, PlStatement};
 use ogsql_parser::ast::Expr;
 
 use crate::error::EngineError;
+use crate::rules::RuleRegistry;
 use crate::value::SpinValue;
+use std::collections::BTreeMap;
 
 /// 变量名 Newtype（AGENTS §5 边界类型纪律）。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -115,9 +117,18 @@ pub struct IrProg {
 
 /// 编译器：AST 语句列表 → IR。预扫描收集 PL 变量名集合（SQL 改写用）。
 pub fn compile_stmts(stmts: &[PlStatement]) -> Result<IrProg, EngineError> {
+    compile_stmts_with(stmts, &RuleRegistry::default())
+}
+
+/// 带规则注册表的编译（SQL 改写应用函数映射与解析级变换）。
+pub fn compile_stmts_with(
+    stmts: &[PlStatement],
+    rules: &RuleRegistry,
+) -> Result<IrProg, EngineError> {
     let vars = collect_var_names(stmts);
     let mut c = Compiler {
         vars,
+        funcs: rules.functions.clone(),
         ..Default::default()
     };
     c.stmts(stmts)?;
@@ -202,9 +213,24 @@ pub fn compile_block(block: &PlBlock) -> Result<IrProg, EngineError> {
     compile_stmts(&block.body)
 }
 
+/// 改写管线：token 变量替换/函数重命名 → 解析级变换（DECODE/TO_NUMBER/TO_CHAR）。
+fn rewrite_sql(
+    sql_text: &str,
+    vars: &crate::sql::VarScope,
+    funcs: &BTreeMap<String, String>,
+) -> Result<crate::sql::SqlUnit, EngineError> {
+    let unit = crate::sql::rewrite_tokens_with_rules(sql_text, vars, funcs)?;
+    let text = crate::sql::apply_ast_transforms(&unit.text)?;
+    Ok(crate::sql::SqlUnit {
+        text,
+        binds: unit.binds,
+    })
+}
+
 #[derive(Default)]
 struct Compiler {
     vars: crate::sql::VarScope,
+    funcs: BTreeMap<String, String>,
     code: Vec<IrStmt>,
     labels: std::collections::HashMap<String, usize>,
     fixups: Vec<(usize, String)>,
@@ -434,7 +460,7 @@ impl Compiler {
                         cleaned, None,
                     )),
                 );
-                let unit = crate::sql::rewrite_tokens(&formatted, &self.vars)?;
+                let unit = rewrite_sql(&formatted, &self.vars, &self.funcs)?;
                 let into = match into_targets {
                     None => Vec::new(),
                     Some(targets) => {
@@ -459,7 +485,7 @@ impl Compiler {
                 self.code.push(IrStmt::SqlQuery { sql, binds, into });
             }
             S::Insert(_) | S::Update(_) | S::Delete(_) | S::Truncate(_) => {
-                let unit = crate::sql::rewrite_tokens(sql_text, &self.vars)?;
+                let unit = rewrite_sql(sql_text, &self.vars, &self.funcs)?;
                 let (sql, binds) = (unit.text, unit.binds);
                 self.code.push(IrStmt::SqlExec { sql, binds });
             }

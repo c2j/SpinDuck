@@ -423,14 +423,14 @@ mod tests {
             sql_text: sql.to_string(),
             statement: Box::new(parsed),
         };
-        let mut ex = FakeExecutor::with_rows(
+        let ex = FakeExecutor::with_rows(
             vec!["flag".to_string()],
             vec![
                 vec![SpinValue::Str("0".into())],
                 vec![SpinValue::Str("1".into())],
             ],
         );
-        let (_, out) = run_pl_with(vec![stmt], &mut ex);
+        let (_, out) = run_pl_with(vec![stmt], &ex);
         assert_eq!(out.unwrap_err().code.to_string(), "BIZ-0101");
     }
 
