@@ -146,3 +146,21 @@ E2E（`cargo test --features gauss gauss_e2e`，`tests/gauss_e2e.rs`）两个用
   按 `SELECT *` 列序对齐，两侧列名不一致时由调用方在 `load` 阶段对齐。
 - 容器实测显示 openGauss `INT` 读回为文本 `"5"`（`simple_query` 文本协议），
   物化/回写不依赖二进制协议，故跨版本兼容性风险低。
+
+## V8. Rust 侧 SQL 上下文函数调用（M6.5 门禁）
+
+**结论：宏路径（§8.2 路径③）在 1.5.5 上成立且无需 UDF 重入。**
+
+| 探针 | 结果 |
+|---|---|
+| `CREATE MACRO f(p) AS (p * 2)` 后 `SELECT f(21)` | 42（`INTEGER`），登记即生效，无需重连 |
+| 宏在过程体 SQL 内可见（`INSERT INTO dat2 SELECT fnc_double(n) FROM dat`） | 42，游标/INSERT-SELECT 同一会话内可见 |
+| 宏体经 `[functions]` 规则映射（`nvl` → `coalesce`） | `f(NULL)=0`、`f(7)=7` |
+| 含局部变量/多语句的函数 | **不进入** `duckdb_functions()`；PL 上下文直调仍返回 2 |
+| 过程（无返回） | 不进入内核函数命名空间 |
+| 宏体类型 | 不 CAST 到声明返回类型：`INTEGER` 实参 → `INTEGER` 结果（避免 DECIMAL(38,6) 精度/语义损失） |
+
+**未落地项与依据**：② 内联需编译期跨语句 SQL 重写（与动态 SQL 注入面同批，
+M8）；① UDF 需同 Database 第二连接，`SqlExecutor` 接缝未暴露该能力，属接缝
+签名变更（Ask first），故推迟。过程级函数在 SQL 上下文调用会得到
+`KERNEL-0010`（Catalog Error），属明确失败。

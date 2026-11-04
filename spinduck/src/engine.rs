@@ -44,6 +44,44 @@ impl Engine {
         Ok(n)
     }
 
+    /// 纯表达式函数 → 内核宏（§8.2 路径③），使 SQL 上下文可直接调用。
+    ///
+    /// 只登记"无过程逻辑"的函数：单 `RETURN <表达式>`、无局部变量、纯 IN 参数、
+    /// 且函数名非包限定（包函数需 schema 前缀，M7 处理）。其余保持 PL 上下文
+    /// 直调；SQL 上下文调用将得到内核 Catalog Error（不静默降级为错误语义）。
+    fn install_sql_macro(
+        &mut self,
+        r: &crate::catalog::CompiledRoutine,
+    ) -> Result<(), EngineError> {
+        use crate::catalog::{ParamMode, RoutineKind};
+        if r.kind != RoutineKind::Function
+            || r.name.contains('.')
+            || r.params.iter().any(|p| p.mode != ParamMode::In)
+        {
+            return Ok(());
+        }
+        let Some(expr) = r.prog.single_return_expr() else {
+            return Ok(());
+        };
+        let Some(body) = crate::sql::expr_to_sql(expr, &self.rules) else {
+            return Ok(());
+        };
+        let params = r
+            .params
+            .iter()
+            .map(|p| p.name.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ddl = format!(
+            "CREATE OR REPLACE MACRO {}({}) AS ({})",
+            r.name.to_ascii_lowercase(),
+            params,
+            body
+        );
+        self.ex.execute(&ddl, &crate::exec::BindMap::new())?;
+        Ok(())
+    }
+
     /// 单条 AST 语句的注册（含 PACKAGE BODY 展开）。
     pub fn register_statement(&mut self, st: &Statement) -> Result<usize, EngineError> {
         match st {
@@ -51,6 +89,7 @@ impl Engine {
                 let routines = compile_statement_routine(st, &self.rules)?;
                 let n = routines.len();
                 for r in routines {
+                    self.install_sql_macro(&r)?;
                     self.catalog.register(r);
                 }
                 Ok(n)
@@ -210,4 +249,125 @@ pub fn param_names_to_vars(params: &[String]) -> Vec<VarName> {
         .iter()
         .map(|p| VarName(p.to_ascii_lowercase()))
         .collect()
+}
+
+#[cfg(all(test, feature = "native"))]
+mod kernel_tests {
+    use super::*;
+    use crate::exec::BindMap;
+    use crate::sql::DuckExecutor;
+
+    #[test]
+    fn should_expose_expression_function_as_macro_in_sql_context() {
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+        eng.register(
+            "CREATE OR REPLACE FUNCTION fnc_double(p IN NUMBER) RETURN NUMBER IS \
+             BEGIN RETURN p * 2; END;",
+        )
+        .unwrap();
+
+        // SQL 上下文（DuckDB 内）可直接调用：宏路径③
+        let mut s = eng
+            .ex
+            .query("SELECT fnc_double(21) AS v", &BindMap::new())
+            .unwrap();
+        let rows = s.fetch_many(1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], SpinValue::Int(42));
+    }
+
+    #[test]
+    fn should_use_macro_inside_procedure_sql() {
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+        // 表由 load 通道建立（register 只处理例程）
+        let empty = BindMap::new();
+        eng.ex.execute("CREATE TABLE dat(n INT)", &empty).unwrap();
+        eng.ex.execute("CREATE TABLE dat2(n INT)", &empty).unwrap();
+        eng.ex
+            .execute("INSERT INTO dat VALUES (21)", &empty)
+            .unwrap();
+        eng.register(
+            "CREATE OR REPLACE FUNCTION fnc_double(p IN NUMBER) RETURN NUMBER IS \
+             BEGIN RETURN p * 2; END;",
+        )
+        .unwrap();
+        // 过程体内的 SQL 语句直接引用该函数（改写后由内核宏求值）
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_ins IS \
+             BEGIN INSERT INTO dat2 SELECT fnc_double(n) FROM dat; END;",
+        )
+        .unwrap();
+        eng.call("prc_ins", &[]).unwrap();
+
+        let mut s = eng.ex.query("SELECT n FROM dat2", &BindMap::new()).unwrap();
+        let rows = s.fetch_many(10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], SpinValue::Int(42));
+    }
+
+    #[test]
+    fn should_apply_function_rules_when_rendering_macro_body() {
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        let mut rules = RuleRegistry::default();
+        rules
+            .functions
+            .insert("NVL".to_string(), "coalesce".to_string());
+        let mut eng = Engine::new(Box::new(ex), rules);
+        eng.register(
+            "CREATE OR REPLACE FUNCTION fnc_nz(p IN NUMBER) RETURN NUMBER IS \
+             BEGIN RETURN nvl(p, 0); END;",
+        )
+        .unwrap();
+
+        let mut s = eng
+            .ex
+            .query("SELECT fnc_nz(NULL) AS v, fnc_nz(7) AS w", &BindMap::new())
+            .unwrap();
+        let rows = s.fetch_many(1);
+        assert_eq!(rows[0][0], SpinValue::Int(0));
+        assert_eq!(rows[0][1], SpinValue::Int(7));
+    }
+
+    #[test]
+    fn should_not_register_macro_for_function_with_local_logic() {
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+        eng.register(
+            "CREATE OR REPLACE FUNCTION fnc_local(p IN NUMBER) RETURN NUMBER IS \
+             DECLARE v NUMBER; BEGIN v := p + 1; RETURN v; END;",
+        )
+        .unwrap();
+
+        let mut s = eng
+            .ex
+            .query(
+                "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'fnc_local'",
+                &BindMap::new(),
+            )
+            .unwrap();
+        let rows = s.fetch_many(1);
+        assert_eq!(rows[0][0], SpinValue::Int(0), "含局部变量不进宏命名空间");
+
+        // PL 上下文仍可用（解释器直调）
+        let fr = eng.call("fnc_local", &[SpinValue::Int(1)]).unwrap();
+        assert_eq!(fr.return_value, Some(SpinValue::Int(2)));
+    }
+
+    #[test]
+    fn should_keep_procedure_out_of_sql_macro_namespace() {
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+        eng.register("CREATE OR REPLACE PROCEDURE prc_noop IS BEGIN NULL; END;")
+            .unwrap();
+        let r = eng.ex.query(
+            "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'prc_noop'",
+            &BindMap::new(),
+        );
+        // 过程不应进入内核函数命名空间（宏只登记纯表达式函数）
+        let mut r = r.unwrap();
+        let rows = r.fetch_many(1);
+        assert_eq!(rows[0][0], SpinValue::Int(0));
+    }
 }
