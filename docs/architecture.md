@@ -57,25 +57,47 @@ spinduck/
 ├── src/
 │   ├── lib.rs
 │   ├── catalog.rs        # 例程目录：CREATE PROCEDURE/FUNCTION/PACKAGE 注册与解析缓存
-│   ├── ir/
-│   │   ├── mod.rs        # Prog / Proc / Frame 定义
-│   │   ├── stmt.rs       # IR 语句（扁平化 + 基于标签的跳转）
-│   │   └── types.rs      # SpinType ↔ DuckDB LogicalType（映射值来自规则文件）
+│   ├── ir/               # 模块装配与对外表面在 mod.rs（§3 规模拆分，单文件 ≤500 行）
+│   │   ├── mod.rs        # IR 类型 / 编译入口的再导出
+│   │   ├── types.rs      # IrProg / IrStmt / IrExpr / AssignTarget / BindSrc 等 IR 类型
+│   │   ├── entry.rs      # 编译入口（compile_*）与 SQL 改写管线
+│   │   ├── control.rs    # Compiler 状态：标签、跳转、fixup、嵌套深度护栏
+│   │   ├── stmt.rs       # 语句编译
+│   │   ├── sql.rs        # SQL 语句 / 赋值目标 / 循环标签
+│   │   └── expr.rs       # 表达式编译与原子量
 │   ├── runtime/
 │   │   ├── value.rs      # SpinValue（DuckDB Value 包装 + NULL + RECORD）
-│   │   ├── frame.rs      # 执行帧（变量槽、OUT 参数、返回值）
+│   │   ├── frame.rs      # 执行帧（变量槽、游标表、OUT 参数、返回值）
+│   │   ├── eval.rs       # PL 表达式求值（三值逻辑、NULL 传播、内建/例程分派）
+│   │   │   └── numeric.rs# 数值定标与比较（unscaled i128 × 10^-scale）
 │   │   ├── cursor.rs     # 游标状态机（open/fetch/close/scroll 有限支持）
-│   │   ├── interp.rs     # 树遍历解释器主循环
-│   │   └── error.rs      # PlError + 异常处理（WHEN ... THEN 匹配）
+│   │   ├── interp.rs     # 树遍历解释器主循环（trap 展开）；语句执行按类拆于同名目录
+│   │   │   ├── flow.rs       # 事务/赋值/条件/RETURN/RAISE
+│   │   │   ├── sqlstmts.rs   # SELECT INTO / DML / 动态执行
+│   │   │   ├── cursors.rs    # 游标 OPEN/FETCH/CLOSE
+│   │   │   ├── routine.rs    # CALL / FuncCall 例程直调
+│   │   │   ├── dynamic.rs    # EXECUTE IMMEDIATE 语句准备
+│   │   │   ├── binds.rs      # 绑定解析
+│   │   │   └── trace.rs      # TraceSink 埋点事件构造
 │   ├── sql/
-│   │   ├── rewrite.rs    # 改写引擎（机制）：读 RuleRegistry 应用规则
-│   │   ├── bind.rs       # 绑定值 → DuckDB 参数
-│   │   └── exec.rs       # duckdb 连接封装：query/execute/事务/结果集
+│   │   ├── rewrite/      # 改写引擎（机制）：读 RuleRegistry 应用规则
+│   │   │   ├── tokens.rs     # token 级变量替换 + [functions] 重命名
+│   │   │   ├── scan.rs       # 调用点扫描（括号配平、引号感知）
+│   │   │   ├── split.rs      # 顶层切分与字面量引号处理
+│   │   │   └── ast.rs        # 解析级变换（DECODE/TO_*/INTERVALTONUM、UPDATE 去别名）
+│   │   ├── sqlfn/        # SQL 上下文例程调用下沉（§8.3 路径②）
+│   │   ├── render.rs     # IR 表达式 → SQL 文本/绑定（含 bind 收集）
+│   │   ├── patterns.rs   # [patterns] 文本形态开关
+│   │   └── exec_native.rs# 内核接缝的 DuckDB 实现（query/execute/事务/结果集）
+│   ├── exec.rs           # SqlExecutor / TraceSink 接缝 trait（§1 两个接缝）
+│   ├── error.rs          # EngineError + 故障域（ENG/KERNEL/BIZ/ENV）与异常匹配
+│   ├── project/          # 研发态项目结构（spinduck.toml / *.case.toml 识别）
+│   │   ├── mod.rs        # ProjectConfig（项目声明与目录定位）
+│   │   ├── case.rs       # CaseConfig（用例声明）
+│   │   └── fs.rs         # 配置读取与目录扫描
 │   ├── io/
 │   │   ├── mod.rs        # DataSource / DataSink trait（§13 接缝）
-│   │   ├── gauss.rs      # GaussDB 连接器（COPY 批量读、批量写回）
-│   │   ├── materialize.rs# 物化：表清单解析、增量策略、类型保真
-│   │   └── sync.rs       # 回写：append/upsert/分区替换、幂等与校验
+│   │   └── gauss.rs      # GaussDB 连接器：COPY 批量读（materialize）/ 批量写回（sync_append）
 │   └── engine.rs         # 对外入口：Engine::connect / execute_batch / call
 ├── config/rewrite-rules.toml   # 规则数据（种子 + 项目覆盖）
 ├── src/bin/
@@ -191,7 +213,7 @@ SQL 侧列引用。改写器与解释器必须共享同一判定，避免两套�
 赋值/拼接/函数参数处的宽松转换统一走一个 `coerce(value, target_type)` 入口，
 并产出 lint 诊断；差异行为（如空串与 NULL）必须显式配置，禁止默认含糊。
 
-### 3.4 存过内 SQL 改写（`sql/rewrite.rs`，机制层）
+### 3.4 存过内 SQL 改写（`sql/rewrite/`，机制层）
 
 对 PL 块内的每条 SQL 语句（`Statement` AST）在编译期做三件事：
 
@@ -455,7 +477,7 @@ UDF 回调发生在 DuckDB 执行查询的过程中：
 | 路径 | 状态 | 判定依据 |
 |---|---|---|
 | ③ 宏（表达式级） | **已落地** | 纯表达式函数（单 `RETURN <expr>`、无局部变量、纯 IN 参数、非包限定）在 `register` 时登记为 `CREATE OR REPLACE MACRO`；表达式经 `sql::render` 由 IR 渲染，函数名走 `[functions]` 规则映射，`@` 变换标记拒绝渲染 |
-| ② SQL 上下文例程调用 | ✅ 已实现（参数元组缓存化下沉） | `sql/sqlfn.rs`：编译期按调用点构造 `SELECT DISTINCT <args> [FROM…][WHERE…]`（剔除自身谓词、上下文依赖拓扑、相同调用去重），调用点内联为相关子查询；运行期逐元组调用例程填 `sd_fnN` 临时表。**前提**：例程在语句执行期确定性；元组上界 10 万；上下文互引显式拒绝（BIZ-0160）。见 validation V15 |
+| ② SQL 上下文例程调用 | ✅ 已实现（参数元组缓存化下沉） | `sql/sqlfn/`：编译期按调用点构造 `SELECT DISTINCT <args> [FROM…][WHERE…]`（剔除自身谓词、上下文依赖拓扑、相同调用去重），调用点内联为相关子查询；运行期逐元组调用例程填 `sd_fnN` 临时表。**前提**：例程在语句执行期确定性；元组上界 10 万；上下文互引显式拒绝（BIZ-0160）。见 validation V15 |
 | ① UDF（过程级） | **主动推迟** | DuckDB 禁止同一连接在查询执行中发起子查询（§8.2-1），回调内必须走同 Database 的第二连接；`SqlExecutor` 接缝当前不暴露 Database 句柄，新增能力属接缝签名变更（AGENTS §1 需 Ask first）。折中约束：过程级函数**只能 PL 上下文调用**，SQL 上下文调用得到内核 Catalog Error（明确失败，不静默降级） |
 
 实现纪律：

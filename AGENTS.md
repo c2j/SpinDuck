@@ -181,8 +181,8 @@ TDD 重写。Rust 的合法 Red 允许是编译失败（引用尚不存在的 AP
 
 ### 4.4 变异测试（Mutation Testing）
 
-- 工具：`cargo-mutants`；**范围**：`src/ir/`、`src/sql/rewrite.rs`、
-  `runtime/value.rs`（coerce）——编译器与改写是正确性核心
+- 工具：`cargo-mutants`；**范围**：`src/ir/`、`src/sql/rewrite/`、`src/sql/sqlfn/`、
+  `src/runtime/value.rs`（coerce）——编译器与改写是正确性核心（路径随 V19 规模拆分更新）
 - **节奏**：不在每次提交跑（太慢）；在 M3.5 / M6.5 / M10 三个门禁节点各跑
   一轮完整变异测试
 - **目标**：核心模块 mutation score ≥ **70%**；未达标时逐个评审"幸存变异体"

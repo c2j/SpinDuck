@@ -516,3 +516,34 @@ call/golden 口径分裂）。修复：`ProjectConfig::discover`（自语料目�
 - 变异测试（§4.4）全轮未完成（V17：部分 155/220 ≈39%），幸存者清单不入库；
   `include_str!` 使 crate 非独立可拷贝 → 变异只能 `--in-place` 串行，与编辑期互斥，
   安排在合入后的独立窗口执行。
+
+## V19. §3 规模拆分轮（机械切分，行为零变更）
+
+**门禁**：`cargo fmt --all -- --check` 干净；`cargo clippy --all-features --tests -- -D warnings`
+干净；`cargo test --features native` **207 passed / 0 failed** —— 与拆分前同一数字（本轮未增删
+任何测试，测试集合逐条同名）。
+
+**方法**：只按职责边界移动代码（函数体一字不改），跨文件可见性用 `pub(super)` / `pub(crate)`
+收口；每完成一个文件立即跑同一组测试。忠实性用行级比对校验：把 HEAD 原文件与拆分后的全部
+新文件的规范化行（去 `use`/`mod`/单字符大括号行、去 `pub(...)` 前缀、折叠空白）做多重集差，
+差异只出现在可见性限定符与 rustfmt 重新折行处，注释行零丢失。
+
+| 原文件（行数） | 拆分去向 | 拆后最大文件 |
+|---|---|---|
+| `runtime/interp.rs`（1652） | `runtime/interp/{binds,cursors,dynamic,flow,routine,sqlstmts,trace}.rs` + `interp/{tests,m5,kernel_tests}.rs`；主文件只留主循环与 trap 展开 | 471（`interp/kernel_tests.rs`，测试文件） |
+| `ir/mod.rs`（1216） | `ir/{types,entry,control,stmt,sql,expr}.rs`；`mod.rs` 只做装配与再导出（29 行） | 483（`ir/stmt.rs`） |
+| `sql/rewrite.rs`（841） | `sql/rewrite/{tokens,scan,split,ast}.rs` + `rewrite/{tests,transform_tests}.rs` | 227（`rewrite/ast.rs`） |
+| `sql/sqlfn.rs`（813） | `sql/sqlfn/{plan,region}.rs` + `sqlfn/tests.rs`；类型集中在 `sqlfn/mod.rs` | 417（`sqlfn/region.rs`） |
+| `runtime/frame.rs`（677） | 求值整体移到 `runtime/eval.rs`（含 `eval/numeric.rs` 数值定标），`frame.rs` 只留帧本体 | 368（`runtime/eval.rs`） |
+| `project.rs`（553） | `project/{case,fs}.rs` + `project/tests.rs`，为 V20 的入口声明腾出空间 | 179（`project/mod.rs`） |
+
+`docs/architecture.md` §2 模块树同步为真实布局（含 `sql/exec_native.rs` 与 `io/gauss.rs`
+的既有事实），并修正 §3.4 / §8.3 中的旧路径引用。
+
+**遗留（登记，非静默跳过）**：
+- `engine.rs` 664 行（非测试部分 429 行）依 §3「含 `#[cfg(test)]` 总行 ≤700」保留，不拆。
+- §3 单函数 ≤60 行：`ir/stmt.rs::stmt_inner`（约 490 行）与 `runtime/interp.rs::run_inner`
+  仍是巨型 match 分发，属计划债（按语句类别下沉到 `interp/` 子模块是既定方向），本轮不动，
+  不在文档里声称已达标。
+- §4.4 变异测试范围路径随本次拆分更新为 `src/ir`、`src/sql/rewrite`、`src/sql/sqlfn`、
+  `src/runtime`、`src/value.rs`（`cargo mutants -f` 目录写法不变，无需改 AGENTS §8 命令）。
