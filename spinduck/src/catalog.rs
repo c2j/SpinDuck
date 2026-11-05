@@ -49,11 +49,23 @@ pub struct CallResult {
 #[derive(Debug, Default, Clone)]
 pub struct RoutineCatalog {
     routines: BTreeMap<String, CompiledRoutine>,
+    /// SQL 方言规则（函数改名/`@` 变换标记表）：动态 SQL 运行期改写需要
+    sql_functions: BTreeMap<String, String>,
 }
 
 impl RoutineCatalog {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 注入 SQL 方言规则函数表（Engine 构造时同步）。
+    pub fn set_sql_functions(&mut self, funcs: BTreeMap<String, String>) {
+        self.sql_functions = funcs;
+    }
+
+    /// SQL 方言规则函数表（动态 SQL 改写用）。
+    pub fn sql_functions(&self) -> &BTreeMap<String, String> {
+        &self.sql_functions
     }
 
     pub fn register(&mut self, r: CompiledRoutine) {

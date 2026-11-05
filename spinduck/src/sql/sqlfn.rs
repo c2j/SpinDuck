@@ -85,6 +85,7 @@ pub fn plan_sites(
         return Ok((sql_text.to_string(), Vec::new()));
     }
     let region = context_region(sql_text, &tokens)?;
+    let _ = &region;
 
     // 去重：同 name + 同实参文本只物化一次
     let mut plans: Vec<CallPlan> = Vec::new();
@@ -322,9 +323,13 @@ fn context_region(sql_text: &str, tokens: &[TokenWithSpan]) -> Result<Region, En
     }
 }
 
-/// 为第 `site` 个调用构造参数元组查询：
-/// - 上下文（FROM/WHERE）中**自身**调用所在合取项被剔除（避免自引用）；
-/// - 其它调用（依赖）替换为其子查询（拓扑序保证已规划）。
+/// 为第 `site` 个调用构造参数元组查询。
+///
+/// 上下文取**该调用所在层级的 SELECT 块**的 FROM/WHERE（动态 SQL 的调用常位于
+/// 派生表内部；用最外层 FROM 会把调用本身带进元组查询，形成自引用）：
+/// - UPDATE（顶层）：表 + WHERE；
+/// - INSERT：无上下文（单行元组）；
+/// - SELECT：调用所在括号深度的最近 FROM/WHERE（边界为所在块）。
 fn distinct_query(
     sql_text: &str,
     tokens: &[TokenWithSpan],
@@ -337,41 +342,223 @@ fn distinct_query(
     if !region.has_context {
         return Ok(format!("SELECT {args}"));
     }
-    let head = statement_head(sql_text);
-    let kw = top_level_keywords(sql_text, tokens);
-    let from_seg = match head.as_str() {
-        "update" => {
-            let (_, u_end) = kw.get("update").expect("update kw");
-            let (set_start, _) = kw.get("set").expect("set kw");
-            let table = sql_text[*u_end..*set_start].trim();
-            format!(" FROM {table}")
-        }
-        _ => {
-            let (_, f_end) = kw.get("from").expect("from kw");
-            let f_end2 = clause_end(&kw, "from", *f_end, sql_text);
-            format!(" FROM {}", sql_text[*f_end..f_end2].trim())
-        }
+    let (site_start, _) = c.occurrences[0];
+    let block = block_context(sql_text, tokens, site_start);
+    let from_seg = match &block.from_seg_override {
+        Some(seg) => format!(" FROM {seg}"),
+        None => match block.from {
+            Some((_, f_end)) => format!(" FROM {}", block.slice(sql_text, f_end, block.from_end)),
+            None => String::new(),
+        },
     };
-    let where_seg = match kw.get("where") {
-        Some((_, w_after)) => {
-            let w_end = if head == "update" {
-                sql_text.len()
-            } else {
-                clause_end(&kw, "where", *w_after, sql_text)
-            };
-            Some(non_self_where(&sql_text[*w_after..w_end], c))
-        }
-        None => None,
-    };
+    let where_seg = block
+        .where_clause
+        .map(|(w_after, w_end)| non_self_where(&sql_text[w_after..w_end], c))
+        .filter(|w| !w.trim().is_empty());
     let mut q = format!("SELECT DISTINCT {args}{from_seg}");
     if let Some(w) = where_seg {
-        if !w.trim().is_empty() {
-            q.push_str(" WHERE ");
-            q.push_str(&w);
+        q.push_str(" WHERE ");
+        q.push_str(&w);
+    }
+    Ok(q)
+}
+
+/// 站点所在括号层级上的最近 SELECT 块上下文（FROM/WHERE 区间）。
+struct BlockCtx {
+    from: Option<(usize, usize)>,
+    from_end: usize,
+    where_clause: Option<(usize, usize)>,
+    /// UPDATE 的表段（无 FROM 关键字）
+    from_seg_override: Option<String>,
+}
+
+impl BlockCtx {
+    fn slice(&self, text: &str, start: usize, end: usize) -> String {
+        text[start..end].trim().to_string()
+    }
+}
+
+fn block_context(sql_text: &str, tokens: &[TokenWithSpan], site_start: usize) -> BlockCtx {
+    // 每个 token 的括号深度（'(' 记为外层深度）
+    let mut depths = Vec::with_capacity(tokens.len());
+    let mut depth = 0i32;
+    for t in tokens {
+        match t.token {
+            Token::LParen => {
+                depths.push(depth);
+                depth += 1;
+            }
+            Token::RParen => {
+                depth -= 1;
+                depths.push(depth);
+            }
+            _ => depths.push(depth),
         }
     }
-    // 依赖调用已在 from/where 文本中以子查询形式存在（拓扑序）
-    Ok(q)
+    let site_idx = tokens
+        .iter()
+        .position(|t| t.span.start == site_start)
+        .unwrap_or(0);
+    let head = statement_head(sql_text);
+
+    // UPDATE（顶层）：表段 + WHERE
+    if head == "update" && depths[site_idx] == 0 {
+        let kw = top_level_keywords(sql_text, tokens);
+        let mut ctx = BlockCtx {
+            from: None,
+            from_end: 0,
+            where_clause: None,
+            from_seg_override: None,
+        };
+        if let (Some((_, u_end)), Some((set_start, _))) = (kw.get("update"), kw.get("set")) {
+            ctx.from = Some((*u_end, *u_end));
+            ctx.from_end = *set_start;
+            ctx.from_seg_override = Some(sql_text[*u_end..*set_start].trim().to_string());
+        }
+        if let Some((_, w_end)) = kw.get("where") {
+            ctx.where_clause = Some((*w_end, sql_text.len()));
+        }
+        return ctx;
+    }
+
+    // SELECT：自内向外找第一个带 FROM 的层级（调用可能在无 FROM 的标量子查询里，
+    // 实参引用外层列的场合）
+    for level in (0..=depths[site_idx]).rev() {
+        let (block_start, block_end) = block_bounds(tokens, &depths, site_idx, level);
+        let mut from = None;
+        let mut where_kw = None;
+        // 整个块内查找（SELECT 列表中的调用，其 FROM 位于调用之后）
+        for (i, t) in tokens.iter().enumerate() {
+            if depths[i] != level || t.span.start < block_start || t.span.start >= block_end {
+                continue;
+            }
+            let w = sql_text[t.span.start..t.span.end].to_ascii_lowercase();
+            match w.as_str() {
+                "from" if from.is_none() => {
+                    from = Some((t.span.start, t.span.end));
+                }
+                "where" if where_kw.is_none() => {
+                    where_kw = Some((t.span.start, t.span.end));
+                }
+                _ => {}
+            }
+        }
+        if let Some((_, f_end)) = from {
+            let after_where_clause = where_kw.and_then(|(_, w_end)| {
+                tokens
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, t)| {
+                        depths[*i] == level && t.span.start >= w_end && t.span.start < block_end
+                    })
+                    .find(|(_, t)| {
+                        let w = sql_text[t.span.start..t.span.end].to_ascii_lowercase();
+                        matches!(w.as_str(), "group" | "order" | "having")
+                    })
+                    .map(|(_, t)| t.span.start)
+            });
+            let clause_end = where_kw
+                .map(|(s, _)| s)
+                .or(after_where_clause)
+                .unwrap_or(block_end);
+            // FROM 段可能是派生表 `(SELECT …)`：必须含配平右括号
+            let from_end = match paren_extent(tokens, sql_text, f_end) {
+                Some(close_end) => close_end,
+                None => clause_end,
+            };
+            let where_clause = where_kw.map(|(_, e)| {
+                (
+                    e,
+                    after_where_clause.filter(|c| *c > e).unwrap_or(block_end),
+                )
+            });
+            return BlockCtx {
+                from,
+                from_end,
+                where_clause,
+                from_seg_override: None,
+            };
+        }
+    }
+    // UPDATE 的 SET 实参 / WHERE 中的调用可能位于括号层级，回退到语句级表+WHERE
+    if head == "update" {
+        let kw = top_level_keywords(sql_text, tokens);
+        let mut ctx = BlockCtx {
+            from: None,
+            from_end: 0,
+            where_clause: None,
+            from_seg_override: None,
+        };
+        if let (Some((_, u_end)), Some((set_start, _))) = (kw.get("update"), kw.get("set")) {
+            ctx.from_seg_override = Some(sql_text[*u_end..*set_start].trim().to_string());
+        }
+        if let Some((_, w_end)) = kw.get("where") {
+            ctx.where_clause = Some((*w_end, sql_text.len()));
+        }
+        return ctx;
+    }
+    BlockCtx {
+        from: None,
+        from_end: 0,
+        where_clause: None,
+        from_seg_override: None,
+    }
+}
+
+/// FROM 段若以 `(` 开头（派生表），返回其配平右括号的结束偏移。
+fn paren_extent(tokens: &[TokenWithSpan], sql_text: &str, from_after: usize) -> Option<usize> {
+    let rest = sql_text.get(from_after..)?;
+    let skip = rest.len() - rest.trim_start().len();
+    if !rest[skip..].starts_with('(') {
+        return None;
+    }
+    let open_pos = from_after + skip;
+    let start_tok = tokens.iter().position(|t| t.span.start >= open_pos)?;
+    let mut depth = 0i32;
+    for t in &tokens[start_tok..] {
+        match t.token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(t.span.end);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn block_bounds(
+    tokens: &[TokenWithSpan],
+    depths: &[i32],
+    site_idx: usize,
+    level: i32,
+) -> (usize, usize) {
+    let start = if level == 0 {
+        0
+    } else {
+        tokens[..site_idx]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(i, t)| matches!(t.token, Token::LParen) && depths[*i] + 1 == level)
+            .map(|(_, t)| t.span.end)
+            .unwrap_or(0)
+    };
+    let end = if level == 0 {
+        tokens.last().map(|t| t.span.end).unwrap_or(0)
+    } else {
+        // '(' 记外层深度、')' 记外层深度：内容层级 L 的配平 ')' 深度为 L-1
+        tokens[site_idx..]
+            .iter()
+            .enumerate()
+            .find(|(i, t)| matches!(t.token, Token::RParen) && depths[site_idx + i] == level - 1)
+            .map(|(_, t)| t.span.start)
+            .unwrap_or_else(|| tokens.last().map(|t| t.span.end).unwrap_or(0))
+    };
+    (start, end)
 }
 
 /// 从 WHERE 片段中剔除"包含该调用自身"的顶层合取项。
@@ -589,6 +776,36 @@ mod tests {
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].distinct_sql, "SELECT f, d, '3', k");
         assert!(out.contains("(SELECT v FROM sd_fn0"));
+    }
+
+    #[test]
+    fn should_plan_call_nested_in_derived_table_with_inner_context() {
+        // 语料 prc_trd_hz_byfund 动态 SQL 形态：调用在两层派生表的 SELECT 列表，
+        // 且同名调用亦出现在 GROUP BY（去重）；参数元组必须取自**内层** FROM/WHERE，
+        // 不能把调用本身带进元组查询（自引用）。
+        let sql = "SELECT SUM(FXJ), ROUND(NVL(SUM(fxj2), 0), 2), FUND_CODE, XWDM, TRADE_TYPE, VENTURE_TYPE FROM (SELECT SUM(NVL(ROUND(fxj, 2), 0)) FXJ, NVL(SUM(fxj), 0) FXJ2, fund_code, bs, xwdm, trade_type, venture_type FROM (SELECT zqdm, fund_code, bs, xwdm, trade_type, SUM(NVL(fxj, 0)) FXJ, fnc_com_get_seat_fee_type(BCRQ, SCDM, FUND_CODE, XWDM, STOCK_KIND) VENTURE_TYPE FROM mid_yjqs_detail WHERE SCDM = '001' AND BCRQ = '20250715' AND (substr(stock_kind, 1, 2) = '01') AND NOT (is_yysg = '1' AND ywlb IN ('ES', '77')) GROUP BY zqdm, bs, fund_code, xwdm, trade_type, fnc_com_get_seat_fee_type(BCRQ, SCDM, FUND_CODE, XWDM, STOCK_KIND)) GROUP BY fund_code, bs, XWDM, TRADE_TYPE, venture_type) GROUP BY fund_code, XWDM, TRADE_TYPE, venture_type";
+        let (out, sites) = plan_sites(
+            sql,
+            &VarScope::new(),
+            &BTreeMap::new(),
+            &names(&["fnc_com_get_seat_fee_type"]),
+        )
+        .unwrap();
+        assert_eq!(sites.len(), 1, "同名调用去重");
+        assert!(
+            !sites[0]
+                .distinct_sql
+                .to_ascii_lowercase()
+                .contains("fnc_com_get_seat_fee_type("),
+            "元组查询不得自引用：{}",
+            sites[0].distinct_sql
+        );
+        assert!(
+            sites[0].distinct_sql.contains("FROM mid_yjqs_detail"),
+            "上下文应取内层 FROM：{}",
+            sites[0].distinct_sql
+        );
+        assert_eq!(out.matches("(SELECT v FROM sd_fn0").count(), 2);
     }
 
     #[test]

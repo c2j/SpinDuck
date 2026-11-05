@@ -143,9 +143,6 @@ fn run_inner(
             }
             IrStmt::Jump(to) => *pc = *to,
             IrStmt::JumpIfNot { cond, to } => {
-                if std::env::var("SPINDUCK_DEBUG_JUMP").is_ok() {
-                    eprintln!("JUMPIFNOT {:?} -> {}", cond, to);
-                }
                 let t = {
                     let env = crate::runtime::frame::EvalEnv {
                         frame,
@@ -323,14 +320,19 @@ fn run_inner(
                             .map(|st| fmt.format_statement(st))
                             .collect::<Vec<_>>()
                             .join(";\n");
-                        let sql = crate::sql::apply_ast_transforms(&sql)?;
-                        // 动态 SQL 中的 SQL 上下文例程调用：运行期规划并下沉
-                        let names = cat.routine_names();
+                        // 规则改名（nvl→coalesce 等）与静态语句同口径
+                        let named = crate::sql::rewrite_tokens_with_rules(
+                            &sql,
+                            &Default::default(),
+                            cat.sql_functions(),
+                        )?;
+                        let sql = crate::sql::apply_ast_transforms(&named.text)?;
+                        // 动态 SQL 中的 SQL 上下文例程调用：运行期规划 + 物化缓存
                         let (marked, sites) = crate::sql::plan_sites(
                             &sql,
                             &Default::default(),
                             &Default::default(),
-                            &names,
+                            &cat.routine_names(),
                         )?;
                         materialize_fn_sites(&sites, frame, ex, cat, depth)?;
                         (marked, BindMap::new())

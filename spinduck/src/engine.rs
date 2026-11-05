@@ -26,10 +26,12 @@ pub struct CallResultExt {
 
 impl Engine {
     pub fn new(ex: Box<dyn SqlExecutor>, rules: RuleRegistry) -> Self {
+        let mut catalog = RoutineCatalog::new();
+        catalog.set_sql_functions(rules.functions.clone());
         Self {
             ex,
             rules,
-            catalog: RoutineCatalog::new(),
+            catalog,
             macro_names: std::collections::BTreeSet::new(),
         }
     }

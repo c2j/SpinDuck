@@ -167,6 +167,8 @@ pub struct CaseConfig {
     pub scenarios: Vec<Scenario>,
     /// `procedure` 形态的输出读取 SQL（两侧共用，必须自含 ORDER BY）
     pub output_sql: Option<String>,
+    /// 附加输出读取 SQL（两侧逐行比对，不参与基线漂移检查）
+    pub extra_sql: Option<String>,
     /// `procedure` 形态的 `p_o_succeed` 期望（`None` = 不校验）
     pub expect_succeed: Option<String>,
     /// 基线文件名（`cases/baselines/` 下）
@@ -259,6 +261,10 @@ impl CaseConfig {
             .cloned()
             .unwrap_or(toml::Value::Table(Default::default()));
         let output_sql = output.get("sql").and_then(|x| x.as_str()).map(String::from);
+        let extra_sql = output
+            .get("extra_sql")
+            .and_then(|x| x.as_str())
+            .map(String::from);
         if kind == CaseKind::Procedure && output_sql.is_none() {
             return Err(EngineError::env(
                 31,
@@ -271,6 +277,7 @@ impl CaseConfig {
             routine: routine.to_string(),
             scenarios,
             output_sql,
+            extra_sql,
             expect_succeed: case
                 .get("expect_succeed")
                 .and_then(|x| x.as_str())

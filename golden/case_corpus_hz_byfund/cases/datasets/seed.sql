@@ -1,7 +1,8 @@
 -- 种子（自实现）：驱动 prc_trd_hz_byfund 主聚合循环。
 -- 覆盖：两笔正常成交（不同基金/席位）→ dat_fund_cjqs 两行；债券类型未维护
 --        （v_par_bond 无行）→ 两侧同为 NO_DATA_FOUND 路径；风险金维度表
---        par_oper_venture 为空 → 动态 SQL 段不执行；QFII 开关日期设为远期 → 段不执行。
+--        par_oper_venture 一行 → 动态 SQL 段（OPEN FOR + 函数下沉）执行，
+--        结果落 dat_fund_xw_venture；QFII 开关日期设为远期 → QFII 段不执行。
 
 INSERT INTO par_fund_info (fund_code, data_mode, fund_status) VALUES
 ('F001', '1', '1'),
@@ -14,6 +15,10 @@ INSERT INTO par_fund_partner (fund_code, partner_code, market_code, sub_partner_
 INSERT INTO par_fund_seat (seat_id, fund_code, seat_code, market_code, inure_begin_date, inure_end_date, valid_flag) VALUES
 ('1', 'F001', 'X001', '001', '20200101', '20991231', '1'),
 ('2', 'F002', 'X002', '001', '20200101', '20991231', '1');
+
+-- 风险金维度（动态 SQL 段）：stock_kind_str 是拼进动态 SQL 的谓词片段
+INSERT INTO par_oper_venture (stock_kind_str, venture_name, market_code, operation_kind) VALUES
+('(substr(stock_kind,1,2) = ''01'')', '债券', '001', '01');
 
 -- QFII 开关日期：远期 → 过程内 IF p_i_date >= split_date 为假，QFII 段跳过
 INSERT INTO dic_all_kind (operation_kind, kind_id, kind_name) VALUES

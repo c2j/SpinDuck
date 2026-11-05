@@ -208,6 +208,29 @@ fn run_case_inner(name: &str) {
             spin[i], baseline[i],
             "[{name}] {why}: 与提交基线 expected.json 不一致（行为变化需单独评审）"
         );
+        if let Some(extra) = &case.extra_sql {
+            let (_, b_rows) = og
+                .fetch_rows(extra)
+                .unwrap_or_else(|e| err("参照侧附加输出读取", e.message));
+            let base_extra: Vec<Vec<String>> = b_rows
+                .iter()
+                .map(|r| r.iter().map(|c| norm(c.clone())).collect())
+                .collect();
+            let mut rs = eng
+                .ex
+                .query(extra, &BindMap::new())
+                .unwrap_or_else(|e| err("被测侧附加输出读取", e.message));
+            let got_extra: Vec<Vec<String>> = rs
+                .fetch_many(1000)
+                .iter()
+                .map(|r| r.iter().map(|v| norm(Some(v.as_str_loose()))).collect())
+                .collect();
+            assert_eq!(
+                got_extra, base_extra,
+                "[{name}] {why}: 附加输出（`{extra}`）不一致"
+            );
+            println!("OK [{name}] {why} [extra]: rows={}", got_extra.len());
+        }
         println!("OK [{name}] {why}: {}", spin[i].describe());
     }
 }

@@ -18,8 +18,9 @@ materialize = [
 outputs = ["dat_fund_cjqs", "dat_fund_xw_venture"]
 
 [case.output]
+extra_sql = "SELECT fund_code, xwdm, bcrq, qsje, scdm, operation_kind, trade_type, venture_type, qsje2 FROM dat_fund_xw_venture ORDER BY fund_code, xwdm, trade_type"
 sql = "SELECT fund_code, xwdm, main_xwdm, security_id, bs, trade_type, bcrq, cjsl, cjje, yhs, jsf, jiesf, zgf, ghf, yj, fxj, accrual, pay_type, stock_kind, mrcb, scdm, gddm, gddmzm, check_type, cjbz FROM dat_fund_cjqs ORDER BY fund_code, security_id, bs"
 
 [[case.scenarios]]
-why = "按基金汇总（主聚合循环 + 无风险金配置 + QFII 开关关闭）"
+why = "按基金汇总（主聚合 + 风险金动态 SQL 段 + QFII 开关关闭）"
 args = ["'20250715'", "null"]
