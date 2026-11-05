@@ -1,7 +1,55 @@
+# ───────────── 构建产物 ─────────────
 target/
+*.rlib
+*.rmeta
+# 本地 cargo home（registry/git 缓存与 vendored 依赖源码，可重装）
 .cargo-home/
+
+# ───────────── 生成报告 / 工具输出 ─────────────
+# cargo-mutants（变异测试报告；结论摘要入 docs/validation.md，原始产物不入库）
+mutants.out*/
+# 覆盖率
+*.profraw
+*.profdata
+lcov.info
+coverage/
+tarpaulin-report.html
+# 本地脚本缓存
+.codeweb/
+
+# ───────────── 运行态（SPINDUCK_HOME 开发实例） ─────────────
 .spinduck/
 *.duckdb
+*.duckdb.wal
 *.wal
+# 物化缓存（§13.1 Parquet）
+*.parquet
+
+# ───────────── 日志 / 临时文件 ─────────────
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+crash/
+
+# ───────────── Python（scripts/ 模拟器与评测脚本） ─────────────
 __pycache__/
-.codeweb/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ───────────── 编辑器 / 操作系统 ─────────────
+.DS_Store
+.AppleDouble
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ───────────── 本地环境（口令等绝不入库） ─────────────
+.env
+.env.*
+*.local
