@@ -583,6 +583,7 @@ $SPINDUCK_HOME/                       # 根路径，配置项 home；默认 ./�
 ├── conf/
 │   ├── engine.toml                   # 引擎配置（threads/memory/limits/路径/日志策略）
 │   ├── rewrite-rules.toml            # 规则文件（种子或项目覆盖副本）
+│   ├── spinduck.toml                 # 项目声明的运行态快照（`verify` 生成，见 §12.1）
 │   └── conf.d/                       # 项目级覆盖片段（后加载覆盖先加载）
 ├── data/                             # 内核托管：数据库文件（每库一文件，多租户=多文件，§10.2）
 │   ├── <dbname>.duckdb               #   例程 catalog 亦在其内（§3.6）
@@ -861,16 +862,52 @@ include = ["cases/*.case.toml"]
 [package]
 extensions = []                     # 静态链接清单（离线部署 §10.6）
 audit_retention_days = 180          # 部署参数预览（engine.toml 生成模板）
+
+[[entry]]                           # 本项目对外可调用面（0..n 条；verify 的核验起点）
+routine = "pkg_x.prc_y"             # 必须 package.procedure 全名（归一小写）
+kind = "procedure"                  # function | procedure（缺省 procedure）
 ```
+
+**入口声明与链路核验（`spinduck verify [项目目录]`）**
+
+接入验收的口径是"从对外可调用面出发，链路上每个对象都能落地"，而不是"文件都编
+译得过"。因此项目声明显式承载 `[[entry]]`（全名必须带包限定——裸过程名在语料里
+可能同名不同包，链路无法唯一定位），`verify` 据此展开四类核验：
+
+| 核验项 | 判定 | 失败含义 |
+|---|---|---|
+| `Entry` | 全名在例程目录命中且种类（function/procedure）一致 | 入口拼写不符或包体缺失 |
+| `Routine` | 从入口 BFS 沿 `CallRoutine` / SQL 上下文下沉调用点展开，每个被调例程都已登记 | 链路断点（源文件未纳入项目） |
+| `Relation` / `Sequence` | 链路 SQL 引用的表·视图·序列在内核目录存在 | 缺 DDL/桩，或部署顺序不符 |
+| `Scenario` | `*.case.toml` 中声明该入口的每个场景实际调用一次 | 用例缺失显式 `SKIP`（不计失败，但公示"可执行性未验证"） |
+
+SQL 侧对象名取自改写前的静态扫描（`FROM`/`JOIN`/`UPDATE`/`INSERT INTO` 后的标识符
+与 `<seq>.nextval`），字符串字面量与表函数不计——这是**近似口径**，其假阴面（动态
+拼接文本里的表名）由 `Scenario` 的真实执行兜住。退出码：有 `FAIL` → 1。
+
+**运行态项目快照（§11.1 `conf/spinduck.toml`）**：`verify` 同时把"运行态所需的
+那部分声明"（项目名/内核版本 + 可调用面 + 资产绝对路径 + `[runtime]` 来源标注）
+写入 `<home>/conf/spinduck.toml`。设计取舍：
+
+1. **单一写入者**——快照由 `verify` 生成，手写真源仍是项目根的 `spinduck.toml`；
+   快照带 `source`/`generated_by`，内容与真源漂移由下一次 `verify` 报告（`updated`）。
+2. **运行态目录自足**——资产路径已绝对化，故 `ProjectConfig::load` 认
+   `<dir>/spinduck.toml` 与 `<dir>/conf/spinduck.toml` 两处（前者优先），把
+   `.spinduck/` 单独交给运行侧也能复现同一核验结论；此时**不回写**快照，来源
+   标注始终指向研发态真源。
+3. **不复制资产**——快照只是指针集合（源码/规则/用例仍在研发态目录），避免
+   "运行态有一份过期语料"这类二次漂移。
 
 原则重申：目录里全部是**业务侧资产**（源码/规则/用例/报告），`.spinduck/`
 运行态与引擎二进制不入库；同一项目目录在研发态（cli 零参数）与部署态
 （engine.toml 显式配置）间无缝衔接。
 
-**实现状态**：`spinduck_core::project`（`ProjectConfig` / `CaseConfig`）已实现本
-结构的声明识别（路径解析、用例枚举、数据集/基线定位、物化清单）；黄金对比
-harness（`spinduck/tests/common`）是首个消费者，`golden/case_*` 全部按本布局
-组织。`spinduck init/load/register/golden` CLI 命令面属后续里程碑（P1/P3）。
+**实现状态**：`spinduck_core::project`（`ProjectConfig` / `CaseConfig` /
+`EntryConfig`）已实现本结构的声明识别（路径解析、用例枚举、数据集/基线定位、
+物化清单、`[[entry]]` 可调用面）；黄金对比 harness（`spinduck/tests/common`）是其
+首个消费者，`golden/case_*` 全部按本布局组织。`spinduck verify`（`spinduck_core::verify`：
+链路抽取 `chain` / 部署 `deploy` / 逐对象判定 `run` / 运行态快照 `manifest`）已落地，
+`spinduck init/load/register/golden` 命令面属后续里程碑（P1/P3）。
 
 ---
 

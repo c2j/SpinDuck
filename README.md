@@ -72,6 +72,36 @@ export SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
 # rules: … target_duckdb=1.5.5 probe_duckdb=1.5.5 match=true
 ```
 
+### 5. 链路校验（verify）
+
+在项目根（含 `spinduck.toml`）声明本项目对外可调用的存过全名，`verify` 从这些入口
+出发沿调用链逐对象核验——语料是否齐全、链路对象是否真在核内、声明的场景能否执行：
+
+```toml
+# spinduck.toml
+[[entry]]
+routine = "pkg_split_trade_step2.prc_pre_deal_shjycf"   # 必须 package.procedure 全名
+
+[[entry]]
+routine = "pkg_qq_split.prc_general_deal_inst_sh_buy"
+kind = "function"                                       # 缺省 procedure
+```
+
+```bash
+./target/debug/spinduck verify ../golden/exam_split_trade
+# manifest: …/.spinduck/conf/spinduck.toml (updated)
+# == entry pkg_qq_split.prc_general_deal_inst_sh_buy
+#   PASS Entry pkg_qq_split.prc_general_deal_inst_sh_buy — 入口在例程目录命中且种类一致
+#   PASS Relation mid_yjqs_detail — 内核存在（main.mid_yjqs_detail）
+#   FAIL Routine pkg_x.prc_gone — 链路断点：被 pkg_y.prc_z 调用，但语料中未登记
+#   SKIP Scenario - — 无 *.case.toml 声明该入口，可执行性未验证
+# verify: entries=8 checks=64 failed=1 skipped=2
+```
+
+出现 `FAIL` 退出码为 1。核验同时把可调用面与资产绝对路径写成运行态快照
+`<home>/conf/spinduck.toml`（唯一写入者 = `verify`，禁止手改）；把该目录单独交给
+运行侧即可脱离研发态目录复现同一核验结论。
+
 ## 能力矩阵
 
 | 能力 | 状态 |
@@ -94,6 +124,7 @@ export SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
 | **SQL 上下文例程调用**（`UPDATE SET f(col)` / 游标 WHERE / INSERT VALUES 中的 PL 函数） | ✅ 参数元组缓存化下沉（`sqlfn`，确定性前提 + 10 万元组上界） |
 | `%NOTFOUND` 空游标 / `SQLERRM` / `UPDATE` 去别名 / `SELECT INTO` 行数语义（0 行 `NO_DATA_FOUND`、>1 行 `TOO_MANY_ROWS`，静态与动态同口径） | ✅ |
 | 黄金对比 | ✅ `golden/`：toy 用例 + 语料级逐字函数（stock_kind / min_tax）+ 核心过程（purchase / **hz_byfund**） |
+| 入口链路核验 `spinduck verify` | ✅ `[[entry]]` 全名声明 → 例程断点 / 表·序列缺失 / 场景可执行逐条判定 + 运行态 `conf/` 快照（`architecture.md` §11.1、§12.1） |
 | `RETURN NEXT` / `PIPE ROW` / 集合类型（嵌套表/数组元素赋值）/ 带参游标 | ⛔ 待做（语料仅 3+1 例，编译期显式拒绝） |
 | 例程目录持久化 | ✅ 内核内 `spinduck_routines` 表存源 DDL 文本，`reload_catalog` 按当前规则重放编译（`--db` 落盘后跨进程恢复） |
 

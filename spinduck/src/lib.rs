@@ -17,6 +17,7 @@ pub mod runtime;
 pub mod sql;
 pub mod types;
 pub mod value;
+pub mod verify;
 
 pub use ir::{compile_block, compile_stmts, BindSrc, IrExpr, IrProg, IrStmt};
 

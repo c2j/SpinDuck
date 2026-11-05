@@ -165,9 +165,134 @@ fn should_discover_project_root_from_nested_path() {
 }
 
 #[test]
+fn should_load_runtime_snapshot_from_conf_and_prefer_dev_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    // 运行态目录：只有 `verify` 生成的 conf/ 快照，没有手写 spinduck.toml
+    write(root, "conf/spinduck.toml", PROJ);
+    assert_eq!(
+        ProjectConfig::load(root).unwrap().name,
+        "demo-procs",
+        "运行态目录必须自带可加载的项目声明"
+    );
+    assert_eq!(
+        ProjectConfig::discover(&root.join("logs/engine")).map(|p| p.name),
+        Some("demo-procs".to_string()),
+        "从运行态子目录向上查找也应命中快照"
+    );
+
+    // 同一目录同时存在两份时，手写声明是唯一真源，优先于快照
+    write(
+        root,
+        "spinduck.toml",
+        &PROJ.replace("demo-procs", "dev-root"),
+    );
+    assert_eq!(ProjectConfig::load(root).unwrap().name, "dev-root");
+}
+
+#[test]
 fn should_return_none_when_no_project_file_above() {
     let tmp = tempfile::tempdir().unwrap();
     let orphan = tmp.path().join("corpus/routines");
     std::fs::create_dir_all(&orphan).unwrap();
     assert!(ProjectConfig::discover(&orphan).is_none());
+}
+
+#[test]
+fn should_parse_entry_declarations_and_reject_unqualified_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "spinduck.toml",
+        r#"
+[project]
+name = "chain"
+
+[[entry]]
+routine = "pkg_split_trade_step2.prc_pre_deal_shjycf"
+kind = "procedure"
+
+[[entry]]
+routine = "PKG_QQ_SPLIT.PRC_GENERAL_DEAL_INST_SH_BUY"
+"#,
+    );
+    let p = ProjectConfig::load(root).unwrap();
+    assert_eq!(p.entries.len(), 2, "[[entry]] 允许多个");
+    assert_eq!(
+        p.entries[0].routine,
+        "pkg_split_trade_step2.prc_pre_deal_shjycf"
+    );
+    assert_eq!(p.entries[0].kind, CaseKind::Procedure);
+    assert_eq!(
+        p.entries[1].routine, "pkg_qq_split.prc_general_deal_inst_sh_buy",
+        "入口全名归一小写（与例程目录键同口径）"
+    );
+    assert_eq!(
+        p.entries[1].kind,
+        CaseKind::Procedure,
+        "kind 缺省为 procedure"
+    );
+    assert_eq!(
+        ProjectConfig::from_toml_str(
+            "[project]\nname = \"x\"\n\n[[entry]]\nroutine = \"pkg_a.fn_x\"\nkind = \"function\"\n",
+            Path::new("/tmp"),
+        )
+        .unwrap()
+        .entries[0]
+            .kind,
+        CaseKind::Function,
+        "入口可声明函数"
+    );
+
+    let e = ProjectConfig::from_toml_str(
+        "[project]\nname = \"x\"\n\n[[entry]]\nroutine = \"prc_x\"\n",
+        Path::new("/tmp"),
+    )
+    .unwrap_err();
+    assert_eq!(e.code.to_string(), "ENV-0030");
+    assert!(
+        e.message.contains("package.procedure"),
+        "必须说明拒绝原因：缺包限定 {}",
+        e.message
+    );
+}
+
+#[test]
+fn should_derive_case_routine_from_entry_or_reject_both_missing() {
+    let c = CaseConfig::from_toml_str(
+        r#"
+[case]
+name = "chain-buy"
+kind = "procedure"
+entry = "pkg_qq_split.prc_general_deal_inst_sh_buy"
+baseline = "expected.json"
+[case.output]
+sql = "SELECT a FROM t ORDER BY a"
+[[case.scenarios]]
+why = "买入"
+args = ["'20240105'", "1"]
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        c.routine, "pkg_qq_split.prc_general_deal_inst_sh_buy",
+        "[case].entry 可作为被测例程全名来源"
+    );
+    assert_eq!(
+        c.entry.as_deref(),
+        Some("pkg_qq_split.prc_general_deal_inst_sh_buy"),
+        "entry 保留原声明，供 verify 反查链路"
+    );
+
+    let e = CaseConfig::from_toml_str(
+        "[case]\nname = \"x\"\nkind = \"function\"\n[[case.scenarios]]\nwhy = \"w\"\nargs = []\n",
+    )
+    .unwrap_err();
+    assert_eq!(e.code.to_string(), "ENV-0031");
+    assert!(
+        e.message.contains("routine"),
+        "必须提示 routine/entry 至少填一个：{}",
+        e.message
+    );
 }

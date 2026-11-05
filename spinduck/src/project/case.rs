@@ -1,6 +1,7 @@
 //! 用例声明（`*.case.toml`）识别：数据集 × 例程 × 期望输出（§12.1）。
 
 use crate::error::EngineError;
+use crate::project::entry::qualified_routine;
 use crate::project::fs::{cfg_err, read_text, str_list};
 use std::path::Path;
 
@@ -12,6 +13,8 @@ pub struct CaseConfig {
     pub kind: CaseKind,
     /// 被测例程名（`pkg.proc` 形态允许）
     pub routine: String,
+    /// `[case].entry`：入口声明形态的被测例程全名（`package.procedure`，归一小写）
+    pub entry: Option<String>,
     /// 场景列表（执行参数 + 用途说明）
     pub scenarios: Vec<Scenario>,
     /// `procedure` 形态的输出读取 SQL（两侧共用，必须自含 ORDER BY）
@@ -76,10 +79,27 @@ impl CaseConfig {
                 ))
             }
         };
-        let routine = case
-            .get("routine")
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| EngineError::env(31, "case.toml: [case].routine 必填"))?;
+        // 被测例程：`routine`（允许短名，harness 旧口径）或 `entry`（§12.1 入口声明，
+        // 必须包限定）；两者都缺则显式报错，不静默默认
+        let entry = match case.get("entry").and_then(|x| x.as_str()) {
+            Some(raw) => Some(qualified_routine(raw).map_err(|_| {
+                EngineError::env(
+                    31,
+                    format!("case.toml: [case].entry 必须为 package.procedure 全名，收到 '{raw}'"),
+                )
+            })?),
+            None => None,
+        };
+        let routine = match (case.get("routine").and_then(|x| x.as_str()), &entry) {
+            (Some(r), _) => r.to_string(),
+            (None, Some(e)) => e.clone(),
+            (None, None) => {
+                return Err(EngineError::env(
+                    31,
+                    "case.toml: [case].routine 与 [case].entry 至少填一个（entry 须为 package.procedure）",
+                ))
+            }
+        };
         let scenarios_raw = case
             .get("scenarios")
             .and_then(|x| x.as_array())
@@ -125,7 +145,8 @@ impl CaseConfig {
         Ok(Self {
             name: name.to_string(),
             kind,
-            routine: routine.to_string(),
+            routine,
+            entry,
             scenarios,
             output_sql,
             extra_sql,

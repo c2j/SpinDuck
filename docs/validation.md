@@ -547,3 +547,55 @@ call/golden 口径分裂）。修复：`ProjectConfig::discover`（自语料目�
   不在文档里声称已达标。
 - §4.4 变异测试范围路径随本次拆分更新为 `src/ir`、`src/sql/rewrite`、`src/sql/sqlfn`、
   `src/runtime`、`src/value.rs`（`cargo mutants -f` 目录写法不变，无需改 AGENTS §8 命令）。
+
+## V20. 入口声明与链路核验（`[[entry]]` + `spinduck verify`）
+
+**动机**：接入验收的口径是"从对外可调用面出发，链路上每个对象都能落地"，而不是
+"文件都编译得过"（设计 §12.1）。本轮把可调用面写进项目声明，并让 `verify` 从它出发
+逐对象核验；同时回答"项目配置文件也要出现在运行态目录下"这一设计问题。
+
+**门禁**：`cargo fmt --all -- --check` 干净；`cargo clippy --all-features --tests -- -D warnings`
+干净；`cargo test --features native` **235 passed / 0 failed**（lib 181 + 集成/守护/CLI 54），
+较 V19 的 207 净增 28 条测试，全部为本轮新增行为断言。
+
+**测试分层（§4.1）**：
+
+| 层 | 测试 | 条数 |
+|---|---|---|
+| 单元（不触内核） | `verify::chain`（SQL/IR 链路抽取 7）、`verify::run`（`ChainFacts` 手工快照判 8）、`verify::deploy::sql_units`（1）、`verify::manifest`（2）、`project::*`（入口声明 2 + 运行态快照定位 1） | 21 |
+| 内核集成（真实 DuckDB） | `spinduck/tests/verify_chain.rs`：入口命中/断点/表缺席/场景可执行/显式 Skip/退出码/运行态快照 | 6 |
+| CLI 契约 | `cli::args::should_parse_verify_with_optional_path_and_reject_extra_args`、`cli::run::should_fail_verify_when_project_file_is_missing` | 2 |
+
+**运行态快照的三条实测结论**（`verify_chain::should_snapshot_manifest_in_home_conf_and_verify_runtime_dir_alone`）：
+
+1. 研发态 `verify` 落 `<home>/conf/spinduck.toml`，快照带 `source`/`generated_by`，
+   资产路径全部绝对化，报告行 `manifest: …/conf/spinduck.toml (updated)`；同内容重复
+   同步报 `unchanged`。
+2. 把 `.spinduck/` 单独作为项目目录再跑 `verify`，得到**同一结论**（`entries=3 failed=3`、
+   退出码 1），且快照一字不变——`ProjectConfig` 认 `<dir>/spinduck.toml` 与
+   `<dir>/conf/spinduck.toml` 两处（前者优先），运行态因此自足。
+3. 从运行态目录执行时**不回写**快照（`(未改写)`），来源标注始终指向手写真源。
+
+**本轮抓到的两个自身缺陷（都有守护测试，非事后补写）**：
+
+- **链路文本重复计数**：`verify::chain::walk_code` 原先在 `PushTrap` 处按
+  `TrapEntry.body_start..body_end` 递归展开，而处理器体与主语句本就在同一 `code`
+  区，线性遍历已覆盖 → 每个处理器体的 SQL 被计两次（`sql_texts` 实测
+  `[T_BODY, T_HANDLER, T_HANDLER]`）。守护测试
+  `should_walk_exception_handler_bodies` 锁定"按文档序各计一次"，`PushTrap`/`PopTrap`
+  降级为纯标记，`MAX_TRAP_DEPTH` 随之删除。
+- **核验失败仍落运行态快照**：`verify_cmd` 原先先同步清单再核验，导致一个没有
+  `[[entry]]`、直接 `ENV-0030` fail-fast 的项目也会得到一个"声称可调用面"的快照文件。
+  守护测试 `should_not_write_manifest_when_verify_fails_before_reporting` 断言快照不得存在，
+  顺序改为"核验通过 → 落快照 → 渲染"。
+
+**静态扫描的近似口径（登记，不声称已完备）**：SQL 侧对象名取自改写前的词法扫描
+（`FROM`/`JOIN`/`UPDATE`/`INSERT|MERGE INTO` 后首个标识符、`<seq>.nextval|currval`），
+字符串字面量与表函数不计，`EXTRACT(unit FROM ts)` 按括号属主排除；子查询位
+（`FROM (`）不计。已知假阴面：动态拼接文本里的表名、以及写成函数调用形态的关系名——
+由 `Scenario` 的真实执行兜住（调用即报错）。`docs/architecture.md` §12.1 已把该口径写成正文。
+
+**对既有 golden 项目的影响**：`golden/case_*` 五个项目尚未声明 `[[entry]]`，对其执行
+`spinduck verify` 得到 `[ENV-0030] spinduck.toml: 至少一条 [[entry]]（verify 的核验起点）`
+并退出 1——黄金层（`cargo test --features gauss`）不消费 `verify`，故无任何回归。
+入口声明随 V21 的语料级案例一并补齐。

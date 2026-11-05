@@ -30,6 +30,8 @@ pub enum Command {
         table: String,
         cols: Vec<String>,
     },
+    /// 链路校验（§12.1 入口声明）：从 `[[entry]]` 出发逐对象核验。
+    Verify { path: Option<PathBuf> },
     /// 调用例程（可先从 SQL 文件注册例程；可选持久化库文件）。
     Call {
         db: Option<PathBuf>,
@@ -73,8 +75,19 @@ pub fn parse(argv: &[String]) -> Result<Command, EngineError> {
         "explain" => parse_explain(&argv[1..]),
         "materialize" => parse_materialize(&argv[1..]),
         "sync" => parse_sync(&argv[1..]),
+        "verify" => parse_verify(&argv[1..]),
         "call" => parse_call(&argv[1..]),
         other => Err(usage_err(format!("unknown subcommand {other}"))),
+    }
+}
+
+fn parse_verify(rest: &[String]) -> Result<Command, EngineError> {
+    match rest {
+        [] => Ok(Command::Verify { path: None }),
+        [p] => Ok(Command::Verify {
+            path: Some(PathBuf::from(p)),
+        }),
+        _ => Err(usage_err("verify [项目目录]")),
     }
 }
 
@@ -243,6 +256,7 @@ pub fn usage() -> &'static str {
      \x20 compile <path>...               语料编译体检（递归 *.sql）\n\
      \x20 rules probe <rules.toml>        规则文件版本锚定检查\n\
      \x20 explain --file <sql> <routine>   打印例程 IR（不执行）\n\
+     \x20 verify [项目目录]               从 [[entry]] 出发核验链路对象与场景\n\
      \x20 materialize --db <f> --table <t> [--where <expr>]
 \
      \x20                                从 GaussDB 物化到本地 DuckDB（需 feature gauss）
@@ -388,5 +402,22 @@ mod tests {
     #[test]
     fn should_treat_empty_argv_as_help() {
         assert_eq!(parse(&[]).unwrap(), Command::Help);
+    }
+
+    #[test]
+    fn should_parse_verify_with_optional_path_and_reject_extra_args() {
+        assert_eq!(
+            parse(&v(&["verify"])).unwrap(),
+            Command::Verify { path: None }
+        );
+        assert_eq!(
+            parse(&v(&["verify", "golden/case_split_agg"])).unwrap(),
+            Command::Verify {
+                path: Some(PathBuf::from("golden/case_split_agg"))
+            }
+        );
+        let e = parse(&v(&["verify", "a", "b"])).unwrap_err();
+        assert_eq!(e.code.to_string(), "ENG-0010");
+        assert!(e.message.contains("verify"), "{}", e.message);
     }
 }

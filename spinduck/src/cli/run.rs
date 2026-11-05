@@ -68,6 +68,7 @@ fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError> {
         Command::Materialize { .. } => materialize_cmd(cmd_materialize(cmd), out),
         Command::Sync { .. } => sync_cmd(cmd_sync(cmd), out),
         Command::Call { .. } => call_cmd(cmd_call(cmd), out),
+        Command::Verify { path } => crate::cli::verify::verify_cmd(path.as_deref(), out),
     }
 }
 
@@ -472,5 +473,16 @@ mod tests {
         ]);
         assert_eq!(code, EXIT_OK, "{out}");
         assert!(out.contains("OUT p_o = 42"), "{out}");
+    }
+
+    #[test]
+    fn should_fail_verify_when_project_file_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (code, out) = run_str(&["verify", &tmp.path().to_string_lossy()]);
+        assert_eq!(code, EXIT_FAIL);
+        assert!(
+            out.contains("spinduck.toml"),
+            "诊断需指向缺失的项目声明文件：{out}"
+        );
     }
 }

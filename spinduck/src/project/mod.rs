@@ -8,12 +8,14 @@
 //! `fs`（目录扫描与配置读取）；`tests` 为本模块单测。
 
 mod case;
+mod entry;
 mod fs;
 
 #[cfg(test)]
 mod tests;
 
 pub use case::{CaseConfig, CaseKind, Scenario};
+pub use entry::EntryConfig;
 
 use crate::error::EngineError;
 use crate::project::fs::{cfg_err, list_dir_suffix, read_text, sql_files};
@@ -35,18 +37,33 @@ pub struct ProjectConfig {
     pub home_dir: PathBuf,
     /// `[cases] include` 的条目（如 `cases/*.case.toml`）
     pub case_includes: Vec<String>,
+    /// `[[entry]]` 声明：本项目可被调用的存过全名（可多个；链路校验起点）
+    pub entries: Vec<EntryConfig>,
     /// 项目根（相对路径基准）
     pub root: PathBuf,
 }
 
 impl ProjectConfig {
     /// 读取项目声明；相对路径以项目根为基准解析。
-    pub fn load(root: &Path) -> Result<Self, EngineError> {
-        let text = read_text(&root.join("spinduck.toml"))?;
-        Self::from_toml_str(&text, root)
+    ///
+    /// 声明文件两处（§11.1/§12.1）：研发态 `<dir>/spinduck.toml`（手写真源，优先）、
+    /// 运行态 `<dir>/conf/spinduck.toml`（`verify` 生成的快照，路径已绝对化，
+    /// 故运行态目录自带可加载声明）。
+    pub fn load(dir: &Path) -> Result<Self, EngineError> {
+        let file = fs::project_file(dir).ok_or_else(|| {
+            EngineError::env(
+                30,
+                format!(
+                    "未在 {} 找到项目声明（spinduck.toml 或 conf/spinduck.toml）",
+                    dir.display()
+                ),
+            )
+        })?;
+        let text = read_text(&file)?;
+        Self::from_toml_str(&text, dir)
     }
 
-    /// 从 `start` 逐级向上查找项目根（含 `spinduck.toml` 的目录）。
+    /// 从 `start` 逐级向上查找项目根（含 `spinduck.toml` 或运行态快照的目录）。
     ///
     /// 用途：CLI 编译/校验语料目录时继承所在项目的规则与入口声明，
     /// 避免"口径靠调用参数临时拼装"（§12.1）。找不到返回 `None`（回落内置种子）；
@@ -55,7 +72,7 @@ impl ProjectConfig {
     pub fn discover(start: &Path) -> Option<Self> {
         start
             .ancestors()
-            .find(|d| d.join("spinduck.toml").is_file())
+            .find(|d| fs::project_file(d).is_some())
             .and_then(|root| Self::load(root).ok())
     }
 
@@ -114,6 +131,16 @@ impl ProjectConfig {
                 .collect(),
             _ => vec!["cases/*.case.toml".to_string()],
         };
+        let mut entries = Vec::new();
+        for e in v
+            .get("entry")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
+            entries.push(EntryConfig::from_toml_value(&e)?);
+        }
+
         Ok(Self {
             name: name.to_string(),
             kernel: kernel.to_string(),
@@ -126,6 +153,7 @@ impl ProjectConfig {
             baselines_dir: get_path("baselines", "cases/baselines"),
             home_dir: get_path("home", ".spinduck"),
             case_includes,
+            entries,
             root: root.to_path_buf(),
         })
     }
@@ -149,6 +177,11 @@ impl ProjectConfig {
     /// 例程源码（`sql/routines/*.sql`，排序）。
     pub fn routine_files(&self) -> Result<Vec<PathBuf>, EngineError> {
         sql_files(&self.routines_dir, false)
+    }
+
+    /// 数据集种子（`cases/datasets/*.sql`，排序）。
+    pub fn dataset_files(&self) -> Result<Vec<PathBuf>, EngineError> {
+        sql_files(&self.datasets_dir, false)
     }
 
     /// 桩包源码（`[paths].stubs` 各目录的 `*.sql`，按目录顺序拼接）。

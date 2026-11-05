@@ -5,6 +5,7 @@
 pub mod args;
 pub mod explain;
 pub mod run;
+mod verify;
 
 use crate::engine::Engine;
 use crate::error::EngineError;
