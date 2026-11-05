@@ -28,6 +28,9 @@ pub fn rewrite_tokens(
     let mut binds: Vec<(String, VarName)> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut cursor = 0usize;
+    // 限定名保护：前一个 token 为 '.' 时当前 Ident 是限定名的后半段
+    // （table.column / package.routine），不是 PL 变量，禁止替换
+    let mut prev_was_dot = false;
     for tws in &tokens {
         let gap = sql_text
             .get(cursor..tws.span.start)
@@ -36,7 +39,7 @@ pub fn rewrite_tokens(
         match &tws.token {
             Token::Ident(value) => {
                 let lower = value.to_ascii_lowercase();
-                if var_names.contains(&lower) {
+                if var_names.contains(&lower) && !prev_was_dot {
                     let ph = format!("$v_{lower}");
                     out.push_str(&ph);
                     if seen.insert(ph.clone()) {
@@ -46,8 +49,15 @@ pub fn rewrite_tokens(
                     out.push_str(&sql_text[tws.span.start..tws.span.end]);
                 }
             }
+            Token::Dot => {
+                out.push_str(&sql_text[tws.span.start..tws.span.end]);
+                prev_was_dot = true;
+                cursor = tws.span.end;
+                continue;
+            }
             _ => out.push_str(&sql_text[tws.span.start..tws.span.end]),
         }
+        prev_was_dot = false;
         cursor = tws.span.end;
     }
     out.push_str(&sql_text[cursor..]);
@@ -117,6 +127,23 @@ mod tests {
     }
 
     #[test]
+    fn should_not_substitute_qualified_name_parts_sharing_a_var_name() {
+        // 回归（语料 FNC_GET_STOCK_KIND）：局部变量与列同名时，
+        // 限定名 `t.stock_kind` 的列部分曾被替换为占位符 → 内核绑定错误
+        let u = rewrite_tokens(
+            "SELECT t.stock_kind FROM dic_stock_kind_sub t WHERE x = stock_kind",
+            &vars(&["stock_kind"]),
+        )
+        .unwrap();
+        assert_eq!(
+            u.text,
+            "SELECT t.stock_kind FROM dic_stock_kind_sub t WHERE x = $v_stock_kind"
+        );
+        assert_eq!(u.binds.len(), 1);
+        assert_eq!(u.binds[0].1, VarName("stock_kind".into()));
+    }
+
+    #[test]
     fn should_resolve_placeholder_names_case_insensitively() {
         let u = rewrite_tokens("SELECT * FROM t WHERE d = P_I_DATE", &vars(&["p_i_date"])).unwrap();
         assert_eq!(u.binds[0].1, VarName("p_i_date".into()));
@@ -140,6 +167,9 @@ pub fn rewrite_tokens_with_rules(
     let mut binds: Vec<(String, VarName)> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut cursor = 0usize;
+    // 限定名保护：前一个 token 为 '.' 时当前 Ident 是限定名的后半段
+    // （table.column / package.routine），不是 PL 变量，禁止替换
+    let mut prev_was_dot = false;
     for tws in &tokens {
         let gap = sql_text
             .get(cursor..tws.span.start)
@@ -148,7 +178,7 @@ pub fn rewrite_tokens_with_rules(
         match &tws.token {
             Token::Ident(value) => {
                 let lower = value.to_ascii_lowercase();
-                if var_names.contains(&lower) {
+                if var_names.contains(&lower) && !prev_was_dot {
                     let ph = format!("$v_{lower}");
                     out.push_str(&ph);
                     if seen.insert(ph.clone()) {
@@ -163,8 +193,15 @@ pub fn rewrite_tokens_with_rules(
             Token::Keyword(_) => {
                 apply_rename(&mut out, sql_text, tws.span.start, tws.span.end, functions);
             }
+            Token::Dot => {
+                out.push_str(&sql_text[tws.span.start..tws.span.end]);
+                prev_was_dot = true;
+                cursor = tws.span.end;
+                continue;
+            }
             _ => out.push_str(&sql_text[tws.span.start..tws.span.end]),
         }
+        prev_was_dot = false;
         cursor = tws.span.end;
     }
     out.push_str(&sql_text[cursor..]);

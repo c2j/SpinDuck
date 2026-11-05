@@ -85,7 +85,8 @@ export SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=15432 \
 | `EXECUTE IMMEDIATE '<静态文本>'` | ✅（运行期拼接显式拒绝 `ENG-0062`） |
 | 事务标记 `COMMIT`/`ROLLBACK`（延迟事务） | ✅ 顶层执行 |
 | GaussDB 物化/回写 | ✅（文本承载，回写为 append） |
-| 黄金对比 | ✅ `golden/` + `tests/golden_gauss.rs` |
+| `rownum = 1` 首行谓词 | ✅ `[patterns] rownum_first_row` 规则改写（AST 级，语料 42 处） |
+| 黄金对比 | ✅ `golden/`：toy 用例 + **语料级逐字函数**（stock_kind / min_tax，Oracle A 模式容器逐行比对） |
 | `RETURN NEXT` / `PIPE ROW` / 集合类型（嵌套表/数组元素赋值）/ 带参游标 | ⛔ 待做（语料仅 3+1 例，编译期显式拒绝） |
 | 例程目录持久化 | ⛔ 待做（当前进程内内存目录） |
 

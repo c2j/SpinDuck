@@ -84,6 +84,15 @@ strip_hint_comments = true               # /*FORCE*/ 等 hint 注释剥离
 "(+) 外连接标记"     = "→ LEFT/RIGHT JOIN（ogsql AST 已保留标记）"
 "seq.NEXTVAL"       = "nextval('seq')（DuckDB 原生序列）"
 
+# ── 语句模式改写（编译期 AST 级，机器可读开关）────────────────
+# 状态：verified —— openGauss 5.0.0（Oracle A 模式容器）+ DuckDB 1.5.5 双侧
+# 实测见 validation V13（2026-11-05）。
+# `rownum = 1` 首行谓词 → LIMIT 1。DuckDB 无 rownum，不改写语句必然报错。
+# 已知损失：平铺 `ORDER BY … rownum = 1` 在 Oracle 中先取首行再排序（结果不定），
+# 改写后按排序取首行（确定且通常是业务意图）；内层 ORDER BY 子查询 + 外层
+# rownum = 1（语料主流形态，42 处/14 文件）两侧语义一致。
+rownum_first_row = true
+
 # ── 隐式类型转换（解释器与改写器共用）────────────────────────────
 [implicit]
 concat_numeric_to_varchar = false  # verified@1.5.5：'x'||DECIMAL 原生可用，无需 CAST（V6 修订 R12）

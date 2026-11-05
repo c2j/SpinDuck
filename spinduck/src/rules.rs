@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// 规则注册表：种子 + 项目覆盖叠加。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RuleRegistry {
     /// `[types]`：GaussDB 类型名 → DuckDB 类型族名
     pub types: BTreeMap<String, String>,
@@ -13,9 +13,27 @@ pub struct RuleRegistry {
     pub functions: BTreeMap<String, String>,
     /// `[implicit]`：隐式转换开关
     pub implicit_concat_numeric_to_varchar: bool,
+    /// `[patterns] rownum_first_row`：`rownum = 1` 首行谓词 → `LIMIT 1` 改写开关。
+    /// DuckDB 无 rownum，不改写则语句必然内核报错，故默认 true（可经规则文件关闭）。
+    pub patterns_rownum_first_row: bool,
     /// 内核版本（探针锚定）
     pub target_duckdb: String,
     pub probe_duckdb: String,
+}
+
+impl Default for RuleRegistry {
+    /// 程序化默认值：rownum 改写默认开启（DuckDB 无 rownum，不改写必然报错）；
+    /// 其余空表/关闭，与 `RuleRegistry::default()` 旧语义兼容。
+    fn default() -> Self {
+        Self {
+            types: BTreeMap::new(),
+            functions: BTreeMap::new(),
+            implicit_concat_numeric_to_varchar: false,
+            patterns_rownum_first_row: true,
+            target_duckdb: String::new(),
+            probe_duckdb: String::new(),
+        }
+    }
 }
 
 impl RuleRegistry {
@@ -63,6 +81,11 @@ impl RuleRegistry {
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false);
         }
+        if let Some(p) = v.get("patterns").and_then(|x| x.as_table()) {
+            if let Some(b) = p.get("rownum_first_row").and_then(|x| x.as_bool()) {
+                reg.patterns_rownum_first_row = b;
+            }
+        }
         Ok(reg)
     }
 
@@ -82,6 +105,11 @@ impl RuleRegistry {
                 if let Some(s) = val.as_str() {
                     self.functions.insert(k.to_ascii_uppercase(), s.to_string());
                 }
+            }
+        }
+        if let Some(p) = v.get("patterns").and_then(|x| x.as_table()) {
+            if let Some(b) = p.get("rownum_first_row").and_then(|x| x.as_bool()) {
+                self.patterns_rownum_first_row = b;
             }
         }
         Ok(())
@@ -115,6 +143,19 @@ DECODE = "@case"
 [implicit]
 concat_numeric_to_varchar = false
 "#;
+
+    #[test]
+    fn should_load_and_overlay_rownum_pattern_flag() {
+        let on = RuleRegistry::from_toml_str("[patterns]\nrownum_first_row = true").unwrap();
+        assert!(on.patterns_rownum_first_row);
+        let off = RuleRegistry::from_toml_str("[patterns]\nrownum_first_row = false").unwrap();
+        assert!(!off.patterns_rownum_first_row, "规则文件可显式关闭");
+        // 程序化默认：开启（DuckDB 无 rownum，不改写必然报错）
+        assert!(RuleRegistry::default().patterns_rownum_first_row);
+        let mut d = RuleRegistry::default();
+        d.overlay("[patterns]\nrownum_first_row = false").unwrap();
+        assert!(!d.patterns_rownum_first_row, "overlay 可覆盖");
+    }
 
     #[test]
     fn should_load_seed_rules_from_toml() {

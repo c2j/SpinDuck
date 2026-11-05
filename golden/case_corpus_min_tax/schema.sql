@@ -1,0 +1,25 @@
+-- 黄金用例（语料级）：par_sys_marketrate DDL 逐字取自考题基线 1_表结构
+DROP TABLE IF EXISTS par_sys_marketrate;
+
+CREATE TABLE par_sys_marketrate (
+    market_code character varying(3) NOT NULL,
+    par_code character varying(3) NOT NULL,
+    stock_kind character varying(4) NOT NULL,
+    par_kind numeric(1,0) NOT NULL,
+    par_name character varying(50),
+    par_value numeric(19,10) DEFAULT 0 NOT NULL,
+    min_value numeric(20,4) DEFAULT 0 NOT NULL,
+    max_value numeric(20,4) DEFAULT (9999999999::bigint)::numeric NOT NULL,
+    unit character varying(1),
+    min_tax numeric(15,4) DEFAULT 0 NOT NULL,
+    operator character varying(10),
+    check_user character varying(10),
+    inure_begin_date character varying(8) NOT NULL,
+    inure_end_date character varying(8) DEFAULT '99991231'::character varying,
+    par_day numeric(8,0) DEFAULT 0 NOT NULL,
+    stock_status character varying(2) DEFAULT '99'::character varying NOT NULL,
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20),
+    fund_age character varying(2) DEFAULT '0'::character varying NOT NULL
+);

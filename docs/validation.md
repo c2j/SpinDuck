@@ -317,3 +317,43 @@ refused`），因此无法取得 GaussDB 基线。门禁改用**同内核血统�
 
 **结论**：75.8% ≥ 70% 门禁达标；幸存变异体全部归类并登记，其中"等价变异"
 类不改代码，"测试可达性弱"类作为下轮测试补强输入（AGENTS §4.4）。
+
+## V13. 本地 GaussDB 容器（Oracle A 模式）重建验证 + 语料级黄金对比
+
+**环境重建**。按 dota-adapter 交付脚本（`prototype-1.7/dota-scheduler/dota-adapter/docker/`）
+以 `docker compose up -d` 重建 `dota-gaussdb`：openGauss 5.0.0，**Oracle A 兼容模式**
+（`datcompatibility=A`，healthcheck 强制校验），md5 认证经镜像环境变量原生配置
+（`GS_HOST_AUTH_METHOD=md5` + `password_encryption_type=1`——无需手改配置文件，
+纠正 V7 时代 `password_encryption_type=0` 的手工改造），端口 5433，DOTA schema 自动应用。
+SpinDuck 全部 GaussDB 通道（gauss_e2e / golden / golden_corpus）切换至该容器实跑。
+
+**新规则（rules-as-data）**：`[patterns] rownum_first_row = true`（config/rewrite-rules.toml）。
+`rownum = 1` 首行谓词 → `LIMIT 1`（AST 级 AND 链剥除，OR/NOT 内保守保留；已有 LIMIT 时
+保守还原）。语料 42 处 / 14 文件由此获得运行期可执行性。已知损失：平铺
+`ORDER BY … rownum = 1` 在 Oracle 中先取首行再排序（结果不定），改写后按序取首行
+（确定，通常即业务意图）；语料主流形态"内层 ORDER BY 子查询 + 外层 rownum"两侧语义一致。
+
+**语料级黄金对比（新增，逐字源码）**：`golden/case_corpus_stock_kind/` 与
+`golden/case_corpus_min_tax/`，源码逐字取自考题基线 `5_函数/`，不做任何语法改写：
+
+| 函数 | 场景 | 结果 |
+|---|---|---|
+| `FNC_GET_STOCK_KIND`（%TYPE、rownum=1、内层 EXCEPTION OTHERS、BETWEEN 区间） | 命中/第二区间/未配置/市场无配置 ×4 | 两侧逐行一致 ✅ |
+| `FNC_COM_GET_MIN_TAX`（substr 下沉、nvl→coalesce、子查询 ORDER BY DESC + rownum、日期 BETWEEN、DEFAULT NULL 参数） | 精确命中（过期行排除）/组内兜底/全局兜底/无配置归 0 ×4 | 两侧逐行一致 ✅ |
+
+对比口径：数值文本归一（GaussDB NUMBER 按声明 scale 渲染 `0.0000`，SpinDuck `0`，
+值相等不作格式差异失败）。
+
+**门禁抓出的真实缺陷（语料级验证的价值实证）**：
+
+1. **限定名误替换**：局部变量与列同名时，`SELECT t.stock_kind` 的列部分被改写为
+   `t.$v_stock_kind` → 内核绑定错误 → 被函数内 `WHEN OTHERS` 吞掉后返回兜底值
+   'AAAA'。该缺陷在 toy fixture 下不可见（无变量/列同名），语料函数一跑即现。
+   修复：两个改写器（`rewrite_tokens` / `rewrite_tokens_with_rules`）均增加限定名
+   保护——前一 token 为 `.` 时不替换。守护测试
+   `should_not_substitute_qualified_name_parts_sharing_a_var_name`。
+2. rownum 规则的回归守护：`should_rewrite_rownum_first_row_predicate_on_real_kernel`
+   （平铺与子查询两种形态，真实内核）。
+
+**最终门禁（本轮）**：142 测试全绿（114 lib + 15 编译契约 + 9 表达式 + 2 gauss E2E
++ 2 golden fixture + 2 golden corpus，clippy 0 警告）；语料编译 136/136 维持。

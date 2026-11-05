@@ -1,0 +1,12 @@
+{
+  "case": "case_corpus_min_tax",
+  "baseline_kernel": "openGauss 5.0.0 Oracle A 模式（dota-gaussdb 容器）",
+  "source": "考题基线 5_函数/2_FNC_COM_GET_MIN_TAX.sql（逐字，去除尾部分隔符与源注释）",
+  "note": "期望值以两侧实跑一致为准；缺失场景经 EXCEPTION OTHERS + nvl 归 0",
+  "cases": [
+    {"args": ["83", "P1", "0102", "20240630"], "why": "精确 stock_kind 命中（排除 2023 过期行）"},
+    {"args": ["83", "P2", "0105", "20240630"], "why": "组内兜底 0100"},
+    {"args": ["83", "P3", "0200", "20240630"], "why": "全局兜底 0000"},
+    {"args": ["83", "P4", "0900", "20240630"], "why": "无配置 → 异常兜底 0"}
+  ]
+}

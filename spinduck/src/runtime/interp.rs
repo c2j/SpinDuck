@@ -1009,6 +1009,52 @@ mod kernel_tests {
         let _ = VarName("x".into());
     }
 
+    /// 端到端探针：`rownum = 1` 首行谓词改写为 LIMIT 1（语料 42 处，§9 规则）。
+    /// 覆盖两种语料形态：平铺 WHERE 与"内层 ORDER BY 子查询 + 外层 rownum"。
+    #[test]
+    fn should_rewrite_rownum_first_row_predicate_on_real_kernel() {
+        use crate::engine::Engine;
+        use crate::rules::RuleRegistry;
+        use crate::value::SpinValue;
+
+        // patterns_rownum_first_row 默认即 true（DuckDB 无 rownum，不改写必然报错）
+        let rules = RuleRegistry::default();
+        let ex = crate::sql::DuckExecutor::open_in_memory().unwrap();
+        ex.execute("CREATE TABLE t(k VARCHAR, v INT)", &BindMap::new())
+            .unwrap();
+        for (k, v) in [("a", 1), ("b", 2), ("c", 3)] {
+            ex.execute(
+                &format!("INSERT INTO t VALUES ('{k}', {v})"),
+                &BindMap::new(),
+            )
+            .unwrap();
+        }
+        let mut eng = Engine::new(Box::new(ex), rules);
+
+        // 形态 1：平铺 WHERE rownum = 1（有序 LIMIT 语义）
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_first(p_o OUT VARCHAR) IS \
+             BEGIN SELECT k INTO p_o FROM t WHERE rownum = 1 ORDER BY k; END;",
+        )
+        .unwrap();
+        let r = eng.call("prc_first", &[SpinValue::Null]).unwrap();
+        assert_eq!(r.outs.get("p_o"), Some(&SpinValue::Str("a".into())));
+
+        // 形态 2：语料典型——内层 ORDER BY 子查询 + 外层 rownum = 1
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_top(p_o OUT INT) IS \
+             BEGIN SELECT v INTO p_o FROM (SELECT v FROM t ORDER BY v DESC) WHERE rownum = 1; \
+             END;",
+        )
+        .unwrap();
+        let r = eng.call("prc_top", &[SpinValue::Null]).unwrap();
+        assert_eq!(
+            r.outs.get("p_o"),
+            Some(&SpinValue::Int(3)),
+            "内层 DESC 首行"
+        );
+    }
+
     /// 端到端探针：PL 上下文的内建函数下沉内核（ABS/SUBSTR/COALESCE/ROUND）。
     #[test]
     fn should_evaluate_builtin_functions_in_pl_context_on_real_kernel() {
