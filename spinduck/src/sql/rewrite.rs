@@ -104,6 +104,19 @@ mod tests {
     }
 
     #[test]
+    fn should_cast_single_arg_to_char_to_varchar() {
+        // 回归（语料 BIZ-0132）：1 参 TO_CHAR 曾直接报错，语料大量使用
+        let out = apply_ast_transforms("SELECT TO_CHAR(123.450) FROM dual").unwrap();
+        assert_eq!(out, "SELECT CAST(123.450 AS VARCHAR) FROM dual");
+    }
+
+    #[test]
+    fn should_rewrite_two_arg_to_char_with_oracle_format() {
+        let out = apply_ast_transforms("SELECT TO_CHAR(d, 'YYYYMMDD') FROM dual").unwrap();
+        assert!(out.contains("strftime(d, '%Y%m%d')"), "{out}");
+    }
+
+    #[test]
     fn should_resolve_placeholder_names_case_insensitively() {
         let u = rewrite_tokens("SELECT * FROM t WHERE d = P_I_DATE", &vars(&["p_i_date"])).unwrap();
         assert_eq!(u.binds[0].1, VarName("p_i_date".into()));
@@ -368,31 +381,43 @@ pub fn apply_ast_transforms(text: &str) -> Result<String, EngineError> {
                 format!("CAST({} AS DECIMAL(38,6))", args[0])
             }
             "TO_CHAR" => {
-                if args.len() != 2 {
-                    return Err(EngineError::business(132, "TO_CHAR requires 2 arguments"));
-                }
-                let fmt_out = oracle_format_to_strftime(&unquote(&args[1]));
-                let inner_expr = &args[0];
-                let inner = match find_innermost_calls(inner_expr, &["TO_DATE"])
-                    .into_iter()
-                    .next()
-                {
-                    Some((s0, e0, _, a0)) => {
-                        // 原位替换 TO_DATE 调用，保留调用点前后的算术表达式（如 + v_days）
-                        let dargs = split_top_level_commas(&a0);
-                        if dargs.len() != 2 {
-                            return Err(EngineError::business(133, "TO_DATE requires 2 arguments"));
+                // 1 参形式（无数值/日期掩码）：GaussDB 按默认格式转字符串，
+                // DuckDB 无对应默认格式 → CAST AS VARCHAR（已知限制：默认格式差异，
+                // 见 validation.md V9 与规则文件 [functions] 注释）
+                if args.len() == 1 {
+                    format!("CAST({} AS VARCHAR)", args[0])
+                } else if args.len() != 2 {
+                    return Err(EngineError::business(
+                        132,
+                        "TO_CHAR requires 1 or 2 arguments",
+                    ));
+                } else {
+                    let fmt_out = oracle_format_to_strftime(&unquote(&args[1]));
+                    let inner_expr = &args[0];
+                    let inner = match find_innermost_calls(inner_expr, &["TO_DATE"])
+                        .into_iter()
+                        .next()
+                    {
+                        Some((s0, e0, _, a0)) => {
+                            // 原位替换 TO_DATE 调用，保留调用点前后的算术表达式（如 + v_days）
+                            let dargs = split_top_level_commas(&a0);
+                            if dargs.len() != 2 {
+                                return Err(EngineError::business(
+                                    133,
+                                    "TO_DATE requires 2 arguments",
+                                ));
+                            }
+                            let sp = format!(
+                                "strptime({}, '{}')",
+                                dargs[0],
+                                oracle_format_to_strftime(&unquote(&dargs[1]))
+                            );
+                            format!("{}{}{}", &inner_expr[..s0], sp, &inner_expr[e0..])
                         }
-                        let sp = format!(
-                            "strptime({}, '{}')",
-                            dargs[0],
-                            oracle_format_to_strftime(&unquote(&dargs[1]))
-                        );
-                        format!("{}{}{}", &inner_expr[..s0], sp, &inner_expr[e0..])
-                    }
-                    None => inner_expr.to_string(),
-                };
-                format!("strftime({}, '{}')", inner, fmt_out)
+                        None => inner_expr.to_string(),
+                    };
+                    format!("strftime({}, '{}')", inner, fmt_out)
+                }
             }
             _ => unreachable!("names list"),
         };

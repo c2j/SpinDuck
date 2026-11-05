@@ -164,3 +164,43 @@ E2E（`cargo test --features gauss gauss_e2e`，`tests/gauss_e2e.rs`）两个用
 M8）；① UDF 需同 Database 第二连接，`SqlExecutor` 接缝未暴露该能力，属接缝
 签名变更（Ask first），故推迟。过程级函数在 SQL 上下文调用会得到
 `KERNEL-0010`（Catalog Error），属明确失败。
+
+## V9. 语料批量编译体检（M7 门禁）
+
+工具：`spinduck compile <path>...`（`src/cli`，编译期不触碰内核 → 与 DuckDB 版本解耦）。
+语料：`lib/fastaas/exam/清算拆分优化考题/基线代码`（清算拆分考题基线，136 个 SQL 文件）
+与 `lib/fastaas/exam`（含历史收集，187 文件）。
+
+| 语料 | 文件 | 通过 | 失败 | 注册例程 |
+|---|---|---|---|---|
+| 基线代码（首轮） | 136 | 121 | 15 | 28 |
+| 基线代码（当前） | 136 | **136** | **0** | **54** |
+| exam 全树（当前） | 187 | 183 | 4 | 72 |
+
+首轮失败原因 → 修复动作（每条都带回归测试）：
+
+| 失败码 | 数量 | 根因 | 动作 |
+|---|---|---|---|
+| ENG-0026 | 8 | PL 表达式缺 `Parenthesized`/`UnaryOp(-)`/`InList`/`Between` | 编译期脱糖为既有 IR（BETWEEN→`>= AND <=`，IN→等式析取，一元负→`0 - x`）；`tests/ir_expr_forms.rs` |
+| ENG-0020 | 6 | ①空 `ELSE` 时 `if_next` 标签未 mark；②`<<label>>` 语句标签未 mark（GOTO 目标） | 编译期统一 mark；`should_compile_if_without_else_branch`、`should_resolve_goto_to_labeled_statement` |
+| ENG-0056 | 2 | `FOR rec IN <query>` 未实现 | 脱糖为隐式游标（OPEN/FETCH/%NOTFOUND/CLOSE），内核探针 `should_run_for_loop_over_query_on_real_kernel` 验证 v_sum=6 |
+| BIZ-0132 | 1 | 1 参 `TO_CHAR` 被规则误判为错误 | 1 参 → `CAST(x AS VARCHAR)`（默认格式差异登记为已知限制） |
+| ENG-0022 | 1 | `EXECUTE IMMEDIATE '<静态文本>'` 未编译 | 有 `parsed_query` 时按静态 SQL 下沉；运行期拼接仍显式拒绝（ENG-0062，注入面 M8） |
+| ENG-0022（新） | 1 | PL `CASE` 语句未实现 | 简单 CASE 求选择子一次后脱糖为 IF 链；搜索 CASE 直接取条件；`should_desugar_pl_case_statement` |
+
+**顺带修出的语义缺陷（守护测试锁定）**：`BinOp::Ne` 对 `compare()` 结果二次取反，
+导致 `<>`/`!=` 恒等于等值判断（`'07' <> '02'` 返回 false）。修复见
+`src/runtime/frame.rs`，守护测试 `should_evaluate_ne_as_inequality_not_inverted`
+与语料 IN/NOT IN 用例。
+
+**剩余 4 例（显式拒绝，非静默）**：
+
+| 文件 | 原因 | 归类 |
+|---|---|---|
+| `0907sql/…`、`all_sq/…PKG_IMPORT_EXCEL.sql`、`final2/…` | 集合元素赋值 `t_res(i) := v`（PL 集合类型，非 UTF-8 只是伴随特征） | 集合/数组类型 M9+ |
+| `all_sq/…PKG_SPLIT_TRADE_STEP3_SH.sql` | 带参游标 `OPEN c(args)`（`PlOpenKind` 参数化游标） | 带参游标 M9+ |
+
+**非 UTF-8 语料**：GBK 文件以有损 UTF-8 解码（SQL 关键字/标识符为 ASCII，仅注释
+与中文字面量受影响），报告行标注 `(non-utf8)`。实测该 47 个文件解码后全部通过
+编译，说明有损解码在编译期够用；若后续需要保真字符串字面量，再引入显式 GBK
+解码（新增依赖需 Ask first）。

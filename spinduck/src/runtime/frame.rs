@@ -276,7 +276,9 @@ fn eval_bin(op: BinOp, l: &SpinValue, r: &SpinValue) -> Result<SpinValue, Engine
         BinOp::Concat => Ok(V::Str(format!("{}{}", l.as_str_loose(), r.as_str_loose()))),
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => arith(&op, l, r),
         BinOp::Eq => Ok(V::Bool(compare(&op, l, r)?)),
-        BinOp::Ne => Ok(V::Bool(!compare(&op, l, r)?)),
+        // compare() 内部已按传入运算符求值；Ne 只能对 Eq 结果取反，
+        // 否则 `<>` 会被双重取反（回归守护见 tests/ir_expr_forms.rs）
+        BinOp::Ne => Ok(V::Bool(!compare(&BinOp::Eq, l, r)?)),
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => Ok(V::Bool(compare(&op, l, r)?)),
         BinOp::And => and3(l, r),
         BinOp::Or => or3(l, r),
@@ -422,5 +424,76 @@ fn num_of(v: &SpinValue) -> Option<i128> {
         SpinValue::Decimal(v, _, _) => Some(*v),
         SpinValue::Str(s) => s.trim().parse::<i64>().ok().map(|i| i as i128),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::BinOp;
+
+    fn ev(op: BinOp, l: SpinValue, r: SpinValue) -> SpinValue {
+        eval_bin(op, &l, &r).unwrap()
+    }
+
+    #[test]
+    fn should_evaluate_ne_as_inequality_not_inverted() {
+        // 回归：Ne 曾对 compare() 结果二次取反，导致 `<>`/`!=` 恒为等值判断
+        assert_eq!(
+            ev(
+                BinOp::Ne,
+                SpinValue::Str("07".into()),
+                SpinValue::Str("02".into())
+            ),
+            SpinValue::Bool(true)
+        );
+        assert_eq!(
+            ev(
+                BinOp::Ne,
+                SpinValue::Str("02".into()),
+                SpinValue::Str("02".into())
+            ),
+            SpinValue::Bool(false)
+        );
+        assert_eq!(
+            ev(BinOp::Ne, SpinValue::Int(1), SpinValue::Int(2)),
+            SpinValue::Bool(true)
+        );
+        assert_eq!(
+            ev(BinOp::Eq, SpinValue::Int(1), SpinValue::Int(1)),
+            SpinValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn should_propagate_null_for_comparison_and_arith() {
+        assert_eq!(
+            ev(BinOp::Eq, SpinValue::Null, SpinValue::Int(1)),
+            SpinValue::Null
+        );
+        assert_eq!(
+            ev(BinOp::Add, SpinValue::Int(1), SpinValue::Null),
+            SpinValue::Null
+        );
+    }
+
+    #[test]
+    fn should_apply_three_valued_logic_for_and_or() {
+        assert_eq!(
+            ev(BinOp::And, SpinValue::Bool(false), SpinValue::Null),
+            SpinValue::Bool(false)
+        );
+        assert_eq!(
+            ev(BinOp::And, SpinValue::Bool(true), SpinValue::Null),
+            SpinValue::Null
+        );
+        assert_eq!(
+            ev(BinOp::Or, SpinValue::Bool(true), SpinValue::Null),
+            SpinValue::Bool(true)
+        );
+        assert_eq!(
+            ev(BinOp::Or, SpinValue::Bool(false), SpinValue::Null),
+            SpinValue::Null
+        );
     }
 }

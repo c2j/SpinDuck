@@ -308,10 +308,25 @@ fn run_inner(
                 sink.on_event(TraceEvent::CursorOpen { schema: Vec::new() });
                 *pc += 1;
             }
-            IrStmt::Fetch { cursor, targets } => {
+            IrStmt::Fetch {
+                cursor,
+                targets,
+                record,
+            } => {
                 let fetch_schema = frame.cursor_schema(cursor);
                 let row = frame.cursor_mut(cursor)?.fetch()?;
                 match row {
+                    Some(r) if *record => {
+                        // FOR rec IN <query>：整行按 schema 建 RECORD（GaussDB 语义）
+                        let fields = fetch_schema
+                            .iter()
+                            .cloned()
+                            .zip(r.iter().cloned())
+                            .collect::<Vec<_>>();
+                        let target = targets.first().expect("FOR record target");
+                        assign(frame, target, SpinValue::Record(fields))?;
+                        sink.on_event(TraceEvent::Fetch { row: Some(1) });
+                    }
                     Some(r) => {
                         // 位置对位写槽；INTO 目标多于列 → 报错
                         if targets.len() > r.len() {
@@ -992,6 +1007,40 @@ mod kernel_tests {
         let _ = TraceNoopSink;
         let _ = Frame::new();
         let _ = VarName("x".into());
+    }
+
+    /// 端到端探针：FOR rec IN <query>（隐式游标脱糖，§7.3.4）真实内核语义。
+    #[test]
+    fn should_run_for_loop_over_query_on_real_kernel() {
+        use crate::engine::Engine;
+        use crate::value::SpinValue;
+
+        let ex = crate::sql::DuckExecutor::open_in_memory().unwrap();
+        ex.execute("CREATE TABLE dat(a VARCHAR, n INT)", &BindMap::new())
+            .unwrap();
+        for i in 1..=3 {
+            ex.execute(
+                &format!("INSERT INTO dat VALUES ('r{i}', {i})"),
+                &BindMap::new(),
+            )
+            .unwrap();
+        }
+        let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_for(p_o OUT NUMBER) IS \
+             DECLARE v_sum NUMBER := 0; \
+             BEGIN \
+               FOR r IN (SELECT n FROM dat ORDER BY n) LOOP \
+                 v_sum := v_sum + r.n; \
+               END LOOP; \
+               p_o := v_sum; \
+             END;",
+        )
+        .unwrap();
+        let r = eng
+            .call("prc_for", &[SpinValue::Null])
+            .expect("FOR rec IN query 应可执行");
+        assert_eq!(r.outs.get("p_o"), Some(&SpinValue::Int(6)), "{:?}", r.outs);
     }
 
     #[test]

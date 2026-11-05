@@ -122,6 +122,8 @@ pub enum IrStmt {
     Fetch {
         cursor: VarName,
         targets: Vec<AssignTarget>,
+        /// true = 隐式游标（FOR rec IN ...）：单目标整体按 schema 建 RECORD
+        record: bool,
     },
     CloseCursor {
         cursor: VarName,
@@ -230,16 +232,35 @@ pub fn compile_routine_with(
         funcs: rules.functions.clone(),
         ..Default::default()
     };
+    use ogsql_parser::ast::plpgsql::PlDeclaration;
+    // 声明段：变量入变量集并生成初始化指令（GaussDB 语义：声明即变量，
+    // 未给初值时为 NULL）；游标编译为静态 SQL 待 OPEN 使用
     for decl in &block.declarations {
-        if let ogsql_parser::ast::plpgsql::PlDeclaration::Cursor(cd) = decl {
-            let name = cd.name.to_ascii_lowercase();
-            let query_text = match &cd.parsed_query {
-                Some(q) => ogsql_parser::formatter::SqlFormatter::new().format_statement(q),
-                None => cd.query.clone(),
-            };
-            let unit = crate::sql::rewrite_tokens_with_rules(&query_text, &c.vars, &c.funcs)?;
-            let text = crate::sql::apply_ast_transforms(&unit.text)?;
-            c.pending_cursor_sql.insert(name, (text, unit.binds));
+        match decl {
+            PlDeclaration::Cursor(cd) => {
+                let name = cd.name.to_ascii_lowercase();
+                let query_text = match &cd.parsed_query {
+                    Some(q) => ogsql_parser::formatter::SqlFormatter::new().format_statement(q),
+                    None => cd.query.clone(),
+                };
+                let unit = crate::sql::rewrite_tokens_with_rules(&query_text, &c.vars, &c.funcs)?;
+                let text = crate::sql::apply_ast_transforms(&unit.text)?;
+                c.pending_cursor_sql.insert(name, (text, unit.binds));
+            }
+            PlDeclaration::Variable(v) => {
+                let name = VarName(v.name.to_ascii_lowercase());
+                c.vars.insert(name.0.clone());
+                let init = match &v.default {
+                    Some(e) => c.expr(e)?,
+                    None => IrExpr::Const(SpinValue::Null),
+                };
+                c.code.push(IrStmt::Assign {
+                    target: AssignTarget::Var(name),
+                    expr: init,
+                });
+            }
+            // RECORD/TYPE/PRAGMA/嵌套例程：v1 不影响帧布局（嵌套例程 M9）
+            _ => {}
         }
     }
     c.stmts(&block.body)?;
@@ -401,6 +422,31 @@ impl Compiler {
         Ok(())
     }
 
+    /// FOR 隐式游标循环体：FETCH → %NOTFOUND 退出 → 循环体 → 回跳。
+    fn for_cursor_loop(
+        &mut self,
+        cursor: &VarName,
+        rec: &VarName,
+        body: &[PlStatement],
+        start: &str,
+        end: &str,
+    ) -> Result<(), EngineError> {
+        self.mark(start);
+        self.code.push(IrStmt::Fetch {
+            cursor: cursor.clone(),
+            targets: vec![AssignTarget::Var(rec.clone())],
+            record: true,
+        });
+        let not_found = IrExpr::CursorAttr {
+            cursor: cursor.clone(),
+            kind: CursorAttrKind::NotFound,
+        };
+        self.jump(end, Some(not_found), true);
+        self.stmts(body)?;
+        self.jump(start, None, true);
+        Ok(())
+    }
+
     fn synth_label(&mut self, hint: &str) -> String {
         self.synth += 1;
         format!("__{hint}_{}", self.synth)
@@ -453,9 +499,46 @@ impl Compiler {
                     self.stmts(&ei.stmts)?;
                     self.jump(&end, None, true);
                 }
+                // 空 ELSE 时 `next` 仍必须是跳转目标（= end），否则 fixup 悬空
+                self.mark(&next);
                 if !i.else_stmts.is_empty() {
-                    self.mark(&next);
                     self.stmts(&i.else_stmts)?;
+                }
+                self.mark(&end);
+            }
+            PlStatement::Case(cs) => {
+                // PL CASE → IF 链脱糖：简单 CASE 先求选择子一次（临时变量），
+                // 搜索 CASE 直接取 when 条件；语义与 SQL CASE 一致（首个命中）
+                let end = self.synth_label("case_end");
+                let sel = match &cs.expression {
+                    Some(e) => {
+                        let tmp = VarName(self.synth_label("case_sel"));
+                        let init = self.expr(e)?;
+                        self.code.push(IrStmt::Assign {
+                            target: AssignTarget::Var(tmp.clone()),
+                            expr: init,
+                        });
+                        Some(tmp)
+                    }
+                    None => None,
+                };
+                for w in &cs.whens {
+                    let next = self.synth_label("case_next");
+                    let cond = match &sel {
+                        Some(tmp) => IrExpr::Bin {
+                            op: BinOp::Eq,
+                            l: Box::new(IrExpr::Var(tmp.clone())),
+                            r: Box::new(self.expr(&w.condition)?),
+                        },
+                        None => self.expr(&w.condition)?,
+                    };
+                    self.jump(&next, Some(cond), false);
+                    self.stmts(&w.stmts)?;
+                    self.jump(&end, None, true);
+                    self.mark(&next);
+                }
+                if !cs.else_stmts.is_empty() {
+                    self.stmts(&cs.else_stmts)?;
                 }
                 self.mark(&end);
             }
@@ -588,6 +671,7 @@ impl Compiler {
                     .map(|e| self.assign_target(e))
                     .collect::<Result<Vec<_>, _>>()?;
                 self.code.push(IrStmt::Fetch {
+                    record: false,
                     cursor: cname,
                     targets,
                 });
@@ -657,17 +741,76 @@ impl Compiler {
                         });
                         self.jump(&start, None, true);
                     }
-                    PlForKind::Query { .. } => {
-                        return Err(EngineError::invariant(
-                            56,
-                            "FOR rec IN query is deferred to M4c (implicit cursor desugar)",
-                        ));
+                    PlForKind::Query {
+                        query,
+                        parsed_query,
+                        using_args,
+                    } => {
+                        // FOR rec IN <query>：脱糖为隐式游标（§7.3.4），
+                        // 与显式游标共用 OPEN/FETCH/CLOSE 语义与 %NOTFOUND 判定
+                        if !using_args.is_empty() {
+                            return Err(EngineError::invariant(
+                                58,
+                                "FOR rec IN query USING is not supported in v1",
+                            ));
+                        }
+                        let text = match parsed_query {
+                            Some(st) => {
+                                ogsql_parser::formatter::SqlFormatter::new().format_statement(st)
+                            }
+                            None => query.clone(),
+                        };
+                        let unit = rewrite_sql(&text, &self.vars, &self.funcs)?;
+                        let cname = self.synth_label("for_cur");
+                        self.code.push(IrStmt::OpenCursor {
+                            cursor: VarName(cname.clone()),
+                            source: CursorSource::Static {
+                                sql: unit.text,
+                                binds: unit.binds,
+                            },
+                        });
+                        self.for_cursor_loop(&VarName(cname.clone()), &var, &f.body, &start, &end)?;
+                        self.code.push(IrStmt::CloseCursor {
+                            cursor: VarName(cname),
+                        });
                     }
-                    PlForKind::Cursor { .. } => {
-                        return Err(EngineError::invariant(
-                            57,
-                            "FOR rec IN cursor is deferred to M4c",
-                        ));
+                    PlForKind::Cursor {
+                        cursor_name,
+                        arguments,
+                    } => {
+                        if !arguments.is_empty() {
+                            return Err(EngineError::invariant(
+                                59,
+                                "FOR rec IN cursor(args) is not supported in v1",
+                            ));
+                        }
+                        let name = match cursor_name {
+                            Expr::PlVariable(n) | Expr::ColumnRef(n) => ident_path(n),
+                            other => {
+                                return Err(EngineError::invariant(
+                                    60,
+                                    format!("unsupported cursor reference: {other:?}"),
+                                ));
+                            }
+                        };
+                        // 复用声明段已编译的静态 SQL（游标声明 = 唯一真源）
+                        let (sql, binds) = self
+                            .pending_cursor_sql
+                            .get(&name.to_ascii_lowercase())
+                            .cloned()
+                            .ok_or_else(|| {
+                                EngineError::invariant(
+                                    61,
+                                    format!("FOR rec IN {name}: cursor query not compiled"),
+                                )
+                            })?;
+                        let cname = VarName(name.clone());
+                        self.code.push(IrStmt::OpenCursor {
+                            cursor: cname.clone(),
+                            source: CursorSource::Static { sql, binds },
+                        });
+                        self.for_cursor_loop(&cname, &var, &f.body, &start, &end)?;
+                        self.code.push(IrStmt::CloseCursor { cursor: cname });
                     }
                 }
                 self.loop_stack.pop();
@@ -712,41 +855,78 @@ impl Compiler {
                     .unwrap_or_else(|| IrExpr::Const(SpinValue::Str("EXCEPTION".into())));
                 self.code.push(IrStmt::Raise { message: msg });
             }
-            PlStatement::Block(b) => match &b.exception_block {
-                None => self.stmts(&b.body)?,
-                // BEGIN..EXCEPTION：PushTrap → try 体 → PopTrap → Jump(resume)
-                // → handlers 区（每臂 Jump(resume)）→ resume:
-                Some(exc) => {
-                    let resume = self.synth_label("trap_resume");
-                    let mut entries = Vec::new();
-                    self.code.push(IrStmt::PushTrap {
-                        entries: Vec::new(),
-                    }); // 占位，回填
-                    let trap_at = self.here() - 1;
-                    self.stmts(&b.body)?;
-                    self.code.push(IrStmt::PopTrap);
-                    self.jump(&resume, None, true);
-                    // handlers 区
-                    for h in &exc.handlers {
-                        let body_start = self.here();
-                        self.stmts(&h.statements)?;
-                        let body_end = self.here();
-                        self.jump(&resume, None, true);
-                        entries.push(TrapEntry {
-                            conds: h
-                                .conditions
-                                .iter()
-                                .map(|c| c.to_ascii_lowercase())
-                                .collect(),
-                            body_start,
-                            body_end,
-                        });
-                    }
-                    self.mark(&resume);
-                    // 回填 PushTrap.entries
-                    self.code[trap_at] = IrStmt::PushTrap { entries };
+            PlStatement::Block(b) => {
+                // `<<label>>` 语句标签（GOTO 目标）：先 mark 再编译块体
+                if let Some(l) = &b.label {
+                    self.mark(l);
                 }
-            },
+                match &b.exception_block {
+                    None => self.stmts(&b.body)?,
+                    // BEGIN..EXCEPTION：PushTrap → try 体 → PopTrap → Jump(resume)
+                    // → handlers 区（每臂 Jump(resume)）→ resume:
+                    Some(exc) => {
+                        let resume = self.synth_label("trap_resume");
+                        let mut entries = Vec::new();
+                        self.code.push(IrStmt::PushTrap {
+                            entries: Vec::new(),
+                        }); // 占位，回填
+                        let trap_at = self.here() - 1;
+                        self.stmts(&b.body)?;
+                        self.code.push(IrStmt::PopTrap);
+                        self.jump(&resume, None, true);
+                        // handlers 区
+                        for h in &exc.handlers {
+                            let body_start = self.here();
+                            self.stmts(&h.statements)?;
+                            let body_end = self.here();
+                            self.jump(&resume, None, true);
+                            entries.push(TrapEntry {
+                                conds: h
+                                    .conditions
+                                    .iter()
+                                    .map(|c| c.to_ascii_lowercase())
+                                    .collect(),
+                                body_start,
+                                body_end,
+                            });
+                        }
+                        self.mark(&resume);
+                        // 回填 PushTrap.entries
+                        self.code[trap_at] = IrStmt::PushTrap { entries };
+                    }
+                }
+            }
+            PlStatement::Execute(sp) => {
+                // EXECUTE IMMEDIATE：只有"静态文本 + 已解析语句"可编译期下沉；
+                // 运行期拼接（动态）保留为 M8 范围并显式拒绝（§10.4 注入面）
+                let st = sp.parsed_query.as_ref().ok_or_else(|| {
+                    EngineError::invariant(
+                        62,
+                        "EXECUTE with runtime-built SQL text is deferred to M8",
+                    )
+                })?;
+                if !sp.using_args.is_empty() {
+                    return Err(EngineError::invariant(
+                        58,
+                        "EXECUTE IMMEDIATE .. USING is not supported in v1",
+                    ));
+                }
+                let text = ogsql_parser::formatter::SqlFormatter::new().format_statement(st);
+                if sp.into_targets.is_empty() {
+                    self.sql_statement(&text, st)?;
+                } else {
+                    let mut into = Vec::with_capacity(sp.into_targets.len());
+                    for t in &sp.into_targets {
+                        into.push(self.assign_target(t)?);
+                    }
+                    let unit = rewrite_sql(&text, &self.vars, &self.funcs)?;
+                    self.code.push(IrStmt::SqlQuery {
+                        sql: unit.text,
+                        binds: unit.binds,
+                        into,
+                    });
+                }
+            }
             // —— M2 之后的里程碑纳入（编译期显式拒绝，禁止静默错误翻译）——
             other => {
                 return Err(EngineError::invariant(
@@ -928,7 +1108,72 @@ impl Compiler {
                     .map(|a| self.expr(a))
                     .collect::<Result<Vec<_>, _>>()?,
             }),
-            // 其余表达式（LIKE/CASE/Between/子查询…）M2 不支持；SQL 侧表达式的
+            Expr::Parenthesized(inner) => self.expr(inner),
+            Expr::UnaryOp { op, expr } if op == "-" => Ok(IrExpr::Bin {
+                op: BinOp::Sub,
+                l: Box::new(IrExpr::Const(SpinValue::Int(0))),
+                r: Box::new(self.expr(expr)?),
+            }),
+            Expr::UnaryOp { op, expr } if op == "+" => self.expr(expr),
+            // BETWEEN 闭区间（§3.2 求值口径与 SQL 一致）：NOT BETWEEN 为区间外
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                let x = self.expr(expr)?;
+                let lo = self.expr(low)?;
+                let hi = self.expr(high)?;
+                let ge = IrExpr::Bin {
+                    op: BinOp::Ge,
+                    l: Box::new(x.clone()),
+                    r: Box::new(lo),
+                };
+                let le = IrExpr::Bin {
+                    op: BinOp::Le,
+                    l: Box::new(x.clone()),
+                    r: Box::new(hi),
+                };
+                if *negated {
+                    let lt = IrExpr::Bin {
+                        op: BinOp::Lt,
+                        l: Box::new(x.clone()),
+                        r: Box::new(self.expr(low)?),
+                    };
+                    let gt = IrExpr::Bin {
+                        op: BinOp::Gt,
+                        l: Box::new(x),
+                        r: Box::new(self.expr(high)?),
+                    };
+                    Ok(or_chain(vec![lt, gt]))
+                } else {
+                    Ok(and_chain(vec![ge, le]))
+                }
+            }
+            // IN 列表：等式析取（NOT IN 为全部不等）
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let x = self.expr(expr)?;
+                let mut parts = Vec::with_capacity(list.len());
+                for item in list {
+                    let eq = IrExpr::Bin {
+                        op: if *negated { BinOp::Ne } else { BinOp::Eq },
+                        l: Box::new(x.clone()),
+                        r: Box::new(self.expr(item)?),
+                    };
+                    parts.push(eq);
+                }
+                Ok(if *negated {
+                    and_chain(parts)
+                } else {
+                    or_chain(parts)
+                })
+            }
+            // 其余表达式（LIKE/CASE/子查询…）M2 不支持；SQL 侧表达式的
             // 大多数场景发生在 SQL 文本内（M3 改写管线），PL 侧按需逐里程碑扩展
             other => Err(EngineError::invariant(
                 26,
@@ -936,6 +1181,26 @@ impl Compiler {
             )),
         }
     }
+}
+
+/// 条件链左结合组合（OR）：`a OR b OR c`。
+fn or_chain(parts: Vec<IrExpr>) -> IrExpr {
+    fold_bin(BinOp::Or, parts)
+}
+
+/// 条件链左结合组合（AND）：`a AND b AND c`。
+fn and_chain(parts: Vec<IrExpr>) -> IrExpr {
+    fold_bin(BinOp::And, parts)
+}
+
+fn fold_bin(op: BinOp, parts: Vec<IrExpr>) -> IrExpr {
+    let mut it = parts.into_iter();
+    let first = it.next().expect("chain requires at least one item");
+    it.fold(first, |acc, next| IrExpr::Bin {
+        op,
+        l: Box::new(acc),
+        r: Box::new(next),
+    })
 }
 
 fn lit(l: &ogsql_parser::ast::Literal) -> SpinValue {

@@ -5,6 +5,7 @@
 //! 原生实现中。
 
 pub mod catalog;
+pub mod cli;
 pub mod engine;
 pub mod error;
 pub mod exec;

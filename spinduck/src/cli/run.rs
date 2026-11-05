@@ -1,0 +1,293 @@
+//! 子命令执行与渲染（纯函数式：写 `out` 并返回退出码，便于契约测试）。
+
+use crate::cli::args::{parse, parse_literal, usage, Command};
+use crate::cli::{compile_dir, summarize, FileReport};
+use crate::error::EngineError;
+use crate::rules::RuleRegistry;
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+/// 退出码：0 成功 / 1 业务或编译失败 / 2 用法错误。
+pub const EXIT_OK: i32 = 0;
+pub const EXIT_FAIL: i32 = 1;
+pub const EXIT_USAGE: i32 = 2;
+
+/// 执行一次 CLI 调用。
+pub fn run(argv: &[String], out: &mut dyn Write) -> i32 {
+    let cmd = match parse(argv) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = writeln!(out, "[{}] {}", e.code, e.message);
+            let _ = write!(out, "{}", usage());
+            return EXIT_USAGE;
+        }
+    };
+    match exec(cmd, out) {
+        Ok(code) => code,
+        Err(e) => {
+            let _ = writeln!(out, "[{}] {}", e.code, e.message);
+            EXIT_FAIL
+        }
+    }
+}
+
+fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError> {
+    match cmd {
+        Command::Help => {
+            write!(out, "{}", usage()).map_err(io_err)?;
+            Ok(EXIT_OK)
+        }
+        Command::Version => {
+            writeln!(out, "spinduck {}", crate::version()).map_err(io_err)?;
+            Ok(EXIT_OK)
+        }
+        Command::RulesProbe { path } => {
+            let rules = RuleRegistry::load(&path)?;
+            writeln!(
+                out,
+                "rules: {} target_duckdb={} probe_duckdb={} match={}",
+                path.display(),
+                rules.target_duckdb,
+                rules.probe_duckdb,
+                rules.probe_versions_match()
+            )
+            .map_err(io_err)?;
+            Ok(if rules.probe_versions_match() {
+                EXIT_OK
+            } else {
+                EXIT_FAIL
+            })
+        }
+        Command::Compile { paths } => compile_cmd(&paths, out),
+        Command::Call { .. } => call_cmd(cmd_call(cmd), out),
+    }
+}
+
+/// 兼容取包（避免在 match 中重复绑定）。
+fn cmd_call(cmd: Command) -> CallParts {
+    match cmd {
+        Command::Call {
+            db,
+            rules,
+            files,
+            routine,
+            args,
+        } => CallParts {
+            db,
+            rules,
+            files,
+            routine,
+            args,
+        },
+        _ => unreachable!("cmd_call only for Call"),
+    }
+}
+
+struct CallParts {
+    db: Option<PathBuf>,
+    rules: Option<PathBuf>,
+    files: Vec<PathBuf>,
+    routine: String,
+    args: Vec<String>,
+}
+
+fn compile_cmd(paths: &[PathBuf], out: &mut dyn Write) -> Result<i32, EngineError> {
+    let rules = RuleRegistry::default();
+    let mut all: Vec<FileReport> = Vec::new();
+    for p in paths {
+        if p.is_dir() {
+            for r in compile_dir(p, &rules)? {
+                all.push(FileReport {
+                    file: format!("{}/{}", p.display(), r.file),
+                    ..r
+                });
+            }
+        } else {
+            let one = compile_single(p, &rules)?;
+            all.push(one);
+        }
+    }
+    let s = summarize(&all);
+    for r in &all {
+        let mark = if r.non_utf8 { "  (non-utf8)" } else { "" };
+        match &r.error {
+            None => writeln!(out, "OK   {}  routines={}{}", r.file, r.routines, mark),
+            Some(e) => writeln!(out, "FAIL {}  [{}] {}{}", r.file, e.code, e.message, mark),
+        }
+        .map_err(io_err)?;
+    }
+    writeln!(
+        out,
+        "summary: files={} ok={} failed={} routines={}",
+        s.files, s.ok, s.failed, s.routines
+    )
+    .map_err(io_err)?;
+    for (code, n) in failure_histogram(&all) {
+        writeln!(out, "reason {} x{}", code, n).map_err(io_err)?;
+    }
+    Ok(if s.failed == 0 { EXIT_OK } else { EXIT_FAIL })
+}
+
+fn compile_single(path: &Path, rules: &RuleRegistry) -> Result<FileReport, EngineError> {
+    let (text, non_utf8) = crate::cli::read_source(path)?;
+    let mut eng = crate::engine::Engine::new(Box::new(crate::cli::NoopExecutor), rules.clone());
+    Ok(match eng.register(&text) {
+        Ok(n) => FileReport {
+            file: path.display().to_string(),
+            routines: n,
+            error: None,
+            non_utf8,
+        },
+        Err(e) => FileReport {
+            file: path.display().to_string(),
+            routines: 0,
+            error: Some(e),
+            non_utf8,
+        },
+    })
+}
+
+/// 失败原因直方图（按错误码降序计数），用于优先级排序。
+fn failure_histogram(reports: &[FileReport]) -> Vec<(String, usize)> {
+    let mut m: BTreeMap<String, usize> = BTreeMap::new();
+    for r in reports {
+        if let Some(e) = &r.error {
+            *m.entry(e.code.to_string()).or_default() += 1;
+        }
+    }
+    let mut v: Vec<(String, usize)> = m.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v
+}
+
+#[cfg(feature = "native")]
+fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, EngineError> {
+    use crate::engine::Engine;
+    let rules = match &parts.rules {
+        Some(p) => RuleRegistry::load(p)?,
+        None => RuleRegistry::default(),
+    };
+    let ex = match &parts.db {
+        Some(p) => crate::sql::DuckExecutor::open(&p.to_string_lossy())?,
+        None => crate::sql::DuckExecutor::open_in_memory()?,
+    };
+    let mut eng = Engine::new(Box::new(ex), rules);
+    for f in &parts.files {
+        let (text, _) = crate::cli::read_source(f)?;
+        eng.register(&text)?;
+    }
+    let args: Vec<crate::value::SpinValue> = parts.args.iter().map(|a| parse_literal(a)).collect();
+    let res = eng.call(&parts.routine, &args)?;
+    if res.outs.is_empty() && res.return_value.is_none() {
+        writeln!(out, "CALL {} OK", parts.routine).map_err(io_err)?;
+        return Ok(EXIT_OK);
+    }
+    for (k, v) in &res.outs {
+        writeln!(out, "OUT {} = {}", k, v.display()).map_err(io_err)?;
+    }
+    if let Some(v) = &res.return_value {
+        writeln!(out, "RETURN {}", v.display()).map_err(io_err)?;
+    }
+    Ok(EXIT_OK)
+}
+
+#[cfg(not(feature = "native"))]
+fn call_cmd(_parts: CallParts, _out: &mut dyn Write) -> Result<i32, EngineError> {
+    Err(EngineError::env(
+        12,
+        "call requires feature `native` (rebuild with --features cli)".to_string(),
+    ))
+}
+
+fn io_err(e: std::io::Error) -> EngineError {
+    EngineError::env(13, format!("stdout: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn run_str(items: &[&str]) -> (i32, String) {
+        let mut buf: Vec<u8> = Vec::new();
+        let code = run(&argv(items), &mut buf);
+        (code, String::from_utf8(buf).unwrap())
+    }
+
+    #[test]
+    fn should_print_usage_and_exit_2_on_usage_error() {
+        let (code, out) = run_str(&["compile"]);
+        assert_eq!(code, EXIT_USAGE);
+        assert!(out.contains("ENG-0010"));
+        assert!(out.contains("compile <path>"));
+    }
+
+    #[test]
+    fn should_report_compile_summary_and_reason_histogram() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("ok.sql"),
+            "CREATE OR REPLACE PROCEDURE p_ok IS BEGIN NULL; END;",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("bad.sql"),
+            "CREATE OR REPLACE PROCEDURE p_bad IS BEGIN FORALL i IN 1..2 INSERT INTO t VALUES (i); END;",
+        )
+        .unwrap();
+        let (code, out) = run_str(&["compile", &tmp.path().to_string_lossy()]);
+        assert_eq!(code, EXIT_FAIL);
+        assert!(
+            out.contains("summary: files=2 ok=1 failed=1 routines=1"),
+            "{out}"
+        );
+        assert!(out.contains("reason ENG-0022 x1"), "{out}");
+    }
+
+    #[test]
+    fn should_pass_rules_probe_when_versions_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("rules.toml");
+        std::fs::write(&p, "target_duckdb = \"1.5.5\"\nprobe_duckdb = \"1.5.5\"\n").unwrap();
+        let (code, out) = run_str(&["rules", "probe", &p.to_string_lossy()]);
+        assert_eq!(code, EXIT_OK);
+        assert!(out.contains("match=true"), "{out}");
+    }
+
+    #[test]
+    fn should_fail_rules_probe_on_version_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("rules.toml");
+        std::fs::write(&p, "target_duckdb = \"1.5.5\"\nprobe_duckdb = \"1.4.4\"\n").unwrap();
+        let (code, out) = run_str(&["rules", "probe", &p.to_string_lossy()]);
+        assert_eq!(code, EXIT_FAIL);
+        assert!(out.contains("match=false"), "{out}");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn should_register_file_and_call_routine_with_out_param() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("pkg.sql");
+        std::fs::write(
+            &f,
+            "CREATE OR REPLACE PROCEDURE prc_calc(p_i IN NUMBER, p_o OUT NUMBER) IS \
+             BEGIN p_o := p_i * 3; END;",
+        )
+        .unwrap();
+        let (code, out) = run_str(&[
+            "call",
+            "--file",
+            &f.to_string_lossy(),
+            "prc_calc",
+            "14",
+            "null",
+        ]);
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("OUT p_o = 42"), "{out}");
+    }
+}
