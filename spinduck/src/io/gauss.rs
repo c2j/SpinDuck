@@ -9,6 +9,9 @@ use crate::exec::BindMap;
 use crate::value::SpinValue;
 use postgres::{Client, NoTls};
 
+/// 回写批大小（单次从 DuckDB 取的行数）。
+const SYNC_BATCH: usize = 1000;
+
 /// 结果集：列名顺序 + 每行文本值（NULL → None）。
 pub type GaussRows = (Vec<String>, Vec<Vec<Option<String>>>);
 
@@ -19,6 +22,23 @@ pub struct GaussConn {
 
 fn env_err(e: impl std::fmt::Display) -> EngineError {
     EngineError::env(20, format!("gaussdb: {e}"))
+}
+
+/// 数据库错误保真呈现：SQLSTATE + 服务端消息（`postgres::Error` 的 Display 只有
+/// "db error"，定位 DDL/DML 失败必须看 DbError 字段）。
+fn db_err(e: postgres::Error) -> EngineError {
+    match e.as_db_error() {
+        Some(d) => EngineError::env(
+            20,
+            format!(
+                "gaussdb: {} {} ({})",
+                d.code().code(),
+                d.message(),
+                d.severity()
+            ),
+        ),
+        None => EngineError::env(20, format!("gaussdb: {e}")),
+    }
 }
 
 impl GaussConn {
@@ -51,12 +71,21 @@ impl GaussConn {
 
     /// 执行 DDL/DML（不返回行）。
     pub fn exec(&mut self, sql: &str) -> Result<u64, EngineError> {
-        self.client.execute(sql, &[]).map_err(env_err)
+        self.client.execute(sql, &[]).map_err(db_err)
+    }
+
+    /// 执行脚本（多语句 / PL 块）：走简单查询协议，忽略结果集。
+    ///
+    /// 与 [`exec`](Self::exec) 的区别：简单查询不支持参数绑定，但可执行多语句
+    /// 与 PL 块（`DO $$..$$`、`CREATE PROCEDURE .. AS $$..$$`），用于部署夹具。
+    pub fn exec_script(&mut self, sql: &str) -> Result<(), EngineError> {
+        self.client.simple_query(sql).map_err(db_err)?;
+        Ok(())
     }
 
     /// 读取行（文本形态；NULL → None）。
     pub fn fetch_rows(&mut self, sql: &str) -> Result<GaussRows, EngineError> {
-        let rows = self.client.simple_query(sql).map_err(env_err)?;
+        let rows = self.client.simple_query(sql).map_err(db_err)?;
         let mut schema = Vec::new();
         let mut out = Vec::new();
         for msg in &rows {
@@ -115,26 +144,32 @@ impl GaussConn {
     ) -> Result<usize, EngineError> {
         let collist = cols.join(", ");
         let mut s = duck.query(&format!("SELECT {collist} FROM {table}"), &BindMap::new())?;
-        let rows = s.fetch_many(10_000);
         let mut n = 0;
-        for r in &rows {
-            let vals: Vec<String> = r
-                .iter()
-                .map(|v| match v {
-                    SpinValue::Null => "NULL".into(),
-                    other => format!("'{}'", other.as_str_loose().replace('\'', "''")),
-                })
-                .collect();
-            self.client
-                .execute(
-                    &format!(
-                        "INSERT INTO {table} ({collist}) VALUES ({})",
-                        vals.join(", ")
-                    ),
-                    &[],
-                )
-                .map_err(env_err)?;
-            n += 1;
+        // 分批拉取直到耗尽（一次 fetch 有上限，>1 万行时必须循环）
+        loop {
+            let rows = s.fetch_many(SYNC_BATCH);
+            if rows.is_empty() {
+                break;
+            }
+            for r in &rows {
+                let vals: Vec<String> = r
+                    .iter()
+                    .map(|v| match v {
+                        SpinValue::Null => "NULL".into(),
+                        other => format!("'{}'", other.as_str_loose().replace('\'', "''")),
+                    })
+                    .collect();
+                self.client
+                    .execute(
+                        &format!(
+                            "INSERT INTO {table} ({collist}) VALUES ({})",
+                            vals.join(", ")
+                        ),
+                        &[],
+                    )
+                    .map_err(db_err)?;
+                n += 1;
+            }
         }
         Ok(n)
     }

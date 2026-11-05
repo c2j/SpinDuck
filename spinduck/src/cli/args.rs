@@ -16,6 +16,18 @@ pub enum Command {
     Compile { paths: Vec<PathBuf> },
     /// 规则文件探针（版本锚定检查）。
     RulesProbe { path: PathBuf },
+    /// 物化：GaussDB 表 → 本地 DuckDB 表（feature `gauss`）。
+    Materialize {
+        db: PathBuf,
+        table: String,
+        where_clause: Option<String>,
+    },
+    /// 回写：本地 DuckDB 表 → GaussDB 追加（feature `gauss`）。
+    Sync {
+        db: PathBuf,
+        table: String,
+        cols: Vec<String>,
+    },
     /// 调用例程（可先从 SQL 文件注册例程；可选持久化库文件）。
     Call {
         db: Option<PathBuf>,
@@ -56,6 +68,8 @@ pub fn parse(argv: &[String]) -> Result<Command, EngineError> {
                 path: PathBuf::from(path),
             })
         }
+        "materialize" => parse_materialize(&argv[1..]),
+        "sync" => parse_sync(&argv[1..]),
         "call" => parse_call(&argv[1..]),
         other => Err(usage_err(format!("unknown subcommand {other}"))),
     }
@@ -107,6 +121,63 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
     })
 }
 
+fn parse_materialize(rest: &[String]) -> Result<Command, EngineError> {
+    let mut db = None;
+    let mut table = None;
+    let mut where_clause = None;
+    let mut it = rest.iter();
+    while let Some(tok) = it.next() {
+        match tok.as_str() {
+            "--db" => db = Some(PathBuf::from(next_arg(&mut it, "--db <path>")?)),
+            "--table" => table = Some(next_arg(&mut it, "--table <name>")?),
+            "--where" => where_clause = Some(next_arg(&mut it, "--where <expr>")?),
+            t if t.starts_with("--") => return Err(usage_err(format!("unknown flag {t}"))),
+            t => return Err(usage_err(format!("unexpected argument {t}"))),
+        }
+    }
+    Ok(Command::Materialize {
+        db: db.ok_or_else(|| usage_err("materialize --db <path> --table <name>"))?,
+        table: table.ok_or_else(|| usage_err("materialize --db <path> --table <name>"))?,
+        where_clause,
+    })
+}
+
+fn parse_sync(rest: &[String]) -> Result<Command, EngineError> {
+    let mut db = None;
+    let mut table = None;
+    let mut cols = Vec::new();
+    let mut it = rest.iter();
+    while let Some(tok) = it.next() {
+        match tok.as_str() {
+            "--db" => db = Some(PathBuf::from(next_arg(&mut it, "--db <path>")?)),
+            "--table" => table = Some(next_arg(&mut it, "--table <name>")?),
+            "--cols" => {
+                let raw = next_arg(&mut it, "--cols a,b")?;
+                cols = raw
+                    .split(',')
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty())
+                    .collect();
+            }
+            t if t.starts_with("--") => return Err(usage_err(format!("unknown flag {t}"))),
+            t => return Err(usage_err(format!("unexpected argument {t}"))),
+        }
+    }
+    let table = table.ok_or_else(|| usage_err("sync --db <path> --table <name> --cols a,b"))?;
+    if cols.is_empty() {
+        return Err(usage_err("sync requires --cols a,b,..."));
+    }
+    Ok(Command::Sync {
+        db: db.ok_or_else(|| usage_err("sync --db <path> --table <name> --cols a,b"))?,
+        table,
+        cols,
+    })
+}
+
+fn next_arg(it: &mut std::slice::Iter<'_, String>, usage: &str) -> Result<String, EngineError> {
+    it.next().cloned().ok_or_else(|| usage_err(usage))
+}
+
 /// 字面量 → SpinValue 推断（CLI 入参）：整数 / 小数 / 带引号串 / 其余按串。
 pub fn parse_literal(text: &str) -> crate::value::SpinValue {
     use crate::value::SpinValue;
@@ -145,6 +216,14 @@ pub fn usage() -> &'static str {
      \x20 version                         打印版本\n\
      \x20 compile <path>...               语料编译体检（递归 *.sql）\n\
      \x20 rules probe <rules.toml>        规则文件版本锚定检查\n\
+     \x20 materialize --db <f> --table <t> [--where <expr>]
+\
+     \x20                                从 GaussDB 物化到本地 DuckDB（需 feature gauss）
+\
+     \x20 sync --db <f> --table <t> --cols a,b
+\
+     \x20                                本地 DuckDB 回写追加到 GaussDB（需 feature gauss）
+\
      \x20 call [--db <f>] [--rules <f>] [--file <sql>]... <routine> [args...]\n\
      \x20                                注册 SQL 文件内例程并调用（args: 整数/小数/'串'/null）\n"
 }
@@ -214,6 +293,53 @@ mod tests {
         assert_eq!(parse_literal("null"), SpinValue::Null);
         assert_eq!(parse_literal("TRUE"), SpinValue::Bool(true));
         assert_eq!(parse_literal("abc"), SpinValue::Str("abc".into()));
+    }
+
+    #[test]
+    fn should_parse_materialize_with_optional_where() {
+        let c = parse(&v(&["materialize", "--db", "w.duckdb", "--table", "t1"])).unwrap();
+        assert_eq!(
+            c,
+            Command::Materialize {
+                db: PathBuf::from("w.duckdb"),
+                table: "t1".to_string(),
+                where_clause: None,
+            }
+        );
+        let c = parse(&v(&[
+            "materialize",
+            "--db",
+            "w",
+            "--table",
+            "t1",
+            "--where",
+            "bcrq = '20240105'",
+        ]))
+        .unwrap();
+        match c {
+            Command::Materialize { where_clause, .. } => {
+                assert_eq!(where_clause.as_deref(), Some("bcrq = '20240105'"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_require_table_and_cols_for_sync() {
+        let e = parse(&v(&["sync", "--db", "w", "--table", "t"])).unwrap_err();
+        assert!(e.message.contains("--cols"), "{}", e.message);
+        let c = parse(&v(&[
+            "sync", "--db", "w", "--table", "t", "--cols", "a, b ,c",
+        ]))
+        .unwrap();
+        assert_eq!(
+            c,
+            Command::Sync {
+                db: PathBuf::from("w"),
+                table: "t".to_string(),
+                cols: vec!["a".into(), "b".into(), "c".into()],
+            }
+        );
     }
 
     #[test]

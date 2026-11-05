@@ -236,3 +236,21 @@ fn should_desugar_pl_case_statement() {
         Some(SpinValue::Str("zero".into()))
     );
 }
+
+#[test]
+fn should_treat_decimal_literals_as_numbers_not_strings() {
+    // 回归：小数曾被降级为字符串，导致 `x * 0.0008` 在 DuckDB 侧类型推断失败
+    let mut eng = engine();
+    eng.register(
+        "CREATE OR REPLACE FUNCTION f_rate(p IN NUMBER) RETURN NUMBER IS \
+         BEGIN RETURN p * 0.0008; END;",
+    )
+    .unwrap();
+    let r = eng.call("f_rate", &[SpinValue::Int(1000000)]).unwrap();
+    // 标度取操作数最大标度（Int 0，字面量 4）→ 800.0000
+    assert_eq!(
+        r.return_value,
+        Some(SpinValue::Decimal(8_000_000, 38, 4)),
+        "1000000 * 0.0008 = 800.0000"
+    );
+}

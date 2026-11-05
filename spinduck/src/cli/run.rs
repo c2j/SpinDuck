@@ -60,6 +60,8 @@ fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError> {
             })
         }
         Command::Compile { paths } => compile_cmd(&paths, out),
+        Command::Materialize { .. } => materialize_cmd(cmd_materialize(cmd), out),
+        Command::Sync { .. } => sync_cmd(cmd_sync(cmd), out),
         Command::Call { .. } => call_cmd(cmd_call(cmd), out),
     }
 }
@@ -81,6 +83,40 @@ fn cmd_call(cmd: Command) -> CallParts {
             args,
         },
         _ => unreachable!("cmd_call only for Call"),
+    }
+}
+
+struct MaterializeParts {
+    db: PathBuf,
+    table: String,
+    where_clause: Option<String>,
+}
+
+fn cmd_materialize(cmd: Command) -> MaterializeParts {
+    match cmd {
+        Command::Materialize {
+            db,
+            table,
+            where_clause,
+        } => MaterializeParts {
+            db,
+            table,
+            where_clause,
+        },
+        _ => unreachable!("cmd_materialize only for Materialize"),
+    }
+}
+
+struct SyncParts {
+    db: PathBuf,
+    table: String,
+    cols: Vec<String>,
+}
+
+fn cmd_sync(cmd: Command) -> SyncParts {
+    match cmd {
+        Command::Sync { db, table, cols } => SyncParts { db, table, cols },
+        _ => unreachable!("cmd_sync only for Sync"),
     }
 }
 
@@ -190,6 +226,56 @@ fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, EngineError> {
         writeln!(out, "RETURN {}", v.display()).map_err(io_err)?;
     }
     Ok(EXIT_OK)
+}
+
+/// GaussDB 连接参数来自环境变量（避免命令行泄露口令，§10.4）。
+#[cfg(feature = "gauss")]
+fn open_gauss() -> Result<crate::io::GaussConn, EngineError> {
+    let host = std::env::var("SPINDUCK_OG_HOST")
+        .map_err(|_| EngineError::env(14, "SPINDUCK_OG_HOST is required".to_string()))?;
+    let port: u16 = std::env::var("SPINDUCK_OG_PORT")
+        .unwrap_or_else(|_| "5432".to_string())
+        .parse()
+        .map_err(|_| EngineError::env(14, "SPINDUCK_OG_PORT must be a port number".to_string()))?;
+    let user = std::env::var("SPINDUCK_OG_USER").unwrap_or_else(|_| "gaussdb".to_string());
+    let password = std::env::var("SPINDUCK_OG_PASSWORD")
+        .map_err(|_| EngineError::env(14, "SPINDUCK_OG_PASSWORD is required".to_string()))?;
+    let dbname = std::env::var("SPINDUCK_OG_DB").unwrap_or_else(|_| "postgres".to_string());
+    crate::io::GaussConn::connect_parts(&host, port, &user, &password, &dbname)
+}
+
+#[cfg(feature = "gauss")]
+fn materialize_cmd(parts: MaterializeParts, out: &mut dyn Write) -> Result<i32, EngineError> {
+    let mut og = open_gauss()?;
+    let duck = crate::sql::DuckExecutor::open(&parts.db.to_string_lossy())?;
+    let n = og.materialize(&duck, &parts.table, parts.where_clause.as_deref())?;
+    writeln!(out, "MATERIALIZE {} rows={}", parts.table, n).map_err(io_err)?;
+    Ok(EXIT_OK)
+}
+
+#[cfg(not(feature = "gauss"))]
+fn materialize_cmd(_parts: MaterializeParts, _out: &mut dyn Write) -> Result<i32, EngineError> {
+    Err(EngineError::env(
+        12,
+        "materialize requires feature `gauss`".to_string(),
+    ))
+}
+
+#[cfg(feature = "gauss")]
+fn sync_cmd(parts: SyncParts, out: &mut dyn Write) -> Result<i32, EngineError> {
+    let mut og = open_gauss()?;
+    let duck = crate::sql::DuckExecutor::open(&parts.db.to_string_lossy())?;
+    let n = og.sync_append(&duck, &parts.table, &parts.cols)?;
+    writeln!(out, "SYNC {} rows={}", parts.table, n).map_err(io_err)?;
+    Ok(EXIT_OK)
+}
+
+#[cfg(not(feature = "gauss"))]
+fn sync_cmd(_parts: SyncParts, _out: &mut dyn Write) -> Result<i32, EngineError> {
+    Err(EngineError::env(
+        12,
+        "sync requires feature `gauss`".to_string(),
+    ))
 }
 
 #[cfg(not(feature = "native"))]

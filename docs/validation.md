@@ -204,3 +204,57 @@ M8）；① UDF 需同 Database 第二连接，`SqlExecutor` 接缝未暴露该�
 与中文字面量受影响），报告行标注 `(non-utf8)`。实测该 47 个文件解码后全部通过
 编译，说明有损解码在编译期够用；若后续需要保真字符串字面量，再引入显式 GBK
 解码（新增依赖需 Ask first）。
+
+## V10. 黄金对比门禁（M10）
+
+**参照实现的选择。** 考题提供的 GaussDB 实例（`121.36.227.23:8000`，见考题
+`文档/4-数据库与连接信息.md`）在本机不可达：TCP 连接被拒绝（`Connection
+refused`），因此无法取得 GaussDB 基线。门禁改用**同内核血统的 openGauss 5.0.0**
+（本机容器）作为参照实现，边界与差异在下方逐条登记。
+
+**用例**：`golden/case_split_agg/`（表结构取自考题基线的最小可用子集：成交明细
+`mid_yjqs_detail` + 指令表 `dat_inst_fund_cjqs`）。两侧表达同一逻辑但语法形态不同，
+以结果表逐行比对为准：
+
+| 侧 | 形态 |
+|---|---|
+| 参照（openGauss） | `FUNCTION` + `FOR r IN SELECT … LOOP` 隐式游标 + `$$ … $$ LANGUAGE plpgsql` |
+| 被测（SpinDuck） | `PROCEDURE` + 显式 `CURSOR`/`OPEN`/`FETCH`/`%NOTFOUND`/`CLOSE` + `EXCEPTION OTHERS` |
+
+**结果：两侧输出逐行一致**（`cjsl/cjje/fee` 全部相等），同时与提交入库的
+`expected.json` 一致：
+
+```
+('20240105','F001','600000', 300.0000, 3250.00, 2.60)
+('20240105','F002','000001',  50.0000, 1012.50, 0.81)
+```
+
+流程同时覆盖：openGauss 建表/灌数 → **物化进 DuckDB**（4 行）→ 注册 Oracle 形态
+例程 → `CALL` → 回读结果表。即"物化 → 处理 → 对比"闭环在真实内核数据上成立。
+
+**openGauss 5.0.0 参照侧语法实证（影响夹具写法，不影响引擎）**：
+
+| 形态 | 结果 | 说明 |
+|---|---|---|
+| `CREATE FUNCTION f() … AS $$ … $$ LANGUAGE plpgsql` | 通过 | 参照侧主力形态 |
+| `DO $$ … $$` | 通过 | 可用于一次性 PL 块 |
+| `FOR r IN SELECT … LOOP` | 通过 | 隐式游标可用 |
+| `CREATE PROCEDURE p() AS $$ … $$ LANGUAGE plpgsql` | **42601** `subprogram body is not ended correctly` | openGauss 的 `CREATE PROCEDURE` 不接受 PG 风格 `$$` 体 |
+| `DECLARE c CURSOR FOR/IS SELECT …` | **42601** `syntax error at or near "SELECT"` | 函数内游标声明形式受限 |
+
+结论：**差异只在参照侧的 DDL 语法层**；PL 求值语义（游标/循环/异常/参数）由被测侧
+独立实现并与参照侧结果一致。
+
+**本门禁抓出的被测侧缺陷**：
+
+1. **小数字面量被降级为字符串**：AST `Literal::Float` 曾映射为 `SpinValue::Str`，
+   使 `p_amt * 0.0008` 在 DuckDB 侧变成"数值 × 字符串"而报类型推断失败
+   （`Binder Error: Could not choose a best candidate function`）。修复为十进制
+   字面量（非标度值 + scale，指数形式显式降级为字符串）。守护测试
+   `should_treat_decimal_literals_as_numbers_not_strings`。
+2. **回写分页漏行**：`sync_append` 只取一批（1 万行）就结束，>1 万行时静默截断。
+   改为循环取批直到耗尽（`SYNC_BATCH = 1000`）。
+
+**已知限制**：`materialize` 逐行 INSERT（万级可行，百万级需批量通道，未做）；
+参照侧 `expected.json` 依赖 openGauss 实时生成，若后续能访问 GaussDB，应重跑并
+对比（替换参照实现不改变夹具与断言）。

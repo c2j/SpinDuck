@@ -1207,15 +1207,47 @@ fn lit(l: &ogsql_parser::ast::Literal) -> SpinValue {
     use ogsql_parser::ast::Literal as L;
     match l {
         L::Integer(i) => SpinValue::Int(*i),
-        L::Float(f) | L::String(f) | L::EscapeString(f) | L::NationalString(f) => {
-            SpinValue::Str(f.clone())
-        }
+        // 小数按十进制字面量承载（禁止降级为字符串：`x * 0.0008` 曾因字符串
+        // 常量在 DuckDB 侧类型推断失败）
+        L::Float(f) => match parse_decimal_literal(f) {
+            Some(v) => v,
+            None => SpinValue::Str(f.clone()),
+        },
+        L::String(f) | L::EscapeString(f) | L::NationalString(f) => SpinValue::Str(f.clone()),
         L::Boolean(b) => SpinValue::Bool(*b),
         L::Null => SpinValue::Null,
         L::BitString(s) | L::HexString(s) | L::DollarString { body: s, .. } => {
             SpinValue::Str(s.clone())
         }
     }
+}
+
+/// 十进制字面量 → `SpinValue::Decimal`（非标度值 + scale）；指数形式不支持时返回
+/// `None`（调用方降级为字符串，行为显式可测）。
+fn parse_decimal_literal(text: &str) -> Option<SpinValue> {
+    let t = text.trim();
+    if t.contains('e') || t.contains('E') {
+        return None;
+    }
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (ip, fp) = match body.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (body, ""),
+    };
+    if ip.is_empty() && fp.is_empty() {
+        return None;
+    }
+    if !ip.chars().all(|c| c.is_ascii_digit()) || !fp.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let scale = fp.len().min(18) as u8;
+    let digits = format!("{ip}{fp}");
+    let unscaled: i128 = digits.parse().ok()?;
+    let signed = if neg { -unscaled } else { unscaled };
+    Some(SpinValue::Decimal(signed, 38, scale))
 }
 
 fn binop(op: &str) -> Result<BinOp, EngineError> {

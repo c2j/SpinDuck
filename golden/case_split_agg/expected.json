@@ -1,0 +1,10 @@
+{
+  "case": "case_split_agg",
+  "baseline_kernel": "openGauss 5.0.0 (GaussDB 内核血统；GaussDB 实例不可达，见 validation.md V10)",
+  "generated_by": "SELECT bcrq, fund_code, scdm, cjsl, cjje, fee FROM dat_inst_fund_cjqs ORDER BY fund_code, scdm",
+  "call": "SELECT fn_agg_fund('20240105')",
+  "result": [
+    {"bcrq": "20240105", "fund_code": "F001", "scdm": "600000", "cjsl": "300.0000", "cjje": "3250.00", "fee": "2.60"},
+    {"bcrq": "20240105", "fund_code": "F002", "scdm": "000001", "cjsl": "50.0000", "cjje": "1012.50", "fee": "0.81"}
+  ]
+}
