@@ -133,8 +133,21 @@ struct CallParts {
     args: Vec<String>,
 }
 
+/// 语料目录的规则口径：内置种子为基座 + 各路径向上发现的 `spinduck.toml`
+/// `[paths].rules` 叠加（§6 只增不删）。compile/explain 与 golden 用例同一基座，
+/// 避免"体检绿、运行红"的口径分裂。
+fn rules_for_corpus(paths: &[PathBuf]) -> Result<RuleRegistry, EngineError> {
+    let mut files: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    for p in paths {
+        if let Some(proj) = crate::project::ProjectConfig::discover(p) {
+            files.extend(proj.rules_files);
+        }
+    }
+    RuleRegistry::default().with_project_rules(&files.iter().cloned().collect::<Vec<_>>())
+}
+
 fn compile_cmd(paths: &[PathBuf], out: &mut dyn Write) -> Result<i32, EngineError> {
-    let rules = RuleRegistry::default();
+    let rules = rules_for_corpus(paths)?;
     let mut all: Vec<FileReport> = Vec::new();
     for p in paths {
         if p.is_dir() {
@@ -366,6 +379,40 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("reason ENG-0022 x1"), "{out}");
+    }
+
+    #[test]
+    fn should_overlay_project_rules_when_compiling() {
+        // 语料目录所在项目（spinduck.toml `[paths].rules`）的规则必须参与编译，
+        // 否则 compile 体检口径与 call/golden 不一致（评审第三轮 F-编译规则）
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("spinduck.toml"),
+            "[project]\nname = \"demo\"\n[paths]\nrules = [\"rules/custom.toml\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("rules")).unwrap();
+        std::fs::write(
+            root.join("rules/custom.toml"),
+            "[functions]\nMYNVL = \"coalesce\"\n",
+        )
+        .unwrap();
+        let corpus = root.join("sql/routines");
+        std::fs::create_dir_all(&corpus).unwrap();
+
+        let r = rules_for_corpus(std::slice::from_ref(&corpus)).expect("项目规则叠加");
+        assert_eq!(r.functions["MYNVL"], "coalesce");
+        assert_eq!(r.functions["NVL"], "coalesce", "内置种子仍为基座");
+        // 项目声明对其下所有语料目录生效（子目录继承，无需重复声明）
+        let nested = root.join("sql/routines/pkg");
+        std::fs::create_dir_all(&nested).unwrap();
+        let r2 = rules_for_corpus(&[nested]).expect("子目录继承项目规则");
+        assert_eq!(r2.functions["MYNVL"], "coalesce");
+        // 无项目声明的目录回落内置种子（compile 与 call 同口径的基座）
+        let outside = tempfile::tempdir().unwrap();
+        let plain = rules_for_corpus(&[outside.path().to_path_buf()]).expect("无项目声明也可编译");
+        assert_eq!(plain.functions.get("MYNVL"), None);
     }
 
     #[test]

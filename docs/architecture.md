@@ -898,7 +898,31 @@ materialize(物化快照+时间戳)
 
 > 决策记录 2025-11-05（PR#1 评审）：① COMMIT/ROLLBACK 实现统一事务边界（最外层显式事务，Tx 语句即时提交/回滚并重开，未处理异常统一 ROLLBACK，DuckDB ACID 承载原子性），不降级；② ENG-0062 撤销整体拒绝，动态文本统一经 ogsql 解析管线（解析失败 BIZ-061；解析器不支持的形态向 ogsql-parser 上游提 issue）；③ 内置规则 `config/rewrite-rules.toml` 编译期嵌入，`RuleRegistry::default()` 直接加载，CLI/项目规则叠加其上；④ 容器口令经 `.env` 注入（`${GS_PASSWORD:?}`），端口仅回环；
 ⑤ `DuckExecutor::connection()` 暴露内核连接句柄——**Ask-first 决策记录（2025-11-05）**：
-io/gauss 回写通道与 e2e 初始化需要内核事务/批量能力，`SqlExecutor` 接缝尚未提供
-对应方法（扩接缝 = 破坏所有消费者，需单独评审）；接受为**过渡态**，移除条件 =
+e2e 测试（`tests/gauss_e2e.rs` 直取内核句柄校验 GaussDB 侧落库）需要内核事务/批量能力，
+`SqlExecutor` 接缝尚未提供对应方法（扩接缝 = 破坏所有消费者，需单独评审）；接受为**过渡态**，移除条件 =
 回写通道参数化改造（评审 PR#1 行内评论）落地时收敛，届时 `gauss.rs` 不再触及
 duckdb 类型；⑥ fastaas 子模块保留现状（私有项目）。
+
+> 决策记录 2026-11-06（PR#1 第三轮复审后自行修复）：
+> ⑦ **静态/动态 SQL 改写收口为一条管线**：`ir::rewrite_sql` 成为唯一入口（`[patterns]`
+> → 调用点下沉规划 → token 规则改名 → AST 变换），动态路径不再自写第二份顺序
+> （曾为"改名→AST 变换→规划"，与静态相反）。`[patterns]` 的 AST 实现集中到
+> `src/sql/patterns.rs`；两路径产物一致性由 `tests/guard/guard_sql_pipeline_parity.rs`
+> 锁定（大小写/空白差异属文本来源不同，按"去空白 + 小写"归一化比对）。
+> 覆盖面同时扩到 `INSERT … SELECT` 子查询的 `rownum = 1`（语料主形态，此前只在
+> 顶层 SELECT 生效，原样下发必然内核报错）；UPDATE/DELETE 的 rownum 无对应
+> DuckDB 语法位，两口径一致地原样下发，留 M8 处理。
+> ⑧ **注册静默丢弃护栏 `ENG-0064`**：文本声明了例程（`CREATE … PROCEDURE|FUNCTION|PACKAGE`）
+> 而解析后零登记时报 ENGINE 域错误——ogsql-parser 对个别 PL 构造（如 PL 条件里的
+> `IN ()`）会把整条 `CREATE PROCEDURE` 降级为 `Empty`，此前 `register` 返回 `Ok(0)`，
+> 语料接入时表现为"存过凭空消失"（§1：解析器行为只记录，不在其仓库内动手）。
+> 包规格（spec）合法地不产出例程名，护栏显式豁免。
+> ⑨ **回滚失败的归域**：`Engine::call` 统一 ROLLBACK 失败时并入原错误消息，
+> 主因保持原域与原错误码（§5 禁止在调用上层事后改判），不得改写为 KERNEL。
+> ⑩ **CI 审计豁免**：`zip 6.0.0` 的四条公告（RUSTSEC-2026-0367/0368/0369/0429）来自
+> `libduckdb-sys` 的 **build-dependency**（`bundled` 解压缩包用），不进运行时产物；
+> 升级它即违反 §1 内核版本锚定（`duckdb = "=1.10505.0"`），故 CI 显式 `--ignore` 四条，
+> 内核升级 PR（V6 门禁）必须复评该清单。
+> ⑪ **CI 口令与目录**：golden job 的 GaussDB 口令改为 runner 内随机生成（一次一密，
+> 不落仓库），三条子模块步骤显式 `working-directory: .`（`defaults` 为 `spinduck/`，
+> 在 crate 目录内 `git submodule update --init lib/ogsql-parser` 报 pathspec 不匹配）。

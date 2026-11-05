@@ -264,16 +264,23 @@ cargo llvm-cov --html
 
 ## 9. CI 要求
 
-CI 定义 `.github/workflows/ci.yml`，四个 job 全部必须通过：
+CI 定义 `.github/workflows/ci.yml`。常驻门禁五个 job 全部必须通过：
 
 - **Format**: `cargo fmt --all -- --check`
 - **Clippy**: `cargo clippy --all-features -- -D warnings`
 - **Test**: `cargo test --features native`（默认/内核通道；gauss 黄金层
   需 A 模式容器，缺容器必红——见 golden job）
-- **Security Audit**: `cargo audit`
+- **Security Audit**: `cargo audit`（构建期 `zip` 豁免清单见 workflow 注释与
+  `docs/architecture.md`「审计豁免」，内核升级 PR 必须复评）
 - **Golden**: `cargo test --features gauss`（openGauss 5.0.0 服务容器，
   与 golden/gaussdb-docker compose 同口径；决策记录 2025-11-05 第二轮复审）
-- **Platform Build**（发版触发）：按 §10 矩阵逐平台构建 + 冒烟（`call` 一个内置探针例程）
+
+此外 **Platform Build**（发版触发，非常驻门禁）：按 §10 矩阵逐平台构建 + 冒烟
+（`call` 一个内置探针例程）。
+
+> 子模块初始化（`git submodule update --init lib/ogsql-parser`）必须在仓库根
+> 执行；workflow 的 `defaults.working-directory` 是 `spinduck/`，故这些步骤逐条
+> 显式 `working-directory: .`（否则 pathspec 不匹配，CI 必红）。
 
 > `cargo fmt --all -- --check` 失败是最常见 CI 错误。提交前先运行
 > `cargo fmt --all` 自动修复，再 `git add`。版本号在 `Cargo.toml` 维护。

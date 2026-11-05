@@ -49,3 +49,15 @@ path = "tests/guard/guard_tx_semantics.rs"
 name = "guard_execute_dynamic"
 path = "tests/guard/guard_execute_dynamic.rs"
 
+[[test]]
+name = "guard_error_domain"
+path = "tests/guard/guard_error_domain.rs"
+
+[[test]]
+name = "guard_sql_pipeline_parity"
+path = "tests/guard/guard_sql_pipeline_parity.rs"
+
+[[test]]
+name = "guard_register_silent_drop"
+path = "tests/guard/guard_register_silent_drop.rs"
+

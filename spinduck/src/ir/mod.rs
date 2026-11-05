@@ -248,8 +248,7 @@ pub fn compile_stmts_with(
     let vars = collect_var_names(stmts);
     let mut c = Compiler {
         vars,
-        funcs: rules.functions.clone(),
-        rownum_first_row: rules.patterns_rownum_first_row,
+        rules: rules.clone(),
         ..Default::default()
     };
     c.stmts(stmts)?;
@@ -289,10 +288,8 @@ pub fn compile_routine_with_names(
     }
     let mut c = Compiler {
         vars,
-        funcs: rules.functions.clone(),
-        rownum_first_row: rules.patterns_rownum_first_row,
+        rules: rules.clone(),
         routine_names: routine_names.clone(),
-        update_strip_alias: rules.patterns_update_strip_alias,
         ..Default::default()
     };
     use ogsql_parser::ast::plpgsql::PlDeclaration;
@@ -306,13 +303,7 @@ pub fn compile_routine_with_names(
                     Some(q) => ogsql_parser::formatter::SqlFormatter::new().format_statement(q),
                     None => cd.query.clone(),
                 };
-                let unit = rewrite_sql(
-                    &query_text,
-                    &c.vars,
-                    &c.funcs,
-                    &c.routine_names,
-                    c.update_strip_alias,
-                )?;
+                let unit = rewrite_sql(&query_text, &c.vars, &c.rules, &c.routine_names)?;
                 c.pending_cursor_sql
                     .insert(name, (unit.text, unit.binds, unit.fn_sites));
             }
@@ -425,24 +416,23 @@ fn collect_expr(e: &Expr, set: &mut crate::sql::VarScope) {
     }
 }
 
-fn rewrite_sql(
+/// 统一 SQL 改写管线（静态语句编译与动态 SQL 准备共用，§6 单一实现点）：
+/// `[patterns]`（rownum 首行 / UPDATE 去别名）→ 调用点下沉规划 → token 规则改名
+/// → AST 级变换。动态路径以空 VarScope 调用（USING v1 不支持，PL 变量须先
+/// 拼接为字面量），其余口径与静态一致。
+pub(crate) fn rewrite_sql(
     sql_text: &str,
     vars: &crate::sql::VarScope,
-    funcs: &BTreeMap<String, String>,
+    rules: &RuleRegistry,
     routine_names: &BTreeSet<String>,
-    update_strip_alias: bool,
 ) -> Result<crate::sql::SqlUnit, EngineError> {
-    // UPDATE 目标别名去限定（DuckDB 不支持 UPDATE .. SET 限定列名）
-    let stripped;
-    let sql_text = if update_strip_alias {
-        stripped = crate::sql::strip_update_alias(sql_text);
-        stripped.as_str()
-    } else {
-        sql_text
-    };
+    // UPDATE 目标别名去限定 / rownum 首行 → LIMIT 1（唯一实现见 sql::patterns）
+    let text = crate::sql::apply_text_patterns(sql_text, rules)?;
+    let sql_text = text.as_str();
     // SQL 上下文例程调用下沉：先规划调用点（原始名文本），再统一改写。
-    let (marked, fn_sites) = crate::sql::plan_sites(sql_text, vars, funcs, routine_names)?;
-    let unit = crate::sql::rewrite_tokens_with_rules(&marked, vars, funcs)?;
+    let (marked, fn_sites) =
+        crate::sql::plan_sites(sql_text, vars, &rules.functions, routine_names)?;
+    let unit = crate::sql::rewrite_tokens_with_rules(&marked, vars, &rules.functions)?;
     let text = crate::sql::apply_ast_transforms(&unit.text)?;
     let mut binds = unit.binds;
     for s in &fn_sites {
@@ -462,17 +452,14 @@ fn rewrite_sql(
 #[derive(Default)]
 pub(crate) struct Compiler {
     vars: crate::sql::VarScope,
-    /// `[patterns] rownum_first_row`（§9）：`rownum = 1` → `LIMIT 1` 改写开关
-    rownum_first_row: bool,
+    /// 规则注册表（`[functions]` 改名表 + `[patterns]` 开关）：SQL 改写唯一来源
+    rules: RuleRegistry,
     /// 静态游标声明 → 编译后的 (sql, binds)（compile_block_with 填充，§7.2）
     pending_cursor_sql: BTreeMap<String, CompiledCursorSql>,
     /// `%ROWTYPE` 变量 → 锚定游标名（§7.3.2：FETCH INTO 整行记录判定）
     rowtype_of: BTreeMap<String, String>,
     /// 已注册例程名（SQL 上下文调用下沉判定；空集 = 不下沉）
     routine_names: BTreeSet<String>,
-    /// `[patterns] update_strip_alias`
-    update_strip_alias: bool,
-    funcs: BTreeMap<String, String>,
     code: Vec<IrStmt>,
     labels: std::collections::HashMap<String, usize>,
     fixups: Vec<(usize, String)>,
@@ -887,13 +874,8 @@ impl Compiler {
                             }
                             None => query.clone(),
                         };
-                        let unit = rewrite_sql(
-                            &text,
-                            &self.vars,
-                            &self.funcs,
-                            &self.routine_names,
-                            self.update_strip_alias,
-                        )?;
+                        let unit =
+                            rewrite_sql(&text, &self.vars, &self.rules, &self.routine_names)?;
                         let cname = self.synth_label("for_cur");
                         self.code.push(IrStmt::OpenCursor {
                             cursor: VarName(cname.clone()),
@@ -1079,32 +1061,16 @@ impl Compiler {
                 // 摘除 INTO 后经 formatter 重建 SQL 文本（DuckDB 不支持 INTO 子句）
                 let mut cleaned = sel.node.clone();
                 cleaned.into_targets = None;
-                // [patterns] rownum_first_row：rownum=1 首行谓词 → LIMIT 1
-                // （DuckDB 无 rownum；语料 42 处，validation V13）
-                if self.rownum_first_row {
-                    if let Some(w) = cleaned.where_clause.take() {
-                        let (rest, stripped) = strip_rownum_first(w.clone());
-                        cleaned.where_clause = rest;
-                        if stripped && cleaned.limit.is_none() {
-                            cleaned.limit =
-                                Some(Expr::Literal(ogsql_parser::ast::Literal::Integer(1)));
-                        } else if stripped {
-                            cleaned.where_clause = Some(w); // 已有 LIMIT：保守还原
-                        }
-                    }
+                // [patterns] rownum_first_row：唯一实现见 sql::patterns
+                if self.rules.patterns_rownum_first_row {
+                    crate::sql::patterns::apply_on_select(&mut cleaned);
                 }
                 let formatted = ogsql_parser::formatter::SqlFormatter::new().format_statement(
                     &ogsql_parser::ast::Statement::Select(ogsql_parser::ast::Spanned::new(
                         cleaned, None,
                     )),
                 );
-                let unit = rewrite_sql(
-                    &formatted,
-                    &self.vars,
-                    &self.funcs,
-                    &self.routine_names,
-                    self.update_strip_alias,
-                )?;
+                let unit = rewrite_sql(&formatted, &self.vars, &self.rules, &self.routine_names)?;
                 let into = match into_targets {
                     None => Vec::new(),
                     Some(targets) => {
@@ -1134,13 +1100,7 @@ impl Compiler {
                 });
             }
             S::Insert(_) | S::Update(_) | S::Delete(_) | S::Truncate(_) => {
-                let unit = rewrite_sql(
-                    sql_text,
-                    &self.vars,
-                    &self.funcs,
-                    &self.routine_names,
-                    self.update_strip_alias,
-                )?;
+                let unit = rewrite_sql(sql_text, &self.vars, &self.rules, &self.routine_names)?;
                 let (sql, binds, fn_sites) = (unit.text, unit.binds, unit.fn_sites);
                 self.code.push(IrStmt::SqlExec {
                     sql,
@@ -1287,7 +1247,8 @@ impl Compiler {
                 let raw = ident_path(name);
                 let upper = raw.to_ascii_uppercase();
                 let mapped = self
-                    .funcs
+                    .rules
+                    .functions
                     .get(&upper)
                     .filter(|v| !v.starts_with('@'))
                     .cloned()
@@ -1297,7 +1258,8 @@ impl Compiler {
                     .map(|a| self.expr(a))
                     .collect::<Result<Vec<_>, _>>()?;
                 if self
-                    .funcs
+                    .rules
+                    .functions
                     .get(&upper)
                     .map(|v| v.starts_with('@'))
                     .unwrap_or(false)
@@ -1413,47 +1375,6 @@ fn fold_bin(op: BinOp, parts: Vec<IrExpr>) -> IrExpr {
         l: Box::new(acc),
         r: Box::new(next),
     })
-}
-
-/// 递归剥除 AND 链中的 `rownum = 1` 谓词。返回 (剩余条件, 是否剥除)。
-/// 仅处理 AND 链；OR/NOT 分支内的 rownum 保守保留（不改写）。
-pub(crate) fn strip_rownum_first(e: Expr) -> (Option<Expr>, bool) {
-    if is_rownum_first(&e) {
-        return (None, true);
-    }
-    if let Expr::BinaryOp { op, left, right } = &e {
-        if op.eq_ignore_ascii_case("AND") {
-            let (l, ls) = strip_rownum_first((**left).clone());
-            let (r, rs) = strip_rownum_first((**right).clone());
-            let stripped = ls || rs;
-            let rest = match (l, r) {
-                (Some(l), Some(r)) => Some(Expr::BinaryOp {
-                    op: op.clone(),
-                    left: Box::new(l),
-                    right: Box::new(r),
-                }),
-                (one, None) | (None, one) => one,
-            };
-            return (rest, stripped);
-        }
-    }
-    (Some(e), false)
-}
-
-/// `rownum = 1` / `1 = rownum`（大小写不敏感）。
-fn is_rownum_first(e: &Expr) -> bool {
-    let Expr::BinaryOp { op, left, right } = e else {
-        return false;
-    };
-    if !op.eq_ignore_ascii_case("=") {
-        return false;
-    }
-    let is_one = |x: &Expr| matches!(x, Expr::Literal(ogsql_parser::ast::Literal::Integer(1)));
-    let is_rownum = |x: &Expr| {
-        matches!(x, Expr::ColumnRef(id) | Expr::PlVariable(id)
-        if id.len() == 1 && id[0].value.eq_ignore_ascii_case("rownum"))
-    };
-    (is_rownum(left) && is_one(right)) || (is_one(left) && is_rownum(right))
 }
 
 fn lit(l: &ogsql_parser::ast::Literal) -> SpinValue {

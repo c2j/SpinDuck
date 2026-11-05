@@ -59,6 +59,31 @@ fn should_commit_on_tx_commit_statement() {
     });
 }
 
+/// 区分"过程内 COMMIT 即时生效"与"只靠最终统一 COMMIT"：过程内提交后的写入
+/// 必须挺过后续异常回滚（TxCommit 若退回 Nop，本断言得到 0）。
+#[test]
+fn should_keep_writes_before_mid_procedure_commit_after_later_failure() {
+    big_stack(|| {
+        let mut eng = setup();
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_mid IS BEGIN \
+         INSERT INTO tx_t VALUES (1); COMMIT; INSERT INTO tx_t VALUES (2); \
+         RAISE_APPLICATION_ERROR(-20001, 'boom'); \
+         END;",
+        )
+        .unwrap();
+        assert!(
+            eng.call("prc_mid", &[]).is_err(),
+            "过程内 COMMIT 后的异常仍须外抛"
+        );
+        assert_eq!(
+            count(&eng),
+            1,
+            "过程内 COMMIT 之前的 1 行必须持久化，其后 1 行被统一 ROLLBACK 撤销"
+        );
+    });
+}
+
 #[test]
 fn should_rollback_on_tx_rollback_statement() {
     big_stack(|| {

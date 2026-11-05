@@ -498,9 +498,10 @@ fn assign(frame: &mut Frame, target: &AssignTarget, v: SpinValue) -> Result<(), 
     frame.assign(target, v)
 }
 
-/// 动态 SQL 统一管线（决策 2025-11-05 收口）：文本求值 → ogsql 解析 →
-/// 规则改名 → 方言变换 → 函数下沉规划 → 物化缓存。EXECUTE IMMEDIATE 与
-/// OPEN FOR 共用；解析失败显式报错（BIZ-061），不执行未解析文本。
+/// 动态 SQL 统一管线（决策 2025-11-05 收口）：文本求值 → ogsql 解析校验 →
+/// **静态语句同一条改写管线**（`ir::rewrite_sql`：`[patterns]` → 调用点下沉 →
+/// 规则改名 → 方言变换）→ 物化缓存。EXECUTE IMMEDIATE 与 OPEN FOR 共用；
+/// 解析失败显式报错（BIZ-061），不执行未解析文本。
 fn prepare_dynamic_sql(
     text: &str,
     frame: &Frame,
@@ -517,48 +518,23 @@ fn prepare_dynamic_sql(
             format!("动态 SQL 解析失败（ogsql-parser 不支持的形态请向其上游提 issue）：{head}"),
         ));
     }
-    // [patterns] 与静态语句同口径：rownum 首行 / UPDATE 去别名
-    let rules = cat.sql_rules();
     let fmt = ogsql_parser::formatter::SqlFormatter::new();
-    let mut parts = Vec::with_capacity(infos.len());
-    for si in &infos {
-        let mut st = si.statement.clone();
-        if let ogsql_parser::ast::Statement::Select(mut sel) = st {
-            if rules.patterns_rownum_first_row {
-                if let Some(w) = sel.node.where_clause.take() {
-                    let (rest, stripped) = crate::ir::strip_rownum_first(w.clone());
-                    sel.node.where_clause = rest;
-                    if stripped && sel.node.limit.is_none() {
-                        sel.node.limit = Some(ogsql_parser::ast::Expr::Literal(
-                            ogsql_parser::ast::Literal::Integer(1),
-                        ));
-                    } else if stripped {
-                        sel.node.where_clause = Some(w); // 已有 LIMIT：保守还原
-                    }
-                }
-            }
-            st = ogsql_parser::ast::Statement::Select(sel);
-        }
-        let mut text_st = fmt.format_statement(&st);
-        if rules.patterns_update_strip_alias {
-            text_st = crate::sql::strip_update_alias(&text_st);
-        }
-        parts.push(text_st);
-    }
-    let sql = parts.join(";\n");
-    // 规则改名与 plan 下沉均用真实函数表；动态文本不含 PL 变量
-    // （USING v1 不支持，变量须先拼接为字面量）→ 空 VarScope 是**口径**而非缺省
-    let named =
-        crate::sql::rewrite_tokens_with_rules(&sql, &Default::default(), cat.sql_functions())?;
-    let sql = crate::sql::apply_ast_transforms(&named.text)?;
-    let (marked, sites) = crate::sql::plan_sites(
+    let sql = infos
+        .iter()
+        .map(|si| fmt.format_statement(&si.statement))
+        .collect::<Vec<String>>()
+        .join(";\n");
+    // 动态文本不含 PL 变量（USING v1 不支持，变量须先拼接为字面量）
+    // → 空 VarScope 是**口径**而非缺省
+    let unit = crate::ir::rewrite_sql(
         &sql,
         &Default::default(),
-        cat.sql_functions(),
+        cat.sql_rules(),
         &cat.routine_names(),
     )?;
+    let sites = unit.fn_sites;
     materialize_fn_sites(&sites, frame, ex, cat, depth)?;
-    Ok((marked, sites))
+    Ok((unit.text, sites))
 }
 
 /// SQL 上下文例程调用下沉物化（§8.3 路径②）。

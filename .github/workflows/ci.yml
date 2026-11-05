@@ -2,6 +2,11 @@
 # 说明：`cargo test --all-features` 含 gauss 黄金层，缺 A 模式容器必红（§4.1
 # 禁止跳过即绿）——故 CI 拆为 test(native) 与 golden(容器内实跑) 两个 job，
 # 文本契约见 AGENTS §9（决策记录 2025-11-05 第二轮复审）。
+#
+# 工作目录约定：crate 在 spinduck/（仓库根无 Cargo.toml），故 defaults 设为
+# spinduck；**git 操作（子模块）必须在仓库根**，逐步骤显式 `working-directory: .`
+# ——否则 `git submodule update --init lib/ogsql-parser` 在 spinduck/ 下报
+# pathspec 不匹配（CI run 42060549897 实测红）。
 name: ci
 
 on:
@@ -33,6 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Init ogsql-parser submodule（path 依赖，编译必需；fastaas 为私有项目不拉取）
+        working-directory: .
         run: git submodule update --init lib/ogsql-parser
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -45,6 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Init ogsql-parser submodule
+        working-directory: .
         run: git submodule update --init lib/ogsql-parser
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -56,8 +63,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-audit --locked || true
-      - run: cargo audit
+      - run: cargo install cargo-audit --locked
+      # 内核锚定（AGENTS §1：duckdb = "=1.10505.0"）带来的构建期依赖：
+      # zip 6.0.0 是 libduckdb-sys 的 build-dependency（bundled 解压缩包用），
+      # 不进运行时产物，也无法在不违反内核版本锚定的前提下漂浮升级。
+      # 四条公告均为该构建期 zip 的解压/符号链接边界缺陷 → 显式忽略并留档
+      # （决策与复评节奏见 docs/architecture.md「审计豁免」；内核升级 PR 时复评）。
+      - name: cargo audit（构建期 zip 豁免清单）
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2026-0367 \
+            --ignore RUSTSEC-2026-0368 \
+            --ignore RUSTSEC-2026-0369 \
+            --ignore RUSTSEC-2026-0429
 
   golden:
     # 黄金对比：复用 golden/gaussdb-docker compose（与本地完全同口径：
@@ -72,13 +90,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Init ogsql-parser submodule
+        working-directory: .
         run: git submodule update --init lib/ogsql-parser
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Generate one-off GaussDB password（仅本次 runner 生命周期）
+        id: gspwd
+        working-directory: .
+        # 大写 A + 十六进制体 + 数字尾巴：保证大小写与数字三类字符（openGauss
+        # 复杂度校验），且不含需要 shell 转义的符号
+        run: echo "value=A$(openssl rand -hex 12)9z" >> "$GITHUB_OUTPUT"
       - name: Bring up A-mode container（compose 校验 datcompatibility=A 才 healthy）
         working-directory: golden/gaussdb-docker
         env:
-          GS_PASSWORD: SpinDuckCi-6f3a9c
+          GS_PASSWORD: ${{ steps.gspwd.outputs.value }}
         run: |
           docker compose up -d
           for i in $(seq 1 60); do
@@ -90,5 +115,5 @@ jobs:
       - name: Run golden + gauss suites
         working-directory: spinduck
         env:
-          SPINDUCK_OG_PASSWORD: SpinDuckCi-6f3a9c
+          SPINDUCK_OG_PASSWORD: ${{ steps.gspwd.outputs.value }}
         run: cargo test --features gauss

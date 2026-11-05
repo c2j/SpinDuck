@@ -126,6 +126,20 @@ mod tests {
     }
 
     #[test]
+    fn should_map_single_arg_number_to_scale_zero() {
+        // 语料形态锁定（golden/case_corpus_* 的 PL 声明里出现 NUMBER(8)）：
+        // Oracle/GaussDB 语义下 NUMBER(p) 即整数，scale 显式为 0，不得默认 6
+        let m = default_type_mapping();
+        assert_eq!(
+            SpinType::from_gauss_name("NUMBER(8)", &m),
+            Some(SpinType::Decimal {
+                precision: 8,
+                scale: 0
+            })
+        );
+    }
+
+    #[test]
     fn should_map_bare_number_to_decimal38x6() {
         let m = default_type_mapping();
         assert_eq!(

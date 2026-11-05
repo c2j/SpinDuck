@@ -1,5 +1,19 @@
 //! RuleRegistry：兼容性规则数据加载（机制层，规则值见 config/rewrite-rules.toml）。
 //! 引擎只实现"规则应用"，规则值以 TOML 数据驱动（AGENTS.md §6）。
+//!
+//! 接线面（本类型消费的种子段落，未列出的段落为登记/探针用途，改写器不读）：
+//! - `[functions]`：全表进 map，SQL 上下文改名/下沉（`sql::rewrite_tokens_with_rules`）。
+//! - `[types]`：全表进 map，但 `spin_type` 目前**无生产调用点**（语料建表走参照侧
+//!   schema 物化）；接入点在 DDL 翻译，见 `spin_type` 文档与 validation.md V18。
+//! - `[patterns]`：仅 `rownum_first_row`、`update_strip_alias` 两个布尔开关，
+//!   由 `should_wire_every_seed_pattern_key` 做漂移守护——新增布尔键必须接线。
+//! - `target_duckdb` / `probe_duckdb`：`probe_versions_match`（V6 门禁）。
+//! - `[dates.formats]`：载入 `date_formats`，映射表本体仍在
+//!   `sql::oracle_format_to_strftime`，由
+//!   `should_keep_seed_date_formats_in_sync_with_strftime_mapper` 守护两侧不漂移。
+//! - `[implicit]` `[ddl]` `[rejects]` `version`：语料事实与探针期望的
+//!   数据登记，当前无改写器消费；`implicit_concat_numeric_to_varchar` 保留为
+//!   可读字段（种子值 false，用于黄金比对口径追溯）。
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -19,6 +33,11 @@ pub struct RuleRegistry {
     /// `[patterns] update_strip_alias`：`UPDATE t SET t.c = …` → 去别名限定
     /// （DuckDB 不支持 UPDATE .. SET 的限定列名）
     pub patterns_update_strip_alias: bool,
+    /// `[dates.formats]`：Oracle 整串日期格式 → strftime 格式。
+    /// 映射表本体在 `sql::oracle_format_to_strftime`（逐令牌变换，覆盖语料全部格式），
+    /// 本字段登记语料事实并做漂移守护（`should_keep_seed_date_formats_in_sync_with_strftime_mapper`）；
+    /// 改写器接线待 rewrite.rs 拆分时一并做（见 docs/architecture.md 决策记录）。
+    pub date_formats: BTreeMap<String, String>,
     /// 内核版本（探针锚定）
     pub target_duckdb: String,
     pub probe_duckdb: String,
@@ -46,6 +65,7 @@ impl RuleRegistry {
             implicit_concat_numeric_to_varchar: false,
             patterns_rownum_first_row: true,
             patterns_update_strip_alias: true,
+            date_formats: BTreeMap::new(),
             target_duckdb: String::new(),
             probe_duckdb: String::new(),
         }
@@ -116,7 +136,11 @@ impl RuleRegistry {
             if let Some(b) = p.get("rownum_first_row").and_then(|x| x.as_bool()) {
                 reg.patterns_rownum_first_row = b;
             }
+            if let Some(b) = p.get("update_strip_alias").and_then(|x| x.as_bool()) {
+                reg.patterns_update_strip_alias = b;
+            }
         }
+        reg.date_formats = date_formats_of(&v);
         Ok(reg)
     }
 
@@ -149,11 +173,19 @@ impl RuleRegistry {
             if let Some(b) = p.get("rownum_first_row").and_then(|x| x.as_bool()) {
                 self.patterns_rownum_first_row = b;
             }
+            if let Some(b) = p.get("update_strip_alias").and_then(|x| x.as_bool()) {
+                self.patterns_update_strip_alias = b;
+            }
+        }
+        for (k, val) in date_formats_of(&v) {
+            self.date_formats.insert(k, val);
         }
         Ok(())
     }
 
     /// 类型名 → SpinType（unknown 返回 None，由调用方报 ENG 域改写缺口）。
+    /// 现状：语料 DDL 的 DuckDB 建表由黄金 harness 按参照侧 schema 物化，本方法尚无
+    /// 生产调用点——接入点在 DDL 翻译（`docs/validation.md` V18 登记）。
     pub fn spin_type(&self, gauss_name: &str) -> Option<crate::types::SpinType> {
         crate::types::SpinType::from_gauss_name(gauss_name, &self.types)
     }
@@ -162,6 +194,22 @@ impl RuleRegistry {
     pub fn probe_versions_match(&self) -> bool {
         !self.probe_duckdb.is_empty() && self.probe_duckdb == self.target_duckdb
     }
+}
+
+/// `[dates.formats]`：Oracle 整串日期格式 → strftime 格式（键统一大写）。
+fn date_formats_of(v: &toml::Value) -> BTreeMap<String, String> {
+    v.get("dates")
+        .and_then(|d| d.get("formats"))
+        .and_then(|x| x.as_table())
+        .map(|t| {
+            t.iter()
+                .filter_map(|(k, val)| {
+                    val.as_str()
+                        .map(|s| (k.to_ascii_uppercase(), s.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -254,5 +302,87 @@ BINARY_DOUBLE = "DOUBLE"
     fn should_fall_back_to_default_mapping_when_no_file() {
         let m = crate::types::default_type_mapping();
         assert_eq!(m["VARCHAR2"], "VARCHAR");
+    }
+
+    #[test]
+    fn should_parse_and_overlay_update_strip_alias() {
+        // 回归守护：该开关被静态/动态改写路径消费，曾只在结构体里存在而不可配置
+        let off = RuleRegistry::from_toml_str("[patterns]\nupdate_strip_alias = false").unwrap();
+        assert!(!off.patterns_update_strip_alias);
+        let mut d = RuleRegistry::default();
+        d.overlay("[patterns]\nupdate_strip_alias = false").unwrap();
+        assert!(!d.patterns_update_strip_alias, "overlay 可关闭");
+        assert!(
+            RuleRegistry::default().patterns_update_strip_alias,
+            "种子 config/rewrite-rules.toml 声明 true"
+        );
+    }
+
+    #[test]
+    fn should_embed_built_in_rules() {
+        // default() 必须是种子规则本体，而不是解析失败后的空表回退
+        let r = RuleRegistry::default();
+        assert_eq!(r.types["VARCHAR2"], "VARCHAR");
+        assert_eq!(r.types["CLOB"], "VARCHAR");
+        assert_eq!(r.types["NUMBER"], "DECIMAL");
+        assert_eq!(r.functions["NVL"], "coalesce");
+        assert_eq!(r.target_duckdb, "1.5.5");
+        assert!(r.probe_versions_match(), "种子内 probe/target 版本必须一致");
+    }
+
+    #[test]
+    fn should_wire_every_seed_pattern_key() {
+        // 漂移守护：种子 [patterns] 下每个布尔键都必须落到规则字段
+        let v: toml::Value = toml::from_str(BUILT_IN_RULES_TOML).expect("内置种子规则必须可解析");
+        let p = v
+            .get("patterns")
+            .and_then(|x| x.as_table())
+            .expect("[patterns]");
+        let reg = RuleRegistry::default();
+        let mut wired = 0usize;
+        for (k, val) in p {
+            let Some(seed_val) = val.as_bool() else {
+                continue;
+            };
+            let field = match k.as_str() {
+                "rownum_first_row" => reg.patterns_rownum_first_row,
+                "update_strip_alias" => reg.patterns_update_strip_alias,
+                other => panic!("未接线的 [patterns] 布尔键: {other}"),
+            };
+            assert_eq!(field, seed_val, "[patterns] {k} 与规则字段漂移");
+            wired += 1;
+        }
+        assert_eq!(wired, 2, "种子 [patterns] 布尔键数量变化：必须同步接线");
+    }
+
+    #[test]
+    fn should_parse_seed_date_formats() {
+        let r = RuleRegistry::default();
+        assert_eq!(r.date_formats["YYYYMMDD"], "%Y%m%d");
+        assert_eq!(r.date_formats["YYYY-MM-DD"], "%Y-%m-%d");
+        assert_eq!(r.date_formats["YYYYMMDDHH24MISS"], "%Y%m%d%H%M%S");
+    }
+
+    #[test]
+    fn should_keep_seed_date_formats_in_sync_with_strftime_mapper() {
+        // 漂移守护：种子 [dates.formats] 的每个整串映射都必须等于代码内
+        // `oracle_format_to_strftime` 的输出（映射表本体在代码，规则数据是语料事实清单）
+        let r = RuleRegistry::default();
+        for (oracle, expected) in &r.date_formats {
+            assert_eq!(
+                &crate::sql::oracle_format_to_strftime(oracle),
+                expected,
+                "[dates.formats] {oracle} 与 strftime 映射器漂移"
+            );
+        }
+    }
+
+    #[test]
+    fn should_overlay_seed_date_formats() {
+        let mut r = RuleRegistry::default();
+        r.overlay("[dates.formats]\n\"DD-MON-YYYY\" = \"%d-%b-%Y\"\n")
+            .expect("overlay");
+        assert_eq!(r.date_formats["DD-MON-YYYY"], "%d-%b-%Y");
+        assert_eq!(r.date_formats["YYYYMMDD"], "%Y%m%d", "种子未动");
     }
 }

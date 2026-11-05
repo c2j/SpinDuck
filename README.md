@@ -41,7 +41,7 @@ cargo build --features gauss                # 追加 GaussDB 连接器
 
 ```bash
 ./target/debug/spinduck call --db /tmp/w.duckdb \
-  --file ../golden/case_split_agg/routine.sql \
+  --file ../golden/case_split_agg/sql/routines/routine.sql \
   prc_agg_fund "'20240105'"
 # OUT … / RETURN …
 ```
@@ -84,18 +84,18 @@ export SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
 | 异常：`EXCEPTION WHEN <cond>` 匹配、未捕获上抛、`SQLSTATE` 匹配 | ✅ |
 | 例程：`CREATE PROCEDURE`/`FUNCTION`/`PACKAGE BODY`、IN/OUT/INOUT、过程间调用 | ✅ |
 | SQL 上下文函数分派 | ✅ 表达式级→内核宏；②内联/①UDF 见 `architecture.md` §8.3 |
-| `EXECUTE IMMEDIATE '<静态文本>'` | ✅（运行期拼接显式拒绝 `ENG-0062`） |
-| 事务标记 `COMMIT`/`ROLLBACK`（延迟事务） | ✅ 顶层执行 |
+| `EXECUTE IMMEDIATE`（静态文本与运行期拼接同一管线） | ✅ 与 OPEN FOR 共用解析/改写管线；`USING` 绑定 ⛔ 待做（`ENG-0058`，变量须先拼进文本） |
+| 事务标记 `COMMIT`/`ROLLBACK` | ✅ 统一事务边界：最外层调用包 `BEGIN…COMMIT`，过程内 `COMMIT`/`ROLLBACK` 即时生效并重开（`architecture.md` §3.5） |
 | GaussDB 物化/回写 | ✅（文本承载，回写为 append） |
-| `rownum = 1` 首行谓词 | ✅ `[patterns] rownum_first_row` 规则改写（AST 级，语料 42 处） |
+| `rownum = 1` 首行谓词 | ✅ `[patterns] rownum_first_row`（AST 级，语料 42 处：顶层 SELECT 与 `INSERT … SELECT` 子查询；UPDATE/DELETE 无对应语法位，原样下发由内核报错） |
 | 记录变量限定字段下发 SQL（`INSERT … VALUES (r.field)`） | ✅ `BindSrc::Field`（`$v_<rec>__<field>` 绑定） |
 | `%ROWTYPE` 整行记录 + 显式 `FETCH c INTO rec` | ✅ |
 | PL 上下文 `@` 标记函数（`TO_CHAR`/`TO_DATE`/`INTERVALTONUM`） | ✅ SQL-first 下沉（`SqlFn`，保留日期中间类型；`日期±n` 自动 `to_days`） |
 | **SQL 上下文例程调用**（`UPDATE SET f(col)` / 游标 WHERE / INSERT VALUES 中的 PL 函数） | ✅ 参数元组缓存化下沉（`sqlfn`，确定性前提 + 10 万元组上界） |
-| `EXECUTE IMMEDIATE`（动态文本，与 OPEN FOR 同一解析管线）/ 过程内 COMMIT·ROLLBACK（统一事务边界）/ `%NOTFOUND` 空游标 / `SQLERRM` / `UPDATE` 去别名 | ✅ |
+| `%NOTFOUND` 空游标 / `SQLERRM` / `UPDATE` 去别名 / `SELECT INTO` 行数语义（0 行 `NO_DATA_FOUND`、>1 行 `TOO_MANY_ROWS`，静态与动态同口径） | ✅ |
 | 黄金对比 | ✅ `golden/`：toy 用例 + 语料级逐字函数（stock_kind / min_tax）+ 核心过程（purchase / **hz_byfund**） |
 | `RETURN NEXT` / `PIPE ROW` / 集合类型（嵌套表/数组元素赋值）/ 带参游标 | ⛔ 待做（语料仅 3+1 例，编译期显式拒绝） |
-| 例程目录持久化 | ⛔ 待做（当前进程内内存目录） |
+| 例程目录持久化 | ✅ 内核内 `spinduck_routines` 表存源 DDL 文本，`reload_catalog` 按当前规则重放编译（`--db` 落盘后跨进程恢复） |
 
 语料实证：考题基线 **136/136 文件编译通过（54 例程）**；`exam` 全树 183/187
 （余 4 例为集合元素赋值与带参游标，显式拒绝）。详见 `docs/validation.md` V9。

@@ -479,3 +479,40 @@ compose 同口径引导、口令步骤内生成不落仓库）；⑥ golden job 
 - 待决（Ask first 候选）：内置规则嵌入与 crate 独立构建的矛盾——候选方案
   （a）规则文件移入 crate 目录（config 仓库资产保留为生成源）；（b）保留
   现状并规定变异/复制类工具一律 `--in-place`。
+
+
+## V18. 第三轮复审修复批（自审—修复—再审）
+
+**门禁实测**（`spinduck/`，2026-11-06）：
+`cargo fmt --all -- --check` 干净；`cargo clippy --all-features --tests -- -D warnings` 干净；
+`cargo test --features native` **207 passed / 0 failed**（库单测 159 + 集成与守护 48）。
+
+| 评审问题 | 修复 | 证据（测试名） |
+|---|---|---|
+| §5：统一回滚失败把 BIZ 改判成 KERNEL | 主因保留原域与原码，次因并入消息 | `guard_error_domain::should_keep_business_code_when_rollback_also_fails`、`should_report_single_cause_when_rollback_succeeds`（假执行器注入 ROLLBACK 失败，断言 BIZ-0100 + 双因文本） |
+| `compare()` 跨标度对齐 `checked_mul` 之前已溢出 | `pow10`+`checked_mul`，溢出显式 BIZ-0112 | `frame::should_report_overflow_on_wide_scale_compare_not_wrap` |
+| 规则键 `[patterns] update_strip_alias` 无人解析、种子与代码漂移 | 解析 + overlay 双侧支持；`sql/patterns.rs` 成为 `[patterns]` 唯一实现；漂移守护 | `rules::should_parse_and_overlay_update_strip_alias`、`should_wire_every_seed_pattern_key`（新增布尔键必须接线，否则 panic） |
+| `[dates.formats]` 只在注释里，与代码内格式串表可能漂移 | 载入 `RuleRegistry::date_formats`（含 overlay），代码/数据互验 | `rules::should_parse_seed_date_formats`、`should_keep_seed_date_formats_in_sync_with_strftime_mapper`、`should_overlay_seed_date_formats` |
+| catalog 双函数表（`set_sql_functions` 死路 + 与规则漂移） | 目录只携带 `RuleRegistry`，`sql_functions()` 派生 | `catalog::should_derive_sql_functions_from_injected_rules`、`should_keep_sql_functions_consistent_with_default` |
+| 静态/动态两套改写管线（阶段顺序不同、`INSERT..SELECT` 漏 rownum、动态漏 update 去别名） | 统一入口 `ir::rewrite_sql`（`apply_text_patterns` → plan → 改名 → AST 变换 → 物化）；动态路径改为复用 | `guard_sql_pipeline_parity::should_produce_same_sql_text_on_static_and_dynamic_paths`、`should_pass_update_and_delete_rownum_through_on_both_paths`、`should_strip_rownum_in_insert_select_on_both_paths` |
+| `EXECUTE IMMEDIATE .. INTO` 缺 0 行/多行语义 | 与静态 SELECT INTO 同语义 | `guard_execute_dynamic::should_raise_no_data_found_on_dynamic_into_zero_rows`、`should_raise_too_many_rows_on_dynamic_into_multiple_rows` |
+| 过程体内 `IF p_v IN ()` 被解析器降级为 `Empty`，`register` 静默返回 `Ok(0)`（例程消失） | 新增 ENG-0064「声明了例程却未登记任何例程」守护（包规格豁免） | `guard_register_silent_drop`（4 例：规格 Ok(0)/正常 Ok(1)/`IN ()` 命中 ENG-0064/纯 DDL Ok(0)）；`guard_ir_in_list_empty` 改为无条件断言 ENG-0064 |
+| 过程内 COMMIT 曾被当 Nop，事务守护偏弱 | 中途提交即时生效并可证持久 | `guard_tx_semantics::should_keep_writes_before_mid_procedure_commit_after_later_failure` |
+| CI：submodule 步骤路径错、口令明文入库、`cargo audit` 安装失败被 `\|\| true` 吞 | 三处步骤 `working-directory: .`；口令步骤 `openssl rand` 一次性生成注入；安装不吞错；四条 `zip 6.0.0` 告警 `--ignore` 并记理由 | 本地复现：`spinduck/` 内 `git submodule update --init lib/ogsql-parser` 退出 1，仓库根退出 0；`grep SpinDuckCi` 无明文（口令为一次性随机） |
+| README/AGENTS 与实现脱节（ENG-0062、事务行、rownum 覆盖面、job 数量） | 文档回写 + §9 五个常驻 job 与 Platform Build 触发口径 | `docs/architecture.md` 决策 ⑦–⑪ |
+
+**新增本轮自审发现并已修**：`compile` 子命令忽略项目 `[paths].rules`（语料体检与
+call/golden 口径分裂）。修复：`ProjectConfig::discover`（自语料目录向上找
+`spinduck.toml`）+ `rules_for_corpus`（内置种子为基座叠加项目规则）。
+证据 `cli::run::should_overlay_project_rules_when_compiling`（子目录继承、无声明目录回落种子）。
+
+**遗留（已在文档登记，非本轮静默跳过）**：
+- §3 规模：`runtime/interp.rs`、`ir/mod.rs`、`sql/rewrite.rs`、`sql/sqlfn.rs` 仍超 500 行，
+  拆分在下一节（V19）落地，行为不变、同组测试前后各跑一次。
+- `[types]` 链（`spin_type`/`from_gauss_name`）当前无生产调用点：语料建表走参照侧 schema
+  物化；`rules.rs` 模块文档与 `spin_type` 文档已如实标注，接入点在 DDL 翻译（V19/考题用例）。
+- 探针层（§4.1）仍随规则实现放在单测内，`tests/probes/`、`golden/*/probes/` 只有 README；
+  规则 `status` 注释（verified@1.5.5）与 `rules probe` 版本锚定是现有约束，独立探针文件待 M8。
+- 变异测试（§4.4）全轮未完成（V17：部分 155/220 ≈39%），幸存者清单不入库；
+  `include_str!` 使 crate 非独立可拷贝 → 变异只能 `--in-place` 串行，与编辑期互斥，
+  安排在合入后的独立窗口执行。

@@ -49,9 +49,8 @@ pub struct CallResult {
 #[derive(Debug, Default, Clone)]
 pub struct RoutineCatalog {
     routines: BTreeMap<String, CompiledRoutine>,
-    /// SQL 方言规则（函数改名/`@` 变换标记表）：动态 SQL 运行期改写需要
-    sql_functions: BTreeMap<String, String>,
-    /// 完整规则注册表（patterns 开关等）：动态路径与静态语句同口径
+    /// SQL 方言规则（函数表 + patterns 开关）：动态 SQL 运行期改写与静态语句
+    /// 同口径，函数表一律由本注册表派生（单一事实源，不得并存第二份表）
     sql_rules: crate::rules::RuleRegistry,
 }
 
@@ -60,14 +59,8 @@ impl RoutineCatalog {
         Self::default()
     }
 
-    /// 注入 SQL 方言规则函数表（Engine 构造时同步）。
-    pub fn set_sql_functions(&mut self, funcs: BTreeMap<String, String>) {
-        self.sql_functions = funcs;
-    }
-
     /// 注入完整规则注册表（patterns 开关；动态路径同口径）。
     pub fn set_sql_rules(&mut self, rules: crate::rules::RuleRegistry) {
-        self.sql_functions = rules.functions.clone();
         self.sql_rules = rules;
     }
 
@@ -76,9 +69,9 @@ impl RoutineCatalog {
         &self.sql_rules
     }
 
-    /// SQL 方言规则函数表（动态 SQL 改写用）。
+    /// SQL 方言规则函数表（动态 SQL 改写用）：`sql_rules.functions` 的视图。
     pub fn sql_functions(&self) -> &BTreeMap<String, String> {
-        &self.sql_functions
+        &self.sql_rules.functions
     }
 
     pub fn register(&mut self, r: CompiledRoutine) {
@@ -243,5 +236,29 @@ mod tests {
     fn should_reject_unknown_parameter_mode() {
         let e = map_mode_pub(&Some("READONLY".into())).unwrap_err();
         assert_eq!(e.code.to_string(), "BIZ-0130");
+    }
+
+    #[test]
+    fn should_derive_sql_functions_from_the_injected_rules() {
+        // 单一事实源：函数表必须是规则注册表的一部分，不得两处各自维护
+        // （回归守护：曾并存 sql_functions 字段与 sql_rules.functions，可被注入成漂移状态）
+        let mut rules = crate::rules::RuleRegistry::default();
+        rules
+            .functions
+            .insert("MY_FN".to_string(), "my_sql_fn".to_string());
+        let mut cat = RoutineCatalog::new();
+        cat.set_sql_rules(rules);
+        assert_eq!(cat.sql_functions()["NVL"], "coalesce");
+        assert_eq!(cat.sql_functions(), &cat.sql_rules().functions);
+    }
+
+    #[test]
+    fn should_keep_default_catalog_functions_consistent_with_default_rules() {
+        let cat = RoutineCatalog::new();
+        assert_eq!(
+            cat.sql_functions(),
+            &cat.sql_rules().functions,
+            "默认目录的函数表与规则表同源"
+        );
     }
 }

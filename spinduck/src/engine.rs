@@ -52,6 +52,18 @@ impl Engine {
         for st in &stmts {
             names.extend(self.register_statement_named(st)?);
         }
+        // 静默丢弃护栏：文本声明了例程，解析后一条都没登记（ogsql 对个别 PL
+        // 构造把整条 CREATE 降级为 Empty/其它形态）。归域 ENGINE：输入被解析器
+        // 吞掉是引擎侧缺口，不得伪装成"没有例程"（守护：guard_register_silent_drop）
+        if names.is_empty() && declares_routine(sql_text) && !has_package_spec(&stmts) {
+            let head: String = sql_text.trim().chars().take(120).collect();
+            return Err(EngineError::invariant(
+                64,
+                format!(
+                    "声明了例程却未登记任何例程（解析器降级/静默丢弃，常见原因：体内构造不支持）：{head}"
+                ),
+            ));
+        }
         Ok(names)
     }
 
@@ -338,13 +350,11 @@ impl Engine {
             0,
         ) {
             Ok(out) => out,
-            Err(e) => {
-                // 回滚失败不得静默：并入原错误（原错误为主因，回滚失败为次因）
+            Err(mut e) => {
+                // 回滚失败不得静默：并入原错误消息。归域在产生点已定（§5），
+                // 主因保持原域与原错误码，回滚失败只作为次因文本追加。
                 if let Err(rb) = self.ex.execute("ROLLBACK", &crate::exec::BindMap::new()) {
-                    return Err(crate::error::EngineError::kernel(
-                        10,
-                        format!("{}（且 ROLLBACK 失败: {}）", e.message, rb.message),
-                    ));
+                    e.message = format!("{}（且 ROLLBACK 失败: {}）", e.message, rb.message);
                 }
                 return Err(e);
             }
@@ -363,6 +373,23 @@ impl Engine {
         }
         Ok(result)
     }
+}
+
+/// 文本是否声明例程（`CREATE … PROCEDURE|FUNCTION|PACKAGE`）。
+/// 粗粒度文本判定：只用于"零登记"护栏，宁可多报也不放过静默丢弃。
+fn declares_routine(sql_text: &str) -> bool {
+    let up = sql_text.to_ascii_uppercase();
+    up.contains("CREATE")
+        && ["PROCEDURE", "FUNCTION", "PACKAGE"]
+            .iter()
+            .any(|k| up.contains(k))
+}
+
+/// 解析结果里是否存在包规格（spec 合法地不产出例程名，只有包体才编译例程）。
+fn has_package_spec(stmts: &[Statement]) -> bool {
+    stmts
+        .iter()
+        .any(|st| matches!(st, Statement::CreatePackage(_)))
 }
 
 /// SQL 文本 → 各语句的规范化文本（目录表重放用，依赖 ogsql formatter）。
@@ -406,6 +433,7 @@ pub fn param_names_to_vars(params: &[String]) -> Vec<VarName> {
 
 #[cfg(all(test, feature = "native"))]
 mod kernel_tests {
+
     use super::*;
     use crate::exec::BindMap;
     use crate::sql::DuckExecutor;

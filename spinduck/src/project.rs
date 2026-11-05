@@ -37,6 +37,19 @@ impl ProjectConfig {
         Self::from_toml_str(&text, root)
     }
 
+    /// 从 `start` 逐级向上查找项目根（含 `spinduck.toml` 的目录）。
+    ///
+    /// 用途：CLI 编译/校验语料目录时继承所在项目的规则与入口声明，
+    /// 避免"口径靠调用参数临时拼装"（§12.1）。找不到返回 `None`（回落内置种子）；
+    /// 命中但解析失败同样返回 `None`——显式错误路径由 `ProjectConfig::load` 承担
+    /// （调用方需要严格语义时直接传项目根）。
+    pub fn discover(start: &Path) -> Option<Self> {
+        start
+            .ancestors()
+            .find(|d| d.join("spinduck.toml").is_file())
+            .and_then(|root| Self::load(root).ok())
+    }
+
     /// 从 TOML 文本解析（root 为相对路径基准）。
     pub fn from_toml_str(text: &str, root: &Path) -> Result<Self, EngineError> {
         let v: toml::Value = toml::from_str(text).map_err(|e| cfg_err("spinduck.toml", e))?;
@@ -515,5 +528,26 @@ args = ["'b'", "2"]
             ProjectConfig::from_toml_str("[paths]\nddl = \"x\"\n", Path::new("/tmp")).unwrap_err();
         assert_eq!(e.code.to_string(), "ENV-0030");
         assert!(e.message.contains("[project]"));
+    }
+
+    #[test]
+    fn should_discover_project_root_from_nested_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("spinduck.toml"), "[project]\nname = \"p\"\n").unwrap();
+        let nested = root.join("sql/routines/pkg");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let found = ProjectConfig::discover(&nested).expect("向上查找必须命中项目根");
+        assert_eq!(found.root, root);
+        assert_eq!(found.name, "p");
+    }
+
+    #[test]
+    fn should_return_none_when_no_project_file_above() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orphan = tmp.path().join("corpus/routines");
+        std::fs::create_dir_all(&orphan).unwrap();
+        assert!(ProjectConfig::discover(&orphan).is_none());
     }
 }

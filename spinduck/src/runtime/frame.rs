@@ -506,11 +506,14 @@ fn compare(op: &BinOp, l: &SpinValue, r: &SpinValue) -> Result<bool, EngineError
             // 数值与字符串混合：可解析为数值则按数值比较（真实 scale 对齐）
             if let (Ok((a, sa)), Ok((b, sb))) = (num_parts(l), num_parts(r)) {
                 let s = sa.max(sb);
-                let (la, lb) = (
-                    a * 10i128.pow((s - sa) as u32),
-                    b * 10i128.pow((s - sb) as u32),
-                );
-                la.cmp(&lb)
+                // 对齐中间量与算术路径同口径显式报错（BIZ-0112），不得环绕或 panic
+                let overflow = || EngineError::business(112, "numeric overflow");
+                let pa = pow10(s - sa).and_then(|p| a.checked_mul(p));
+                let pb = pow10(s - sb).and_then(|p| b.checked_mul(p));
+                match (pa, pb) {
+                    (Some(la), Some(lb)) => la.cmp(&lb),
+                    _ => return Err(overflow()),
+                }
             } else {
                 l.as_str_loose().cmp(&r.as_str_loose())
             }
@@ -579,6 +582,24 @@ mod tests {
         let big = SpinValue::Int(i64::MAX);
         let e = eval_bin(BinOp::Add, &big, &SpinValue::Int(1)).unwrap_err();
         assert_eq!(e.code.to_string(), "BIZ-0112");
+    }
+
+    #[test]
+    fn should_report_overflow_on_wide_scale_compare_not_wrap() {
+        // 跨定标对齐（100 vs 1e-38）的中间量超 i128：与算术路径同口径报
+        // BIZ-0112，不得 panic（debug 环绕检查）或静默给出错序结果。
+        let e = eval_bin(
+            BinOp::Lt,
+            &SpinValue::Int(100),
+            &SpinValue::Decimal(1, 38, 38),
+        )
+        .unwrap_err();
+        assert_eq!(e.code.to_string(), "BIZ-0112");
+        assert!(
+            e.message.contains("overflow"),
+            "消息须说明溢出，实际: {}",
+            e.message
+        );
     }
 
     #[test]

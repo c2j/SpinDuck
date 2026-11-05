@@ -61,12 +61,17 @@ fn should_report_unparseable_dynamic_sql_explicitly() {
          END;",
         )
         .unwrap();
-        // ogsql-parser 对乱码文本宽容接受（无解析错误返回）→ 由内核显式报错；
-        // 宽容解析已登记上游 issue（ogsql-parser#337）：待其提供严格模式后收敛为 BIZ-061
+        // ogsql-parser 对乱码文本给出解析错误 → 运行期显式 BIZ-061，不执行未解析文本
         let e = eng.call("prc_bad", &[]).unwrap_err();
+        assert_eq!(
+            e.code.to_string(),
+            "BIZ-0061",
+            "乱码动态 SQL 必须报解析缺口，实际: {e:?}"
+        );
         assert!(
-            !e.message.is_empty(),
-            "乱码动态 SQL 必须显式失败，不得静默成功: {e:?}"
+            e.message.contains("动态 SQL 解析失败"),
+            "消息须点明动态 SQL 解析失败，实际: {}",
+            e.message
         );
     });
 }
@@ -98,5 +103,55 @@ fn should_fetch_dynamic_execute_into_targets() {
             .query("SELECT count(*) FROM src_t WHERE a = 43", &BindMap::new())
             .unwrap();
         assert_eq!(s.fetch_many(1)[0][0], SpinValue::Int(1));
+    });
+}
+
+/// 动态 INTO 的行数语义必须与静态 SELECT INTO 同口径（0 行 / >1 行）。
+#[test]
+fn should_raise_no_data_found_on_dynamic_into_zero_rows() {
+    big_stack(|| {
+        let mut eng = Engine::new(
+            Box::new(DuckExecutor::open_in_memory().unwrap()),
+            RuleRegistry::default(),
+        );
+        eng.ex
+            .execute("CREATE TABLE empty_t(a INT)", &BindMap::new())
+            .unwrap();
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_ndf IS DECLARE v_a NUMBER; BEGIN \
+             EXECUTE IMMEDIATE 'select a from empty_t' INTO v_a; \
+             END;",
+        )
+        .unwrap();
+        let e = eng
+            .call("prc_ndf", &[])
+            .expect_err("0 行必须报 NO_DATA_FOUND");
+        assert_eq!(e.code.to_string(), "BIZ-0100", "实际: {e:?}");
+    });
+}
+
+#[test]
+fn should_raise_too_many_rows_on_dynamic_into_multiple_rows() {
+    big_stack(|| {
+        let mut eng = Engine::new(
+            Box::new(DuckExecutor::open_in_memory().unwrap()),
+            RuleRegistry::default(),
+        );
+        eng.ex
+            .execute("CREATE TABLE two_t(a INT)", &BindMap::new())
+            .unwrap();
+        eng.ex
+            .execute("INSERT INTO two_t VALUES (1), (2)", &BindMap::new())
+            .unwrap();
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_tmr IS DECLARE v_a NUMBER; BEGIN \
+             EXECUTE IMMEDIATE 'select a from two_t' INTO v_a; \
+             END;",
+        )
+        .unwrap();
+        let e = eng
+            .call("prc_tmr", &[])
+            .expect_err(">1 行必须报 TOO_MANY_ROWS");
+        assert_eq!(e.code.to_string(), "BIZ-0101", "实际: {e:?}");
     });
 }
