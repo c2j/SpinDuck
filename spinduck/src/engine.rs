@@ -38,15 +38,21 @@ impl Engine {
 
     /// 解析 SQL 文本并注册其中的例程（CREATE PROCEDURE/FUNCTION/PACKAGE BODY）。
     pub fn register(&mut self, sql_text: &str) -> Result<usize, EngineError> {
+        Ok(self.register_named(sql_text)?.len())
+    }
+
+    /// 注册并返回**本次定义/替换**的例程名（目录持久化按名单写行，
+    /// 不得遍历全目录——回归守护见 should_persist_each_routine_with_its_own_source）。
+    fn register_named(&mut self, sql_text: &str) -> Result<Vec<String>, EngineError> {
         let tokens = Tokenizer::new(sql_text)
             .tokenize()
             .map_err(|e| EngineError::invariant(63, format!("tokenizer: {e}")))?;
         let stmts = ogsql_parser::parser::Parser::new(tokens).parse();
-        let mut n = 0;
+        let mut names = Vec::new();
         for st in &stmts {
-            n += self.register_statement(st)?;
+            names.extend(self.register_statement_named(st)?);
         }
-        Ok(n)
+        Ok(names)
     }
 
     /// 纯表达式函数 → 内核宏（§8.2 路径③），使 SQL 上下文可直接调用。
@@ -98,18 +104,23 @@ impl Engine {
 
     /// 单条 AST 语句的注册（含 PACKAGE BODY 展开）。
     pub fn register_statement(&mut self, st: &Statement) -> Result<usize, EngineError> {
+        Ok(self.register_statement_named(st)?.len())
+    }
+
+    fn register_statement_named(&mut self, st: &Statement) -> Result<Vec<String>, EngineError> {
         match st {
             Statement::CreateProcedure(_) | Statement::CreateFunction(_) => {
                 let routines =
                     compile_statement_routine_with_names(st, &self.rules, &self.downshift_names())?;
-                let n = routines.len();
+                let mut names = Vec::with_capacity(routines.len());
                 for r in routines {
                     if self.install_sql_macro(&r)? {
                         self.macro_names.insert(r.name.to_ascii_lowercase());
                     }
+                    names.push(r.name.clone());
                     self.catalog.register(r);
                 }
-                Ok(n)
+                Ok(names)
             }
             // PACKAGE BODY：items 内的 Procedure/Function 逐个编译，例程名带包前缀
             Statement::CreatePackageBody(pb) => {
@@ -119,7 +130,7 @@ impl Engine {
                     .map(|i| i.value.clone())
                     .collect::<Vec<_>>()
                     .join(".");
-                let mut n = 0;
+                let mut names: Vec<String> = Vec::new();
                 for item in &pb.items {
                     // items 的变体名与 spec 对称：Procedure/Function
                     if let ogsql_parser::ast::PackageItem::Procedure(p) = item {
@@ -147,18 +158,20 @@ impl Engine {
                         let params = p
                             .parameters
                             .iter()
-                            .map(|pp| crate::catalog::RoutineParam {
-                                name: pp.name.clone(),
-                                mode: crate::catalog::map_mode_pub(&pp.mode),
+                            .map(|pp| {
+                                Ok(crate::catalog::RoutineParam {
+                                    name: pp.name.clone(),
+                                    mode: crate::catalog::map_mode_pub(&pp.mode)?,
+                                })
                             })
-                            .collect();
+                            .collect::<Result<Vec<_>, EngineError>>()?;
+                        names.push(full.clone());
                         self.catalog.register(crate::catalog::CompiledRoutine {
                             name: full,
                             kind: crate::catalog::RoutineKind::Procedure,
                             params,
                             prog,
                         });
-                        n += 1;
                     }
                     if let ogsql_parser::ast::PackageItem::Function(f) = item {
                         let full = format!(
@@ -185,23 +198,25 @@ impl Engine {
                         let params = f
                             .parameters
                             .iter()
-                            .map(|pp| crate::catalog::RoutineParam {
-                                name: pp.name.clone(),
-                                mode: crate::catalog::map_mode_pub(&pp.mode),
+                            .map(|pp| {
+                                Ok(crate::catalog::RoutineParam {
+                                    name: pp.name.clone(),
+                                    mode: crate::catalog::map_mode_pub(&pp.mode)?,
+                                })
                             })
-                            .collect();
+                            .collect::<Result<Vec<_>, EngineError>>()?;
+                        names.push(full.clone());
                         self.catalog.register(crate::catalog::CompiledRoutine {
                             name: full,
                             kind: crate::catalog::RoutineKind::Function,
                             params,
                             prog,
                         });
-                        n += 1;
                     }
                 }
-                Ok(n)
+                Ok(names)
             }
-            _ => Ok(0), // 非例程语句（建表等）由 load 通道处理
+            _ => Ok(Vec::new()), // 非例程语句（建表等）由 load 通道处理
         }
     }
 
@@ -215,13 +230,14 @@ impl Engine {
 
     /// 注册例程并把源 DDL 落到内核目录表（重启后 [`reload_catalog`](Self::reload_catalog) 恢复）。
     pub fn register_persistent(&mut self, sql_text: &str) -> Result<usize, EngineError> {
-        let n = self.register(sql_text)?;
-        if n == 0 {
+        let names = self.register_named(sql_text)?;
+        if names.is_empty() {
             return Ok(0); // 非例程语句（建表等）不写目录
         }
         self.ensure_catalog_table()?;
         let source = format_statements(sql_text)?.join("\n");
-        for name in self.catalog.names() {
+        let n = names.len();
+        for name in names {
             let kind = match self.catalog.lookup(&name).map(|r| r.kind) {
                 Some(crate::catalog::RoutineKind::Procedure) => "PROCEDURE",
                 Some(crate::catalog::RoutineKind::Function) => "FUNCTION",
@@ -536,6 +552,61 @@ mod persist_tests {
             .query("SELECT count(*) FROM spinduck_routines", &BindMap::new())
             .unwrap();
         assert_eq!(s.fetch_many(1)[0][0], SpinValue::Int(1));
+    }
+
+    #[test]
+    fn should_persist_each_routine_with_its_own_source() {
+        // 回归守护：register_persistent 曾用本次 SQL 文本覆盖全部已存例程的 source，
+        // reload 后两个过程行为相同（持久化能力失效）
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("w.duckdb");
+        let path = db.to_string_lossy().into_owned();
+        {
+            let ex = DuckExecutor::open(&path).unwrap();
+            let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+            eng.register_persistent(
+                "CREATE OR REPLACE PROCEDURE prc_a(p_o OUT NUMBER) IS BEGIN p_o := 1; END;",
+            )
+            .unwrap();
+            eng.register_persistent(
+                "CREATE OR REPLACE PROCEDURE prc_b(p_o OUT NUMBER) IS BEGIN p_o := 2; END;",
+            )
+            .unwrap();
+        }
+        let ex = DuckExecutor::open(&path).unwrap();
+        let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+        assert_eq!(eng.reload_catalog().unwrap(), 2);
+        assert_eq!(
+            eng.call("prc_a", &[SpinValue::Null])
+                .unwrap()
+                .outs
+                .get("p_o"),
+            Some(&SpinValue::Int(1))
+        );
+        assert_eq!(
+            eng.call("prc_b", &[SpinValue::Null])
+                .unwrap()
+                .outs
+                .get("p_o"),
+            Some(&SpinValue::Int(2))
+        );
+    }
+
+    #[test]
+    fn should_treat_in_out_params_as_in_and_out() {
+        // IN OUT：入参值参与运算且写回调用方（归类曾被 contains("OUT") 破坏）
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_io(p_x IN OUT NUMBER) IS BEGIN p_x := p_x + 1; END;",
+        )
+        .unwrap();
+        assert_eq!(
+            eng.catalog.lookup("prc_io").unwrap().params[0].mode,
+            crate::catalog::ParamMode::InOut
+        );
+        let r = eng.call("prc_io", &[SpinValue::Int(41)]).unwrap();
+        assert_eq!(r.outs.get("p_x"), Some(&SpinValue::Int(42)));
     }
 
     #[test]

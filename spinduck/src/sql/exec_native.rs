@@ -100,14 +100,16 @@ impl SqlExecutor for DuckExecutor {
         let named = Self::named_binds(binds);
         // duckdb 1.10505：列元数据在执行后才有效，故先 query 再取 schema
         let mut rows = stmt.query(&named).map_err(kernel_err)?;
-        // 行元数据经 Rows 的 Deref 访问（borrow 与行迭代共存）
-        let ncols = rows.as_ref().unwrap().column_count();
+        // 行元数据经 Rows 的 Deref 访问（borrow 与行迭代共存）；
+        // Statement 已被消费/复位时 as_ref 为 None → KERNEL 域错误（不 panic）
+        let st_ref = rows
+            .as_ref()
+            .ok_or_else(|| EngineError::kernel(10, "rows metadata unavailable"))?;
+        let ncols = st_ref.column_count();
         let schema: Vec<String> = (0..ncols)
             .map(|i| {
                 rows.as_ref()
-                    .unwrap()
-                    .column_name(i)
-                    .cloned()
+                    .and_then(|st| st.column_name(i).ok().map(String::from))
                     .unwrap_or_default()
             })
             .collect();

@@ -44,9 +44,21 @@ impl Recorder {
     }
 }
 
+impl Recorder {
+    /// 记录收到的 SQL 文本与绑定快照：`SQL<TAB>{bind: value, …}`（可断言绑定值）
+    fn record(&self, sql: &str, binds: &BindMap) {
+        let pairs = binds
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v.as_str_loose()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.calls.borrow_mut().push(format!("{sql}\t{{{pairs}}}"));
+    }
+}
+
 impl SqlExecutor for Recorder {
-    fn query(&self, sql: &str, _binds: &BindMap) -> Result<RowStream, EngineError> {
-        self.calls.borrow_mut().push(sql.to_string());
+    fn query(&self, sql: &str, binds: &BindMap) -> Result<RowStream, EngineError> {
+        self.record(sql, binds);
         let mut it = self.script.borrow_mut();
         if it.is_empty() {
             Ok(RowStream::new(Vec::new(), Vec::new()))
@@ -54,8 +66,8 @@ impl SqlExecutor for Recorder {
             Ok(it.remove(0))
         }
     }
-    fn execute(&self, sql: &str, _binds: &BindMap) -> Result<ExecOutcome, EngineError> {
-        self.calls.borrow_mut().push(sql.to_string());
+    fn execute(&self, sql: &str, binds: &BindMap) -> Result<ExecOutcome, EngineError> {
+        self.record(sql, binds);
         Ok(ExecOutcome { rows_affected: 0 })
     }
 }
@@ -298,7 +310,15 @@ fn should_delegate_builtin_calls_to_kernel_with_named_binds() {
         .iter()
         .find(|s| s.to_ascii_lowercase().starts_with("select abs"))
         .unwrap_or_else(|| panic!("内建函数应下沉内核：{calls:?}"));
-    assert_eq!(q.to_ascii_lowercase(), "select abs($p0)");
+    assert_eq!(
+        q.split('\t')
+            .next()
+            .unwrap_or(q.as_str())
+            .to_ascii_lowercase(),
+        "select abs($p0)"
+    );
+    // 绑定快照：$p0 = -5（按名绑定逐值断言）
+    assert!(q.contains("$p0=-5"), "{q}");
 }
 
 #[test]
@@ -391,10 +411,11 @@ fn should_execute_for_loop_body_once_per_row() {
         .iter()
         .find(|s| s.to_ascii_lowercase().contains("insert into out_t"))
         .expect("循环结束后应有聚合 INSERT");
-    // 记录字段取自脚本行：v_sum = 1+2+3 = 6，以绑定/文本形态出现
+    // §4.2：绑定值才是聚合结果的唯一可信载体——断言 $v_v_sum = 6
+    // （记录字段取自脚本行 1+2+3；文本形态含占位符 + Tab 后的绑定快照）
     assert!(
-        ins.contains("6") || ins.contains("$v_v_sum"),
-        "聚合结果应进入 INSERT：{ins}"
+        ins.contains("$v_v_sum") && ins.contains("$v_v_sum=6"),
+        "INSERT 应绑定 v_sum 且绑定值为 6：{ins}"
     );
 }
 

@@ -20,9 +20,14 @@ impl SpinType {
     /// 无精度 NUMBER 默认 DECIMAL(38,6)（语义损失见规则文件注释）。
     pub fn from_gauss_name(name: &str, mapping: &BTreeMap<String, String>) -> Option<SpinType> {
         let base = name.trim().to_ascii_uppercase();
-        // 拆参数：VARCHAR2(4000) / NUMBER(15,2)
+        // 拆参数：VARCHAR2(4000) / NUMBER(15,2)；畸形（`NUMBER(` 无右括号）
+        // 返回 None → 上层显式"未知类型"，不得切片 panic（回归守护见
+        // tests/guard/guard_types_name_parsing.rs）
         let (head, args) = match base.find('(') {
-            Some(i) => (&base[..i], &base[i + 1..base.len() - 1]),
+            Some(i) => match base.strip_suffix(')') {
+                Some(rest) if rest.len() > i => (&base[..i], &rest[i + 1..]),
+                _ => return None,
+            },
             None => (base.as_str(), ""),
         };
         let mapped = mapping.get(head)?.as_str();
@@ -34,10 +39,9 @@ impl SpinType {
             ("DECIMAL", a) => {
                 let mut it = a.split(',');
                 let p: u8 = it.next()?.trim().parse().ok()?;
-                let s: u8 = it
-                    .next()
-                    .map(|x| x.trim().parse::<u8>().unwrap_or(0))
-                    .unwrap_or(0);
+                // 坏 scale（`NUMBER(15,x)`）显式返回 None（上层报未知类型），
+                // 不得静默变 0（§6 语义损失显式化）
+                let s: u8 = it.next()?.trim().parse().ok()?;
                 Some(SpinType::Decimal {
                     precision: p,
                     scale: s,

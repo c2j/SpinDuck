@@ -1373,6 +1373,10 @@ impl Compiler {
                 negated,
             } => {
                 let x = self.expr(expr)?;
+                // 空表语义（Oracle）：x IN () = FALSE，x NOT IN () = TRUE
+                if list.is_empty() {
+                    return Ok(IrExpr::Const(SpinValue::Bool(*negated)));
+                }
                 let mut parts = Vec::with_capacity(list.len());
                 for item in list {
                     let eq = IrExpr::Bin {
@@ -1410,7 +1414,10 @@ fn and_chain(parts: Vec<IrExpr>) -> IrExpr {
 
 fn fold_bin(op: BinOp, parts: Vec<IrExpr>) -> IrExpr {
     let mut it = parts.into_iter();
-    let first = it.next().expect("chain requires at least one item");
+    // 空链在 InList 脱糖处已先行短路；此处兜底为中性值（ENG 防御，不 panic）
+    let Some(first) = it.next() else {
+        return IrExpr::Const(SpinValue::Bool(op == BinOp::And));
+    };
     it.fold(first, |acc, next| IrExpr::Bin {
         op,
         l: Box::new(acc),

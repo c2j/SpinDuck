@@ -200,81 +200,79 @@ pub fn eval(e: &IrExpr, env: &EvalEnv<'_>) -> Result<SpinValue, EngineError> {
         },
         IrExpr::Bin { op, l, r } => eval_bin(*op, &eval(l, env)?, &eval(r, env)?),
         IrExpr::CursorAttr { cursor, kind } => Ok(f.cursor_attr(cursor, *kind)),
-        IrExpr::SqlFn { name, args } => {
-            // §8.2 @变换标记：整体下沉单条 SQL（保留日期等中间类型，不经 SpinValue）
-            let Some((arg_sql, binds_vec)) =
-                crate::sql::render::expr_to_sql_binds(&e_sqlfn_args(args))
-            else {
-                return Err(EngineError::invariant(
-                    64,
-                    "SqlFn argument not renderable (cursor attribute?)",
-                ));
-            };
-            let sql = format!("SELECT {}({})", name.to_ascii_lowercase(), arg_sql);
-            let sql = crate::sql::apply_ast_transforms(&sql)?;
-            let bind_map = crate::runtime::interp::resolve_binds(&binds_vec, env.frame)?;
-            let mut rows = env.ex.query(&sql, &bind_map)?;
-            Ok(rows
-                .fetch_many(1)
-                .into_iter()
-                .next()
-                .and_then(|r| r.into_iter().next())
-                .unwrap_or(SpinValue::Null))
-        }
-        IrExpr::FuncCall { name, args } => {
-            // §8 分派矩阵：PL 上下文 → 例程目录直调；未命中视为内建/库函数，
-            // 下沉为 `SELECT f($p0,…)` 交给内核求值（内建函数语义由 DuckDB 提供，
-            // Gauss 方言差异由编译期规则改名 + 解析级变换承担）
-            let Some(routine) = env.cat.lookup(name).cloned() else {
-                return eval_builtin(env, name, args);
-            };
-            if routine.kind != crate::catalog::RoutineKind::Function {
-                return Err(EngineError::business(
-                    153,
-                    format!("{name} is a procedure and cannot be used in an expression"),
-                ));
-            }
-            if args.len() != routine.params.len() {
-                return Err(EngineError::business(
-                    151,
-                    format!(
-                        "{} expects {} args, got {}",
-                        name,
-                        routine.params.len(),
-                        args.len()
-                    ),
-                ));
-            }
-            if env.depth > 100 {
-                return Err(EngineError::invariant(63, "call depth exceeded (100)"));
-            }
-            let mut callee = Frame::new();
-            for (p, ir_a) in routine.params.iter().zip(args) {
-                let v = eval(ir_a, env)?;
-                callee.set(&VarName(p.name.to_ascii_lowercase()), v);
-            }
-            let noop = crate::exec::TraceNoopSink;
-            let out = crate::runtime::run_with_catalog(
-                &routine.prog,
-                &mut callee,
-                env.ex,
-                &mut crate::exec::TraceNoopSink,
-                env.cat,
-                env.depth + 1,
-            )?;
-            let _ = noop;
-            match out {
-                RunOutcome::Returned(Some(v)) => Ok(v),
-                RunOutcome::Returned(None) => Ok(SpinValue::Null),
-                RunOutcome::Completed => Ok(SpinValue::Null),
-            }
-        }
+        IrExpr::SqlFn { name, args } => eval_sqlfn(name, args, env),
+        IrExpr::FuncCall { name, args } => eval_funccall(name, args, env),
     }
 }
 
-#[allow(clippy::too_many_lines)]
-/// PL 上下文的内建/库函数：构造单行 SQL 下发内核，取首行首列。
-/// 复用渲染器的小包装：以 SqlFn 形态渲染参数列表。
+/// §8.2 @变换标记：整体下沉单条 SQL（保留日期等中间类型，不经 SpinValue）。
+fn eval_sqlfn(name: &str, args: &[IrExpr], env: &EvalEnv<'_>) -> Result<SpinValue, EngineError> {
+    let Some((arg_sql, binds_vec)) = crate::sql::render::expr_to_sql_binds(&e_sqlfn_args(args))
+    else {
+        return Err(EngineError::invariant(
+            64,
+            "SqlFn argument not renderable (cursor attribute?)",
+        ));
+    };
+    let sql = format!("SELECT {}({})", name.to_ascii_lowercase(), arg_sql);
+    let sql = crate::sql::apply_ast_transforms(&sql)?;
+    let bind_map = crate::runtime::interp::resolve_binds(&binds_vec, env.frame)?;
+    let mut rows = env.ex.query(&sql, &bind_map)?;
+    Ok(rows
+        .fetch_many(1)
+        .into_iter()
+        .next()
+        .and_then(|r| r.into_iter().next())
+        .unwrap_or(SpinValue::Null))
+}
+
+/// §8 分派矩阵：PL 上下文 → 例程目录直调；未命中视为内建/库函数，
+/// 下沉为 `SELECT f($p0,…)` 交给内核求值（内建函数语义由 DuckDB 提供，
+/// Gauss 方言差异由编译期规则改名 + 解析级变换承担）。
+fn eval_funccall(name: &str, args: &[IrExpr], env: &EvalEnv<'_>) -> Result<SpinValue, EngineError> {
+    let Some(routine) = env.cat.lookup(name).cloned() else {
+        return eval_builtin(env, name, args);
+    };
+    if routine.kind != crate::catalog::RoutineKind::Function {
+        return Err(EngineError::business(
+            153,
+            format!("{name} is a procedure and cannot be used in an expression"),
+        ));
+    }
+    if args.len() != routine.params.len() {
+        return Err(EngineError::business(
+            151,
+            format!(
+                "{} expects {} args, got {}",
+                name,
+                routine.params.len(),
+                args.len()
+            ),
+        ));
+    }
+    if env.depth > 100 {
+        return Err(EngineError::invariant(63, "call depth exceeded (100)"));
+    }
+    let mut callee = Frame::new();
+    for (p, ir_a) in routine.params.iter().zip(args) {
+        let v = eval(ir_a, env)?;
+        callee.set(&VarName(p.name.to_ascii_lowercase()), v);
+    }
+    let out = crate::runtime::run_with_catalog(
+        &routine.prog,
+        &mut callee,
+        env.ex,
+        &mut crate::exec::TraceNoopSink,
+        env.cat,
+        env.depth + 1,
+    )?;
+    match out {
+        RunOutcome::Returned(Some(v)) => Ok(v),
+        _ => Ok(SpinValue::Null),
+    }
+}
+
+/// PL 上下文的内建/库函数参数：以 SqlFn 形态渲染参数列表（供下沉）。
 fn e_sqlfn_args(args: &[IrExpr]) -> IrExpr {
     IrExpr::SqlFn {
         name: String::new(),
@@ -367,58 +365,90 @@ fn bool3(v: &SpinValue) -> Result<Option<bool>, EngineError> {
 
 fn arith(op: &BinOp, l: &SpinValue, r: &SpinValue) -> Result<SpinValue, EngineError> {
     use SpinValue as V;
-    let (a, b) = match (l, r) {
-        (V::Int(x), V::Int(y)) => return Ok(V::Int(apply_i(op, *x, *y))),
-        _ => (num_unscaled(l)?, num_unscaled(r)?),
-    };
-    let scale = num_scale(l).max(num_scale(r));
-    let div = 10i128.pow(scale as u32);
-    // 对齐到公共 scale 后做整数运算（DECIMAL 语义）
-    let (a, b) = (
-        a * (div / 10i128.pow(num_scale(l) as u32)),
-        b * (div / 10i128.pow(num_scale(r) as u32)),
-    );
-    let out = match *op {
-        BinOp::Add => a + b,
-        BinOp::Sub => a - b,
-        BinOp::Mul => a * b / div,
+    if let (V::Int(x), V::Int(y)) = (l, r) {
+        return apply_i(op, *x, *y).map(V::Int);
+    }
+    // 字符串数值解析为真实 (unscaled, scale)——不得虚拟定标（回归守护：'1.5'+1）
+    let (a, sa) = num_parts(l)?;
+    let (b, sb) = num_parts(r)?;
+    // 统一溢出出口：中间量超 i128 视为数值溢出（显式报错，不静默截断）
+    let overflow = || EngineError::business(112, "numeric overflow");
+    let (out, scale) = match *op {
+        BinOp::Add | BinOp::Sub => {
+            let scale = sa.max(sb);
+            let a2 = pow10(scale - sa)
+                .and_then(|p| a.checked_mul(p))
+                .ok_or_else(overflow)?;
+            let b2 = pow10(scale - sb)
+                .and_then(|p| b.checked_mul(p))
+                .ok_or_else(overflow)?;
+            let v = if *op == BinOp::Add {
+                a2.checked_add(b2)
+            } else {
+                a2.checked_sub(b2)
+            };
+            (v.ok_or_else(overflow)?, scale)
+        }
+        BinOp::Mul => {
+            let scale = sa.saturating_add(sb);
+            if scale > 38 {
+                return Err(overflow());
+            }
+            (a.checked_mul(b).ok_or_else(overflow)?, scale)
+        }
         BinOp::Div => {
             if b == 0 {
                 return Err(EngineError::business(124, "division by zero"));
             }
-            a * div / b
+            // value = (a/10^sa) / (b/10^sb)；以 scale S 表示：
+            // u = a·10^(sb+S-sa) / b（指数为负时把 10^|k| 移到分母）
+            let scale = sa.max(sb);
+            let shift = sb as i32 + scale as i32 - sa as i32;
+            let (num, den) = if shift >= 0 {
+                let p = pow10(shift as u8).ok_or_else(overflow)?;
+                (a.checked_mul(p).ok_or_else(overflow)?, b)
+            } else {
+                let p = pow10((-shift) as u8).ok_or_else(overflow)?;
+                (a, b.checked_mul(p).ok_or_else(overflow)?)
+            };
+            (num / den, scale)
         }
         _ => return Err(EngineError::invariant(30, "not arithmetic")),
     };
     Ok(V::Decimal(out, 38, scale))
 }
 
-fn apply_i(op: &BinOp, x: i64, y: i64) -> i64 {
+/// 10^n（n ≤ 38，i128 上界内）；超出返回 None。
+fn pow10(n: u8) -> Option<i128> {
+    if n > 38 {
+        return None;
+    }
+    let mut r: i128 = 1;
+    for _ in 0..n {
+        r = r.checked_mul(10)?;
+    }
+    Some(r)
+}
+
+/// 整数路径：除零与 DECIMAL 路径同报 ZERO_DIVIDE（BIZ-124），不得防御性返 0。
+fn apply_i(op: &BinOp, x: i64, y: i64) -> Result<i64, EngineError> {
     match op {
-        BinOp::Add => x + y,
-        BinOp::Sub => x - y,
-        BinOp::Mul => x * y,
-        BinOp::Div => {
-            if y == 0 {
-                0 // 除零在 DECIMAL 路径报错；INT 路径防御性返回 0（探针覆盖）
-            } else {
-                x / y
-            }
-        }
-        _ => 0,
+        BinOp::Add => Ok(x.wrapping_add(y)),
+        BinOp::Sub => Ok(x.wrapping_sub(y)),
+        BinOp::Mul => Ok(x.wrapping_mul(y)),
+        BinOp::Div if y == 0 => Err(EngineError::business(124, "division by zero")),
+        BinOp::Div => Ok(x / y),
+        _ => Err(EngineError::invariant(30, "not arithmetic")),
     }
 }
 
-fn num_unscaled(v: &SpinValue) -> Result<i128, EngineError> {
+/// 数值部件：(unscaled, scale)。字符串按十进制字面量解析出真实小数位；
+/// 非十进制字面量（科学计数法等）显式拒绝（BIZ-112），不做虚拟定标。
+fn num_parts(v: &SpinValue) -> Result<(i128, u8), EngineError> {
     match v {
-        SpinValue::Int(i) => Ok(*i as i128),
-        SpinValue::Decimal(v, _, _) => Ok(*v),
-        SpinValue::Str(s) => {
-            let t = s.trim();
-            t.parse::<i128>()
-                .or_else(|_| t.parse::<f64>().map(|f| (f * 1_000_000.0).round() as i128))
-                .map_err(|_| EngineError::business(112, format!("invalid numeric literal: {s}")))
-        }
+        SpinValue::Int(i) => Ok((*i as i128, 0)),
+        SpinValue::Decimal(v, _, s) => Ok((*v, *s)),
+        SpinValue::Str(s) => parse_num_str(s),
         other => Err(EngineError::business(
             125,
             format!("arithmetic requires numeric, got {}", other.display()),
@@ -426,11 +456,41 @@ fn num_unscaled(v: &SpinValue) -> Result<i128, EngineError> {
     }
 }
 
-fn num_scale(v: &SpinValue) -> u8 {
-    match v {
-        SpinValue::Decimal(_, _, s) => *s,
-        _ => 0,
+fn parse_num_str(s: &str) -> Result<(i128, u8), EngineError> {
+    let t = s.trim();
+    let neg = t.starts_with('-');
+    let body = t.strip_prefix(['-', '+']).unwrap_or(t);
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((a, b)) => (a, b),
+        None => (body, ""),
+    };
+    let digits_ok = |x: &str| !x.is_empty() || !frac_part.is_empty();
+    let all_ascii_digits = int_part.chars().all(|c| c.is_ascii_digit())
+        && frac_part.chars().all(|c| c.is_ascii_digit());
+    if !digits_ok(int_part) || !all_ascii_digits {
+        return Err(EngineError::business(
+            112,
+            format!("invalid numeric literal: {s}"),
+        ));
     }
+    let scale = frac_part.len().min(u8::MAX as usize) as u8;
+    let mut digits = format!("{int_part}{frac_part}");
+    if digits.is_empty() {
+        digits.push('0');
+    }
+    if digits.len() > 30 {
+        return Err(EngineError::business(
+            112,
+            format!("numeric literal out of range: {s}"),
+        ));
+    }
+    let mut unscaled: i128 = digits
+        .parse()
+        .map_err(|_| EngineError::business(112, format!("invalid numeric literal: {s}")))?;
+    if neg {
+        unscaled = -unscaled;
+    }
+    Ok((unscaled, scale))
 }
 
 fn compare(op: &BinOp, l: &SpinValue, r: &SpinValue) -> Result<bool, EngineError> {
@@ -441,14 +501,12 @@ fn compare(op: &BinOp, l: &SpinValue, r: &SpinValue) -> Result<bool, EngineError
         (V::Str(x), V::Str(y)) => x.cmp(y),
         (V::Bool(x), V::Bool(y)) => x.cmp(y),
         _ => {
-            // 数值与字符串混合：按宽松字符串比较（GaussDB VARCHAR2 语义近似）
-            let (a, b) = (num_of(l), num_of(r));
-            if let (Some(a), Some(b)) = (a, b) {
-                let s = num_scale(l).max(num_scale(r));
-                let div = 10i128.pow(s as u32);
+            // 数值与字符串混合：可解析为数值则按数值比较（真实 scale 对齐）
+            if let (Ok((a, sa)), Ok((b, sb))) = (num_parts(l), num_parts(r)) {
+                let s = sa.max(sb);
                 let (la, lb) = (
-                    a * (div / 10i128.pow(num_scale(l) as u32)),
-                    b * (div / 10i128.pow(num_scale(r) as u32)),
+                    a * 10i128.pow((s - sa) as u32),
+                    b * 10i128.pow((s - sb) as u32),
                 );
                 la.cmp(&lb)
             } else {
@@ -467,15 +525,6 @@ fn compare(op: &BinOp, l: &SpinValue, r: &SpinValue) -> Result<bool, EngineError
     })
 }
 
-fn num_of(v: &SpinValue) -> Option<i128> {
-    match v {
-        SpinValue::Int(i) => Some(*i as i128),
-        SpinValue::Decimal(v, _, _) => Some(*v),
-        SpinValue::Str(s) => s.trim().parse::<i64>().ok().map(|i| i as i128),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +532,55 @@ mod tests {
 
     fn ev(op: BinOp, l: SpinValue, r: SpinValue) -> SpinValue {
         eval_bin(op, &l, &r).unwrap()
+    }
+
+    #[test]
+    fn should_add_string_decimal_with_true_scale() {
+        // 回归守护：字符串数值曾按虚拟定标 ×10⁶ 参与运算（'1.5'+1 → 1500001）
+        assert_eq!(
+            ev(BinOp::Add, SpinValue::Str("1.5".into()), SpinValue::Int(1)),
+            SpinValue::Decimal(25, 38, 1) // 2.5
+        );
+        assert_eq!(
+            ev(
+                BinOp::Mul,
+                SpinValue::Str("0.1".into()),
+                SpinValue::Str("0.2".into())
+            ),
+            SpinValue::Decimal(2, 38, 2) // 0.02
+        );
+    }
+
+    #[test]
+    fn should_compare_mixed_numeric_by_value() {
+        // 字符串小数与整数按数值比较，不得按虚拟定标错序
+        assert_eq!(
+            ev(BinOp::Gt, SpinValue::Str("2.5".into()), SpinValue::Int(2)),
+            SpinValue::Bool(true)
+        );
+        assert_eq!(
+            ev(BinOp::Lt, SpinValue::Str("1.5".into()), SpinValue::Int(2)),
+            SpinValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn should_report_zero_divide_on_int_division() {
+        // INT 路径除零与 DECIMAL 路径同报 BIZ-124，不得防御性返 0
+        let e = eval_bin(BinOp::Div, &SpinValue::Int(5), &SpinValue::Int(0)).unwrap_err();
+        assert_eq!(e.code.to_string(), "BIZ-0124");
+    }
+
+    #[test]
+    fn should_reject_non_decimal_numeric_string() {
+        // 科学计数法等非十进制字面量显式拒绝（不做虚拟定标）
+        let e = eval_bin(
+            BinOp::Add,
+            &SpinValue::Str("1e3".into()),
+            &SpinValue::Int(1),
+        )
+        .unwrap_err();
+        assert_eq!(e.code.to_string(), "BIZ-0112");
     }
 
     #[test]

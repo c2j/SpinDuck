@@ -95,20 +95,23 @@ impl RoutineCatalog {
 }
 
 /// ogsql `RoutineParam.mode: Option<String>` → ParamMode。
-pub fn map_mode_pub(mode: &Option<String>) -> ParamMode {
+pub fn map_mode_pub(mode: &Option<String>) -> Result<ParamMode, EngineError> {
     map_mode(mode)
 }
 
-fn map_mode(mode: &Option<String>) -> ParamMode {
-    match mode
-        .as_deref()
-        .unwrap_or("IN")
-        .to_ascii_uppercase()
-        .as_str()
-    {
-        s if s.contains("OUT") => ParamMode::Out,
-        s if s.contains("IN") => ParamMode::In,
-        _ => ParamMode::In,
+/// 参数模式解析：`IN OUT`/`INOUT` 必须归 [`ParamMode::InOut`]（回归守护：
+/// `contains("OUT")` 曾使 IN OUT 被归类为 OUT，丢入参值）；未知模式显式拒绝。
+fn map_mode(mode: &Option<String>) -> Result<ParamMode, EngineError> {
+    let raw = mode.as_deref().unwrap_or("IN");
+    let compact = raw.to_ascii_uppercase().replace([' ', '_'], "");
+    match compact.as_str() {
+        "" | "IN" => Ok(ParamMode::In),
+        "OUT" => Ok(ParamMode::Out),
+        "INOUT" => Ok(ParamMode::InOut),
+        _ => Err(EngineError::business(
+            130,
+            format!("unknown parameter mode: {raw:?}"),
+        )),
     }
 }
 
@@ -142,11 +145,13 @@ pub fn compile_statement_routine_with_names(
             let params = cs
                 .parameters
                 .iter()
-                .map(|p| RoutineParam {
-                    name: p.name.clone(),
-                    mode: map_mode(&p.mode),
+                .map(|p| {
+                    Ok(RoutineParam {
+                        name: p.name.clone(),
+                        mode: map_mode(&p.mode)?,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, EngineError>>()?;
             out.push(CompiledRoutine {
                 name: cs
                     .name
@@ -172,11 +177,13 @@ pub fn compile_statement_routine_with_names(
             let params = cf
                 .parameters
                 .iter()
-                .map(|p| RoutineParam {
-                    name: p.name.clone(),
-                    mode: map_mode(&p.mode),
+                .map(|p| {
+                    Ok(RoutineParam {
+                        name: p.name.clone(),
+                        mode: map_mode(&p.mode)?,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, EngineError>>()?;
             out.push(CompiledRoutine {
                 name: cf
                     .name
@@ -197,4 +204,31 @@ pub fn compile_statement_routine_with_names(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_classify_in_out_as_inout() {
+        // 回归守护：contains("OUT") 曾使 `IN OUT` 被归类为 Out（丢入参值）
+        assert_eq!(map_mode_pub(&Some("IN".into())).unwrap(), ParamMode::In);
+        assert_eq!(map_mode_pub(&None).unwrap(), ParamMode::In);
+        assert_eq!(map_mode_pub(&Some("OUT".into())).unwrap(), ParamMode::Out);
+        assert_eq!(
+            map_mode_pub(&Some("IN OUT".into())).unwrap(),
+            ParamMode::InOut
+        );
+        assert_eq!(
+            map_mode_pub(&Some("INOUT".into())).unwrap(),
+            ParamMode::InOut
+        );
+    }
+
+    #[test]
+    fn should_reject_unknown_parameter_mode() {
+        let e = map_mode_pub(&Some("READONLY".into())).unwrap_err();
+        assert_eq!(e.code.to_string(), "BIZ-0130");
+    }
 }

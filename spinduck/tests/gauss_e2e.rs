@@ -4,7 +4,7 @@
 //! 容器环境（自包含复现包，见 golden/README.md）：
 //!   docker compose -f golden/gaussdb-docker/docker-compose.yml up -d
 //!   SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
-//!   SPINDUCK_OG_USER=gaussdb SPINDUCK_OG_PASSWORD='Enmo@123' \
+//!   SPINDUCK_OG_USER=gaussdb SPINDUCK_OG_PASSWORD=… \
 //!   cargo test --features gauss --test gauss_e2e
 
 #![cfg(feature = "gauss")]
@@ -27,7 +27,8 @@ fn og() -> Option<GaussConn> {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(5432),
             &std::env::var("SPINDUCK_OG_USER").unwrap_or_else(|_| "gaussdb".into()),
-            &std::env::var("SPINDUCK_OG_PASSWORD").unwrap_or_else(|_| "Enmo@123".into()),
+            &std::env::var("SPINDUCK_OG_PASSWORD")
+                .expect("SPINDUCK_OG_PASSWORD 必须显式提供（口令不入库）"),
             &std::env::var("SPINDUCK_OG_DB").unwrap_or_else(|_| "postgres".into()),
         )
         .expect("connect openGauss"),
@@ -137,8 +138,13 @@ impl SqlExecutor for HandleExec {
 #[test]
 fn gauss_e2e_materialize_process_sync_back() {
     let Some(mut og) = og() else {
-        eprintln!("SKIP: SPINDUCK_OG_HOST not set");
-        return;
+        // §4.1：黄金层禁止"跳过即绿"——缺容器必须让测试显式变红，
+        // 否则 V13–V15 结论可被无容器环境静默"复验"
+        panic!(
+            "E2E 用例需要 A 模式容器（golden/gaussdb-docker）：\n\
+             docker compose -f golden/gaussdb-docker/docker-compose.yml up -d\n\
+             SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 SPINDUCK_OG_PASSWORD=… cargo test --features gauss"
+        );
     };
 
     // 0. 源端准备（幂等）
@@ -197,8 +203,13 @@ fn gauss_e2e_materialize_process_sync_back() {
 #[test]
 fn gauss_e2e_materialize_with_where_clause() {
     let Some(mut og) = og() else {
-        eprintln!("SKIP: SPINDUCK_OG_HOST not set");
-        return;
+        // §4.1：黄金层禁止"跳过即绿"——缺容器必须让测试显式变红，
+        // 否则 V13–V15 结论可被无容器环境静默"复验"
+        panic!(
+            "E2E 用例需要 A 模式容器（golden/gaussdb-docker）：\n\
+             docker compose -f golden/gaussdb-docker/docker-compose.yml up -d\n\
+             SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 SPINDUCK_OG_PASSWORD=… cargo test --features gauss"
+        );
     };
     let _ = og.exec("DROP TABLE IF EXISTS sd_incr");
     og.exec("CREATE TABLE sd_incr(a VARCHAR(20), bcrq VARCHAR(8), n INT)")

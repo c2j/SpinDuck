@@ -135,8 +135,13 @@ fn run_case_inner(name: &str) {
     assert_eq!(case_files.len(), 1, "{name}: 期望恰好一个 *.case.toml");
     let case = CaseConfig::load(&case_files[0]).unwrap_or_else(|e| err("加载 case.toml", e));
     let Some(mut og) = og() else {
-        eprintln!("SKIP: SPINDUCK_OG_HOST not set");
-        return;
+        // §4.1：黄金层禁止"跳过即绿"——缺容器必须让测试显式变红，
+        // 否则 V13–V15 结论可被无容器环境静默"复验"
+        panic!(
+            "黄金用例需要 A 模式容器（golden/gaussdb-docker）：\n\
+             docker compose -f golden/gaussdb-docker/docker-compose.yml up -d\n\
+             SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 SPINDUCK_OG_PASSWORD=… cargo test --features gauss"
+        );
     };
 
     // ── 参照侧：A 模式容器整体重建 → 部署 → 种子 → 执行 ──

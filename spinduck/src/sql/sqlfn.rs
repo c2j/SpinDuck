@@ -85,7 +85,6 @@ pub fn plan_sites(
         return Ok((sql_text.to_string(), Vec::new()));
     }
     let region = context_region(sql_text, &tokens)?;
-    let _ = &region;
 
     // 去重：同 name + 同实参文本只物化一次
     let mut plans: Vec<CallPlan> = Vec::new();
@@ -662,26 +661,6 @@ fn top_level_keywords(
         }
     }
     out
-}
-
-fn clause_end(
-    kw: &BTreeMap<String, (usize, usize)>,
-    cur: &str,
-    cur_end: usize,
-    text: &str,
-) -> usize {
-    let mut end = text.len();
-    for name in ["where", "group", "order", "having"] {
-        if name == cur {
-            continue;
-        }
-        if let Some((start, _)) = kw.get(name) {
-            if *start > cur_end && *start < end {
-                end = *start;
-            }
-        }
-    }
-    end
 }
 
 /// 语句文本 → 改写 + 方言变换 + 记录字段绑定（与 `ir::rewrite_sql` 同口径）。

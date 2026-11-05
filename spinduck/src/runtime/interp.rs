@@ -56,20 +56,24 @@ pub fn run_with_catalog(
     let mut pc = 0usize;
     let mut steps = 0u64;
     loop {
-        match run_inner(
-            prog, frame, ex, sink, &mut traps, &mut pc, &mut steps, cat, depth,
-        ) {
+        let mut ctx = ExecCtx {
+            ex,
+            sink,
+            cat,
+            depth,
+        };
+        match run_inner(prog, frame, &mut ctx, &mut traps, &mut pc, &mut steps) {
             Ok(out) => return Ok(out),
             Err(e) => {
                 // 自顶向下找匹配处理器；进入处理器前写 SQLERRM/SQLCODE 帧变量
                 let mut handled = false;
                 while !traps.is_empty() {
-                    let hit = traps
-                        .last()
-                        .unwrap()
-                        .entries
-                        .iter()
-                        .find(|en| en.conds.iter().any(|c| crate::error::cond_matches(c, &e)));
+                    // 循环条件保证非空；仍以模式匹配防御（§5：内核状态一律 ? / 显式错误）
+                    let hit = traps.last().and_then(|top| {
+                        top.entries
+                            .iter()
+                            .find(|en| en.conds.iter().any(|c| crate::error::cond_matches(c, &e)))
+                    });
                     match hit {
                         Some(h) => {
                             // 消费该 trap（丢弃其上全部未弹出的内层 trap）并重入处理器体；
@@ -98,19 +102,27 @@ pub fn run_with_catalog(
     }
 }
 
+/// 执行上下文（§3：≥5 参数一律结构体；接缝引用保持 `SqlExecutor`/`TraceSink`）。
+struct ExecCtx<'a> {
+    ex: &'a dyn SqlExecutor,
+    sink: &'a mut dyn TraceSink,
+    cat: &'a crate::catalog::RoutineCatalog,
+    depth: usize,
+}
+
 /// 内层执行驱动（traps/pc/steps 由外层持有，支持跨重试持久化）。
-#[allow(clippy::too_many_arguments)]
 fn run_inner(
     prog: &IrProg,
     frame: &mut Frame,
-    ex: &dyn SqlExecutor,
-    sink: &mut dyn TraceSink,
+    ctx: &mut ExecCtx<'_>,
     traps: &mut Vec<TrapFrame>,
     pc: &mut usize,
     steps: &mut u64,
-    cat: &crate::catalog::RoutineCatalog,
-    depth: usize,
 ) -> Result<RunOutcome, EngineError> {
+    let ex: &dyn SqlExecutor = ctx.ex;
+    let cat: &crate::catalog::RoutineCatalog = ctx.cat;
+    let depth: usize = ctx.depth;
+    let sink: &mut dyn TraceSink = ctx.sink;
     loop {
         *steps += 1;
         if *steps > MAX_STEPS {
@@ -358,7 +370,9 @@ fn run_inner(
                             .cloned()
                             .zip(r.iter().cloned())
                             .collect::<Vec<_>>();
-                        let target = targets.first().expect("FOR record target");
+                        let target = targets.first().ok_or_else(|| {
+                            EngineError::invariant(47, "FOR-record fetch requires one INTO target")
+                        })?;
                         assign(frame, target, SpinValue::Record(fields))?;
                         sink.on_event(TraceEvent::Fetch { row: Some(1) });
                     }

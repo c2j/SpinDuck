@@ -338,10 +338,15 @@ fn find_innermost_calls(text: &str, names: &[&str]) -> Vec<(usize, usize, String
                             }
                             j += 1;
                         }
-                        let args = &text[k + 1..j];
-                        let has_nested = names.iter().any(|n| upper_eq_find(args, n));
-                        if !has_nested {
-                            out.push((start, j + 1, upper, args.to_string()));
+                        // 括号未配平（含未闭合字符串吞掉右括号）→ 不识别该调用，
+                        // 交由下游显式报错；不得产出越界区间（回归守护见
+                        // should_not_panic_on_unterminated_string）
+                        if depth == 0 && j < text.len() {
+                            let args = &text[k + 1..j];
+                            let has_nested = names.iter().any(|n| upper_eq_find(args, n));
+                            if !has_nested {
+                                out.push((start, j + 1, upper, args.to_string()));
+                            }
                         }
                     }
                 } else {
@@ -551,7 +556,7 @@ pub fn apply_ast_transforms(text: &str) -> Result<String, EngineError> {
                 format!(
                     "strptime({}, '{}')",
                     args[0],
-                    oracle_format_to_strftime(&unquote(&args[1]))
+                    requote(&oracle_format_to_strftime(&unquote(&args[1])))
                 )
             }
             "INTERVALTONUM" => {
@@ -611,13 +616,13 @@ pub fn apply_ast_transforms(text: &str) -> Result<String, EngineError> {
                             let sp = format!(
                                 "strptime({}, '{}')",
                                 dargs[0],
-                                oracle_format_to_strftime(&unquote(&dargs[1]))
+                                requote(&oracle_format_to_strftime(&unquote(&dargs[1])))
                             );
                             format!("{}{}{}", &inner_expr[..s0], sp, &inner_expr[e0..])
                         }
                         None => inner_expr.to_string(),
                     };
-                    format!("strftime({}, '{}')", inner, fmt_out)
+                    format!("strftime({}, '{}')", inner, requote(&fmt_out))
                 }
             }
             _ => unreachable!("names list"),
@@ -662,6 +667,12 @@ fn split_top_level_minus(text: &str) -> Vec<String> {
     }
 }
 
+/// 再转义：反转义后的文本重新嵌入单引号字面量前必须还原 `'` → `''`
+/// （unquote 与 requote 必须成对使用，否则掩码含引号即产出畸形 SQL）。
+fn requote(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 fn unquote(literal: &str) -> String {
     let t = literal.trim();
     if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
@@ -674,6 +685,25 @@ fn unquote(literal: &str) -> String {
 #[cfg(test)]
 mod transform_tests {
     use super::*;
+
+    #[test]
+    fn should_requote_embedded_format_mask() {
+        // 回归守护：掩码内含单引号字面量时，unquote 后必须 requote 再嵌入，
+        // 否则产出畸形 SQL（''y' 曾还原为 'y' 直接进入 strftime 字面量）
+        // 掩码 x'y 经大写化后字面量 ' 必须以 '' 转义嵌入（requote），
+        // 否则 'X'Y' 会让字符串提前闭合（畸形 SQL）
+        assert_eq!(
+            apply_ast_transforms("to_char(d, 'x''y')").unwrap(),
+            "strftime(d, 'X''Y')"
+        );
+    }
+
+    #[test]
+    fn should_not_panic_on_unterminated_string() {
+        // 未闭合字符串吞掉右括号：不得越界 panic，原样返回交由下游报错
+        let out = apply_ast_transforms("to_char(d, 'x''y'yyyymmdd')").unwrap();
+        assert_eq!(out, "to_char(d, 'x''y'yyyymmdd')");
+    }
 
     #[test]
     fn should_transform_decode_to_case_with_default() {
