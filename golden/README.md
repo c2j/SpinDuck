@@ -123,7 +123,8 @@ cargo test --features gauss --test gauss_e2e
 ```
 
 未设置 `SPINDUCK_OG_HOST` 时用例打印 `SKIP` 并返回——**跳过不等于通过**，
-CI/验收必须在设置了环境变量的前提下运行。
+CI/验收必须在设置了环境变量的前提下运行。用例根目录可用
+`SPINDUCK_GOLDEN_DIR=<dir>` 覆盖（默认仓库内 `golden/`）。
 
 ### 预期输出
 
