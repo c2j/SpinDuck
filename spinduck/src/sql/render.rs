@@ -39,8 +39,10 @@ pub fn expr_to_sql(e: &IrExpr, rules: &RuleRegistry) -> Option<String> {
                 parts.join(", ")
             ))
         }
-        // 记录字段、游标属性依赖运行期帧状态，SQL 文本无对应物
-        IrExpr::Field { .. } | IrExpr::CursorAttr { .. } => None,
+        // 记录字段、游标属性依赖运行期帧状态，SQL 文本无对应物；
+        // SqlFn（@变换标记）在宏登记场景无内核变换可用 → 拒绝宏化（PL 上下文
+        // 由解释器 SqlFn 下沉路径承担）
+        IrExpr::Field { .. } | IrExpr::CursorAttr { .. } | IrExpr::SqlFn { .. } => None,
     }
 }
 
@@ -62,7 +64,7 @@ fn bin_op_sql(op: BinOp) -> &'static str {
     }
 }
 
-fn const_to_sql(v: &SpinValue) -> Option<String> {
+pub(crate) fn const_to_sql(v: &SpinValue) -> Option<String> {
     match v {
         SpinValue::Null => Some("NULL".to_string()),
         SpinValue::Bool(b) => Some(if *b { "TRUE" } else { "FALSE" }.to_string()),
@@ -92,6 +94,79 @@ fn decimal_literal(unscaled: i128, scale: u8) -> String {
         format!("-{body}")
     } else {
         body
+    }
+}
+
+/// 渲染 IR 表达式为 SQL 文本并收集变量/记录字段绑定（供 [`crate::ir::IrExpr::SqlFn`]
+/// 运行期下沉使用）。与 [`expr_to_sql`] 的差异：变量输出命名占位符而非裸名。
+/// 游标属性等帧态节点返回 `None`。
+pub fn expr_to_sql_binds(e: &IrExpr) -> Option<(String, Vec<(String, crate::ir::BindSrc)>)> {
+    let mut binds = Vec::new();
+    let text = render_binds(e, &mut binds)?;
+    Some((text, binds))
+}
+
+fn render_binds(e: &IrExpr, binds: &mut Vec<(String, crate::ir::BindSrc)>) -> Option<String> {
+    use crate::ir::BindSrc;
+    match e {
+        IrExpr::Const(v) => const_to_sql(v),
+        IrExpr::Var(v) => {
+            let ph = BindSrc::placeholder(&v.0, None);
+            binds.push((ph.clone(), BindSrc::Var(v.clone())));
+            Some(ph)
+        }
+        IrExpr::Field { rec, field } => {
+            let ph = BindSrc::placeholder(&rec.0, Some(field));
+            binds.push((
+                ph.clone(),
+                BindSrc::Field {
+                    rec: rec.clone(),
+                    field: field.to_ascii_lowercase(),
+                },
+            ));
+            Some(ph)
+        }
+        IrExpr::Bin { op, l, r } => {
+            let ls = render_binds(l, binds)?;
+            let rs = render_binds(r, binds)?;
+            // Oracle 语义：`日期 ± 数字 n` = 加/减 n 天。渲染期对"一侧为日期
+            // 表达式、另一侧为纯数值绑定/字面量"的加减，将数字侧包 to_days()
+            // 以满足 DuckDB +(TIMESTAMP, INTERVAL)（语料 step4 日期算术形态）
+            if matches!(op, crate::ir::BinOp::Add | crate::ir::BinOp::Sub) {
+                let dateish = |x: &str| x.contains("strptime(") || x.contains("to_date(");
+                let plain_num = |x: &str| x.starts_with("$v_") || x.parse::<i128>().is_ok();
+                // 绑定占位符经 DECIMAL 推断，to_days 需要 INTEGER → 显式 CAST
+                let as_days = |x: &str| {
+                    if x.starts_with("$v_") {
+                        format!("to_days(CAST({x} AS INTEGER))")
+                    } else {
+                        format!("to_days({x})")
+                    }
+                };
+                if dateish(&ls) && plain_num(&rs) {
+                    return Some(format!("({ls} {} {})", bin_op_sql(*op), as_days(&rs)));
+                }
+                if *op == crate::ir::BinOp::Add && plain_num(&ls) && dateish(&rs) {
+                    return Some(format!("({} + {rs})", as_days(&ls)));
+                }
+            }
+            Some(format!("({ls} {} {rs})", bin_op_sql(*op)))
+        }
+        IrExpr::Not(x) => Some(format!("(NOT {})", render_binds(x, binds)?)),
+        IrExpr::IsNull(x) => Some(format!("({} IS NULL)", render_binds(x, binds)?)),
+        IrExpr::FuncCall { name, args } | IrExpr::SqlFn { name, args } => {
+            let mut parts = Vec::with_capacity(args.len());
+            for a in args {
+                parts.push(render_binds(a, binds)?);
+            }
+            let inner = parts.join(", ");
+            if name.is_empty() {
+                Some(inner) // 仅参数列表形态（e_sqlfn_args 包装）
+            } else {
+                Some(format!("{}({})", name.to_ascii_lowercase(), inner))
+            }
+        }
+        IrExpr::CursorAttr { .. } => None,
     }
 }
 

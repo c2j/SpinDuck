@@ -72,6 +72,13 @@ pub enum IrExpr {
         name: String,
         args: Vec<IrExpr>,
     },
+    /// SQL 内建函数（§8.2 [functions] `@` 变换标记）：整体下沉为单条
+    /// `SELECT name(args)` 交给内核求值，保留中间类型（日期算术不能经
+    /// SpinValue 逐函数委托——TIMESTAMP 会被文本化）
+    SqlFn {
+        name: String,
+        args: Vec<IrExpr>,
+    },
     /// 游标属性：cursor%NOTFOUND 等（§7.3.3）
     CursorAttr {
         cursor: VarName,
@@ -276,6 +283,12 @@ pub fn compile_routine_with(
             PlDeclaration::Variable(v) => {
                 let name = VarName(v.name.to_ascii_lowercase());
                 c.vars.insert(name.0.clone());
+                // `%ROWTYPE`：记录锚定游标 → 单目标 FETCH INTO 按整行记录赋值
+                if let ogsql_parser::ast::plpgsql::PlDataType::PercentRowType(anchor) = &v.data_type
+                {
+                    c.rowtype_of
+                        .insert(name.0.clone(), anchor.to_ascii_lowercase());
+                }
                 let init = match &v.default {
                     Some(e) => c.expr(e)?,
                     None => IrExpr::Const(SpinValue::Null),
@@ -396,6 +409,8 @@ pub(crate) struct Compiler {
     rownum_first_row: bool,
     /// 静态游标声明 → 编译后的 (sql, binds)（compile_block_with 填充，§7.2）
     pending_cursor_sql: BTreeMap<String, (String, Vec<(String, BindSrc)>)>,
+    /// `%ROWTYPE` 变量 → 锚定游标名（§7.3.2：FETCH INTO 整行记录判定）
+    rowtype_of: BTreeMap<String, String>,
     funcs: BTreeMap<String, String>,
     code: Vec<IrStmt>,
     labels: std::collections::HashMap<String, usize>,
@@ -712,8 +727,16 @@ impl Compiler {
                     .iter()
                     .map(|e| self.assign_target(e))
                     .collect::<Result<Vec<_>, _>>()?;
+                // %ROWTYPE 单目标：整行记录（GaussDB `FETCH c INTO rec` 语义）
+                let record = targets.len() == 1
+                    && matches!(&targets[0], AssignTarget::Var(v)
+                        if self
+                            .rowtype_of
+                            .get(&v.0)
+                            .map(|c| *c == cname.0.to_ascii_lowercase())
+                            .unwrap_or(false));
                 self.code.push(IrStmt::Fetch {
-                    record: false,
+                    record,
                     cursor: cname,
                     targets,
                 });
@@ -1161,18 +1184,32 @@ impl Compiler {
                 // 规则改名（如 NVL→coalesce）：只对非 `@` 变换标记生效；`@` 标记的
                 // 解析级变换在内建函数下沉时由 apply_ast_transforms 处理
                 let raw = ident_path(name);
+                let upper = raw.to_ascii_uppercase();
                 let mapped = self
                     .funcs
-                    .get(&raw.to_ascii_uppercase())
+                    .get(&upper)
                     .filter(|v| !v.starts_with('@'))
                     .cloned()
-                    .unwrap_or(raw);
+                    .unwrap_or_else(|| raw.clone());
+                let compiled: Vec<IrExpr> = args
+                    .iter()
+                    .map(|a| self.expr(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if self
+                    .funcs
+                    .get(&upper)
+                    .map(|v| v.starts_with('@'))
+                    .unwrap_or(false)
+                {
+                    // @变换标记（@to_char/@to_date/@intertonum…）：SQL-first 下沉
+                    return Ok(IrExpr::SqlFn {
+                        name: mapped,
+                        args: compiled,
+                    });
+                }
                 Ok(IrExpr::FuncCall {
                     name: mapped,
-                    args: args
-                        .iter()
-                        .map(|a| self.expr(a))
-                        .collect::<Result<Vec<_>, _>>()?,
+                    args: compiled,
                 })
             }
             Expr::Parenthesized(inner) => self.expr(inner),

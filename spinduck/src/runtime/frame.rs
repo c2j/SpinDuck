@@ -200,6 +200,27 @@ pub fn eval(e: &IrExpr, env: &EvalEnv<'_>) -> Result<SpinValue, EngineError> {
         },
         IrExpr::Bin { op, l, r } => eval_bin(*op, &eval(l, env)?, &eval(r, env)?),
         IrExpr::CursorAttr { cursor, kind } => Ok(f.cursor_attr(cursor, *kind)),
+        IrExpr::SqlFn { name, args } => {
+            // §8.2 @变换标记：整体下沉单条 SQL（保留日期等中间类型，不经 SpinValue）
+            let Some((arg_sql, binds_vec)) =
+                crate::sql::render::expr_to_sql_binds(&e_sqlfn_args(args))
+            else {
+                return Err(EngineError::invariant(
+                    64,
+                    "SqlFn argument not renderable (cursor attribute?)",
+                ));
+            };
+            let sql = format!("SELECT {}({})", name.to_ascii_lowercase(), arg_sql);
+            let sql = crate::sql::apply_ast_transforms(&sql)?;
+            let bind_map = crate::runtime::interp::resolve_binds(&binds_vec, env.frame)?;
+            let mut rows = env.ex.query(&sql, &bind_map)?;
+            Ok(rows
+                .fetch_many(1)
+                .into_iter()
+                .next()
+                .and_then(|r| r.into_iter().next())
+                .unwrap_or(SpinValue::Null))
+        }
         IrExpr::FuncCall { name, args } => {
             // §8 分派矩阵：PL 上下文 → 例程目录直调；未命中视为内建/库函数，
             // 下沉为 `SELECT f($p0,…)` 交给内核求值（内建函数语义由 DuckDB 提供，
@@ -253,6 +274,14 @@ pub fn eval(e: &IrExpr, env: &EvalEnv<'_>) -> Result<SpinValue, EngineError> {
 
 #[allow(clippy::too_many_lines)]
 /// PL 上下文的内建/库函数：构造单行 SQL 下发内核，取首行首列。
+/// 复用渲染器的小包装：以 SqlFn 形态渲染参数列表。
+fn e_sqlfn_args(args: &[IrExpr]) -> IrExpr {
+    IrExpr::SqlFn {
+        name: String::new(),
+        args: args.to_vec(),
+    }
+}
+
 fn eval_builtin(env: &EvalEnv, name: &str, args: &[IrExpr]) -> Result<SpinValue, EngineError> {
     let mut binds = crate::exec::BindMap::new();
     let mut ph = Vec::with_capacity(args.len());

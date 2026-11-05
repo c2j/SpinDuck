@@ -444,3 +444,42 @@ fn should_bind_record_field_references_in_sql_text() {
     });
     assert!(has_field_bind, "INSERT 绑定表应含 Field 源");
 }
+
+#[test]
+fn should_fetch_whole_row_into_rowtype_record() {
+    // 语料 prc_trd_deal_purchase：`r c%ROWTYPE` + `FETCH c INTO r` + `r.field` 下发 SQL
+    let (ex, log) = Recorder::with_script(&["fee"], vec![vec![SpinValue::Decimal(1250, 15, 2)]]);
+    let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+    eng.register(
+        "CREATE OR REPLACE PROCEDURE p_rowtype IS \
+         DECLARE r_emp c_emp%ROWTYPE; \
+         CURSOR c_emp IS SELECT 1 AS a, 12.50 AS fee; \
+         BEGIN \
+           OPEN c_emp; \
+           LOOP \
+             FETCH c_emp INTO r_emp; \
+             EXIT WHEN c_emp%NOTFOUND; \
+             INSERT INTO out_t(fee) VALUES (r_emp.fee); \
+           END LOOP; \
+           CLOSE c_emp; \
+         END;",
+    )
+    .unwrap();
+    eng.call("p_rowtype", &[]).unwrap();
+    let calls = log.borrow().clone();
+    let ins = calls
+        .iter()
+        .find(|s| s.to_ascii_lowercase().contains("insert into out_t"))
+        .expect("INSERT 应下发");
+    assert!(ins.contains("$v_r_emp__fee"), "整行记录字段应绑定：{ins}");
+}
+
+#[test]
+fn should_render_lowercase_oracle_format() {
+    // 回归（语料 FNC_GET_PURCHASE_JS_DAYS 用小写 'yyyymmdd'）：
+    // 格式令牌大小写不敏感，否则 strptime 按字面量解析必然失败
+    use spinduck_core::sql::oracle_format_to_strftime;
+    assert_eq!(oracle_format_to_strftime("yyyymmdd"), "%Y%m%d");
+    assert_eq!(oracle_format_to_strftime("YYYYMMDD"), "%Y%m%d");
+    assert_eq!(oracle_format_to_strftime("yyyy-mm-dd"), "%Y-%m-%d");
+}

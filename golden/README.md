@@ -15,7 +15,8 @@ golden/
 │   └── spinduck-entrypoint.sh
 ├── case_split_agg/                ← 用例 1：聚合管线（toy，自建例程）
 ├── case_corpus_stock_kind/        ← 用例 2：语料级（考题基线函数逐字）
-└── case_corpus_min_tax/           ← 用例 3：语料级（考题基线函数逐字）
+├── case_corpus_min_tax/           ← 用例 3：语料级（考题基线函数逐字）
+└── case_corpus_purchase/          ← 用例 4：语料级重量（核心过程 prc_trd_deal_purchase）
 ```
 
 每个用例目录包含：
@@ -63,6 +64,11 @@ SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
 SPINDUCK_OG_PASSWORD='Enmo@123' \
 cargo test --features gauss --test golden_corpus_gauss -- --nocapture
 
+# 语料级重量用例：核心过程 pkg_split_trade_step3_sh.prc_trd_deal_purchase
+SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
+SPINDUCK_OG_PASSWORD='Enmo@123' \
+cargo test --features gauss --test golden_corpus_purchase -- --nocapture
+
 # toy 聚合管线用例（含物化 → CALL → 回写 → 读回全链路）
 SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
 SPINDUCK_OG_PASSWORD='Enmo@123' \
@@ -91,6 +97,21 @@ test golden_corpus_min_tax_matches_a_mode_baseline ... ok
 3. 断言两侧输出逐行一致（数值文本按值归一：GaussDB `NUMBER` 按声明 scale 渲染
    `0.0000`，SpinDuck `0`，值相等不算差异）
 4. 同时断言与 `expected.json` 一致（锁住参照行为，防基线漂移）
+
+## 重量级用例（case_corpus_purchase）的特别约定
+
+- 容器侧**整体重建应用 schema**（`DROP SCHEMA gaussdb CASCADE` + 重建）保证幂等：
+  该容器是本复现包专用实例。
+- `src/` 目录保存被测源码**逐字副本**（核心包 + 依赖函数 + 日志桩包），夹具自包含，
+  不引用 `lib/fastaas` 路径。
+- `sys_dummy` 在 A 模式是系统单行表；被测侧（DuckDB）由测试建 `CREATE TABLE
+  sys_dummy AS SELECT 1` 等价物。
+- `%TYPE` 锚定的视图（`v_par_fund_check_para`）容器侧部署真实视图；被测侧建单列
+  占位视图（类型声明不参与求值）。
+- 测试在 256MiB 栈的线程中运行（重量级语料函数的解析/编译递归超过测试默认 2MiB）。
+- 已知脱敏件缺陷：`par_fund_seat_para.commision_fee_type` 为 varchar(1) 而费型码为
+  2 字符——黄金口径取 `swh_all_kind.kind_id='0'` 确定性路径（purchase_yj 两侧同为
+  NULL）；CASE 路径须先修基线列宽。
 
 ## 期望基线（expected.json）的维护规则
 

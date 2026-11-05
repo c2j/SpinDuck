@@ -20,6 +20,9 @@ version = 1
 DECODE_NESTED = "@case"   # verified@1.5.5：decode 缺失，嵌套形式→CASE 语法变换
 TO_CHAR = "@to_char"   # verified@1.5.5：缺失，解析级 strftime+格式串转换
 NVL     = "coalesce"     # verified@1.5.5：nvl 仍缺失（V6）
+# verified@A模式容器+1.5.5 双侧实测（validation V14，2026-11-05）：step4 语料链路
+TO_DATE = "@to_date"         # → strptime(x, <strftime 掩码>)；已知限制：返回 TIMESTAMP 而非 DATE
+INTERVALTONUM = "@intertonum" # → date_diff('day', b, a)；参数形态限定 `日期A - 日期B`
 DECODE  = "@case"   # verified@1.5.5：缺失，解析级 CASE 变换        # 特殊：DECODE(a,b,x,c,y,z) → CASE a WHEN b THEN x WHEN c THEN y ELSE z END（语法变换，非重命名）
 SYSDATE = "CURRENT_TIMESTAMP"  # 探针@1.5.5：now() 需括号，CURRENT_TIMESTAMP 免括号可直接 token 重命名
 SUBSTR  = "SUBSTRING"

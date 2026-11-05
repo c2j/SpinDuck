@@ -360,3 +360,39 @@ SpinDuck 全部 GaussDB 通道（gauss_e2e / golden / golden_corpus）切换至�
 
 **最终门禁（本轮）**：142 测试全绿（114 lib + 15 编译契约 + 9 表达式 + 2 gauss E2E
 + 2 golden fixture + 2 golden corpus，clippy 0 警告）；语料编译 136/136 维持。
+
+## V14. 语料级重量用例：核心过程 prc_trd_deal_purchase（A 模式容器逐行比对）
+
+**用例**：`golden/case_corpus_purchase/`——考题调用链第 4 步
+`pkg_split_trade_step3_sh.prc_trd_deal_purchase`（1090 行核心包中 315 行过程），
+源码逐字副本入夹具（核心包 + 依赖函数 `FNC_GET_PURCHASE_JS_DAYS` /
+`fnc_com_getday` / `fnc_com_if_deal_date` + 日志桩包）。
+
+**结果：两侧 `dat_trd_repurchase` 逐行逐字段一致**（20 列），`p_o_succeed='0'`：
+
+```
+F001|0130000001|A0001|X001|20250715100001|2.000|0.000|10000.000|100|20250715|B|20251013|10500.000|10560.000|5.560|6.220|90|90|0501|S0001
+F002|0130000002|A0002|X002|20250715100002|4.000|0.000|20000.000|200|20250715|B|20260111|21000.000|21120.000|5.560|6.220|180|180|0501|S0002
+```
+
+覆盖点：`%ROWTYPE` 整行 FETCH、记录字段直接下发 SQL、`<<error_row>>`/GOTO、
+嵌套 `EXCEPTION OTHERS`、过程内 COMMIT（延迟事务）、`to_char(to_date(…)+n)`
+日期算术、`INTERVALTONUM`、PL 内建 `substr`、依赖函数链、异常路径（第三行
+A999 股东未维护 → inst_log 桩 → 跳过，两侧一致）。
+
+**本用例（及为其铺路）抓出并修复的引擎缺口**（每项均有守护测试）：
+
+| # | 缺口 | 修复 |
+|---|---|---|
+| 1 | 记录字段 `r.fee` 在 SQL 文本中残留 → 内核绑定错误 | `BindSrc::Field` + 前瞻三元组识别 + `$v_<rec>__<field>` 绑定 |
+| 2 | FOR 循环记录变量未进变量集（`r.fee` 不被替换） | `collect_stmt` 补 `For` 分支 |
+| 3 | `%ROWTYPE` + `FETCH c INTO rec` 走标量路径（"not a record"） | 声明期记录 `%ROWTYPE` 锚定游标，FETCH 单目标按整行记录赋值 |
+| 4 | `to_char(to_date(d)+n,fmt)` 逐函数委托经 SpinValue 丢失 TIMESTAMP | `IrExpr::SqlFn`：`@` 标记函数整体下沉单条 SQL |
+| 5 | `+(TIMESTAMP, INTEGER)` 内核无候选 | 渲染期 `日期 ± 数字` → `to_days(CAST(n AS INTEGER))`（Oracle 语义） |
+| 6 | `INTERVALTONUM` 缺失 / 参数含外层括号 | 新增 `@intertonum` 变换（剥包裹括号 + 顶层 `-` 拆分 → `date_diff`） |
+| 7 | `TO_DATE` 独立缺失 | 新增 `@to_date` → `strptime` |
+| 8 | Oracle 格式令牌大小写混用（`'yyyymmdd'`）未转换 | `oracle_format_to_strftime` 大小写不敏感 |
+| 9 | 重量级函数在测试默认 2MiB 栈上栈溢出 | 测试侧 256MiB 栈线程（引擎 MAX_DEPTH 守护与解析器递归是独立维度） |
+
+另：`par_fund_seat_para.commision_fee_type` 为 varchar(1) 而费型码为 2 字符，属考题
+脱敏件列宽缺陷，黄金口径取 `kind_id='0'` 确定性路径并在夹具注释与 golden/README 记录。

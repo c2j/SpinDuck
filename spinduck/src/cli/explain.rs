@@ -129,6 +129,11 @@ fn expr_text(e: &IrExpr) -> String {
             args.iter().map(expr_text).collect::<Vec<_>>().join(", ")
         ),
         IrExpr::CursorAttr { cursor, kind } => format!("{}%{:?}", cursor.0, kind),
+        IrExpr::SqlFn { name, args } => format!(
+            "{}({}) [sql]",
+            name,
+            args.iter().map(expr_text).collect::<Vec<_>>().join(", ")
+        ),
     }
 }
 

@@ -395,7 +395,8 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
 
 /// Oracle 日期格式串 → strftime 格式串（已知 token 最长匹配，其余原样保留）。
 pub fn oracle_format_to_strftime(fmt: &str) -> String {
-    let mut out = fmt.to_string();
+    // Oracle 格式令牌大小写不敏感（语料混用 'YYYYMMDD'/'yyyymmdd'）
+    let mut out = fmt.to_ascii_uppercase();
     for (o, p) in [
         ("YYYYMMDDHH24MISS", "%Y%m%d%H%M%S"),
         ("YYYY-MM-DD", "%Y-%m-%d"),
@@ -417,7 +418,7 @@ pub fn oracle_format_to_strftime(fmt: &str) -> String {
 /// TO_NUMBER(x) → CAST(x AS DECIMAL(38,6))
 /// TO_CHAR(x,'fmt') → strftime(<x|strptime(d,fmt_in)>, fmt_out)
 pub fn apply_ast_transforms(text: &str) -> Result<String, EngineError> {
-    let names = ["DECODE", "TO_NUMBER", "TO_CHAR"];
+    let names = ["DECODE", "TO_NUMBER", "TO_CHAR", "TO_DATE", "INTERVALTONUM"];
     let mut t = text.to_string();
     loop {
         let calls = find_innermost_calls(&t, &names);
@@ -450,6 +451,44 @@ pub fn apply_ast_transforms(text: &str) -> Result<String, EngineError> {
                     return Err(EngineError::business(131, "TO_NUMBER requires 1 argument"));
                 }
                 format!("CAST({} AS DECIMAL(38,6))", args[0])
+            }
+            "TO_DATE" => {
+                // [functions] TO_DATE=@to_date：A 模式内建，DuckDB 缺失（V6）
+                if args.len() != 2 {
+                    return Err(EngineError::business(134, "TO_DATE requires 2 arguments"));
+                }
+                format!(
+                    "strptime({}, '{}')",
+                    args[0],
+                    oracle_format_to_strftime(&unquote(&args[1]))
+                )
+            }
+            "INTERVALTONUM" => {
+                // [functions] INTERVALTONUM=@intertonum：A 模式日期差（天）。
+                // 参数形态为 `日期A - 日期B`（语料 FNC_GET_PURCHASE_JS_DAYS）；
+                // DuckDB 侧 date - date 原生得天数，这里显式 date_diff 保证可执行
+                if args.len() != 1 {
+                    return Err(EngineError::business(
+                        135,
+                        "INTERVALTONUM requires 1 argument",
+                    ));
+                }
+                // Bin 渲染会包一层括号：剥掉整体包裹括号后按顶层 `-` 拆分
+                let mut expr = args[0].trim().to_string();
+                if expr.starts_with('(') && expr.ends_with(')') {
+                    let inner = expr[1..expr.len() - 1].trim();
+                    if split_top_level_minus(inner).len() == 2 {
+                        expr = inner.to_string();
+                    }
+                }
+                let parts = split_top_level_minus(&expr);
+                if parts.len() != 2 {
+                    return Err(EngineError::business(
+                        135,
+                        "INTERVALTONUM expects `<date_a> - <date_b>`",
+                    ));
+                }
+                format!("date_diff('day', {}, {})", parts[1], parts[0])
             }
             "TO_CHAR" => {
                 // 1 参形式（无数值/日期掩码）：GaussDB 按默认格式转字符串，
@@ -495,6 +534,41 @@ pub fn apply_ast_transforms(text: &str) -> Result<String, EngineError> {
         t = format!("{}{}{}", &t[..start], replaced, &t[end..]);
     }
     Ok(t)
+}
+
+/// 按顶层 `-`（非括号内/非字符串字面量内）拆分为两段；不是恰好一段时返回空。
+fn split_top_level_minus(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_quote = false;
+    let mut cur = String::new();
+    for ch in text.chars() {
+        match ch {
+            '\'' => {
+                in_quote = !in_quote;
+                cur.push(ch);
+            }
+            '(' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            '-' if depth == 0 && !in_quote => {
+                parts.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    parts.push(cur.trim().to_string());
+    if parts.len() == 2 {
+        parts
+    } else {
+        Vec::new()
+    }
 }
 
 fn unquote(literal: &str) -> String {
@@ -561,6 +635,42 @@ mod transform_tests {
     fn should_transform_to_char_with_oracle_format() {
         let r = apply_ast_transforms("SELECT to_char(now(), 'YYYYMMDD') FROM t").unwrap();
         assert!(r.contains("strftime(now(), '%Y%m%d')"), "{r}");
+    }
+
+    #[test]
+    fn should_transform_intertonum_with_wrapped_paren_expr() {
+        // Bin 渲染带外层括号：intertonum((strptime(..) - strptime(..))) 也要可拆
+        let r = apply_ast_transforms(
+            "SELECT intervaltonum((strptime('20240110', '%Y%m%d') - strptime('20240101', '%Y%m%d'))) FROM sys_dummy",
+        )
+        .unwrap();
+        assert!(
+            r.contains(
+                "date_diff('day', strptime('20240101', '%Y%m%d'), strptime('20240110', '%Y%m%d'))"
+            ),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn should_transform_to_date_to_strptime() {
+        let r = apply_ast_transforms("SELECT to_date(d, 'YYYYMMDD') FROM t").unwrap();
+        assert_eq!(r, "SELECT strptime(d, '%Y%m%d') FROM t");
+    }
+
+    #[test]
+    fn should_transform_intertonum_to_date_diff() {
+        // 语料 FNC_GET_PURCHASE_JS_DAYS：A - B → date_diff('day', B, A)
+        let r = apply_ast_transforms(
+            "SELECT intervaltonum(to_date('20240110', 'YYYYMMDD') - to_date('20240101', 'YYYYMMDD')) FROM sys_dummy",
+        )
+        .unwrap();
+        // 内层 to_date 先行变换，intertonum 收到的操作数已是 strptime 形态
+        assert_eq!(
+            r,
+            "SELECT date_diff('day', strptime('20240101', '%Y%m%d'), strptime('20240110', '%Y%m%d')) FROM sys_dummy",
+            "{r}"
+        );
     }
 
     #[test]

@@ -7,7 +7,8 @@ pub mod exec_native;
 
 pub use render::expr_to_sql;
 pub use rewrite::{
-    apply_ast_transforms, rewrite_tokens, rewrite_tokens_with_rules, SqlUnit, VarScope,
+    apply_ast_transforms, oracle_format_to_strftime, rewrite_tokens, rewrite_tokens_with_rules,
+    SqlUnit, VarScope,
 };
 
 #[cfg(feature = "native")]

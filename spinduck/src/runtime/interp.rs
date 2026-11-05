@@ -407,7 +407,7 @@ fn assign(frame: &mut Frame, target: &AssignTarget, v: SpinValue) -> Result<(), 
 
 /// 按名绑定表解析：占位符名 → 帧内变量当前值（未定义变量 = ENG 域断言失败，
 /// 因为编译期预扫描已保证集合一致）。
-fn resolve_binds(
+pub(crate) fn resolve_binds(
     binds: &[(String, crate::ir::BindSrc)],
     frame: &Frame,
 ) -> Result<BindMap, EngineError> {
@@ -1037,6 +1037,38 @@ mod kernel_tests {
         let _ = TraceNoopSink;
         let _ = Frame::new();
         let _ = VarName("x".into());
+    }
+
+    /// 端到端探针：@标记函数整体下沉（SqlFn）——嵌套日期算术的中间类型
+    /// （TIMESTAMP）保留在 SQL 侧，不经 SpinValue 文本化（语料 step4 形态）。
+    #[test]
+    fn should_evaluate_nested_date_functions_via_sqlfn_on_real_kernel() {
+        use crate::engine::Engine;
+        use crate::rules::RuleRegistry;
+        use crate::value::SpinValue;
+
+        let rules = RuleRegistry::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/rewrite-rules.toml"),
+        )
+        .expect("加载种子规则");
+        let mut eng = Engine::new(
+            Box::new(crate::sql::DuckExecutor::open_in_memory().unwrap()),
+            rules,
+        );
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_datefn(p_o OUT VARCHAR2) IS \
+             DECLARE v_days NUMBER(3) := 90; \
+             BEGIN \
+               p_o := to_char(to_date('20250715', 'YYYYMMDD') + v_days, 'YYYYMMDD'); \
+             END;",
+        )
+        .unwrap();
+        let r = eng.call("prc_datefn", &[SpinValue::Null]).unwrap();
+        assert_eq!(
+            r.outs.get("p_o"),
+            Some(&SpinValue::Str("20251013".into())),
+            "20250715 + 90 天 = 20251013"
+        );
     }
 
     /// 端到端探针：`rownum = 1` 首行谓词改写为 LIMIT 1（语料 42 处，§9 规则）。
