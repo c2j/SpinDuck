@@ -1,10 +1,10 @@
 //! 引擎对外入口（§12 P5）：register（注册例程）+ call（调用）。
 //! 错误契约：Business 按错误码分支；未捕获异常携带 cid 由应用上报。
 
-use crate::catalog::{compile_statement_routine, CallResult, RoutineCatalog};
+use crate::catalog::{compile_statement_routine_with_names, CallResult, RoutineCatalog};
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
-use crate::ir::{compile_routine_with, AssignTarget, IrProg, VarName};
+use crate::ir::{compile_routine_with_names, AssignTarget, IrProg, VarName};
 use crate::rules::RuleRegistry;
 use crate::runtime::{Frame, RunOutcome};
 use crate::value::SpinValue;
@@ -16,6 +16,8 @@ pub struct Engine {
     pub ex: Box<dyn SqlExecutor>,
     pub rules: RuleRegistry,
     pub catalog: RoutineCatalog,
+    /// 已装为 DuckDB 宏的表达式函数（这些名字不再参与 SQL 上下文下沉）
+    macro_names: std::collections::BTreeSet<String>,
 }
 
 pub struct CallResultExt {
@@ -28,6 +30,7 @@ impl Engine {
             ex,
             rules,
             catalog: RoutineCatalog::new(),
+            macro_names: std::collections::BTreeSet::new(),
         }
     }
 
@@ -52,19 +55,19 @@ impl Engine {
     fn install_sql_macro(
         &mut self,
         r: &crate::catalog::CompiledRoutine,
-    ) -> Result<(), EngineError> {
+    ) -> Result<bool, EngineError> {
         use crate::catalog::{ParamMode, RoutineKind};
         if r.kind != RoutineKind::Function
             || r.name.contains('.')
             || r.params.iter().any(|p| p.mode != ParamMode::In)
         {
-            return Ok(());
+            return Ok(false);
         }
         let Some(expr) = r.prog.single_return_expr() else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(body) = crate::sql::expr_to_sql(expr, &self.rules) else {
-            return Ok(());
+            return Ok(false);
         };
         let params = r
             .params
@@ -79,17 +82,29 @@ impl Engine {
             body
         );
         self.ex.execute(&ddl, &crate::exec::BindMap::new())?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// SQL 上下文下沉可用的例程名：已注册且**未**宏化。
+    fn downshift_names(&self) -> std::collections::BTreeSet<String> {
+        self.catalog
+            .routine_names()
+            .difference(&self.macro_names)
+            .cloned()
+            .collect()
     }
 
     /// 单条 AST 语句的注册（含 PACKAGE BODY 展开）。
     pub fn register_statement(&mut self, st: &Statement) -> Result<usize, EngineError> {
         match st {
             Statement::CreateProcedure(_) | Statement::CreateFunction(_) => {
-                let routines = compile_statement_routine(st, &self.rules)?;
+                let routines =
+                    compile_statement_routine_with_names(st, &self.rules, &self.downshift_names())?;
                 let n = routines.len();
                 for r in routines {
-                    self.install_sql_macro(&r)?;
+                    if self.install_sql_macro(&r)? {
+                        self.macro_names.insert(r.name.to_ascii_lowercase());
+                    }
                     self.catalog.register(r);
                 }
                 Ok(n)
@@ -118,7 +133,12 @@ impl Engine {
                                     .iter()
                                     .map(|pp| pp.name.to_ascii_lowercase())
                                     .collect();
-                                compile_routine_with(b, &extra, &self.rules)?
+                                compile_routine_with_names(
+                                    b,
+                                    &extra,
+                                    &self.rules,
+                                    &self.catalog.routine_names(),
+                                )?
                             }
                             None => IrProg::default(),
                         };
@@ -151,7 +171,12 @@ impl Engine {
                                     .iter()
                                     .map(|pp| pp.name.to_ascii_lowercase())
                                     .collect();
-                                compile_routine_with(b, &extra, &self.rules)?
+                                compile_routine_with_names(
+                                    b,
+                                    &extra,
+                                    &self.rules,
+                                    &self.catalog.routine_names(),
+                                )?
                             }
                             None => IrProg::default(),
                         };

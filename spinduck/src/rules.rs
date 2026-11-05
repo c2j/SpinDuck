@@ -16,6 +16,9 @@ pub struct RuleRegistry {
     /// `[patterns] rownum_first_row`：`rownum = 1` 首行谓词 → `LIMIT 1` 改写开关。
     /// DuckDB 无 rownum，不改写则语句必然内核报错，故默认 true（可经规则文件关闭）。
     pub patterns_rownum_first_row: bool,
+    /// `[patterns] update_strip_alias`：`UPDATE t SET t.c = …` → 去别名限定
+    /// （DuckDB 不支持 UPDATE .. SET 的限定列名）
+    pub patterns_update_strip_alias: bool,
     /// 内核版本（探针锚定）
     pub target_duckdb: String,
     pub probe_duckdb: String,
@@ -30,6 +33,7 @@ impl Default for RuleRegistry {
             functions: BTreeMap::new(),
             implicit_concat_numeric_to_varchar: false,
             patterns_rownum_first_row: true,
+            patterns_update_strip_alias: true,
             target_duckdb: String::new(),
             probe_duckdb: String::new(),
         }

@@ -10,7 +10,7 @@ use crate::error::EngineError;
 use crate::rules::RuleRegistry;
 use crate::runtime::cursor::CursorAttrKind;
 use crate::value::SpinValue;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// SQL 绑定源：帧变量 / 记录字段（§3.2 消歧——记录变量限定字段可出现在
 /// 下发 SQL 文本，如 `INSERT ... VALUES (r_get_purchase.fee, ...)`）。
@@ -134,11 +134,15 @@ pub enum IrStmt {
         sql: String,
         binds: Vec<(String, BindSrc)>,
         into: Vec<AssignTarget>,
+        /// SQL 上下文例程调用下沉计划（§8.3；空 = 无）
+        fn_sites: Vec<crate::sql::FnSite>,
     },
     /// DML/DDL（Truncate/Insert/Update/Delete/...）
     SqlExec {
         sql: String,
         binds: Vec<(String, BindSrc)>,
+        /// SQL 上下文例程调用下沉计划（§8.3；空 = 无）
+        fn_sites: Vec<crate::sql::FnSite>,
     },
     /// PERFORM <expr>：求值并丢弃
     Perform {
@@ -188,10 +192,15 @@ pub enum CursorSource {
     Static {
         sql: String,
         binds: Vec<(String, BindSrc)>,
+        /// SQL 上下文例程调用下沉计划（§8.3；空 = 无）
+        fn_sites: Vec<crate::sql::FnSite>,
     },
     /// 动态 OPEN FOR <变量>（运行期求值文本，M8 前不做人内变量替换）
     Dynamic { query_expr: IrExpr },
 }
+
+/// 静态游标声明编译产物：(SQL 文本, 绑定表, SQL 上下文调用下沉计划)。
+type CompiledCursorSql = (String, Vec<(String, BindSrc)>, Vec<crate::sql::FnSite>);
 
 /// 编译产物：线性指令序列。
 #[derive(Debug, Clone, Default)]
@@ -255,6 +264,16 @@ pub fn compile_routine_with(
     extra_vars: &[String],
     rules: &RuleRegistry,
 ) -> Result<IrProg, EngineError> {
+    compile_routine_with_names(block, extra_vars, rules, &BTreeSet::new())
+}
+
+/// 例程块编译（带已注册例程名集）：SQL 上下文例程调用下沉判定依赖它。
+pub fn compile_routine_with_names(
+    block: &PlBlock,
+    extra_vars: &[String],
+    rules: &RuleRegistry,
+    routine_names: &BTreeSet<String>,
+) -> Result<IrProg, EngineError> {
     let mut vars = collect_var_names(&block.body);
     for v in extra_vars {
         vars.insert(v.to_ascii_lowercase());
@@ -263,6 +282,8 @@ pub fn compile_routine_with(
         vars,
         funcs: rules.functions.clone(),
         rownum_first_row: rules.patterns_rownum_first_row,
+        routine_names: routine_names.clone(),
+        update_strip_alias: rules.patterns_update_strip_alias,
         ..Default::default()
     };
     use ogsql_parser::ast::plpgsql::PlDeclaration;
@@ -276,9 +297,15 @@ pub fn compile_routine_with(
                     Some(q) => ogsql_parser::formatter::SqlFormatter::new().format_statement(q),
                     None => cd.query.clone(),
                 };
-                let unit = crate::sql::rewrite_tokens_with_rules(&query_text, &c.vars, &c.funcs)?;
-                let text = crate::sql::apply_ast_transforms(&unit.text)?;
-                c.pending_cursor_sql.insert(name, (text, unit.binds));
+                let unit = rewrite_sql(
+                    &query_text,
+                    &c.vars,
+                    &c.funcs,
+                    &c.routine_names,
+                    c.update_strip_alias,
+                )?;
+                c.pending_cursor_sql
+                    .insert(name, (unit.text, unit.binds, unit.fn_sites));
             }
             PlDeclaration::Variable(v) => {
                 let name = VarName(v.name.to_ascii_lowercase());
@@ -393,12 +420,33 @@ fn rewrite_sql(
     sql_text: &str,
     vars: &crate::sql::VarScope,
     funcs: &BTreeMap<String, String>,
+    routine_names: &BTreeSet<String>,
+    update_strip_alias: bool,
 ) -> Result<crate::sql::SqlUnit, EngineError> {
-    let unit = crate::sql::rewrite_tokens_with_rules(sql_text, vars, funcs)?;
+    // UPDATE 目标别名去限定（DuckDB 不支持 UPDATE .. SET 限定列名）
+    let stripped;
+    let sql_text = if update_strip_alias {
+        stripped = crate::sql::strip_update_alias(sql_text);
+        stripped.as_str()
+    } else {
+        sql_text
+    };
+    // SQL 上下文例程调用下沉：先规划调用点（原始名文本），再统一改写。
+    let (marked, fn_sites) = crate::sql::plan_sites(sql_text, vars, funcs, routine_names)?;
+    let unit = crate::sql::rewrite_tokens_with_rules(&marked, vars, funcs)?;
     let text = crate::sql::apply_ast_transforms(&unit.text)?;
+    let mut binds = unit.binds;
+    for s in &fn_sites {
+        for (ph, b) in &s.binds {
+            if !binds.iter().any(|(p, _)| p == ph) {
+                binds.push((ph.clone(), b.clone()));
+            }
+        }
+    }
     Ok(crate::sql::SqlUnit {
         text,
-        binds: unit.binds,
+        binds,
+        fn_sites,
     })
 }
 
@@ -408,9 +456,13 @@ pub(crate) struct Compiler {
     /// `[patterns] rownum_first_row`（§9）：`rownum = 1` → `LIMIT 1` 改写开关
     rownum_first_row: bool,
     /// 静态游标声明 → 编译后的 (sql, binds)（compile_block_with 填充，§7.2）
-    pending_cursor_sql: BTreeMap<String, (String, Vec<(String, BindSrc)>)>,
+    pending_cursor_sql: BTreeMap<String, CompiledCursorSql>,
     /// `%ROWTYPE` 变量 → 锚定游标名（§7.3.2：FETCH INTO 整行记录判定）
     rowtype_of: BTreeMap<String, String>,
+    /// 已注册例程名（SQL 上下文调用下沉判定；空集 = 不下沉）
+    routine_names: BTreeSet<String>,
+    /// `[patterns] update_strip_alias`
+    update_strip_alias: bool,
     funcs: BTreeMap<String, String>,
     code: Vec<IrStmt>,
     labels: std::collections::HashMap<String, usize>,
@@ -666,9 +718,10 @@ impl Compiler {
                     ogsql_parser::ast::plpgsql::PlOpenKind::Simple { .. } => {
                         // 静态游标：声明段 parsed_query 已在 compile_block_with 编译
                         match self.pending_cursor_sql.get(&cname.0.to_ascii_lowercase()) {
-                            Some((sql, binds)) => CursorSource::Static {
+                            Some((sql, binds, sites)) => CursorSource::Static {
                                 sql: sql.clone(),
                                 binds: binds.clone(),
+                                fn_sites: sites.clone(),
                             },
                             None => {
                                 return Err(EngineError::invariant(
@@ -825,13 +878,20 @@ impl Compiler {
                             }
                             None => query.clone(),
                         };
-                        let unit = rewrite_sql(&text, &self.vars, &self.funcs)?;
+                        let unit = rewrite_sql(
+                            &text,
+                            &self.vars,
+                            &self.funcs,
+                            &self.routine_names,
+                            self.update_strip_alias,
+                        )?;
                         let cname = self.synth_label("for_cur");
                         self.code.push(IrStmt::OpenCursor {
                             cursor: VarName(cname.clone()),
                             source: CursorSource::Static {
                                 sql: unit.text,
                                 binds: unit.binds,
+                                fn_sites: unit.fn_sites,
                             },
                         });
                         self.for_cursor_loop(&VarName(cname.clone()), &var, &f.body, &start, &end)?;
@@ -859,7 +919,7 @@ impl Compiler {
                             }
                         };
                         // 复用声明段已编译的静态 SQL（游标声明 = 唯一真源）
-                        let (sql, binds) = self
+                        let (sql, binds, sites) = self
                             .pending_cursor_sql
                             .get(&name.to_ascii_lowercase())
                             .cloned()
@@ -872,7 +932,11 @@ impl Compiler {
                         let cname = VarName(name.clone());
                         self.code.push(IrStmt::OpenCursor {
                             cursor: cname.clone(),
-                            source: CursorSource::Static { sql, binds },
+                            source: CursorSource::Static {
+                                sql,
+                                binds,
+                                fn_sites: sites,
+                            },
                         });
                         self.for_cursor_loop(&cname, &var, &f.body, &start, &end)?;
                         self.code.push(IrStmt::CloseCursor { cursor: cname });
@@ -910,6 +974,7 @@ impl Compiler {
                 self.code.push(IrStmt::SqlExec {
                     sql: unit.text,
                     binds: unit.binds,
+                    fn_sites: Vec::new(),
                 });
             }
             PlStatement::Raise(ra) => {
@@ -984,11 +1049,18 @@ impl Compiler {
                     for t in &sp.into_targets {
                         into.push(self.assign_target(t)?);
                     }
-                    let unit = rewrite_sql(&text, &self.vars, &self.funcs)?;
+                    let unit = rewrite_sql(
+                        &text,
+                        &self.vars,
+                        &self.funcs,
+                        &self.routine_names,
+                        self.update_strip_alias,
+                    )?;
                     self.code.push(IrStmt::SqlQuery {
                         sql: unit.text,
                         binds: unit.binds,
                         into,
+                        fn_sites: unit.fn_sites,
                     });
                 }
             }
@@ -1036,7 +1108,13 @@ impl Compiler {
                         cleaned, None,
                     )),
                 );
-                let unit = rewrite_sql(&formatted, &self.vars, &self.funcs)?;
+                let unit = rewrite_sql(
+                    &formatted,
+                    &self.vars,
+                    &self.funcs,
+                    &self.routine_names,
+                    self.update_strip_alias,
+                )?;
                 let into = match into_targets {
                     None => Vec::new(),
                     Some(targets) => {
@@ -1057,13 +1135,28 @@ impl Compiler {
                         out
                     }
                 };
-                let (sql, binds) = (unit.text, unit.binds);
-                self.code.push(IrStmt::SqlQuery { sql, binds, into });
+                let (sql, binds, fn_sites) = (unit.text, unit.binds, unit.fn_sites);
+                self.code.push(IrStmt::SqlQuery {
+                    sql,
+                    binds,
+                    into,
+                    fn_sites,
+                });
             }
             S::Insert(_) | S::Update(_) | S::Delete(_) | S::Truncate(_) => {
-                let unit = rewrite_sql(sql_text, &self.vars, &self.funcs)?;
-                let (sql, binds) = (unit.text, unit.binds);
-                self.code.push(IrStmt::SqlExec { sql, binds });
+                let unit = rewrite_sql(
+                    sql_text,
+                    &self.vars,
+                    &self.funcs,
+                    &self.routine_names,
+                    self.update_strip_alias,
+                )?;
+                let (sql, binds, fn_sites) = (unit.text, unit.binds, unit.fn_sites);
+                self.code.push(IrStmt::SqlExec {
+                    sql,
+                    binds,
+                    fn_sites,
+                });
             }
             other => {
                 return Err(EngineError::invariant(
@@ -1125,7 +1218,17 @@ impl Compiler {
     fn expr(&mut self, e: &Expr) -> Result<IrExpr, EngineError> {
         match e {
             Expr::Literal(l) => Ok(IrExpr::Const(lit(l))),
-            Expr::PlVariable(name) => Ok(IrExpr::Var(VarName(ident_path(name)))),
+            Expr::PlVariable(name) => {
+                let path = ident_path(name);
+                let up = path.to_ascii_uppercase();
+                if up == "SQLERRM" || up == "SQLCODE" {
+                    return Ok(IrExpr::Var(VarName(format!(
+                        "__{}",
+                        up.to_ascii_lowercase()
+                    ))));
+                }
+                Ok(IrExpr::Var(VarName(path)))
+            }
             Expr::ColumnRef(name) => {
                 if name.len() == 2 {
                     Ok(IrExpr::Field {
@@ -1133,8 +1236,16 @@ impl Compiler {
                         field: ident1(name),
                     })
                 } else {
+                    let path = ident_path(name);
+                    let up = path.to_ascii_uppercase();
+                    if up == "SQLERRM" || up == "SQLCODE" {
+                        return Ok(IrExpr::Var(VarName(format!(
+                            "__{}",
+                            up.to_ascii_lowercase()
+                        ))));
+                    }
                     // 单段标识符在 PL 表达式中仍按变量解释（§3.2 消歧同源）
-                    Ok(IrExpr::Var(VarName(ident_path(name))))
+                    Ok(IrExpr::Var(VarName(path)))
                 }
             }
             Expr::BinaryOp { left, op, right } => Ok(IrExpr::Bin {

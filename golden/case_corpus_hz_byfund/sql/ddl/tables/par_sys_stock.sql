@@ -1,0 +1,23 @@
+CREATE TABLE par_sys_stock (
+    security_id character varying(19) NOT NULL,
+    stock_kind character varying(4),
+    total_capital_stock numeric(16,0),
+    current_capital_stock numeric(16,0),
+    total_capital numeric(18,2),
+    current_capital numeric(18,2),
+    trade_code character varying(12),
+    coin_code character varying(3),
+    operator character varying(10),
+    check_user character varying(10),
+    inure_begin_date character varying(8) DEFAULT '19000101'::character varying NOT NULL,
+    inure_end_date character varying(8) DEFAULT '99991231'::character varying,
+    par_value numeric(15,8) DEFAULT 1 NOT NULL,
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20),
+    fdqdate character varying(8),
+    stock_kind_sub character varying(4),
+    gics_trade_code character varying(12),
+    tmtype character varying(1),
+    if_capital character varying(1) DEFAULT '0'::character varying NOT NULL
+);

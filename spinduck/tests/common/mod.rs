@@ -49,6 +49,10 @@ pub fn norm(v: Option<String>) -> String {
         return "NULL".to_string();
     };
     let t = s.trim().trim_start_matches('+');
+    // A 模式（Oracle 语义）：空字符串即 NULL，两侧归一同口径
+    if t.is_empty() {
+        return "NULL".to_string();
+    }
     let t = if let Some(rest) = t.strip_prefix('.') {
         format!("0.{rest}")
     } else if let Some(rest) = t.strip_prefix("-.") {
@@ -163,6 +167,28 @@ fn run_case_inner(name: &str) {
     materialize_inputs(&mut og, &mut eng, &case).unwrap_or_else(|e| err("物化输入表", e));
     let spin = run_spin(&mut eng, &case);
 
+    // ── 输出表行数一致性（防"输出表未物化"导致的漏比）──
+    for t in &case.outputs {
+        let base_n = og
+            .fetch_rows(&format!("SELECT count(*) FROM {t}"))
+            .map(|(_, r)| r[0][0].clone().unwrap_or_default())
+            .unwrap_or_else(|e| err(&format!("参照侧 {t} 计数"), e.message));
+        let mut rs = eng
+            .ex
+            .query(&format!("SELECT count(*) FROM {t}"), &BindMap::new())
+            .unwrap_or_else(|e| err(&format!("被测侧 {t} 计数"), e.message));
+        let got = rs
+            .fetch_many(1)
+            .first()
+            .and_then(|r| r.first().map(|v| v.as_str_loose()))
+            .unwrap_or_default();
+        assert_eq!(
+            norm(Some(got)),
+            norm(Some(base_n)),
+            "[{name}] 输出表 {t} 行数不一致"
+        );
+    }
+
     // ── 三方比对：参照 = 被测 = 基线 ──
     let baseline = load_baseline(&project, &case);
     for (i, sc) in case.scenarios.iter().enumerate() {
@@ -172,8 +198,11 @@ fn run_case_inner(name: &str) {
             sc.why.clone()
         };
         assert_eq!(
-            spin[i], native[i],
-            "[{name}] {why}: SpinDuck 与 A 模式基线不一致"
+            spin[i],
+            native[i],
+            "[{name}] {why}: SpinDuck 与 A 模式基线不一致\n  SpinDuck: {}\n  参照侧  : {}",
+            spin[i].describe(),
+            native[i].describe()
         );
         assert_eq!(
             spin[i], baseline[i],
@@ -263,9 +292,13 @@ fn build_engine(project: &ProjectConfig) -> Result<Engine, spinduck_core::error:
     let dex = DuckExecutor::open_in_memory()?;
     // 表 DDL（不含视图：视图含内核专属函数，且仅 %TYPE 锚定用途）
     dex.execute("CREATE SCHEMA IF NOT EXISTS gaussdb", &BindMap::new())?;
+    let ddl_funcs = RuleRegistry::load(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/rewrite-rules.toml"),
+    )?
+    .functions;
     for f in project.ddl_files()? {
         let ddl = std::fs::read_to_string(&f).unwrap_or_default();
-        dex.execute(&ddl, &BindMap::new()).map_err(|e| {
+        execute_table_ddl(&dex, &ddl, &ddl_funcs).map_err(|e| {
             spinduck_core::error::EngineError::kernel(
                 70,
                 format!("建表 {}: {}", f.display(), e.message),
@@ -303,16 +336,71 @@ fn build_engine(project: &ProjectConfig) -> Result<Engine, spinduck_core::error:
     Ok(eng)
 }
 
+/// 表 DDL 落 DuckDB：先剔除"非字面量 DEFAULT"（如 A 模式 `to_char(sysdate(), …)`，
+/// DuckDB 无对应函数；本侧数据由物化提供，缺省值仅影响被测侧自有 INSERT），
+/// 再走改写管线（nvl/to_char 等在其它位置仍可翻译）。
+fn execute_table_ddl(
+    dex: &DuckExecutor,
+    ddl: &str,
+    funcs: &std::collections::BTreeMap<String, String>,
+) -> Result<(), spinduck_core::error::EngineError> {
+    let mut pre = String::with_capacity(ddl.len());
+    for line in ddl.lines() {
+        let up = line.to_ascii_uppercase();
+        if up.contains("DEFAULT") && line.contains('(') {
+            if let Some(pos) = up.find(" DEFAULT") {
+                pre.push_str(line[..pos].trim_end());
+                pre.push_str(",\n");
+                continue;
+            }
+        }
+        pre.push_str(line);
+        pre.push('\n');
+    }
+    let unit = spinduck_core::sql::rewrite_tokens_with_rules(&pre, &Default::default(), funcs)?;
+    let transformed = spinduck_core::sql::apply_ast_transforms(&unit.text)?;
+    dex.execute(&transformed, &BindMap::new()).map(|_| ())
+}
+
+/// 用表 DDL 同一改写管线建立真实视图（跳过前置 `drop view`）。
+fn create_view(dex: &DuckExecutor, f: &Path) -> Result<(), spinduck_core::error::EngineError> {
+    let raw = std::fs::read_to_string(f).unwrap_or_default();
+    let up = raw.to_ascii_uppercase();
+    let Some(idx) = up.find("CREATE OR REPLACE") else {
+        return Err(spinduck_core::error::EngineError::kernel(
+            71,
+            "缺少 CREATE VIEW",
+        ));
+    };
+    let stmt = raw[idx..].trim().trim_end_matches(';');
+    let funcs = RuleRegistry::load(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/rewrite-rules.toml"),
+    )?
+    .functions;
+    let unit = spinduck_core::sql::rewrite_tokens_with_rules(stmt, &Default::default(), &funcs)?;
+    let sql = spinduck_core::sql::apply_ast_transforms(&unit.text)?;
+    dex.execute(&sql, &BindMap::new())?;
+    Ok(())
+}
+
 /// 视图名（`... VIEW <name> ...` 首个标识符）。
 fn view_name(f: &Path) -> String {
     let text = std::fs::read_to_string(f).unwrap_or_default();
     let up = text.to_ascii_uppercase();
-    let idx = up.find("VIEW ").map(|i| i + 5).unwrap_or(0);
-    text[idx..]
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .find(|s| !s.is_empty())
-        .unwrap_or("v_placeholder")
-        .to_ascii_lowercase()
+    let mut from = 0usize;
+    while let Some(i) = up[from..].find("VIEW ") {
+        let at = from + i + 5;
+        let word = text[at..]
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .find(|s| !s.is_empty())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(word.as_str(), "if" | "exists" | "as" | "or" | "replace") {
+            return word;
+        }
+        from = at;
+    }
+    "v_placeholder".to_string()
 }
 
 /// 物化输入表：清单来自 `case.toml [case.data].materialize`（输出表不物化）。

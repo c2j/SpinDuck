@@ -24,6 +24,8 @@ pub enum CursorState {
         fetched: usize,
         /// 最近一次 FETCH 是否命中（PG：%FOUND/%NOTFOUND 基于此）
         last_hit: bool,
+        /// 是否已执行过 FETCH（空游标首取即 NOTFOUND；未取过则两者皆 false）
+        attempted: bool,
     },
 }
 
@@ -36,6 +38,7 @@ impl CursorState {
             total,
             fetched: 0,
             last_hit: false,
+            attempted: false,
         }
     }
 
@@ -47,9 +50,11 @@ impl CursorState {
                 stream,
                 fetched,
                 last_hit,
+                attempted,
                 ..
             } => {
                 let row = stream.fetch_many(1).into_iter().next();
+                *attempted = true;
                 *last_hit = row.is_some();
                 if row.is_some() {
                     *fetched += 1;
@@ -69,12 +74,16 @@ impl CursorState {
                 CursorAttrKind::RowCount => SpinValue::Int(0),
             },
             CursorState::Open {
-                fetched, last_hit, ..
+                fetched,
+                last_hit,
+                attempted,
+                ..
             } => match kind {
                 CursorAttrKind::IsOpen => SpinValue::Bool(true),
                 CursorAttrKind::RowCount => SpinValue::Int(*fetched as i64),
-                CursorAttrKind::Found => SpinValue::Bool(*fetched > 0 && *last_hit),
-                CursorAttrKind::NotFound => SpinValue::Bool(*fetched > 0 && !*last_hit),
+                CursorAttrKind::Found => SpinValue::Bool(*last_hit),
+                // 空游标首次 FETCH 无行即为 NOTFOUND（Oracle/PG 语义）
+                CursorAttrKind::NotFound => SpinValue::Bool(*attempted && !*last_hit),
             },
         }
     }

@@ -396,3 +396,31 @@ A999 股东未维护 → inst_log 桩 → 跳过，两侧一致）。
 
 另：`par_fund_seat_para.commision_fee_type` 为 varchar(1) 而费型码为 2 字符，属考题
 脱敏件列宽缺陷，黄金口径取 `kind_id='0'` 确定性路径并在夹具注释与 golden/README 记录。
+
+## V15. 语料级热点过程：prc_trd_hz_byfund（逐字依赖闭包 + 自适应种子）
+
+**用例**：`golden/case_corpus_hz_byfund/`——考题调用链第 3 步、生产性能热点
+`pkg_split_trade_step3_sh.prc_trd_hz_byfund`（763 行过程体）。
+
+**资产纪律（本用例新增要求）**：依赖闭包从考题基线**逐字复制、仅目录重组**，
+不修改任何源码——43 张表（含 `%TYPE` 锚定与视图基表）、4 个视图、16 个例程
+（14 函数 + 2 个 `PROCEDURE` 形态桩）、1 个日志桩包。种子（`cases/datasets/seed.sql`）
+为自实现，覆盖主聚合两笔成交、债券类型缺失分支、风险金维度空集、QFII 开关关闭。
+
+**结果：两侧 `dat_fund_cjqs` 逐行逐字段一致（25 列 × 2 行）**，同时断言
+`dat_fund_xw_venture` 两侧行数一致（空）。
+
+**为跑通该过程实现/修复的引擎能力**（均有守护测试）：
+
+| # | 能力/缺陷 | 处理 |
+|---|---|---|
+| 1 | **SQL 上下文例程调用**（`UPDATE SET f(col)`、游标 WHERE 中的函数、`INSERT VALUES` 中的函数）此前无法执行（M8 路径②） | 新增 `sql/sqlfn.rs` 参数元组缓存化下沉：编译期按调用点构造 `SELECT DISTINCT <args> [FROM …] [WHERE …]`（剔除自身谓词防自引用、拓扑处理上下文互引、相同调用去重），调用点内联为相关子查询；运行期逐元组调用例程填 `sd_fnN` 临时表 |
+| 2 | 宏化表达式函数被误纳入下沉 | `Engine::macro_names`：已装宏的名字不再下沉（否则 `SELECT n` 无 FROM 报错） |
+| 3 | **`%NOTFOUND` 空游标语义错误**：首 FETCH 无行时 `fetched>0 && !last_hit` 为假 → 循环体错误进入（记录未赋值即崩） | `CursorState` 增加 `attempted` 标志：`NotFound = attempted && !last_hit`（Oracle/PG 语义） |
+| 4 | `decode (`（格式化后名字与括号间有空格）逃过解析级变换 | `find_innermost_calls` 允许名字与 `(` 之间空白 |
+| 5 | `UPDATE tbl t SET t.col = …` DuckDB 不支持限定列名 | 规则 `[patterns] update_strip_alias`（token 级去别名，含 `t .` 空格式） |
+| 6 | `SQLERRM` 未支持（异常日志拼接） | 编译期映射为帧变量 `__sqlerrm`，异常派发入处理器前写入错误消息 |
+| 7 | 过程查询真实视图（`v_par_bond` 等），此前 DuckDB 侧为占位视图 → 异常分支与参照侧不同源 | harness 用**同一改写管线**把视图 DDL 落到 DuckDB（依赖顺序重试），失败才回落占位并显式打印 |
+| 8 | 表 DDL 的 `DEFAULT to_char(sysdate(),…)`（A 模式系统函数） | harness 落 DuckDB 前剔除"非字面量 DEFAULT"（本侧数据由物化提供） |
+
+**口径说明**：A 模式空字符串即 NULL（Oracle 语义），比对归一 `'' → NULL`。

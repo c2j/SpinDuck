@@ -108,12 +108,15 @@ impl ProjectConfig {
         })
     }
 
-    /// DDL 源码（`sql/ddl` 下按文件名排序的 `*.sql`，**不含子目录**）。
+    /// 表/序列 DDL（`sql/ddl/*.sql` 与 `sql/ddl/tables/*.sql`，排序合并）。
     ///
-    /// 约定：`sql/ddl/*.sql` 为表（被测侧与参照侧都建）；
-    /// `sql/ddl/views/*.sql` 为视图（仅参照侧建，见 [`view_files`](Self::view_files)）。
+    /// 约定：表在 `sql/ddl/` 或 `sql/ddl/tables/`（两侧都建）；
+    /// 视图在 `sql/ddl/views/`（两侧都建，被测侧走同一改写管线）。
     pub fn ddl_files(&self) -> Result<Vec<PathBuf>, EngineError> {
-        sql_files(&self.ddl_dir, false)
+        let mut out = sql_files(&self.ddl_dir, false)?;
+        out.extend(sql_files(&self.ddl_dir.join("tables"), false)?);
+        out.sort();
+        Ok(out)
     }
 
     /// 视图源码（`sql/ddl/views/*.sql`）：只用于参照侧部署。
@@ -174,6 +177,8 @@ pub struct CaseConfig {
     pub reference_call_sql: Option<String>,
     /// 需从参照侧物化的输入表（输出表不在此列，保持被测侧为空）
     pub materialize: Vec<String>,
+    /// 过程写入的输出表（harness 额外断言两侧行数一致）
+    pub outputs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,19 +288,21 @@ impl CaseConfig {
                 .get("reference_call_sql")
                 .and_then(|x| x.as_str())
                 .map(String::from),
-            materialize: case
-                .get("data")
-                .and_then(|d| d.get("materialize"))
-                .and_then(|x| x.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str())
-                        .map(|s| s.to_ascii_lowercase())
-                        .collect()
-                })
-                .unwrap_or_default(),
+            materialize: str_list(case.get("data").and_then(|d| d.get("materialize"))),
+            outputs: str_list(case.get("data").and_then(|d| d.get("outputs"))),
         })
     }
+}
+
+fn str_list(v: Option<&toml::Value>) -> Vec<String> {
+    v.and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .map(|s| s.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn cfg_err(what: &str, e: toml::de::Error) -> EngineError {

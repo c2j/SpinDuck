@@ -6,9 +6,12 @@ pub mod rewrite;
 pub mod exec_native;
 
 pub use render::expr_to_sql;
+pub mod sqlfn;
+pub use sqlfn::{plan_sites, FnSite};
+
 pub use rewrite::{
     apply_ast_transforms, oracle_format_to_strftime, rewrite_tokens, rewrite_tokens_with_rules,
-    SqlUnit, VarScope,
+    strip_update_alias, SqlUnit, VarScope,
 };
 
 #[cfg(feature = "native")]

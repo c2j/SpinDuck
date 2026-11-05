@@ -1,0 +1,25 @@
+[case]
+name = "corpus_hz_byfund"
+kind = "procedure"
+routine = "pkg_split_trade_step3_sh.prc_trd_hz_byfund"
+baseline = "expected.json"
+
+[case.data]
+# 输入表（输出表不物化：dat_fund_cjqs / dat_fund_xw_venture 由过程写入）
+materialize = [
+  "mid_yjqs_detail", "par_fund_partner", "par_fund_seat", "par_fund_info",
+  "par_fund_check_para", "par_fund_autorun_param", "par_fund_bond_accrual_type",
+  "par_fund_rate_info", "par_fund_seat_para", "par_sys_bond", "par_sys_bond_section",
+  "par_sys_securities", "par_sys_purchase", "par_sys_marketrate", "par_fund_etf",
+  "par_oper_venture", "qfqscjhbrbb_temp", "jyfy_temp", "dic_all_kind",
+  "dic_stock_kind_sub", "swh_all_kind",
+  "dat_xw_venture", "db_log",
+]
+outputs = ["dat_fund_cjqs", "dat_fund_xw_venture"]
+
+[case.output]
+sql = "SELECT fund_code, xwdm, main_xwdm, security_id, bs, trade_type, bcrq, cjsl, cjje, yhs, jsf, jiesf, zgf, ghf, yj, fxj, accrual, pay_type, stock_kind, mrcb, scdm, gddm, gddmzm, check_type, cjbz FROM dat_fund_cjqs ORDER BY fund_code, security_id, bs"
+
+[[case.scenarios]]
+why = "按基金汇总（主聚合循环 + 无风险金配置 + QFII 开关关闭）"
+args = ["'20250715'", "null"]

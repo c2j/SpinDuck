@@ -61,7 +61,7 @@ pub fn run_with_catalog(
         ) {
             Ok(out) => return Ok(out),
             Err(e) => {
-                // 自顶向下找匹配处理器
+                // 自顶向下找匹配处理器；进入处理器前写 SQLERRM/SQLCODE 帧变量
                 let mut handled = false;
                 while !traps.is_empty() {
                     let hit = traps
@@ -72,9 +72,14 @@ pub fn run_with_catalog(
                         .find(|en| en.conds.iter().any(|c| crate::error::cond_matches(c, &e)));
                     match hit {
                         Some(h) => {
-                            // 消费该 trap（丢弃其上全部未弹出的内层 trap）并重入处理器体
+                            // 消费该 trap（丢弃其上全部未弹出的内层 trap）并重入处理器体；
+                            // 处理器可见 SQLERRM（错误消息）
                             let body_start = h.body_start;
                             traps.pop();
+                            frame.set(
+                                &VarName("__sqlerrm".to_string()),
+                                SpinValue::Str(e.message.clone()),
+                            );
                             pc = body_start;
                             handled = true;
                             break;
@@ -138,6 +143,9 @@ fn run_inner(
             }
             IrStmt::Jump(to) => *pc = *to,
             IrStmt::JumpIfNot { cond, to } => {
+                if std::env::var("SPINDUCK_DEBUG_JUMP").is_ok() {
+                    eprintln!("JUMPIFNOT {:?} -> {}", cond, to);
+                }
                 let t = {
                     let env = crate::runtime::frame::EvalEnv {
                         frame,
@@ -161,7 +169,13 @@ fn run_inner(
                 };
                 *pc = if t == Some(true) { *to } else { pc_cur + 1 };
             }
-            IrStmt::SqlQuery { sql, binds, into } => {
+            IrStmt::SqlQuery {
+                sql,
+                binds,
+                into,
+                fn_sites,
+            } => {
+                materialize_fn_sites(fn_sites, frame, ex, cat, depth)?;
                 let bound = resolve_binds(binds, frame)?;
                 sink.on_event(TraceEvent::SqlExec {
                     sql: sql.clone(),
@@ -194,7 +208,12 @@ fn run_inner(
                     _ => unreachable!(),
                 }
             }
-            IrStmt::SqlExec { sql, binds } => {
+            IrStmt::SqlExec {
+                sql,
+                binds,
+                fn_sites,
+            } => {
+                materialize_fn_sites(fn_sites, frame, ex, cat, depth)?;
                 let bound = resolve_binds(binds, frame)?;
                 sink.on_event(TraceEvent::SqlExec {
                     sql: sql.clone(),
@@ -273,7 +292,12 @@ fn run_inner(
             IrStmt::OpenCursor { cursor, source } => {
                 use crate::ir::CursorSource;
                 let (sql, binds) = match source {
-                    CursorSource::Static { sql, binds } => {
+                    CursorSource::Static {
+                        sql,
+                        binds,
+                        fn_sites,
+                    } => {
+                        materialize_fn_sites(fn_sites, frame, ex, cat, depth)?;
                         let m = resolve_binds(binds, frame)?;
                         (sql.clone(), m)
                     }
@@ -300,7 +324,16 @@ fn run_inner(
                             .collect::<Vec<_>>()
                             .join(";\n");
                         let sql = crate::sql::apply_ast_transforms(&sql)?;
-                        (sql, BindMap::new())
+                        // 动态 SQL 中的 SQL 上下文例程调用：运行期规划并下沉
+                        let names = cat.routine_names();
+                        let (marked, sites) = crate::sql::plan_sites(
+                            &sql,
+                            &Default::default(),
+                            &Default::default(),
+                            &names,
+                        )?;
+                        materialize_fn_sites(&sites, frame, ex, cat, depth)?;
+                        (marked, BindMap::new())
                     }
                 };
                 let stream = ex.query(&sql, &binds)?;
@@ -403,6 +436,104 @@ fn run_inner(
 
 fn assign(frame: &mut Frame, target: &AssignTarget, v: SpinValue) -> Result<(), EngineError> {
     frame.assign(target, v)
+}
+
+/// SQL 上下文例程调用下沉物化（§8.3 路径②）。
+///
+/// 语句文本中的调用点已在编译期替换为参数缓存子查询；此处在执行前逐元组
+/// 调用例程、填充缓存表（拓扑序保证依赖表先建）。
+fn materialize_fn_sites(
+    sites: &[crate::sql::FnSite],
+    frame: &Frame,
+    ex: &dyn SqlExecutor,
+    cat: &crate::catalog::RoutineCatalog,
+    depth: usize,
+) -> Result<(), EngineError> {
+    let max = crate::sql::sqlfn::MAX_TUPLES;
+    for site in sites {
+        let binds = resolve_binds(&site.binds, frame)?;
+        let mut st = ex.query(&site.distinct_sql, &binds)?;
+        let rows = st.fetch_many(max + 1);
+        if rows.len() > max {
+            return Err(EngineError::business(
+                157,
+                format!("例程 {} 的 SQL 上下文参数元组超过上界 {max}", site.name),
+            ));
+        }
+        let arity = site.args.len();
+        let mut cols = vec!["v VARCHAR".to_string()];
+        for j in 0..arity {
+            cols.push(format!("a{j} VARCHAR"));
+        }
+        ex.execute(
+            &format!(
+                "CREATE OR REPLACE TEMP TABLE {} ({})",
+                site.table,
+                cols.join(", ")
+            ),
+            &BindMap::new(),
+        )?;
+        for chunk in rows.chunks(500) {
+            let mut tuples = Vec::with_capacity(chunk.len());
+            for row in chunk {
+                let v = call_routine_value(cat, &site.name, row, ex, depth)?;
+                let mut items = vec![sql_literal(&v)];
+                for cell in row {
+                    items.push(sql_literal(cell));
+                }
+                tuples.push(format!("({})", items.join(", ")));
+            }
+            ex.execute(
+                &format!("INSERT INTO {} VALUES {}", site.table, tuples.join(", ")),
+                &BindMap::new(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// 按值调用已注册函数（SQL 上下文下沉用；OUT 写回不适用）。
+fn call_routine_value(
+    cat: &crate::catalog::RoutineCatalog,
+    name: &str,
+    args: &[SpinValue],
+    ex: &dyn SqlExecutor,
+    depth: usize,
+) -> Result<SpinValue, EngineError> {
+    let routine = cat
+        .lookup(name)
+        .ok_or_else(|| EngineError::business(150, format!("routine {name} not registered")))?
+        .clone();
+    if args.len() != routine.params.len() {
+        return Err(EngineError::business(
+            151,
+            format!(
+                "{} expects {} args, got {}",
+                name,
+                routine.params.len(),
+                args.len()
+            ),
+        ));
+    }
+    let mut callee = Frame::new();
+    for (p, v) in routine.params.iter().zip(args) {
+        callee.set(&VarName(p.name.to_ascii_lowercase()), v.clone());
+    }
+    let mut noop = crate::exec::TraceNoopSink;
+    let out = run_with_catalog(&routine.prog, &mut callee, ex, &mut noop, cat, depth + 1)?;
+    Ok(match out {
+        RunOutcome::Returned(Some(v)) => v,
+        _ => SpinValue::Null,
+    })
+}
+
+/// SpinValue → SQL 字面量（文本型转义；数值/布尔按文本直出）。
+fn sql_literal(v: &SpinValue) -> String {
+    match v {
+        SpinValue::Null => "NULL".to_string(),
+        SpinValue::Str(s) => format!("'{}'", s.replace('\'', "''")),
+        other => other.as_str_loose(),
+    }
 }
 
 /// 按名绑定表解析：占位符名 → 帧内变量当前值（未定义变量 = ENG 域断言失败，
@@ -1037,6 +1168,127 @@ mod kernel_tests {
         let _ = TraceNoopSink;
         let _ = Frame::new();
         let _ = VarName("x".into());
+    }
+
+    /// 端到端探针：显式游标空集 + EXIT WHEN %NOTFOUND + 记录引用（语料
+    /// prc_trd_hz_byfund 风险金循环形态）：空集时循环体一次都不执行。
+    #[test]
+    fn should_skip_loop_body_when_cursor_is_empty() {
+        use crate::engine::Engine;
+        use crate::rules::RuleRegistry;
+
+        let mut eng = Engine::new(
+            Box::new(crate::sql::DuckExecutor::open_in_memory().unwrap()),
+            RuleRegistry::default(),
+        );
+        eng.ex
+            .execute("CREATE TABLE venture(a VARCHAR)", &BindMap::new())
+            .unwrap();
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_empty IS \
+             DECLARE \
+               CURSOR c_v IS SELECT a FROM venture WHERE 1 = 0; \
+               r c_v%ROWTYPE; \
+               v VARCHAR2(10) := ''; \
+             BEGIN \
+               OPEN c_v; \
+               LOOP \
+                 FETCH c_v INTO r; \
+                 EXIT WHEN c_v%NOTFOUND; \
+                 v := 'x' || r.a; \
+               END LOOP; \
+               CLOSE c_v; \
+             END;",
+        )
+        .unwrap();
+        let out = eng.call("prc_empty", &[]).unwrap();
+        assert_eq!(
+            out.outs.len(),
+            0,
+            "空集不应进入循环体（否则 r 未赋值即报错）"
+        );
+    }
+
+    /// 端到端探针：SQL 上下文例程调用下沉（§8.3 ②）——UPDATE/SELECT 中的
+    /// PL 函数按参数元组缓存化，INSERT VALUES 行内求值；结果必须与逐行语义一致。
+    #[test]
+    fn should_execute_pl_function_calls_inside_sql_statements() {
+        use crate::engine::Engine;
+        use crate::rules::RuleRegistry;
+        use crate::value::SpinValue;
+
+        let mut eng = Engine::new(
+            Box::new(crate::sql::DuckExecutor::open_in_memory().unwrap()),
+            RuleRegistry::default(),
+        );
+        let ex = &mut eng.ex;
+        ex.execute("CREATE TABLE items(k VARCHAR, v INT)", &BindMap::new())
+            .unwrap();
+        ex.execute(
+            "CREATE TABLE lookup_tbl(k VARCHAR, tag VARCHAR)",
+            &BindMap::new(),
+        )
+        .unwrap();
+        ex.execute(
+            "INSERT INTO items VALUES ('a', 1), ('b', 2)",
+            &BindMap::new(),
+        )
+        .unwrap();
+        ex.execute(
+            "INSERT INTO lookup_tbl VALUES ('a', 'A'), ('b', 'B')",
+            &BindMap::new(),
+        )
+        .unwrap();
+        eng.register(
+            "CREATE OR REPLACE FUNCTION fnc_tag(p VARCHAR2) RETURN VARCHAR2 IS \
+             v VARCHAR2(10); \
+             BEGIN \
+               SELECT tag INTO v FROM lookup_tbl WHERE k = p; \
+               RETURN v; \
+             END;",
+        )
+        .unwrap();
+        // 集合形态：UPDATE ... SET v = length(fnc(k)) * 10
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_upd IS \
+             BEGIN \
+               UPDATE items SET v = length(fnc_tag(k)) * 10 WHERE v = 1; \
+               COMMIT; \
+             END;",
+        )
+        .unwrap();
+        eng.call("prc_upd", &[]).unwrap();
+        // 行内形态：INSERT ... VALUES (v, length(fnc(v)) * 100)
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_ins IS \
+             DECLARE vk VARCHAR2(10) := 'a'; \
+             BEGIN \
+               INSERT INTO items(k, v) VALUES (vk, length(fnc_tag(vk)) * 100); \
+               COMMIT; \
+             END;",
+        )
+        .unwrap();
+        eng.call("prc_ins", &[]).unwrap();
+
+        let mut rs = eng
+            .ex
+            .query("SELECT k, v FROM items ORDER BY k, v", &BindMap::new())
+            .unwrap();
+        let rows: Vec<Vec<String>> = rs
+            .fetch_many(10)
+            .iter()
+            .map(|r| r.iter().map(|v| v.as_str_loose()).collect())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                vec!["a".to_string(), "10".to_string()],
+                vec!["a".to_string(), "100".to_string()],
+                vec!["b".to_string(), "2".to_string()],
+            ],
+            "UPDATE 命中行按 fnc 结果更新、INSERT 行内求值；未命中行不变"
+        );
+        let _ = SpinValue::Null;
     }
 
     /// 端到端探针：@标记函数整体下沉（SqlFn）——嵌套日期算术的中间类型

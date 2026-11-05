@@ -1,0 +1,23 @@
+CREATE TABLE par_sys_debt_loan (
+    security_id character varying(19) NOT NULL,
+    debt_loan_type character varying(20) NOT NULL,
+    coin_code character varying(3) NOT NULL,
+    interest_digit numeric(2,0) DEFAULT 8 NOT NULL,
+    debt_loan_month numeric(17,0) NOT NULL,
+    par_value numeric(17,2) NOT NULL,
+    interest_rate numeric(11,8) NOT NULL,
+    start_day character varying(8) NOT NULL,
+    end_day character varying(8) NOT NULL,
+    accrual_type character varying(2) NOT NULL,
+    settlement_frequency character varying(2) NOT NULL,
+    accrual_algorithm character varying(8) NOT NULL,
+    interest_date_first character varying(8) NOT NULL,
+    inure_begin_date character varying(8) NOT NULL,
+    inure_end_date character varying(8) DEFAULT '99991231'::character varying NOT NULL,
+    check_user character varying(10),
+    operator character varying(10),
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20),
+    debt_loan_name character varying(200)
+);

@@ -2,7 +2,7 @@
 //! 持久化（DuckDB 内部表）在 M7 接入；本模块提供内存目录与编译入口。
 
 use crate::error::EngineError;
-use crate::ir::{compile_routine_with, IrProg};
+use crate::ir::{compile_routine_with_names, IrProg};
 use crate::rules::RuleRegistry;
 use crate::value::SpinValue;
 use ogsql_parser::ast::Statement;
@@ -64,6 +64,11 @@ impl RoutineCatalog {
         self.routines.get(&name.to_ascii_lowercase())
     }
 
+    /// 已注册例程名集合（SQL 上下文调用下沉判定用；小写）。
+    pub fn routine_names(&self) -> std::collections::BTreeSet<String> {
+        self.routines.keys().cloned().collect()
+    }
+
     pub fn len(&self) -> usize {
         self.routines.len()
     }
@@ -101,6 +106,15 @@ pub fn compile_statement_routine(
     st: &Statement,
     rules: &RuleRegistry,
 ) -> Result<Vec<CompiledRoutine>, EngineError> {
+    compile_statement_routine_with_names(st, rules, &Default::default())
+}
+
+/// 带已注册例程名集（SQL 上下文调用下沉判定用）。
+pub fn compile_statement_routine_with_names(
+    st: &Statement,
+    rules: &RuleRegistry,
+    routine_names: &std::collections::BTreeSet<String>,
+) -> Result<Vec<CompiledRoutine>, EngineError> {
     let mut out = Vec::new();
     match st {
         Statement::CreateProcedure(cs) => {
@@ -110,7 +124,7 @@ pub fn compile_statement_routine(
                 .map(|p| p.name.to_ascii_lowercase())
                 .collect();
             let prog = match &cs.block {
-                Some(b) => compile_routine_with(b, &extra, rules)?,
+                Some(b) => compile_routine_with_names(b, &extra, rules, routine_names)?,
                 None => IrProg::default(),
             };
             let params = cs
@@ -140,7 +154,7 @@ pub fn compile_statement_routine(
                 .map(|p| p.name.to_ascii_lowercase())
                 .collect();
             let prog = match &cf.block {
-                Some(b) => compile_routine_with(b, &extra, rules)?,
+                Some(b) => compile_routine_with_names(b, &extra, rules, routine_names)?,
                 None => IrProg::default(),
             };
             let params = cf

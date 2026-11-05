@@ -95,6 +95,9 @@ strip_hint_comments = true               # /*FORCE*/ 等 hint 注释剥离
 # 改写后按排序取首行（确定且通常是业务意图）；内层 ORDER BY 子查询 + 外层
 # rownum = 1（语料主流形态，42 处/14 文件）两侧语义一致。
 rownum_first_row = true
+# 状态：verified —— DuckDB 不支持 UPDATE .. SET 限定列名（A 模式语料惯用
+# `UPDATE tbl t SET t.col = …`）；改写为去别名形态（RHS/WHERE 同步去限定）。
+update_strip_alias = true
 
 # ── 隐式类型转换（解释器与改写器共用）────────────────────────────
 [implicit]

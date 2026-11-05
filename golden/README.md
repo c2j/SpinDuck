@@ -106,6 +106,11 @@ SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
 SPINDUCK_OG_PASSWORD='Enmo@123' \
 cargo test --features gauss --test golden_corpus_gauss -- --nocapture
 
+# 语料级热点用例：核心过程 pkg_split_trade_step3_sh.prc_trd_hz_byfund
+SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
+SPINDUCK_OG_PASSWORD='Enmo@123' \
+cargo test --features gauss --test golden_corpus_hz_byfund -- --nocapture
+
 # 语料级重量用例：核心过程 pkg_split_trade_step3_sh.prc_trd_deal_purchase
 SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
 SPINDUCK_OG_PASSWORD='Enmo@123' \
@@ -155,6 +160,15 @@ test golden_corpus_min_tax_matches_a_mode_baseline ... ok
 - 已知脱敏件缺陷：`par_fund_seat_para.commision_fee_type` 为 varchar(1) 而费型码为
   2 字符——黄金口径取 `swh_all_kind.kind_id='0'` 确定性路径（purchase_yj 两侧同为
   NULL）；CASE 路径须先修基线列宽。
+
+## 用例 5（case_corpus_hz_byfund）的资产纪律
+
+- 依赖闭包（43 表 / 4 视图 / 16 例程 / 1 桩包）从考题基线**逐字复制**，只做目录重组；
+  表按文件放 `sql/ddl/tables/`，视图放 `sql/ddl/views/`（两侧都建真实视图）。
+- 种子自实现：覆盖主聚合两笔成交、债券类型缺失、风险金维度空集、QFII 关闭。
+- 比对两个输出表：`dat_fund_cjqs` 逐行 + `dat_fund_xw_venture` 行数。
+- 该过程含 `UPDATE … SET f(col)` / 游标 WHERE 中的 PL 函数调用，依赖
+  `sqlfn` 参数元组缓存化下沉（validation V15）。
 
 ## 期望基线（expected.json）的维护规则
 

@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct SqlUnit {
     pub text: String,
     pub binds: Vec<(String, SqlBindSrc)>,
+    /// SQL 上下文例程调用下沉计划（`sqlfn::plan_sites` 填充；默认空）
+    pub fn_sites: Vec<crate::sql::FnSite>,
 }
 
 /// token 级变量替换：裸标识符且命中 PL 变量集 → `$v_<小写名>`。
@@ -61,7 +63,11 @@ pub fn rewrite_tokens(
         cursor = tws.span.end;
     }
     out.push_str(&sql_text[cursor..]);
-    Ok(SqlUnit { text: out, binds })
+    Ok(SqlUnit {
+        text: out,
+        binds,
+        fn_sites: Vec::new(),
+    })
 }
 
 /// 已知 PL 变量名集合（编译期预扫描收集：赋值目标 / PL 表达式引用）。
@@ -239,7 +245,11 @@ pub fn rewrite_tokens_with_rules(
         i += 1;
     }
     out.push_str(&sql_text[cursor..]);
-    Ok(SqlUnit { text: out, binds })
+    Ok(SqlUnit {
+        text: out,
+        binds,
+        fn_sites: Vec::new(),
+    })
 }
 
 /// 简单重命名（同参数序；`@` 前缀的解析级变换在此跳过）。
@@ -293,10 +303,15 @@ fn find_innermost_calls(text: &str, names: &[&str]) -> Vec<(usize, usize, String
                     }
                     let word = &text[start..i];
                     let upper = word.to_ascii_uppercase();
-                    if names.contains(&upper.as_str()) && i < text.len() && bytes[i] == b'(' {
+                    // 名字与 '(' 之间允许空白（格式化器产出 `decode (` 形态）
+                    let mut k = i;
+                    while k < text.len() && (bytes[k] as char).is_whitespace() {
+                        k += 1;
+                    }
+                    if names.contains(&upper.as_str()) && k < text.len() && bytes[k] == b'(' {
                         // 配平右括号
                         let mut depth = 0usize;
-                        let mut j = i;
+                        let mut j = k;
                         let mut s2 = in_string;
                         while j < text.len() {
                             let ch = bytes[j] as char;
@@ -323,7 +338,7 @@ fn find_innermost_calls(text: &str, names: &[&str]) -> Vec<(usize, usize, String
                             }
                             j += 1;
                         }
-                        let args = &text[i + 1..j];
+                        let args = &text[k + 1..j];
                         let has_nested = names.iter().any(|n| upper_eq_find(args, n));
                         if !has_nested {
                             out.push((start, j + 1, upper, args.to_string()));
@@ -345,7 +360,7 @@ fn upper_eq_find(haystack: &str, name: &str) -> bool {
 }
 
 /// 顶层逗号切分（括号与字符串感知）。
-fn split_top_level_commas(s: &str) -> Vec<String> {
+pub(crate) fn split_top_level_commas(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut in_string = false;
@@ -410,6 +425,82 @@ pub fn oracle_format_to_strftime(fmt: &str) -> String {
     ] {
         out = out.replace(o, p);
     }
+    out
+}
+
+/// `UPDATE <table> <alias> SET <alias>.c = …` → 去别名：
+/// `UPDATE <table> SET c = …`，并把语句内 `<alias>.` 限定同步去除。
+/// DuckDB 不支持 UPDATE .. SET 的限定列名（[patterns] update_strip_alias）。
+pub fn strip_update_alias(text: &str) -> String {
+    let trimmed = text.trim_start();
+    if !trimmed.to_ascii_uppercase().starts_with("UPDATE ") {
+        return text.to_string();
+    }
+    let Ok(tokens) = Tokenizer::new(trimmed).tokenize() else {
+        return text.to_string();
+    };
+    // 头部：UPDATE <table> [alias] SET …
+    let mut header: Vec<usize> = Vec::new(); // token indexes of update/table/alias
+    let mut set_idx = None;
+    let mut depth = 0i32;
+    for (i, tws) in tokens.iter().enumerate() {
+        match tws.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            _ if depth == 0 => {
+                let w = trimmed[tws.span.start..tws.span.end].to_ascii_lowercase();
+                if w == "set" {
+                    set_idx = Some(i);
+                    break;
+                }
+                header.push(i);
+            }
+            _ => {}
+        }
+    }
+    let Some(set_idx) = set_idx else {
+        return text.to_string();
+    };
+    if header.len() < 2 {
+        return text.to_string();
+    }
+    // header[2] 存在且不是 SET → 别名
+    let alias_idx = if header.len() >= 3 {
+        Some(header[2])
+    } else {
+        None
+    };
+    let Some(alias_idx) = alias_idx else {
+        return trimmed.to_string();
+    };
+    let alias = trimmed[tokens[alias_idx].span.start..tokens[alias_idx].span.end]
+        .trim_matches('"')
+        .to_string();
+    let mut out = String::with_capacity(trimmed.len());
+    let mut cursor = 0usize;
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let tws = &tokens[i];
+        // 跳过别名定义本身（`UPDATE tbl t SET` 的第二个词）
+        if i == alias_idx {
+            out.push_str(&trimmed[cursor..tws.span.start]);
+            cursor = tws.span.end;
+            i += 1;
+            continue;
+        }
+        // 跳过 `alias .`（限定前缀；点号前后空白一并交给后续切片保留）
+        let is_alias_word = trimmed[tws.span.start..tws.span.end].trim_matches('"') == alias
+            && matches!(tws.token, Token::Ident(_) | Token::QuotedIdent(_));
+        if is_alias_word && i + 1 < tokens.len() && matches!(tokens[i + 1].token, Token::Dot) {
+            out.push_str(&trimmed[cursor..tws.span.start]);
+            cursor = tokens[i + 1].span.end;
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&trimmed[cursor..]);
+    let _ = set_idx;
     out
 }
 
