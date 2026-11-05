@@ -1,7 +1,7 @@
-# AGENTS §9 四 job：Format / Clippy / Test / Security Audit。
-# Test 在无 gauss feature 下运行（黄金对比需要 A 模式容器，见 golden job）；
-# golden job 提供 openGauss 5.0.0 服务容器，与 golden/gaussdb-docker 同口径
-# （md5 + password_encryption_type=1，A 模式）。
+# AGENTS §9 门禁：format / clippy / audit + test(native) + golden(gauss 容器)。
+# 说明：`cargo test --all-features` 含 gauss 黄金层，缺 A 模式容器必红（§4.1
+# 禁止跳过即绿）——故 CI 拆为 test(native) 与 golden(容器内实跑) 两个 job，
+# 文本契约见 AGENTS §9（决策记录 2025-11-05 第二轮复审）。
 name: ci
 
 on:
@@ -12,6 +12,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+defaults:
+  run:
+    # crate 在 spinduck/（仓库根无 Cargo.toml）
+    working-directory: spinduck
+
 jobs:
   format:
     runs-on: ubuntu-latest
@@ -20,14 +25,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      # fmt 只读 crate 内文件，不需要子模块
       - run: cargo fmt --all -- --check
 
   clippy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - name: Init ogsql-parser submodule（path 依赖，编译必需；fastaas 为私有项目不拉取）
+        run: git submodule update --init lib/ogsql-parser
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -38,13 +44,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-        with:
-          submodules: recursive   # lib/ogsql-parser（path 依赖，编译必需）
+      - name: Init ogsql-parser submodule
+        run: git submodule update --init lib/ogsql-parser
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # 默认 features（含 native 内核探针）；gauss/golden 见 golden job
       - run: cargo test --features native
 
   audit:
@@ -57,47 +60,35 @@ jobs:
       - run: cargo audit
 
   golden:
-    # 黄金对比：A 模式容器 + 语料逐行比对（V13–V15）。
-    # 结论口径：无容器环境此 job 即为黄金层的"红"，替代本地 SKIP。
+    # 黄金对比：复用 golden/gaussdb-docker compose（与本地完全同口径：
+    # 自定义 entrypoint A 模式引导 + healthcheck 强校验 + 127.0.0.1 绑定）。
+    # 口令由步骤内随机生成经 GS_PASSWORD/SPINDUCK_OG_PASSWORD 注入，不落仓库。
     runs-on: ubuntu-latest
-    services:
-      gaussdb:
-        image: opengauss/opengauss:5.0.0
-        env:
-          GS_PASSWORD: SpinDuckCi2025
-          GS_NODENAME: spinduck_node
-          GS_PORT: "5432"
-          GS_HOST_AUTH_METHOD: md5
-          OTHER_PG_CONF: "password_encryption_type = 1"
-        ports:
-          - 5433:5432
-        options: >-
-          --health-cmd "gsql -U gaussdb -W \"$GS_PASSWORD\" -d postgres -c 'SELECT 1'"
-          --health-interval 5s
-          --health-timeout 10s
-          --health-retries 40
     env:
       SPINDUCK_OG_HOST: 127.0.0.1
       SPINDUCK_OG_PORT: "5433"
       SPINDUCK_OG_USER: gaussdb
       SPINDUCK_OG_DB: postgres
-      SPINDUCK_OG_PASSWORD: SpinDuckCi2025
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - name: Init ogsql-parser submodule
+        run: git submodule update --init lib/ogsql-parser
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Wait for A-mode readiness
+      - name: Bring up A-mode container（compose 校验 datcompatibility=A 才 healthy）
+        working-directory: golden/gaussdb-docker
+        env:
+          GS_PASSWORD: SpinDuckCi-6f3a9c
         run: |
+          docker compose up -d
           for i in $(seq 1 60); do
-            if docker exec "${{ job.services.gaussdb.id }}" \
-              bash -lc 'gsql -U gaussdb -W "$GS_PASSWORD" -d postgres -t -A -c \
-              "SELECT datcompatibility FROM pg_database WHERE datname = current_database()"' \
-              2>/dev/null | tr -d '[:space:]' | grep -qx A; then
-              echo "A-mode ready"; exit 0
-            fi
+            st=$(docker inspect -f '{{.State.Health.Status}}' spinduck-gaussdb || true)
+            [ "$st" = "healthy" ] && { echo "A-mode ready"; break; }
+            [ "$i" = 60 ] && { docker logs spinduck-gaussdb | tail -50; exit 1; }
             sleep 5
           done
-          echo "openGauss not ready in 5 minutes"; exit 1
-      - run: cargo test --features gauss
+      - name: Run golden + gauss suites
+        working-directory: spinduck
+        env:
+          SPINDUCK_OG_PASSWORD: SpinDuckCi-6f3a9c
+        run: cargo test --features gauss

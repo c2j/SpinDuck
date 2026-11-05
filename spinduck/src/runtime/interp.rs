@@ -244,7 +244,10 @@ fn run_inner(
                 ex.execute(sql, &bound)?;
                 *pc += 1;
             }
-            IrStmt::SqlExecDynamic { text_expr } => {
+            IrStmt::SqlExecDynamic {
+                text_expr,
+                into_targets,
+            } => {
                 let v = {
                     let env = crate::runtime::frame::EvalEnv {
                         frame,
@@ -254,15 +257,48 @@ fn run_inner(
                     };
                     eval(text_expr, &env)?
                 };
-                eprintln!("[ARM] text={:?}", v.as_str_loose());
                 let (sql, _) = prepare_dynamic_sql(&v.as_str_loose(), frame, ex, cat, depth)?;
                 sink.on_event(TraceEvent::SqlExec {
                     sql: sql.clone(),
                     binds: BindMap::new(),
                     elapsed_us: 0,
                 });
-                ex.execute(&sql, &BindMap::new())?;
-                *pc += 1;
+                if into_targets.is_empty() {
+                    ex.execute(&sql, &BindMap::new())?;
+                    *pc += 1;
+                } else {
+                    // INTO：与静态 SELECT INTO 同语义（0/1/>1 行）
+                    let mut stream = ex.query(&sql, &BindMap::new())?;
+                    let rows = stream.fetch_many(2);
+                    match rows.len() {
+                        0 => return Err(EngineError::no_data_found()),
+                        n if n > 1 => return Err(EngineError::too_many_rows()),
+                        1 => {
+                            let row = &rows[0];
+                            if into_targets.len() > row.len() {
+                                return Err(EngineError::business(
+                                    126,
+                                    format!(
+                                        "INTO targets ({}) exceed columns ({})",
+                                        into_targets.len(),
+                                        row.len()
+                                    ),
+                                ));
+                            }
+                            for (i, target) in into_targets.iter().enumerate() {
+                                let v = row.get(i).cloned().unwrap_or(SpinValue::Null);
+                                assign(frame, target, v)?;
+                            }
+                            *pc += 1;
+                        }
+                        _ => {
+                            return Err(EngineError::invariant(
+                                33,
+                                "fetch_many(2) returned >2 rows",
+                            ))
+                        }
+                    }
+                }
             }
             IrStmt::CallRoutine {
                 name,
@@ -472,35 +508,55 @@ fn prepare_dynamic_sql(
     cat: &crate::catalog::RoutineCatalog,
     depth: usize,
 ) -> Result<(String, Vec<crate::sql::FnSite>), EngineError> {
-    eprintln!("[DYNT] enter len={}", text.len());
-    let tokens = ogsql_parser::token::tokenizer::Tokenizer::new(text)
-        .tokenize()
-        .map_err(|e| EngineError::business(61, format!("动态 SQL tokenize 失败: {e}")))?;
-    let stmts = ogsql_parser::parser::Parser::new(tokens).parse();
-    if stmts.is_empty() {
+    // 带错误通道解析（与静态语句同口径；不再静默吞解析失败）
+    let (infos, errors) = ogsql_parser::parser::Parser::parse_sql(text);
+    if !errors.is_empty() || infos.is_empty() {
         let head: String = text.chars().take(80).collect();
         return Err(EngineError::business(
             61,
             format!("动态 SQL 解析失败（ogsql-parser 不支持的形态请向其上游提 issue）：{head}"),
         ));
     }
+    // [patterns] 与静态语句同口径：rownum 首行 / UPDATE 去别名
+    let rules = cat.sql_rules();
     let fmt = ogsql_parser::formatter::SqlFormatter::new();
-    let sql = stmts
-        .iter()
-        .map(|st| fmt.format_statement(st))
-        .collect::<Vec<_>>()
-        .join(";\n");
-    // 规则改名（nvl→coalesce 等）与静态语句同口径
+    let mut parts = Vec::with_capacity(infos.len());
+    for si in &infos {
+        let mut st = si.statement.clone();
+        if let ogsql_parser::ast::Statement::Select(mut sel) = st {
+            if rules.patterns_rownum_first_row {
+                if let Some(w) = sel.node.where_clause.take() {
+                    let (rest, stripped) = crate::ir::strip_rownum_first(w.clone());
+                    sel.node.where_clause = rest;
+                    if stripped && sel.node.limit.is_none() {
+                        sel.node.limit = Some(ogsql_parser::ast::Expr::Literal(
+                            ogsql_parser::ast::Literal::Integer(1),
+                        ));
+                    } else if stripped {
+                        sel.node.where_clause = Some(w); // 已有 LIMIT：保守还原
+                    }
+                }
+            }
+            st = ogsql_parser::ast::Statement::Select(sel);
+        }
+        let mut text_st = fmt.format_statement(&st);
+        if rules.patterns_update_strip_alias {
+            text_st = crate::sql::strip_update_alias(&text_st);
+        }
+        parts.push(text_st);
+    }
+    let sql = parts.join(";\n");
+    // 规则改名与 plan 下沉均用真实函数表；动态文本不含 PL 变量
+    // （USING v1 不支持，变量须先拼接为字面量）→ 空 VarScope 是**口径**而非缺省
     let named =
         crate::sql::rewrite_tokens_with_rules(&sql, &Default::default(), cat.sql_functions())?;
     let sql = crate::sql::apply_ast_transforms(&named.text)?;
     let (marked, sites) = crate::sql::plan_sites(
         &sql,
         &Default::default(),
-        &Default::default(),
+        cat.sql_functions(),
         &cat.routine_names(),
     )?;
-    eprintln!("[DYNT] planned sites={}", sites.len());
     materialize_fn_sites(&sites, frame, ex, cat, depth)?;
     Ok((marked, sites))
 }

@@ -448,3 +448,34 @@ A999 股东未维护 → inst_log 桩 → 跳过，两侧一致）。
 （`Parser::parse()` 静默丢弃、`parse_sql` 对 `THIS IS NOT SQL` 返回零错误），
 导致 SpinDuck 侧只能在内核执行期显式失败。已向 ogsql-parser 提 issue 请求
 严格解析模式/错误通道（见 PR#1 评审回复）。
+
+
+## V17. 第二轮复审修复 + 变异补充轮（部分）
+
+**第二轮 7 项 Blocker 修复**（守护随项）：
+① 9 处调试输出清除（库 3 + 测试 6）；② INT 算术改 checked 溢出（BIZ-0112，
+与 DECIMAL 同口径，`should_report_int_overflow_not_wrap`）；③ 动态路径与静态
+同口径——目录携带完整规则注册表（patterns 开关 + 函数表），`rownum_first_row`
+/`update_strip_alias` 在动态文本同样生效，解析改用带错误通道的
+`Parser::parse_sql`，`plan_sites` 传真实函数表；④ 恢复 `EXECUTE IMMEDIATE .. INTO`
+（动态与静态同语义：0 行 NO_DATA_FOUND / >1 行 TOO_MANY，
+`should_fetch_dynamic_execute_into_targets`）；⑤ CI 修正（`working-directory:
+spinduck`、仅初始化 ogsql 子模块——fastaas 私有不拉取、golden job 复用
+compose 同口径引导、口令步骤内生成不落仓库）；⑥ golden job 与本地 compose
+一致（自定义 entrypoint + healthcheck 强校验 A 模式）；⑦ AGENTS §8/§9 文本
+与实际门禁契约对齐（test=native，golden=gauss 容器）。
+
+**变异补充轮（部分结果，跑批中断待续）**：
+- 范围 `sqlfn.rs`+`render.rs`，`--features native`；已完成 **155/220**
+  （caught 94 / missed 60 / timeout 1，**部分 score ≈ 39%**，显著低于 70% 目标）
+- 跑批中断原因（两条结构性发现）：
+  1. cargo-mutants 默认副本目录构建会因 `include_str!("../../config/…")`
+     越过 crate 根而失败——内置规则使 crate **非独立可拷贝构建**，
+     只能 `--in-place`（串行，且与 `--jobs` 互斥），全轮约 3 小时；
+  2. 会话重启杀死后台跑批，结果停在 155/220。
+- **60 个幸存者清单**在 `spinduck/mutants.out/missed.txt`（不入库），
+  聚类显示边界比较与错误分支占比最高；已修复 ② 的 wrapping 溢出即来自
+  该类漏检。后续：完成全轮 → 逐个补断言/书面豁免 → 复测达标 ≥70%。
+- 待决（Ask first 候选）：内置规则嵌入与 crate 独立构建的矛盾——候选方案
+  （a）规则文件移入 crate 目录（config 仓库资产保留为生成源）；（b）保留
+  现状并规定变异/复制类工具一律 `--in-place`。

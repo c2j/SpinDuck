@@ -24,16 +24,13 @@ fn big_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
 #[test]
 fn should_execute_runtime_built_sql() {
     big_stack(|| {
-        eprintln!("[T] a");
         let mut eng = Engine::new(
             Box::new(DuckExecutor::open_in_memory().unwrap()),
             RuleRegistry::default(),
         );
-        eprintln!("[T] b");
         eng.ex
             .execute("CREATE TABLE dyn_t(a INT)", &BindMap::new())
             .unwrap();
-        eprintln!("[T] c");
         eng.register(
             "CREATE OR REPLACE PROCEDURE prc_dyn IS DECLARE v_sql VARCHAR2(100); BEGIN \
              v_sql := 'insert into dyn_t values (' || 7 || ')'; \
@@ -41,9 +38,7 @@ fn should_execute_runtime_built_sql() {
              END;",
         )
         .unwrap();
-        eprintln!("[T] d");
         eng.call("prc_dyn", &[]).unwrap();
-        eprintln!("[T] e");
         let mut s = eng
             .ex
             .query("SELECT count(*) FROM dyn_t", &BindMap::new())
@@ -73,5 +68,35 @@ fn should_report_unparseable_dynamic_sql_explicitly() {
             !e.message.is_empty(),
             "乱码动态 SQL 必须显式失败，不得静默成功: {e:?}"
         );
+    });
+}
+
+#[test]
+fn should_fetch_dynamic_execute_into_targets() {
+    // EXECUTE IMMEDIATE .. INTO：与静态 SELECT INTO 同语义（恢复静态期能力）
+    big_stack(|| {
+        let mut eng = Engine::new(
+            Box::new(DuckExecutor::open_in_memory().unwrap()),
+            RuleRegistry::default(),
+        );
+        eng.ex
+            .execute("CREATE TABLE src_t(a INT)", &BindMap::new())
+            .unwrap();
+        eng.ex
+            .execute("INSERT INTO src_t VALUES (42)", &BindMap::new())
+            .unwrap();
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_into IS DECLARE v_a NUMBER; BEGIN \
+             EXECUTE IMMEDIATE 'select a from src_t' INTO v_a; \
+             INSERT INTO src_t VALUES (v_a + 1); \
+             END;",
+        )
+        .unwrap();
+        eng.call("prc_into", &[]).unwrap();
+        let mut s = eng
+            .ex
+            .query("SELECT count(*) FROM src_t WHERE a = 43", &BindMap::new())
+            .unwrap();
+        assert_eq!(s.fetch_many(1)[0][0], SpinValue::Int(1));
     });
 }

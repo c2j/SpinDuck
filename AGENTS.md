@@ -247,7 +247,7 @@ cargo test --all-features
 cargo fmt --all
 cargo fmt --all -- --check
 cargo clippy --all-features -- -D warnings
-cargo test --all-features
+cargo test --features native        # 无容器环境；gauss 见 golden job
 cargo audit
 
 # 变异测试（仅 M3.5/M6.5/M10 门禁节点）
@@ -268,8 +268,11 @@ CI 定义 `.github/workflows/ci.yml`，四个 job 全部必须通过：
 
 - **Format**: `cargo fmt --all -- --check`
 - **Clippy**: `cargo clippy --all-features -- -D warnings`
-- **Test**: `cargo test --all-features`
+- **Test**: `cargo test --features native`（默认/内核通道；gauss 黄金层
+  需 A 模式容器，缺容器必红——见 golden job）
 - **Security Audit**: `cargo audit`
+- **Golden**: `cargo test --features gauss`（openGauss 5.0.0 服务容器，
+  与 golden/gaussdb-docker compose 同口径；决策记录 2025-11-05 第二轮复审）
 - **Platform Build**（发版触发）：按 §10 矩阵逐平台构建 + 冒烟（`call` 一个内置探针例程）
 
 > `cargo fmt --all -- --check` 失败是最常见 CI 错误。提交前先运行

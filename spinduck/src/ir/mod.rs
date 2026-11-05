@@ -150,6 +150,8 @@ pub enum IrStmt {
     /// ogsql-parser 不支持的形态向其上游提 issue）
     SqlExecDynamic {
         text_expr: Box<IrExpr>,
+        /// INTO 目标（与静态 SELECT INTO 同语义：0 行 NO_DATA_FOUND，>1 行 TOO_MANY）
+        into_targets: Vec<AssignTarget>,
     },
     /// PERFORM <expr>：求值并丢弃
     Perform {
@@ -1042,15 +1044,14 @@ impl Compiler {
                         "EXECUTE IMMEDIATE .. USING is not supported in v1",
                     ));
                 }
-                if !sp.into_targets.is_empty() {
-                    return Err(EngineError::business(
-                        61,
-                        "EXECUTE IMMEDIATE .. INTO 不支持（v1）：动态取数请使用显式游标 OPEN FOR",
-                    ));
-                }
                 let text_expr = self.expr(&sp.string_expr)?;
+                let mut into_targets = Vec::with_capacity(sp.into_targets.len());
+                for t in &sp.into_targets {
+                    into_targets.push(self.assign_target(t)?);
+                }
                 self.code.push(IrStmt::SqlExecDynamic {
                     text_expr: Box::new(text_expr),
+                    into_targets,
                 });
             }
             // —— M2 之后的里程碑纳入（编译期显式拒绝，禁止静默错误翻译）——
@@ -1416,7 +1417,7 @@ fn fold_bin(op: BinOp, parts: Vec<IrExpr>) -> IrExpr {
 
 /// 递归剥除 AND 链中的 `rownum = 1` 谓词。返回 (剩余条件, 是否剥除)。
 /// 仅处理 AND 链；OR/NOT 分支内的 rownum 保守保留（不改写）。
-fn strip_rownum_first(e: Expr) -> (Option<Expr>, bool) {
+pub(crate) fn strip_rownum_first(e: Expr) -> (Option<Expr>, bool) {
     if is_rownum_first(&e) {
         return (None, true);
     }

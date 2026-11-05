@@ -432,10 +432,12 @@ fn pow10(n: u8) -> Option<i128> {
 
 /// 整数路径：除零与 DECIMAL 路径同报 ZERO_DIVIDE（BIZ-124），不得防御性返 0。
 fn apply_i(op: &BinOp, x: i64, y: i64) -> Result<i64, EngineError> {
+    // 溢出与 DECIMAL 路径同口径显式报错（BIZ-0112），不得静默环绕
+    let overflow = || EngineError::business(112, "integer overflow");
     match op {
-        BinOp::Add => Ok(x.wrapping_add(y)),
-        BinOp::Sub => Ok(x.wrapping_sub(y)),
-        BinOp::Mul => Ok(x.wrapping_mul(y)),
+        BinOp::Add => x.checked_add(y).ok_or_else(overflow),
+        BinOp::Sub => x.checked_sub(y).ok_or_else(overflow),
+        BinOp::Mul => x.checked_mul(y).ok_or_else(overflow),
         BinOp::Div if y == 0 => Err(EngineError::business(124, "division by zero")),
         BinOp::Div => Ok(x / y),
         _ => Err(EngineError::invariant(30, "not arithmetic")),
@@ -569,6 +571,14 @@ mod tests {
         // INT 路径除零与 DECIMAL 路径同报 BIZ-124，不得防御性返 0
         let e = eval_bin(BinOp::Div, &SpinValue::Int(5), &SpinValue::Int(0)).unwrap_err();
         assert_eq!(e.code.to_string(), "BIZ-0124");
+    }
+
+    #[test]
+    fn should_report_int_overflow_not_wrap() {
+        // INT 路径溢出与 DECIMAL 路径同报 BIZ-0112，不得静默环绕
+        let big = SpinValue::Int(i64::MAX);
+        let e = eval_bin(BinOp::Add, &big, &SpinValue::Int(1)).unwrap_err();
+        assert_eq!(e.code.to_string(), "BIZ-0112");
     }
 
     #[test]

@@ -39,9 +39,13 @@ impl SpinType {
             ("DECIMAL", a) => {
                 let mut it = a.split(',');
                 let p: u8 = it.next()?.trim().parse().ok()?;
+                // scale 缺省（`NUMBER(15)`）按 Oracle 语义显式取 0；
                 // 坏 scale（`NUMBER(15,x)`）显式返回 None（上层报未知类型），
                 // 不得静默变 0（§6 语义损失显式化）
-                let s: u8 = it.next()?.trim().parse().ok()?;
+                let s: u8 = match it.next() {
+                    Some(x) => x.trim().parse().ok()?,
+                    None => 0,
+                };
                 Some(SpinType::Decimal {
                     precision: p,
                     scale: s,

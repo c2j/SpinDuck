@@ -27,7 +27,7 @@ pub struct CallResultExt {
 impl Engine {
     pub fn new(ex: Box<dyn SqlExecutor>, rules: RuleRegistry) -> Self {
         let mut catalog = RoutineCatalog::new();
-        catalog.set_sql_functions(rules.functions.clone());
+        catalog.set_sql_rules(rules.clone());
         Self {
             ex,
             rules,
@@ -339,7 +339,13 @@ impl Engine {
         ) {
             Ok(out) => out,
             Err(e) => {
-                let _ = self.ex.execute("ROLLBACK", &crate::exec::BindMap::new());
+                // 回滚失败不得静默：并入原错误（原错误为主因，回滚失败为次因）
+                if let Err(rb) = self.ex.execute("ROLLBACK", &crate::exec::BindMap::new()) {
+                    return Err(crate::error::EngineError::kernel(
+                        10,
+                        format!("{}（且 ROLLBACK 失败: {}）", e.message, rb.message),
+                    ));
+                }
                 return Err(e);
             }
         };

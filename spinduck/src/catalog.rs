@@ -51,6 +51,8 @@ pub struct RoutineCatalog {
     routines: BTreeMap<String, CompiledRoutine>,
     /// SQL 方言规则（函数改名/`@` 变换标记表）：动态 SQL 运行期改写需要
     sql_functions: BTreeMap<String, String>,
+    /// 完整规则注册表（patterns 开关等）：动态路径与静态语句同口径
+    sql_rules: crate::rules::RuleRegistry,
 }
 
 impl RoutineCatalog {
@@ -61,6 +63,17 @@ impl RoutineCatalog {
     /// 注入 SQL 方言规则函数表（Engine 构造时同步）。
     pub fn set_sql_functions(&mut self, funcs: BTreeMap<String, String>) {
         self.sql_functions = funcs;
+    }
+
+    /// 注入完整规则注册表（patterns 开关；动态路径同口径）。
+    pub fn set_sql_rules(&mut self, rules: crate::rules::RuleRegistry) {
+        self.sql_functions = rules.functions.clone();
+        self.sql_rules = rules;
+    }
+
+    /// 完整规则注册表（动态路径 patterns/函数同口径）。
+    pub fn sql_rules(&self) -> &crate::rules::RuleRegistry {
+        &self.sql_rules
     }
 
     /// SQL 方言规则函数表（动态 SQL 改写用）。
