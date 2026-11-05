@@ -1,0 +1,103 @@
+# AGENTS §9 四 job：Format / Clippy / Test / Security Audit。
+# Test 在无 gauss feature 下运行（黄金对比需要 A 模式容器，见 golden job）；
+# golden job 提供 openGauss 5.0.0 服务容器，与 golden/gaussdb-docker 同口径
+# （md5 + password_encryption_type=1，A 模式）。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-features --tests -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+        with:
+          submodules: recursive   # lib/ogsql-parser（path 依赖，编译必需）
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # 默认 features（含 native 内核探针）；gauss/golden 见 golden job
+      - run: cargo test --features native
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked || true
+      - run: cargo audit
+
+  golden:
+    # 黄金对比：A 模式容器 + 语料逐行比对（V13–V15）。
+    # 结论口径：无容器环境此 job 即为黄金层的"红"，替代本地 SKIP。
+    runs-on: ubuntu-latest
+    services:
+      gaussdb:
+        image: opengauss/opengauss:5.0.0
+        env:
+          GS_PASSWORD: SpinDuckCi2025
+          GS_NODENAME: spinduck_node
+          GS_PORT: "5432"
+          GS_HOST_AUTH_METHOD: md5
+          OTHER_PG_CONF: "password_encryption_type = 1"
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "gsql -U gaussdb -W \"$GS_PASSWORD\" -d postgres -c 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 40
+    env:
+      SPINDUCK_OG_HOST: 127.0.0.1
+      SPINDUCK_OG_PORT: "5433"
+      SPINDUCK_OG_USER: gaussdb
+      SPINDUCK_OG_DB: postgres
+      SPINDUCK_OG_PASSWORD: SpinDuckCi2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Wait for A-mode readiness
+        run: |
+          for i in $(seq 1 60); do
+            if docker exec "${{ job.services.gaussdb.id }}" \
+              bash -lc 'gsql -U gaussdb -W "$GS_PASSWORD" -d postgres -t -A -c \
+              "SELECT datcompatibility FROM pg_database WHERE datname = current_database()"' \
+              2>/dev/null | tr -d '[:space:]' | grep -qx A; then
+              echo "A-mode ready"; exit 0
+            fi
+            sleep 5
+          done
+          echo "openGauss not ready in 5 minutes"; exit 1
+      - run: cargo test --features gauss

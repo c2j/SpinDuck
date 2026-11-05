@@ -251,7 +251,8 @@ cargo test --all-features
 cargo audit
 
 # 变异测试（仅 M3.5/M6.5/M10 门禁节点）
-cargo mutants -f src/ir,src/sql,runtime
+cargo mutants -f src/ir -f src/sql -f src/runtime -f src/value.rs
+# （逐个 -f；coerce 位于 src/value.rs）
 
 # 覆盖率（评审参考）
 cargo llvm-cov --html
