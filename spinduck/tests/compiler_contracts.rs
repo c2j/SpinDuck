@@ -397,3 +397,50 @@ fn should_execute_for_loop_body_once_per_row() {
         "聚合结果应进入 INSERT：{ins}"
     );
 }
+
+#[test]
+fn should_bind_record_field_references_in_sql_text() {
+    // 语料 PKG_SPLIT_TRADE_STEP3_SH.prc_trd_deal_purchase：
+    // `INSERT ... VALUES (v_fund_code, r_get_purchase.market_code, ...)`
+    // 记录变量限定字段必须替换为字段绑定，表别名限定列不得替换
+    use spinduck_core::ir::BindSrc;
+
+    let (ex, log) = Recorder::with_script(
+        &["a", "fee"],
+        vec![vec![SpinValue::Int(1), SpinValue::Decimal(1250, 15, 2)]],
+    );
+    let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+    eng.register(
+        "CREATE OR REPLACE PROCEDURE p_recfield IS \
+         DECLARE v_fund VARCHAR(10) := 'F001'; \
+         BEGIN \
+           FOR r IN (SELECT 1 AS a, 12.50 AS fee) LOOP \
+             INSERT INTO out_t(f, fee) VALUES (v_fund, r.fee); \
+           END LOOP; \
+         END;",
+    )
+    .unwrap();
+    eng.call("p_recfield", &[]).unwrap();
+
+    let calls = log.borrow().clone();
+    let ins = calls
+        .iter()
+        .find(|s| s.to_ascii_lowercase().contains("insert into out_t"))
+        .expect("INSERT 应下发");
+    assert!(
+        ins.contains("$v_r__fee"),
+        "记录字段应替换为 $v_<rec>__<field> 占位符：{ins}"
+    );
+    assert!(!ins.contains("r."), "不得残留记录限定符：{ins}");
+
+    // 绑定源类型：Field 而非 Var
+    let prog = eng.catalog.lookup("p_recfield").unwrap();
+    let has_field_bind = prog.prog.code.iter().any(|st| {
+        matches!(
+            st,
+            spinduck_core::ir::IrStmt::SqlExec { binds, .. }
+                if binds.iter().any(|(_, src)| matches!(src, BindSrc::Field { .. }))
+        )
+    });
+    assert!(has_field_bind, "INSERT 绑定表应含 Field 源");
+}

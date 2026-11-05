@@ -12,6 +12,30 @@ use crate::runtime::cursor::CursorAttrKind;
 use crate::value::SpinValue;
 use std::collections::BTreeMap;
 
+/// SQL 绑定源：帧变量 / 记录字段（§3.2 消歧——记录变量限定字段可出现在
+/// 下发 SQL 文本，如 `INSERT ... VALUES (r_get_purchase.fee, ...)`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindSrc {
+    /// 裸变量
+    Var(VarName),
+    /// 记录变量.字段（运行期从帧内 RECORD 取字段值）
+    Field { rec: VarName, field: String },
+}
+
+impl BindSrc {
+    /// 占位符名（`$v_<rec>__<field>` / `$v_<var>`；大小写归一小写）。
+    pub fn placeholder(rec_or_var: &str, field: Option<&str>) -> String {
+        match field {
+            Some(f) => format!(
+                "$v_{}__{}",
+                rec_or_var.to_ascii_lowercase(),
+                f.to_ascii_lowercase()
+            ),
+            None => format!("$v_{}", rec_or_var.to_ascii_lowercase()),
+        }
+    }
+}
+
 /// 变量名 Newtype（AGENTS §5 边界类型纪律）。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct VarName(pub String);
@@ -101,13 +125,13 @@ pub enum IrStmt {
     /// SELECT [INTO ...]（行数语义：0→NO_DATA_FOUND，≥2→TOO_MANY_ROWS）
     SqlQuery {
         sql: String,
-        binds: Vec<(String, VarName)>,
+        binds: Vec<(String, BindSrc)>,
         into: Vec<AssignTarget>,
     },
     /// DML/DDL（Truncate/Insert/Update/Delete/...）
     SqlExec {
         sql: String,
-        binds: Vec<(String, VarName)>,
+        binds: Vec<(String, BindSrc)>,
     },
     /// PERFORM <expr>：求值并丢弃
     Perform {
@@ -156,7 +180,7 @@ pub enum CursorSource {
     /// 静态游标：声明段 parsed_query 经改写管线后的文本与绑定
     Static {
         sql: String,
-        binds: Vec<(String, VarName)>,
+        binds: Vec<(String, BindSrc)>,
     },
     /// 动态 OPEN FOR <变量>（运行期求值文本，M8 前不做人内变量替换）
     Dynamic { query_expr: IrExpr },
@@ -301,6 +325,17 @@ fn collect_stmt(st: &PlStatement, set: &mut crate::sql::VarScope) {
             collect_slice(&i.else_stmts, set);
         }
         PlStatement::Loop(l) => collect_slice(&l.body, set),
+        PlStatement::For(f) => {
+            // FOR 循环变量（Range 计数 / Query·Cursor 记录）本身是帧变量，
+            // 其记录字段（rec.field）会出现在体内 SQL 文本中，必须入集
+            use ogsql_parser::ast::plpgsql::PlForKind;
+            set.insert(f.variable.to_ascii_lowercase());
+            if let PlForKind::Query { parsed_query, .. } = &f.kind {
+                // 记录形态：无独立表达式可走，体内语句递归即可
+                let _ = parsed_query;
+            }
+            collect_slice(&f.body, set);
+        }
         PlStatement::While(w) => {
             collect_expr(&w.condition, set);
             collect_slice(&w.body, set);
@@ -360,7 +395,7 @@ pub(crate) struct Compiler {
     /// `[patterns] rownum_first_row`（§9）：`rownum = 1` → `LIMIT 1` 改写开关
     rownum_first_row: bool,
     /// 静态游标声明 → 编译后的 (sql, binds)（compile_block_with 填充，§7.2）
-    pending_cursor_sql: BTreeMap<String, (String, Vec<(String, VarName)>)>,
+    pending_cursor_sql: BTreeMap<String, (String, Vec<(String, BindSrc)>)>,
     funcs: BTreeMap<String, String>,
     code: Vec<IrStmt>,
     labels: std::collections::HashMap<String, usize>,

@@ -17,7 +17,7 @@ pub mod sql;
 pub mod types;
 pub mod value;
 
-pub use ir::{compile_block, compile_stmts, IrExpr, IrProg, IrStmt};
+pub use ir::{compile_block, compile_stmts, BindSrc, IrExpr, IrProg, IrStmt};
 
 pub use catalog::{
     CallResult, CompiledRoutine, ParamMode, RoutineCatalog, RoutineKind, RoutineParam,
