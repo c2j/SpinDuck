@@ -16,6 +16,8 @@ pub enum Command {
     Compile { paths: Vec<PathBuf> },
     /// 规则文件探针（版本锚定检查）。
     RulesProbe { path: PathBuf },
+    /// 打印例程 IR（调试/回归，不执行）。
+    Explain { file: PathBuf, routine: String },
     /// 物化：GaussDB 表 → 本地 DuckDB 表（feature `gauss`）。
     Materialize {
         db: PathBuf,
@@ -68,6 +70,7 @@ pub fn parse(argv: &[String]) -> Result<Command, EngineError> {
                 path: PathBuf::from(path),
             })
         }
+        "explain" => parse_explain(&argv[1..]),
         "materialize" => parse_materialize(&argv[1..]),
         "sync" => parse_sync(&argv[1..]),
         "call" => parse_call(&argv[1..]),
@@ -118,6 +121,29 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
         files,
         routine,
         args,
+    })
+}
+
+fn parse_explain(rest: &[String]) -> Result<Command, EngineError> {
+    let mut file = None;
+    let mut routine = None;
+    let mut it = rest.iter();
+    while let Some(tok) = it.next() {
+        match tok.as_str() {
+            "--file" => file = Some(PathBuf::from(next_arg(&mut it, "--file <path>")?)),
+            t if t.starts_with("--") => return Err(usage_err(format!("unknown flag {t}"))),
+            _ => {
+                if routine.is_none() {
+                    routine = Some(tok.clone());
+                } else {
+                    return Err(usage_err("explain --file <sql> <routine>"));
+                }
+            }
+        }
+    }
+    Ok(Command::Explain {
+        file: file.ok_or_else(|| usage_err("explain --file <sql> <routine>"))?,
+        routine: routine.ok_or_else(|| usage_err("explain --file <sql> <routine>"))?,
     })
 }
 
@@ -216,6 +242,7 @@ pub fn usage() -> &'static str {
      \x20 version                         打印版本\n\
      \x20 compile <path>...               语料编译体检（递归 *.sql）\n\
      \x20 rules probe <rules.toml>        规则文件版本锚定检查\n\
+     \x20 explain --file <sql> <routine>   打印例程 IR（不执行）\n\
      \x20 materialize --db <f> --table <t> [--where <expr>]
 \
      \x20                                从 GaussDB 物化到本地 DuckDB（需 feature gauss）
@@ -293,6 +320,22 @@ mod tests {
         assert_eq!(parse_literal("null"), SpinValue::Null);
         assert_eq!(parse_literal("TRUE"), SpinValue::Bool(true));
         assert_eq!(parse_literal("abc"), SpinValue::Str("abc".into()));
+    }
+
+    #[test]
+    fn should_parse_explain_with_file_and_routine() {
+        let c = parse(&v(&["explain", "--file", "p.sql", "prc_x"])).unwrap();
+        assert_eq!(
+            c,
+            Command::Explain {
+                file: PathBuf::from("p.sql"),
+                routine: "prc_x".to_string(),
+            }
+        );
+        assert!(
+            parse(&v(&["explain", "prc_x"])).is_err(),
+            "缺 --file 应报用法错"
+        );
     }
 
     #[test]

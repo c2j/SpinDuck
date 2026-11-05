@@ -3,6 +3,7 @@
 //! 子命令与退出码契约见 AGENTS.md §8 与 docs/architecture.md §11。
 
 pub mod args;
+pub mod explain;
 pub mod run;
 
 use crate::engine::Engine;

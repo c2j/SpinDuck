@@ -60,6 +60,7 @@ fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError> {
             })
         }
         Command::Compile { paths } => compile_cmd(&paths, out),
+        Command::Explain { file, routine } => explain_cmd(&file, &routine, out),
         Command::Materialize { .. } => materialize_cmd(cmd_materialize(cmd), out),
         Command::Sync { .. } => sync_cmd(cmd_sync(cmd), out),
         Command::Call { .. } => call_cmd(cmd_call(cmd), out),
@@ -163,6 +164,14 @@ fn compile_cmd(paths: &[PathBuf], out: &mut dyn Write) -> Result<i32, EngineErro
         writeln!(out, "reason {} x{}", code, n).map_err(io_err)?;
     }
     Ok(if s.failed == 0 { EXIT_OK } else { EXIT_FAIL })
+}
+
+fn explain_cmd(file: &Path, routine: &str, out: &mut dyn Write) -> Result<i32, EngineError> {
+    let (text, _) = crate::cli::read_source(file)?;
+    for line in crate::cli::explain::explain_routine(&text, routine)? {
+        writeln!(out, "{line}").map_err(io_err)?;
+    }
+    Ok(EXIT_OK)
 }
 
 fn compile_single(path: &Path, rules: &RuleRegistry) -> Result<FileReport, EngineError> {
@@ -362,6 +371,22 @@ mod tests {
         let (code, out) = run_str(&["rules", "probe", &p.to_string_lossy()]);
         assert_eq!(code, EXIT_FAIL);
         assert!(out.contains("match=false"), "{out}");
+    }
+
+    #[test]
+    fn should_explain_routine_as_stable_ir_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("p.sql");
+        std::fs::write(
+            &f,
+            "CREATE OR REPLACE PROCEDURE prc_x(p_i IN NUMBER, p_o OUT NUMBER) IS \
+             BEGIN p_o := p_i * 2; END;",
+        )
+        .unwrap();
+        let (code, out) = run_str(&["explain", "--file", &f.to_string_lossy(), "prc_x"]);
+        assert_eq!(code, EXIT_OK, "{out}");
+        // 参数由调用方预绑定，IR 只含函数体：唯一一条赋值
+        assert_eq!(out, "0\tassign\tp_o := (p_i * 2)\n", "{out}");
     }
 
     #[cfg(feature = "native")]
