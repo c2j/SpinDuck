@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ replace == with != in Compiler::expr
+@@ -1046,17 +1046,17 @@
+         }
+     }
+ 
+     fn expr(&mut self, e: &Expr) -> Result<IrExpr, EngineError> {
+         match e {
+             Expr::Literal(l) => Ok(IrExpr::Const(lit(l))),
+             Expr::PlVariable(name) => Ok(IrExpr::Var(VarName(ident_path(name)))),
+             Expr::ColumnRef(name) => {
+-                if name.len() == 2 {
++                if name.len() != /* ~ changed by cargo-mutants ~ */ 2 {
+                     Ok(IrExpr::Field {
+                         rec: VarName(ident0(name)),
+                         field: ident1(name),
+                     })
+                 } else {
+                     // 单段标识符在 PL 表达式中仍按变量解释（§3.2 消歧同源）
+                     Ok(IrExpr::Var(VarName(ident_path(name))))
+                 }

@@ -1,0 +1,21 @@
+--- src/sql/rewrite.rs
++++ replace && with || in find_innermost_calls
+@@ -217,17 +217,17 @@
+             _ => {
+                 if c.is_ascii_alphabetic() || c == '_' {
+                     let start = i;
+                     while i < text.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                         i += 1;
+                     }
+                     let word = &text[start..i];
+                     let upper = word.to_ascii_uppercase();
+-                    if names.contains(&upper.as_str()) && i < text.len() && bytes[i] == b'(' {
++                    if names.contains(&upper.as_str()) && i < text.len() || /* ~ changed by cargo-mutants ~ */ bytes[i] == b'(' {
+                         // 配平右括号
+                         let mut depth = 0usize;
+                         let mut j = i;
+                         let mut s2 = in_string;
+                         while j < text.len() {
+                             let ch = bytes[j] as char;
+                             if s2 {
+                                 if ch == '\'' {

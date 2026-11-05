@@ -1,0 +1,33 @@
+--- src/sql/rewrite.rs
++++ delete match arm Token::Ident(value) in rewrite_tokens_with_rules
+@@ -141,29 +141,17 @@
+     let mut seen: BTreeSet<String> = BTreeSet::new();
+     let mut cursor = 0usize;
+     for tws in &tokens {
+         let gap = sql_text
+             .get(cursor..tws.span.start)
+             .ok_or_else(|| EngineError::invariant(41, "token span out of order".to_string()))?;
+         out.push_str(gap);
+         match &tws.token {
+-            Token::Ident(value) => {
+-                let lower = value.to_ascii_lowercase();
+-                if var_names.contains(&lower) {
+-                    let ph = format!("$v_{lower}");
+-                    out.push_str(&ph);
+-                    if seen.insert(ph.clone()) {
+-                        binds.push((ph, VarName(lower)));
+-                    }
+-                    cursor = tws.span.end;
+-                    continue;
+-                }
+-                apply_rename(&mut out, sql_text, tws.span.start, tws.span.end, functions);
+-            }
++             /* ~ changed by cargo-mutants ~ */
+             // 关键字（如 SYSDATE）走 Keyword 变体，用源码切片做重命名判定
+             Token::Keyword(_) => {
+                 apply_rename(&mut out, sql_text, tws.span.start, tws.span.end, functions);
+             }
+             _ => out.push_str(&sql_text[tws.span.start..tws.span.end]),
+         }
+         cursor = tws.span.end;
+     }

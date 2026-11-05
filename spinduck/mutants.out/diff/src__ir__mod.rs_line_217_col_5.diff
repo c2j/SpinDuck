@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ replace compile_block_with -> Result<IrProg, EngineError> with Ok(Default::default())
+@@ -209,17 +209,17 @@
+ 
+ /// 从完整 PL 块编译：声明段静态游标在此编译（§7.2）。
+ pub fn compile_block(block: &PlBlock) -> Result<IrProg, EngineError> {
+     compile_block_with(block, &RuleRegistry::default())
+ }
+ 
+ /// 带规则注册表的块编译。
+ pub fn compile_block_with(block: &PlBlock, rules: &RuleRegistry) -> Result<IrProg, EngineError> {
+-    compile_routine_with(block, &[], rules)
++    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// 例程块编译：额外把参数名加入变量集（M6：CALL 参数即帧变量）。
+ pub fn compile_routine_with(
+     block: &PlBlock,
+     extra_vars: &[String],
+     rules: &RuleRegistry,
+ ) -> Result<IrProg, EngineError> {

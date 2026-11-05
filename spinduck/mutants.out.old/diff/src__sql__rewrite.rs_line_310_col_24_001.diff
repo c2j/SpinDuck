@@ -1,0 +1,21 @@
+--- src/sql/rewrite.rs
++++ replace match guard depth == 0 with false in split_top_level_commas
+@@ -302,17 +302,17 @@
+                 '(' => {
+                     depth += 1;
+                     cur.push(c);
+                 }
+                 ')' => {
+                     depth -= 1;
+                     cur.push(c);
+                 }
+-                ',' if depth == 0 => {
++                ',' if false /* ~ changed by cargo-mutants ~ */ => {
+                     out.push(cur.trim().to_string());
+                     cur = String::new();
+                 }
+                 _ => cur.push(c),
+             }
+         }
+         i += 1;
+     }

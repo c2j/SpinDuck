@@ -1,0 +1,26 @@
+--- src/sql/rewrite.rs
++++ delete match arm "TO_NUMBER" in apply_ast_transforms
+@@ -369,22 +369,17 @@
+                     i += 2;
+                 }
+                 if i < args.len() {
+                     cs.push_str(&format!("ELSE {} ", args[i]));
+                 }
+                 cs.push_str("END");
+                 cs
+             }
+-            "TO_NUMBER" => {
+-                if args.len() != 1 {
+-                    return Err(EngineError::business(131, "TO_NUMBER requires 1 argument"));
+-                }
+-                format!("CAST({} AS DECIMAL(38,6))", args[0])
+-            }
++             /* ~ changed by cargo-mutants ~ */
+             "TO_CHAR" => {
+                 // 1 参形式（无数值/日期掩码）：GaussDB 按默认格式转字符串，
+                 // DuckDB 无对应默认格式 → CAST AS VARCHAR（已知限制：默认格式差异，
+                 // 见 validation.md V9 与规则文件 [functions] 注释）
+                 if args.len() == 1 {
+                     format!("CAST({} AS VARCHAR)", args[0])
+                 } else if args.len() != 2 {
+                     return Err(EngineError::business(

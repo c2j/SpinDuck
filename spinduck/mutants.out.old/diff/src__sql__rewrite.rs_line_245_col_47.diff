@@ -1,0 +1,21 @@
+--- src/sql/rewrite.rs
++++ replace -= with += in find_innermost_calls
+@@ -237,17 +237,17 @@
+                                         s2 = false;
+                                     }
+                                 }
+                             } else {
+                                 match ch {
+                                     '\'' => s2 = true,
+                                     '(' => depth += 1,
+                                     ')' => {
+-                                        depth -= 1;
++                                        depth += /* ~ changed by cargo-mutants ~ */ 1;
+                                         if depth == 0 {
+                                             break;
+                                         }
+                                     }
+                                     _ => {}
+                                 }
+                             }
+                             j += 1;

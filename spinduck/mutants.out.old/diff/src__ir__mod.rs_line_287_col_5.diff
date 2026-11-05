@@ -1,0 +1,50 @@
+--- src/ir/mod.rs
++++ replace collect_stmt with ()
+@@ -279,46 +279,17 @@
+ 
+ fn collect_slice(stmts: &[PlStatement], set: &mut crate::sql::VarScope) {
+     for st in stmts {
+         collect_stmt(st, set);
+     }
+ }
+ 
+ fn collect_stmt(st: &PlStatement, set: &mut crate::sql::VarScope) {
+-    match st {
+-        PlStatement::Assignment { target, expression } => {
+-            collect_expr(target, set);
+-            collect_expr(expression, set);
+-        }
+-        PlStatement::If(i) => {
+-            collect_expr(&i.condition, set);
+-            collect_slice(&i.then_stmts, set);
+-            for ei in &i.elsifs {
+-                collect_expr(&ei.condition, set);
+-                collect_slice(&ei.stmts, set);
+-            }
+-            collect_slice(&i.else_stmts, set);
+-        }
+-        PlStatement::Loop(l) => collect_slice(&l.body, set),
+-        PlStatement::While(w) => {
+-            collect_expr(&w.condition, set);
+-            collect_slice(&w.body, set);
+-        }
+-        PlStatement::Exit { condition, .. } | PlStatement::Continue { condition, .. } => {
+-            if let Some(c) = condition {
+-                collect_expr(c, set);
+-            }
+-        }
+-        PlStatement::Return {
+-            expression: Some(e),
+-        } => collect_expr(e, set),
+-        PlStatement::Block(b) => collect_slice(&b.body, set),
+-        _ => {}
+-    }
++    () /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ fn collect_expr(e: &Expr, set: &mut crate::sql::VarScope) {
+     match e {
+         Expr::PlVariable(name) => {
+             set.insert(ident_path(name).to_ascii_lowercase());
+         }
+         Expr::ColumnRef(name) if name.len() == 2 => {

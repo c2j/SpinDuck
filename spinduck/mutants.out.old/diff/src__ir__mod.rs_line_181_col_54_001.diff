@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ replace match guard ret.is_none() with false in IrProg::single_return_expr
+@@ -173,17 +173,17 @@
+     ///
+     /// 该形态不含局部变量/分支/副作用，表达式可直接下沉为内核宏；
+     /// 任何其它指令都返回 `None`（调用方据此拒绝宏登记，不做近似翻译）。
+     pub fn single_return_expr(&self) -> Option<&IrExpr> {
+         let mut ret = None;
+         for st in &self.code {
+             match st {
+                 IrStmt::Nop => {}
+-                IrStmt::Return { value: Some(e) } if ret.is_none() => ret = Some(e),
++                IrStmt::Return { value: Some(e) } if false /* ~ changed by cargo-mutants ~ */ => ret = Some(e),
+                 _ => return None,
+             }
+         }
+         ret
+     }
+ }
+ 
+ /// 编译器：AST 语句列表 → IR。预扫描收集 PL 变量名集合（SQL 改写用）。

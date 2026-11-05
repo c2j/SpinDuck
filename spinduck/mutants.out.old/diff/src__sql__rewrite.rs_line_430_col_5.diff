@@ -1,0 +1,26 @@
+--- src/sql/rewrite.rs
++++ replace unquote -> String with String::new()
+@@ -422,22 +422,17 @@
+             _ => unreachable!("names list"),
+         };
+         t = format!("{}{}{}", &t[..start], replaced, &t[end..]);
+     }
+     Ok(t)
+ }
+ 
+ fn unquote(literal: &str) -> String {
+-    let t = literal.trim();
+-    if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
+-        t[1..t.len() - 1].replace("''", "'")
+-    } else {
+-        t.to_string()
+-    }
++    String::new() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ #[cfg(test)]
+ mod transform_tests {
+     use super::*;
+ 
+     #[test]
+     fn should_transform_decode_to_case_with_default() {

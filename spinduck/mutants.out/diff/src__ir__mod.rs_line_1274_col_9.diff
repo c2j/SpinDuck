@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ delete match arm "=" in binop
+@@ -1266,17 +1266,17 @@
+ 
+ fn binop(op: &str) -> Result<BinOp, EngineError> {
+     Ok(match op.to_ascii_uppercase().as_str() {
+         "+" => BinOp::Add,
+         "-" => BinOp::Sub,
+         "*" => BinOp::Mul,
+         "/" => BinOp::Div,
+         "||" => BinOp::Concat,
+-        "=" => BinOp::Eq,
++         /* ~ changed by cargo-mutants ~ */
+         "<>" | "!=" => BinOp::Ne,
+         "<" => BinOp::Lt,
+         "<=" => BinOp::Le,
+         ">" => BinOp::Gt,
+         ">=" => BinOp::Ge,
+         "AND" => BinOp::And,
+         "OR" => BinOp::Or,
+         _ => {

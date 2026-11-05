@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ delete match arm IrStmt::Nop in IrProg::single_return_expr
+@@ -172,17 +172,17 @@
+     /// 纯表达式函数体识别（§8.2 路径③）：仅允许 `Nop` + 唯一 `RETURN <expr>`。
+     ///
+     /// 该形态不含局部变量/分支/副作用，表达式可直接下沉为内核宏；
+     /// 任何其它指令都返回 `None`（调用方据此拒绝宏登记，不做近似翻译）。
+     pub fn single_return_expr(&self) -> Option<&IrExpr> {
+         let mut ret = None;
+         for st in &self.code {
+             match st {
+-                IrStmt::Nop => {}
++                 /* ~ changed by cargo-mutants ~ */
+                 IrStmt::Return { value: Some(e) } if ret.is_none() => ret = Some(e),
+                 _ => return None,
+             }
+         }
+         ret
+     }
+ }
+ 

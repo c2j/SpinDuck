@@ -1,0 +1,21 @@
+--- src/sql/rewrite.rs
++++ replace == with != in find_innermost_calls
+@@ -210,17 +210,17 @@
+             continue;
+         }
+         match c {
+             '\'' => {
+                 in_string = true;
+                 i += 1;
+             }
+             _ => {
+-                if c.is_ascii_alphabetic() || c == '_' {
++                if c.is_ascii_alphabetic() || c != /* ~ changed by cargo-mutants ~ */ '_' {
+                     let start = i;
+                     while i < text.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                         i += 1;
+                     }
+                     let word = &text[start..i];
+                     let upper = word.to_ascii_uppercase();
+                     if names.contains(&upper.as_str()) && i < text.len() && bytes[i] == b'(' {
+                         // 配平右括号

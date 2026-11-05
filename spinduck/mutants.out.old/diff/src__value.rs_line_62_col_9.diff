@@ -1,0 +1,41 @@
+--- src/value.rs
++++ replace SpinValue::as_str_loose -> String with String::new()
+@@ -54,37 +54,17 @@
+                     .collect::<Vec<_>>()
+                     .join(", ")
+             ),
+         }
+     }
+ 
+     /// 宽松数值语义：字符串可转数字（隐式转换规则 `[implicit]`）。
+     pub fn as_str_loose(&self) -> String {
+-        match self {
+-            SpinValue::Null => "".into(),
+-            SpinValue::Str(s) => s.clone(),
+-            SpinValue::Bool(b) => b.to_string(),
+-            SpinValue::Int(i) => i.to_string(),
+-            SpinValue::Decimal(v, _, s) => {
+-                // 负数必须整体带符号：`-0.005` 而非 `0.0-5`
+-                let neg = *v < 0;
+-                let abs = v.unsigned_abs();
+-                let div = 10u128.pow(*s as u32);
+-                let (ip, frac) = (abs / div, abs % div);
+-                let sign = if neg { "-" } else { "" };
+-                if *s == 0 {
+-                    format!("{sign}{ip}")
+-                } else {
+-                    format!("{sign}{ip}.{frac:0>w$}", w = *s as usize)
+-                }
+-            }
+-            SpinValue::Blob(_) => "<blob>".into(),
+-            SpinValue::Record(_) => "<record>".into(),
+-        }
++        String::new() /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// 隐式转换（规则文件 `[implicit]` 驱动的统一入口）。
+ /// 返回 Err(EngineError) 表示不可转换（产生 BIZ 域诊断）。
+ pub fn coerce(v: &SpinValue, target: &SpinType) -> Result<SpinValue, EngineError> {
+     if v.fits(target) {
+         return Ok(v.clone());

@@ -1,6 +1,6 @@
 //! 子命令执行与渲染（纯函数式：写 `out` 并返回退出码，便于契约测试）。
 
-use crate::cli::args::{parse, parse_literal, usage, Command};
+use crate::cli::args::{parse, usage, Command};
 use crate::cli::{compile_dir, summarize, FileReport};
 use crate::error::EngineError;
 use crate::rules::RuleRegistry;
@@ -208,6 +208,7 @@ fn failure_histogram(reports: &[FileReport]) -> Vec<(String, usize)> {
 
 #[cfg(feature = "native")]
 fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, EngineError> {
+    use crate::cli::args::parse_literal;
     use crate::engine::Engine;
     let rules = match &parts.rules {
         Some(p) => RuleRegistry::load(p)?,
@@ -298,10 +299,17 @@ fn sync_cmd(parts: SyncParts, _out: &mut dyn Write) -> Result<i32, EngineError> 
 }
 
 #[cfg(not(feature = "native"))]
-fn call_cmd(_parts: CallParts, _out: &mut dyn Write) -> Result<i32, EngineError> {
+fn call_cmd(parts: CallParts, _out: &mut dyn Write) -> Result<i32, EngineError> {
     Err(EngineError::env(
         12,
-        "call requires feature `native` (rebuild with --features cli)".to_string(),
+        format!(
+            "call {} (args: {}, files: {:?}, db: {:?}, rules: {:?}) requires feature `native`",
+            parts.routine,
+            parts.args.join(","),
+            parts.files,
+            parts.db,
+            parts.rules
+        ),
     ))
 }
 

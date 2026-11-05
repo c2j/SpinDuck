@@ -1,0 +1,24 @@
+--- src/ir/mod.rs
++++ delete match arm PlStatement::Assignment{target, expression} in collect_stmt
+@@ -280,20 +280,17 @@
+ fn collect_slice(stmts: &[PlStatement], set: &mut crate::sql::VarScope) {
+     for st in stmts {
+         collect_stmt(st, set);
+     }
+ }
+ 
+ fn collect_stmt(st: &PlStatement, set: &mut crate::sql::VarScope) {
+     match st {
+-        PlStatement::Assignment { target, expression } => {
+-            collect_expr(target, set);
+-            collect_expr(expression, set);
+-        }
++         /* ~ changed by cargo-mutants ~ */
+         PlStatement::If(i) => {
+             collect_expr(&i.condition, set);
+             collect_slice(&i.then_stmts, set);
+             for ei in &i.elsifs {
+                 collect_expr(&ei.condition, set);
+                 collect_slice(&ei.stmts, set);
+             }
+             collect_slice(&i.else_stmts, set);

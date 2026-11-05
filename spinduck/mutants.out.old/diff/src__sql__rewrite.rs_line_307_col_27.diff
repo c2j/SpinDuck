@@ -1,0 +1,21 @@
+--- src/sql/rewrite.rs
++++ replace -= with += in split_top_level_commas
+@@ -299,17 +299,17 @@
+                     in_string = true;
+                     cur.push(c);
+                 }
+                 '(' => {
+                     depth += 1;
+                     cur.push(c);
+                 }
+                 ')' => {
+-                    depth -= 1;
++                    depth += /* ~ changed by cargo-mutants ~ */ 1;
+                     cur.push(c);
+                 }
+                 ',' if depth == 0 => {
+                     out.push(cur.trim().to_string());
+                     cur = String::new();
+                 }
+                 _ => cur.push(c),
+             }

@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ delete field vars from struct Compiler expression in compile_routine_with
+@@ -223,17 +223,17 @@
+     extra_vars: &[String],
+     rules: &RuleRegistry,
+ ) -> Result<IrProg, EngineError> {
+     let mut vars = collect_var_names(&block.body);
+     for v in extra_vars {
+         vars.insert(v.to_ascii_lowercase());
+     }
+     let mut c = Compiler {
+-        vars,
++         /* ~ changed by cargo-mutants ~ */
+         funcs: rules.functions.clone(),
+         ..Default::default()
+     };
+     use ogsql_parser::ast::plpgsql::PlDeclaration;
+     // 声明段：变量入变量集并生成初始化指令（GaussDB 语义：声明即变量，
+     // 未给初值时为 NULL）；游标编译为静态 SQL 待 OPEN 使用
+     for decl in &block.declarations {
+         match decl {

@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ replace += with *= in Compiler::synth_label
+@@ -446,17 +446,17 @@
+         };
+         self.jump(end, Some(not_found), true);
+         self.stmts(body)?;
+         self.jump(start, None, true);
+         Ok(())
+     }
+ 
+     fn synth_label(&mut self, hint: &str) -> String {
+-        self.synth += 1;
++        self.synth *= /* ~ changed by cargo-mutants ~ */ 1;
+         format!("__{hint}_{}", self.synth)
+     }
+ 
+     fn stmts(&mut self, stmts: &[PlStatement]) -> Result<(), EngineError> {
+         for st in stmts {
+             self.stmt(st)?;
+         }
+         Ok(())

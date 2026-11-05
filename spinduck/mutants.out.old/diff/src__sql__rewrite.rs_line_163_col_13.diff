@@ -1,0 +1,23 @@
+--- src/sql/rewrite.rs
++++ delete match arm Token::Keyword(_) in rewrite_tokens_with_rules
+@@ -155,19 +155,17 @@
+                         binds.push((ph, VarName(lower)));
+                     }
+                     cursor = tws.span.end;
+                     continue;
+                 }
+                 apply_rename(&mut out, sql_text, tws.span.start, tws.span.end, functions);
+             }
+             // 关键字（如 SYSDATE）走 Keyword 变体，用源码切片做重命名判定
+-            Token::Keyword(_) => {
+-                apply_rename(&mut out, sql_text, tws.span.start, tws.span.end, functions);
+-            }
++             /* ~ changed by cargo-mutants ~ */
+             _ => out.push_str(&sql_text[tws.span.start..tws.span.end]),
+         }
+         cursor = tws.span.end;
+     }
+     out.push_str(&sql_text[cursor..]);
+     Ok(SqlUnit { text: out, binds })
+ }
+ 

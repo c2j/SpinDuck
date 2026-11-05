@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ delete field vars from struct Compiler expression in compile_stmts_with
+@@ -193,17 +193,17 @@
+ 
+ /// 带规则注册表的编译（SQL 改写应用函数映射与解析级变换）。
+ pub fn compile_stmts_with(
+     stmts: &[PlStatement],
+     rules: &RuleRegistry,
+ ) -> Result<IrProg, EngineError> {
+     let vars = collect_var_names(stmts);
+     let mut c = Compiler {
+-        vars,
++         /* ~ changed by cargo-mutants ~ */
+         funcs: rules.functions.clone(),
+         ..Default::default()
+     };
+     c.stmts(stmts)?;
+     c.resolve_fixups()?;
+     Ok(IrProg { code: c.code })
+ }
+ 

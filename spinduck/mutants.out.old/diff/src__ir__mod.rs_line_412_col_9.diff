@@ -1,0 +1,34 @@
+--- src/ir/mod.rs
++++ replace Compiler::resolve_fixups -> Result<(), EngineError> with Ok(())
+@@ -404,30 +404,17 @@
+                     }
+                 });
+                 self.fixups.push((at, label.to_string()));
+             }
+         }
+     }
+ 
+     fn resolve_fixups(&mut self) -> Result<(), EngineError> {
+-        let fixups = std::mem::take(&mut self.fixups);
+-        for (at, label) in fixups {
+-            let resolved = *self.labels.get(&label).ok_or_else(|| {
+-                EngineError::invariant(20, format!("unknown goto/exit label: {label}"))
+-            })?;
+-            match &mut self.code[at] {
+-                IrStmt::Jump(target) => *target = resolved,
+-                IrStmt::JumpIf { to: target, .. } | IrStmt::JumpIfNot { to: target, .. } => {
+-                    *target = resolved
+-                }
+-                _ => return Err(EngineError::invariant(28, "fixup target must be a jump")),
+-            }
+-        }
+-        Ok(())
++        Ok(()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     /// FOR 隐式游标循环体：FETCH → %NOTFOUND 退出 → 循环体 → 回跳。
+     fn for_cursor_loop(
+         &mut self,
+         cursor: &VarName,
+         rec: &VarName,
+         body: &[PlStatement],

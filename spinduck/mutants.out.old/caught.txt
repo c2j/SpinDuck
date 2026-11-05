@@ -1,0 +1,207 @@
+src/ir/mod.rs:177:9: replace IrProg::single_return_expr -> Option<&IrExpr> with None
+src/ir/mod.rs:199:5: replace compile_stmts_with -> Result<IrProg, EngineError> with Ok(Default::default())
+src/ir/mod.rs:201:9: delete field vars from struct Compiler expression in compile_stmts_with
+src/ir/mod.rs:181:54: replace match guard ret.is_none() with false in IrProg::single_return_expr
+src/ir/mod.rs:217:5: replace compile_block_with -> Result<IrProg, EngineError> with Ok(Default::default())
+src/ir/mod.rs:226:5: replace compile_routine_with -> Result<IrProg, EngineError> with Ok(Default::default())
+src/ir/mod.rs:232:9: delete field funcs from struct Compiler expression in compile_routine_with
+src/ir/mod.rs:250:13: delete match arm PlDeclaration::Variable(v) in compile_routine_with
+src/ir/mod.rs:180:17: delete match arm IrStmt::Nop in IrProg::single_return_expr
+src/ir/mod.rs:191:5: replace compile_stmts -> Result<IrProg, EngineError> with Ok(Default::default())
+src/ir/mod.rs:273:5: replace collect_var_names -> crate::sql::VarScope with Default::default()
+src/ir/mod.rs:287:5: replace collect_stmt with ()
+src/ir/mod.rs:288:9: delete match arm PlStatement::Assignment{target, expression} in collect_stmt
+src/ir/mod.rs:320:5: replace collect_expr with ()
+src/ir/mod.rs:321:9: delete match arm Expr::PlVariable(name) in collect_expr
+src/ir/mod.rs:376:9: replace Compiler::here -> usize with 0
+src/ir/mod.rs:376:9: replace Compiler::here -> usize with 1
+src/ir/mod.rs:380:9: replace Compiler::mark with ()
+src/ir/mod.rs:384:9: replace Compiler::jump with ()
+src/ir/mod.rs:412:9: replace Compiler::resolve_fixups -> Result<(), EngineError> with Ok(())
+src/ir/mod.rs:418:17: delete match arm IrStmt::Jump(target) in Compiler::resolve_fixups
+src/ir/mod.rs:419:17: delete match arm IrStmt::JumpIf{to:target, ..} | IrStmt::JumpIfNot{to:target, ..} in Compiler::resolve_fixups
+src/ir/mod.rs:454:9: replace Compiler::synth_label -> String with String::new()
+src/ir/mod.rs:454:9: replace Compiler::synth_label -> String with "xyzzy".into()
+src/ir/mod.rs:454:20: replace += with -= in Compiler::synth_label
+src/ir/mod.rs:454:20: replace += with *= in Compiler::synth_label
+src/ir/mod.rs:459:9: replace Compiler::stmts -> Result<(), EngineError> with Ok(())
+src/ir/mod.rs:466:9: replace Compiler::stmt -> Result<(), EngineError> with Ok(())
+src/ir/mod.rs:466:20: replace += with -= in Compiler::stmt
+src/ir/mod.rs:466:20: replace += with *= in Compiler::stmt
+src/ir/mod.rs:467:23: replace > with < in Compiler::stmt
+src/ir/mod.rs:467:23: replace > with == in Compiler::stmt
+src/ir/mod.rs:467:23: replace > with >= in Compiler::stmt
+src/ir/mod.rs:476:9: replace Compiler::stmt_inner -> Result<(), EngineError> with Ok(())
+src/ir/mod.rs:754:28: delete ! in Compiler::stmt_inner
+src/ir/mod.rs:876:51: replace - with + in Compiler::stmt_inner
+src/ir/mod.rs:876:51: replace - with / in Compiler::stmt_inner
+src/ir/mod.rs:543:20: delete ! in Compiler::stmt_inner
+src/ir/mod.rs:951:9: replace Compiler::sql_statement -> Result<(), EngineError> with Ok(())
+src/ir/mod.rs:1003:9: replace Compiler::loop_end_label -> Result<String, EngineError> with Ok(String::new())
+src/ir/mod.rs:1003:9: replace Compiler::loop_end_label -> Result<String, EngineError> with Ok("xyzzy".into())
+src/ir/mod.rs:1014:9: replace Compiler::loop_start_label -> Result<String, EngineError> with Ok(String::new())
+src/ir/mod.rs:1033:31: replace == with != in Compiler::assign_target
+src/ir/mod.rs:1014:9: replace Compiler::loop_start_label -> Result<String, EngineError> with Ok("xyzzy".into())
+src/ir/mod.rs:911:20: delete ! in Compiler::stmt_inner
+src/ir/mod.rs:1069:43: replace match guard op.eq_ignore_ascii_case("NOT") with true in Compiler::expr
+src/ir/mod.rs:1126:43: replace match guard op == "-" with false in Compiler::expr
+src/ir/mod.rs:1054:31: replace == with != in Compiler::expr
+src/ir/mod.rs:1114:33: delete ! in Compiler::expr
+src/ir/mod.rs:1126:46: replace == with != in Compiler::expr
+src/ir/mod.rs:1242:5: replace parse_decimal_literal -> Option<SpinValue> with None
+src/ir/mod.rs:1257:8: delete ! in parse_decimal_literal
+src/ir/mod.rs:1269:9: delete match arm "+" in binop
+src/ir/mod.rs:1271:9: delete match arm "*" in binop
+src/ir/mod.rs:1270:9: delete match arm "-" in binop
+src/ir/mod.rs:1273:9: delete match arm "||" in binop
+src/ir/mod.rs:1274:9: delete match arm "=" in binop
+src/ir/mod.rs:1272:9: delete match arm "/" in binop
+src/ir/mod.rs:1257:51: delete ! in parse_decimal_literal
+src/ir/mod.rs:1275:9: delete match arm "<>" | "!=" in binop
+src/ir/mod.rs:1278:9: delete match arm ">" in binop
+src/ir/mod.rs:1276:9: delete match arm "<" in binop
+src/ir/mod.rs:1279:9: delete match arm ">=" in binop
+src/ir/mod.rs:1277:9: delete match arm "<=" in binop
+src/ir/mod.rs:1292:5: replace ident_path -> String with String::new()
+src/ir/mod.rs:1292:5: replace ident_path -> String with "xyzzy".into()
+src/ir/mod.rs:1280:9: delete match arm "AND" in binop
+src/ir/mod.rs:1281:9: delete match arm "OR" in binop
+src/ir/mod.rs:1299:5: replace ident0 -> String with String::new()
+src/ir/mod.rs:1299:5: replace ident0 -> String with "xyzzy".into()
+src/value.rs:22:9: replace SpinValue::fits -> bool with true
+src/ir/mod.rs:1303:5: replace ident1 -> String with String::new()
+src/value.rs:22:9: replace SpinValue::fits -> bool with false
+src/ir/mod.rs:1303:5: replace ident1 -> String with "xyzzy".into()
+src/value.rs:41:9: replace SpinValue::display -> String with String::new()
+src/value.rs:41:9: replace SpinValue::display -> String with "xyzzy".into()
+src/value.rs:62:9: replace SpinValue::as_str_loose -> String with String::new()
+src/value.rs:62:9: replace SpinValue::as_str_loose -> String with "xyzzy".into()
+src/value.rs:69:30: replace < with == in SpinValue::as_str_loose
+src/value.rs:69:30: replace < with > in SpinValue::as_str_loose
+src/value.rs:72:39: replace / with % in SpinValue::as_str_loose
+src/value.rs:72:39: replace / with * in SpinValue::as_str_loose
+src/value.rs:72:50: replace % with / in SpinValue::as_str_loose
+src/value.rs:72:50: replace % with + in SpinValue::as_str_loose
+src/value.rs:74:23: replace == with != in SpinValue::as_str_loose
+src/value.rs:94:9: delete match arm (SpinValue::Str(s), SpinType::Int | SpinType::BigInt) in coerce
+src/value.rs:95:9: delete match arm (SpinValue::Str(s), SpinType::Decimal{scale, ..}) in coerce
+src/value.rs:97:9: delete match arm (SpinValue::Int(_) | SpinValue::Decimal(..), SpinType::Varchar) in coerce
+src/value.rs:100:9: delete match arm (SpinValue::Bool(b), SpinType::Varchar) in coerce
+src/value.rs:123:41: replace * with + in parse_numeric
+src/value.rs:123:41: replace * with / in parse_numeric
+src/sql/rewrite.rs:37:13: delete match arm Token::Ident(value) in rewrite_tokens
+src/sql/rewrite.rs:149:13: delete match arm Token::Ident(value) in rewrite_tokens_with_rules
+src/sql/rewrite.rs:163:13: delete match arm Token::Keyword(_) in rewrite_tokens_with_rules
+src/sql/rewrite.rs:182:5: replace apply_rename with ()
+src/sql/rewrite.rs:184:12: delete ! in apply_rename
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(0, 0, String::new(), String::new())]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(0, 0, String::new(), "xyzzy".into())]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(0, 0, "xyzzy".into(), String::new())]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(0, 0, "xyzzy".into(), "xyzzy".into())]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(0, 1, String::new(), String::new())]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(0, 1, String::new(), "xyzzy".into())]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(0, 1, "xyzzy".into(), String::new())]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(0, 1, "xyzzy".into(), "xyzzy".into())]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(1, 0, String::new(), String::new())]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(1, 0, String::new(), "xyzzy".into())]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(1, 0, "xyzzy".into(), String::new())]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(1, 0, "xyzzy".into(), "xyzzy".into())]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(1, 1, String::new(), String::new())]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(1, 1, String::new(), "xyzzy".into())]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(1, 1, "xyzzy".into(), String::new())]
+src/sql/rewrite.rs:195:5: replace find_innermost_calls -> Vec<(usize, usize, String, String)> with vec![(1, 1, "xyzzy".into(), "xyzzy".into())]
+src/sql/rewrite.rs:199:13: replace < with == in find_innermost_calls
+src/sql/rewrite.rs:199:13: replace < with > in find_innermost_calls
+src/sql/rewrite.rs:199:13: replace < with <= in find_innermost_calls
+src/sql/rewrite.rs:203:39: replace && with || in find_innermost_calls
+src/sql/rewrite.rs:203:26: replace < with == in find_innermost_calls
+src/sql/rewrite.rs:203:26: replace < with <= in find_innermost_calls
+src/sql/rewrite.rs:203:22: replace + with - in find_innermost_calls
+src/sql/rewrite.rs:203:22: replace + with * in find_innermost_calls
+src/sql/rewrite.rs:203:55: replace == with != in find_innermost_calls
+src/sql/rewrite.rs:203:50: replace + with * in find_innermost_calls
+src/sql/rewrite.rs:213:13: delete match arm '\'' in find_innermost_calls
+src/sql/rewrite.rs:215:19: replace += with -= in find_innermost_calls
+src/sql/rewrite.rs:215:19: replace += with *= in find_innermost_calls
+src/sql/rewrite.rs:218:44: replace || with && in find_innermost_calls
+src/sql/rewrite.rs:220:42: replace && with || in find_innermost_calls
+src/sql/rewrite.rs:220:29: replace < with <= in find_innermost_calls
+src/sql/rewrite.rs:221:27: replace += with -= in find_innermost_calls
+src/sql/rewrite.rs:225:74: replace && with || in find_innermost_calls
+src/sql/rewrite.rs:225:56: replace && with || in find_innermost_calls
+src/sql/rewrite.rs:225:61: replace < with == in find_innermost_calls
+src/sql/rewrite.rs:225:61: replace < with > in find_innermost_calls
+src/sql/rewrite.rs:225:86: replace == with != in find_innermost_calls
+src/sql/rewrite.rs:230:33: replace < with == in find_innermost_calls
+src/sql/rewrite.rs:230:33: replace < with > in find_innermost_calls
+src/sql/rewrite.rs:233:39: replace == with != in find_innermost_calls
+src/sql/rewrite.rs:234:59: replace && with || in find_innermost_calls
+src/sql/rewrite.rs:234:75: replace == with != in find_innermost_calls
+src/sql/rewrite.rs:234:70: replace + with * in find_innermost_calls
+src/sql/rewrite.rs:243:37: delete match arm '(' in find_innermost_calls
+src/sql/rewrite.rs:244:37: delete match arm ')' in find_innermost_calls
+src/sql/rewrite.rs:243:50: replace += with -= in find_innermost_calls
+src/sql/rewrite.rs:243:50: replace += with *= in find_innermost_calls
+src/sql/rewrite.rs:245:47: replace -= with += in find_innermost_calls
+src/sql/rewrite.rs:245:47: replace -= with /= in find_innermost_calls
+src/sql/rewrite.rs:246:50: replace == with != in find_innermost_calls
+src/sql/rewrite.rs:253:31: replace += with -= in find_innermost_calls
+src/sql/rewrite.rs:255:44: replace + with - in find_innermost_calls
+src/sql/rewrite.rs:255:44: replace + with * in find_innermost_calls
+src/sql/rewrite.rs:257:28: delete ! in find_innermost_calls
+src/sql/rewrite.rs:258:48: replace + with - in find_innermost_calls
+src/sql/rewrite.rs:258:48: replace + with * in find_innermost_calls
+src/sql/rewrite.rs:271:5: replace upper_eq_find -> bool with true
+src/sql/rewrite.rs:278:5: replace split_top_level_commas -> Vec<String> with vec![]
+src/sql/rewrite.rs:278:5: replace split_top_level_commas -> Vec<String> with vec![String::new()]
+src/sql/rewrite.rs:278:5: replace split_top_level_commas -> Vec<String> with vec!["xyzzy".into()]
+src/sql/rewrite.rs:284:13: replace < with == in split_top_level_commas
+src/sql/rewrite.rs:284:13: replace < with > in split_top_level_commas
+src/sql/rewrite.rs:284:13: replace < with <= in split_top_level_commas
+src/sql/rewrite.rs:288:18: replace == with != in split_top_level_commas
+src/sql/rewrite.rs:289:36: replace && with || in split_top_level_commas
+src/sql/rewrite.rs:289:26: replace < with == in split_top_level_commas
+src/sql/rewrite.rs:289:26: replace < with <= in split_top_level_commas
+src/sql/rewrite.rs:289:22: replace + with - in split_top_level_commas
+src/sql/rewrite.rs:289:22: replace + with * in split_top_level_commas
+src/sql/rewrite.rs:289:52: replace == with != in split_top_level_commas
+src/sql/rewrite.rs:289:47: replace + with * in split_top_level_commas
+src/sql/rewrite.rs:298:17: delete match arm '\'' in split_top_level_commas
+src/sql/rewrite.rs:302:17: delete match arm '(' in split_top_level_commas
+src/sql/rewrite.rs:306:17: delete match arm ')' in split_top_level_commas
+src/sql/rewrite.rs:310:24: replace match guard depth == 0 with true in split_top_level_commas
+src/sql/rewrite.rs:310:24: replace match guard depth == 0 with false in split_top_level_commas
+src/sql/rewrite.rs:303:27: replace += with -= in split_top_level_commas
+src/sql/rewrite.rs:303:27: replace += with *= in split_top_level_commas
+src/sql/rewrite.rs:307:27: replace -= with += in split_top_level_commas
+src/sql/rewrite.rs:307:27: replace -= with /= in split_top_level_commas
+src/sql/rewrite.rs:310:30: replace == with != in split_top_level_commas
+src/sql/rewrite.rs:317:11: replace += with -= in split_top_level_commas
+src/sql/rewrite.rs:319:8: delete ! in split_top_level_commas
+src/sql/rewrite.rs:327:5: replace oracle_format_to_strftime -> String with String::new()
+src/sql/rewrite.rs:327:5: replace oracle_format_to_strftime -> String with "xyzzy".into()
+src/sql/rewrite.rs:349:5: replace apply_ast_transforms -> Result<String, EngineError> with Ok(String::new())
+src/sql/rewrite.rs:349:5: replace apply_ast_transforms -> Result<String, EngineError> with Ok("xyzzy".into())
+src/sql/rewrite.rs:358:13: delete match arm "DECODE" in apply_ast_transforms
+src/sql/rewrite.rs:377:13: delete match arm "TO_NUMBER" in apply_ast_transforms
+src/sql/rewrite.rs:383:13: delete match arm "TO_CHAR" in apply_ast_transforms
+src/sql/rewrite.rs:359:31: replace < with > in apply_ast_transforms
+src/sql/rewrite.rs:367:29: replace < with == in apply_ast_transforms
+src/sql/rewrite.rs:367:29: replace < with > in apply_ast_transforms
+src/sql/rewrite.rs:367:29: replace < with <= in apply_ast_transforms
+src/sql/rewrite.rs:367:25: replace + with - in apply_ast_transforms
+src/sql/rewrite.rs:367:25: replace + with * in apply_ast_transforms
+src/sql/rewrite.rs:369:23: replace += with *= in apply_ast_transforms
+src/sql/rewrite.rs:369:23: replace += with -= in apply_ast_transforms
+src/sql/rewrite.rs:371:22: replace < with == in apply_ast_transforms
+src/sql/rewrite.rs:371:22: replace < with > in apply_ast_transforms
+src/sql/rewrite.rs:378:31: replace != with == in apply_ast_transforms
+src/sql/rewrite.rs:387:31: replace == with != in apply_ast_transforms
+src/sql/rewrite.rs:389:38: replace != with == in apply_ast_transforms
+src/sql/rewrite.rs:404:44: replace != with == in apply_ast_transforms
+src/sql/rewrite.rs:430:5: replace unquote -> String with String::new()
+src/sql/rewrite.rs:430:5: replace unquote -> String with "xyzzy".into()
+src/sql/rewrite.rs:431:60: replace >= with < in unquote
+src/sql/rewrite.rs:432:22: replace - with + in unquote
+src/sql/rewrite.rs:432:22: replace - with / in unquote

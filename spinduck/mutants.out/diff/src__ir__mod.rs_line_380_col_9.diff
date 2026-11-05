@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ replace Compiler::mark with ()
+@@ -372,17 +372,17 @@
+ const MAX_DEPTH: usize = 32;
+ 
+ impl Compiler {
+     fn here(&self) -> usize {
+         self.code.len()
+     }
+ 
+     fn mark(&mut self, label: &str) {
+-        self.labels.insert(label.to_string(), self.here());
++        () /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn jump(&mut self, label: &str, cond: Option<IrExpr>, if_cond: bool) {
+         let at = self.here();
+         let known = self.labels.get(label).copied();
+         match (known, cond) {
+             (Some(to), None) => self.code.push(IrStmt::Jump(to)),
+             (Some(to), Some(c)) if if_cond => self.code.push(IrStmt::JumpIf { cond: c, to }),

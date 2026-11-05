@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ delete match arm "-" in binop
+@@ -1262,17 +1262,17 @@
+     let unscaled: i128 = digits.parse().ok()?;
+     let signed = if neg { -unscaled } else { unscaled };
+     Some(SpinValue::Decimal(signed, 38, scale))
+ }
+ 
+ fn binop(op: &str) -> Result<BinOp, EngineError> {
+     Ok(match op.to_ascii_uppercase().as_str() {
+         "+" => BinOp::Add,
+-        "-" => BinOp::Sub,
++         /* ~ changed by cargo-mutants ~ */
+         "*" => BinOp::Mul,
+         "/" => BinOp::Div,
+         "||" => BinOp::Concat,
+         "=" => BinOp::Eq,
+         "<>" | "!=" => BinOp::Ne,
+         "<" => BinOp::Lt,
+         "<=" => BinOp::Le,
+         ">" => BinOp::Gt,

@@ -1,0 +1,23 @@
+--- src/ir/mod.rs
++++ replace collect_slice with ()
+@@ -273,19 +273,17 @@
+     let mut set = crate::sql::VarScope::new();
+     for st in stmts {
+         collect_stmt(st, &mut set);
+     }
+     set
+ }
+ 
+ fn collect_slice(stmts: &[PlStatement], set: &mut crate::sql::VarScope) {
+-    for st in stmts {
+-        collect_stmt(st, set);
+-    }
++    () /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ fn collect_stmt(st: &PlStatement, set: &mut crate::sql::VarScope) {
+     match st {
+         PlStatement::Assignment { target, expression } => {
+             collect_expr(target, set);
+             collect_expr(expression, set);
+         }

@@ -1,0 +1,21 @@
+--- src/value.rs
++++ replace * with + in parse_numeric
+@@ -115,17 +115,17 @@
+     if t.is_empty() {
+         return Ok(SpinValue::Null);
+     }
+     if let Ok(i) = t.parse::<i64>() {
+         return Ok(SpinValue::Decimal(i as i128, 38, scale));
+     }
+     if let Ok(f) = t.parse::<f64>() {
+         let div = 10f64.powi(scale as i32);
+-        return Ok(SpinValue::Decimal((f * div).round() as i128, 38, scale));
++        return Ok(SpinValue::Decimal((f + /* ~ changed by cargo-mutants ~ */ div).round() as i128, 38, scale));
+     }
+     Err(EngineError::business(
+         112,
+         format!("invalid numeric literal: {s}"),
+     ))
+ }
+ 
+ #[cfg(test)]

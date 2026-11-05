@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ replace compile_stmts -> Result<IrProg, EngineError> with Ok(Default::default())
+@@ -183,17 +183,17 @@
+             }
+         }
+         ret
+     }
+ }
+ 
+ /// 编译器：AST 语句列表 → IR。预扫描收集 PL 变量名集合（SQL 改写用）。
+ pub fn compile_stmts(stmts: &[PlStatement]) -> Result<IrProg, EngineError> {
+-    compile_stmts_with(stmts, &RuleRegistry::default())
++    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// 带规则注册表的编译（SQL 改写应用函数映射与解析级变换）。
+ pub fn compile_stmts_with(
+     stmts: &[PlStatement],
+     rules: &RuleRegistry,
+ ) -> Result<IrProg, EngineError> {
+     let vars = collect_var_names(stmts);

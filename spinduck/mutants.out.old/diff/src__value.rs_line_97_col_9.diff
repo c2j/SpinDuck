@@ -1,0 +1,23 @@
+--- src/value.rs
++++ delete match arm (SpinValue::Int(_) | SpinValue::Decimal(..), SpinType::Varchar) in coerce
+@@ -89,19 +89,17 @@
+     if v.fits(target) {
+         return Ok(v.clone());
+     }
+     match (v, target) {
+         // 字符串 → 数值（宽松）
+         (SpinValue::Str(s), SpinType::Int | SpinType::BigInt) => parse_numeric(s, 0),
+         (SpinValue::Str(s), SpinType::Decimal { scale, .. }) => parse_numeric(s, *scale),
+         // 数值 → 字符串（拼接/落 VARCHAR 列）
+-        (SpinValue::Int(_) | SpinValue::Decimal(..), SpinType::Varchar) => {
+-            Ok(SpinValue::Str(v.as_str_loose()))
+-        }
++         /* ~ changed by cargo-mutants ~ */
+         (SpinValue::Bool(b), SpinType::Varchar) => Ok(SpinValue::Str(b.to_string())),
+         // RECORD 字段整体作为标量传出是不合法的
+         (SpinValue::Record(_), _) => Err(EngineError::business(
+             110,
+             "cannot coerce RECORD to scalar type",
+         )),
+         _ => Err(EngineError::business(
+             111,

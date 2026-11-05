@@ -201,12 +201,12 @@ pub fn eval(e: &IrExpr, env: &EvalEnv<'_>) -> Result<SpinValue, EngineError> {
         IrExpr::Bin { op, l, r } => eval_bin(*op, &eval(l, env)?, &eval(r, env)?),
         IrExpr::CursorAttr { cursor, kind } => Ok(f.cursor_attr(cursor, *kind)),
         IrExpr::FuncCall { name, args } => {
-            // §8 分派矩阵：PL 上下文 → 解释器直调（含嵌套；只支持函数）
-            let routine = env
-                .cat
-                .lookup(name)
-                .ok_or_else(|| EngineError::business(152, format!("undefined function: {name}")))?
-                .clone();
+            // §8 分派矩阵：PL 上下文 → 例程目录直调；未命中视为内建/库函数，
+            // 下沉为 `SELECT f($p0,…)` 交给内核求值（内建函数语义由 DuckDB 提供，
+            // Gauss 方言差异由编译期规则改名 + 解析级变换承担）
+            let Some(routine) = env.cat.lookup(name).cloned() else {
+                return eval_builtin(env, name, args);
+            };
             if routine.kind != crate::catalog::RoutineKind::Function {
                 return Err(EngineError::business(
                     153,
@@ -252,6 +252,26 @@ pub fn eval(e: &IrExpr, env: &EvalEnv<'_>) -> Result<SpinValue, EngineError> {
 }
 
 #[allow(clippy::too_many_lines)]
+/// PL 上下文的内建/库函数：构造单行 SQL 下发内核，取首行首列。
+fn eval_builtin(env: &EvalEnv, name: &str, args: &[IrExpr]) -> Result<SpinValue, EngineError> {
+    let mut binds = crate::exec::BindMap::new();
+    let mut ph = Vec::with_capacity(args.len());
+    for (i, a) in args.iter().enumerate() {
+        let key = format!("$p{i}");
+        binds.insert(key.clone(), eval(a, env)?);
+        ph.push(key);
+    }
+    let sql = format!("SELECT {}({})", name, ph.join(", "));
+    let sql = crate::sql::apply_ast_transforms(&sql)?;
+    let mut rows = env.ex.query(&sql, &binds)?;
+    Ok(rows
+        .fetch_many(1)
+        .into_iter()
+        .next()
+        .and_then(|r| r.into_iter().next())
+        .unwrap_or(SpinValue::Null))
+}
+
 fn eval_bin(op: BinOp, l: &SpinValue, r: &SpinValue) -> Result<SpinValue, EngineError> {
     use SpinValue as V;
     // NULL 传播：算术/比较任一侧 NULL → NULL；AND/OR 走三值逻辑

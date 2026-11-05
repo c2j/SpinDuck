@@ -1,0 +1,21 @@
+--- src/sql/rewrite.rs
++++ delete ! in split_top_level_commas
+@@ -311,17 +311,17 @@
+                     out.push(cur.trim().to_string());
+                     cur = String::new();
+                 }
+                 _ => cur.push(c),
+             }
+         }
+         i += 1;
+     }
+-    if !cur.trim().is_empty() {
++    if  /* ~ changed by cargo-mutants ~ */cur.trim().is_empty() {
+         out.push(cur.trim().to_string());
+     }
+     out
+ }
+ 
+ /// Oracle 日期格式串 → strftime 格式串（已知 token 最长匹配，其余原样保留）。
+ pub fn oracle_format_to_strftime(fmt: &str) -> String {
+     let mut out = fmt.to_string();

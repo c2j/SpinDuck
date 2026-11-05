@@ -1,0 +1,21 @@
+--- src/sql/rewrite.rs
++++ replace + with - in split_top_level_commas
+@@ -281,17 +281,17 @@
+     let mut cur = String::new();
+     let bytes = s.as_bytes();
+     let mut i = 0usize;
+     while i < s.len() {
+         let c = bytes[i] as char;
+         if in_string {
+             cur.push(c);
+             if c == '\'' {
+-                if i + 1 < s.len() && bytes[i + 1] == b'\'' {
++                if i + 1 < s.len() && bytes[i - /* ~ changed by cargo-mutants ~ */ 1] == b'\'' {
+                     cur.push('\'');
+                     i += 1;
+                 } else {
+                     in_string = false;
+                 }
+             }
+         } else {
+             match c {

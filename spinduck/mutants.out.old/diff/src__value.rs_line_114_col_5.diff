@@ -1,0 +1,35 @@
+--- src/value.rs
++++ replace parse_numeric -> Result<SpinValue, EngineError> with Ok(Default::default())
+@@ -106,31 +106,17 @@
+         _ => Err(EngineError::business(
+             111,
+             format!("cannot coerce {:?} to {:?}", v, target),
+         )),
+     }
+ }
+ 
+ fn parse_numeric(s: &str, scale: u8) -> Result<SpinValue, EngineError> {
+-    let t = s.trim();
+-    if t.is_empty() {
+-        return Ok(SpinValue::Null);
+-    }
+-    if let Ok(i) = t.parse::<i64>() {
+-        return Ok(SpinValue::Decimal(i as i128, 38, scale));
+-    }
+-    if let Ok(f) = t.parse::<f64>() {
+-        let div = 10f64.powi(scale as i32);
+-        return Ok(SpinValue::Decimal((f * div).round() as i128, 38, scale));
+-    }
+-    Err(EngineError::business(
+-        112,
+-        format!("invalid numeric literal: {s}"),
+-    ))
++    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+     #[test]
+     fn should_return_null_for_empty_string_to_numeric() {

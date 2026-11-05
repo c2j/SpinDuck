@@ -1,0 +1,24 @@
+--- src/value.rs
++++ delete match arm (SpinValue::Record(_), _) in coerce
+@@ -94,20 +94,17 @@
+         (SpinValue::Str(s), SpinType::Int | SpinType::BigInt) => parse_numeric(s, 0),
+         (SpinValue::Str(s), SpinType::Decimal { scale, .. }) => parse_numeric(s, *scale),
+         // 数值 → 字符串（拼接/落 VARCHAR 列）
+         (SpinValue::Int(_) | SpinValue::Decimal(..), SpinType::Varchar) => {
+             Ok(SpinValue::Str(v.as_str_loose()))
+         }
+         (SpinValue::Bool(b), SpinType::Varchar) => Ok(SpinValue::Str(b.to_string())),
+         // RECORD 字段整体作为标量传出是不合法的
+-        (SpinValue::Record(_), _) => Err(EngineError::business(
+-            110,
+-            "cannot coerce RECORD to scalar type",
+-        )),
++         /* ~ changed by cargo-mutants ~ */
+         _ => Err(EngineError::business(
+             111,
+             format!("cannot coerce {:?} to {:?}", v, target),
+         )),
+     }
+ }
+ 
+ fn parse_numeric(s: &str, scale: u8) -> Result<SpinValue, EngineError> {

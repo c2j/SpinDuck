@@ -26,6 +26,7 @@ pub use engine::Engine;
 pub use error::{EngineError, ErrorCode, FaultDomain};
 pub use exec::{BindMap, ExecOutcome, FakeExecutor, Row, RowStream, SqlExecutor, TraceSink};
 pub use rules::RuleRegistry;
+#[cfg(feature = "native")]
 pub use sql::DuckExecutor;
 pub use types::SpinType;
 pub use value::{coerce, SpinValue};

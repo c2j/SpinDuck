@@ -1,0 +1,24 @@
+--- src/ir/mod.rs
++++ replace ident_path -> String with "xyzzy".into()
+@@ -1284,20 +1284,17 @@
+                 27,
+                 format!("unsupported operator: {op}"),
+             ))
+         }
+     })
+ }
+ 
+ fn ident_path(name: &ogsql_parser::ast::ObjectName) -> String {
+-    name.iter()
+-        .map(|i| i.value.clone())
+-        .collect::<Vec<_>>()
+-        .join(".")
++    "xyzzy".into() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ fn ident0(name: &ogsql_parser::ast::ObjectName) -> String {
+     name.first().map(|i| i.value.clone()).unwrap_or_default()
+ }
+ 
+ fn ident1(name: &ogsql_parser::ast::ObjectName) -> String {
+     name.get(1).map(|i| i.value.clone()).unwrap_or_default()

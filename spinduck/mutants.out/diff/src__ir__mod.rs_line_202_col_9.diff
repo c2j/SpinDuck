@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ delete field funcs from struct Compiler expression in compile_stmts_with
+@@ -194,17 +194,17 @@
+ /// 带规则注册表的编译（SQL 改写应用函数映射与解析级变换）。
+ pub fn compile_stmts_with(
+     stmts: &[PlStatement],
+     rules: &RuleRegistry,
+ ) -> Result<IrProg, EngineError> {
+     let vars = collect_var_names(stmts);
+     let mut c = Compiler {
+         vars,
+-        funcs: rules.functions.clone(),
++         /* ~ changed by cargo-mutants ~ */
+         ..Default::default()
+     };
+     c.stmts(stmts)?;
+     c.resolve_fixups()?;
+     Ok(IrProg { code: c.code })
+ }
+ 
+ /// 从完整 PL 块编译：声明段静态游标在此编译（§7.2）。

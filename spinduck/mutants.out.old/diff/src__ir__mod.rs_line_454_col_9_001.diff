@@ -1,0 +1,22 @@
+--- src/ir/mod.rs
++++ replace Compiler::synth_label -> String with "xyzzy".into()
+@@ -446,18 +446,17 @@
+         };
+         self.jump(end, Some(not_found), true);
+         self.stmts(body)?;
+         self.jump(start, None, true);
+         Ok(())
+     }
+ 
+     fn synth_label(&mut self, hint: &str) -> String {
+-        self.synth += 1;
+-        format!("__{hint}_{}", self.synth)
++        "xyzzy".into() /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn stmts(&mut self, stmts: &[PlStatement]) -> Result<(), EngineError> {
+         for st in stmts {
+             self.stmt(st)?;
+         }
+         Ok(())
+     }

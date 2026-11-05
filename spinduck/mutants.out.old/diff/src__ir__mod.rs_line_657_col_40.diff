@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ replace || with && in Compiler::stmt_inner
+@@ -649,17 +649,17 @@
+             }
+             PlStatement::Fetch(fetch_stmt) => {
+                 let (cursor, direction, bulk_collect, into) = (
+                     &fetch_stmt.cursor,
+                     &fetch_stmt.direction,
+                     &fetch_stmt.bulk_collect,
+                     &fetch_stmt.into,
+                 );
+-                if direction.is_some() || *bulk_collect {
++                if direction.is_some() && /* ~ changed by cargo-mutants ~ */ *bulk_collect {
+                     return Err(EngineError::invariant(
+                         52,
+                         "scroll fetch / BULK COLLECT is not supported in v1",
+                     ));
+                 }
+                 let cname = match &cursor {
+                     Expr::PlVariable(n) | Expr::ColumnRef(n) => VarName(ident_path(n)),
+                     other => {

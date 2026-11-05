@@ -1,0 +1,66 @@
+src/ir/mod.rs:202:9: delete field funcs from struct Compiler expression in compile_stmts_with
+src/ir/mod.rs:212:5: replace compile_block -> Result<IrProg, EngineError> with Ok(Default::default())
+src/ir/mod.rs:231:9: delete field vars from struct Compiler expression in compile_routine_with
+src/ir/mod.rs:240:13: delete match arm PlDeclaration::Cursor(cd) in compile_routine_with
+src/ir/mod.rs:181:54: replace match guard ret.is_none() with true in IrProg::single_return_expr
+src/ir/mod.rs:281:5: replace collect_slice with ()
+src/ir/mod.rs:301:9: delete match arm PlStatement::Loop(l) in collect_stmt
+src/ir/mod.rs:292:9: delete match arm PlStatement::If(i) in collect_stmt
+src/ir/mod.rs:302:9: delete match arm PlStatement::While(w) in collect_stmt
+src/ir/mod.rs:306:9: delete match arm PlStatement::Exit{condition, ..} | PlStatement::Continue{condition, ..} in collect_stmt
+src/ir/mod.rs:311:9: delete match arm PlStatement::Return{expression:Some(e),} in collect_stmt
+src/ir/mod.rs:314:9: delete match arm PlStatement::Block(b) in collect_stmt
+src/ir/mod.rs:327:9: delete match arm Expr::BinaryOp{left, right, ..} in collect_expr
+src/ir/mod.rs:331:9: delete match arm Expr::UnaryOp{expr, ..} in collect_expr
+src/ir/mod.rs:332:9: delete match arm Expr::IsNull{expr, ..} in collect_expr
+src/ir/mod.rs:333:9: delete match arm Expr::FunctionCall{args, ..} in collect_expr
+src/ir/mod.rs:324:34: replace match guard name.len() == 2 with true in collect_expr
+src/ir/mod.rs:324:34: replace match guard name.len() == 2 with false in collect_expr
+src/ir/mod.rs:324:45: replace == with != in collect_expr
+src/ir/mod.rs:388:36: replace match guard if_cond with true in Compiler::jump
+src/ir/mod.rs:388:36: replace match guard if_cond with false in Compiler::jump
+src/ir/mod.rs:437:9: replace Compiler::for_cursor_loop -> Result<(), EngineError> with Ok(())
+src/ir/mod.rs:471:20: replace -= with += in Compiler::stmt
+src/ir/mod.rs:471:20: replace -= with /= in Compiler::stmt
+src/ir/mod.rs:507:20: delete ! in Compiler::stmt_inner
+src/ir/mod.rs:657:40: replace || with && in Compiler::stmt_inner
+src/ir/mod.rs:784:28: delete ! in Compiler::stmt_inner
+src/ir/mod.rs:1025:9: replace Compiler::assign_target_lenient -> Option<AssignTarget> with None
+src/ir/mod.rs:1069:43: replace match guard op.eq_ignore_ascii_case("NOT") with false in Compiler::expr
+src/ir/mod.rs:1126:43: replace match guard op == "-" with true in Compiler::expr
+src/ir/mod.rs:1131:43: replace match guard op == "+" with true in Compiler::expr
+src/ir/mod.rs:1131:43: replace match guard op == "+" with false in Compiler::expr
+src/ir/mod.rs:1131:46: replace == with != in Compiler::expr
+src/ir/mod.rs:1243:24: replace || with && in parse_decimal_literal
+src/ir/mod.rs:1254:22: replace && with || in parse_decimal_literal
+src/ir/mod.rs:1257:48: replace || with && in parse_decimal_literal
+src/ir/mod.rs:1263:27: delete - in parse_decimal_literal
+src/value.rs:69:30: replace < with <= in SpinValue::as_str_loose
+src/value.rs:102:9: delete match arm (SpinValue::Record(_), _) in coerce
+src/sql/rewrite.rs:202:18: replace == with != in find_innermost_calls
+src/sql/rewrite.rs:203:26: replace < with > in find_innermost_calls
+src/sql/rewrite.rs:203:50: replace + with - in find_innermost_calls
+src/sql/rewrite.rs:204:23: replace += with *= in find_innermost_calls
+src/sql/rewrite.rs:225:61: replace < with <= in find_innermost_calls
+src/sql/rewrite.rs:230:33: replace < with <= in find_innermost_calls
+src/sql/rewrite.rs:234:46: replace < with == in find_innermost_calls
+src/sql/rewrite.rs:234:46: replace < with > in find_innermost_calls
+src/sql/rewrite.rs:234:46: replace < with <= in find_innermost_calls
+src/sql/rewrite.rs:234:42: replace + with - in find_innermost_calls
+src/sql/rewrite.rs:234:42: replace + with * in find_innermost_calls
+src/sql/rewrite.rs:234:70: replace + with - in find_innermost_calls
+src/sql/rewrite.rs:235:43: replace += with -= in find_innermost_calls
+src/sql/rewrite.rs:235:43: replace += with *= in find_innermost_calls
+src/sql/rewrite.rs:242:37: delete match arm '\'' in find_innermost_calls
+src/sql/rewrite.rs:271:5: replace upper_eq_find -> bool with false
+src/sql/rewrite.rs:289:26: replace < with > in split_top_level_commas
+src/sql/rewrite.rs:289:47: replace + with - in split_top_level_commas
+src/sql/rewrite.rs:291:23: replace += with -= in split_top_level_commas
+src/sql/rewrite.rs:291:23: replace += with *= in split_top_level_commas
+src/sql/rewrite.rs:353:87: replace - with + in apply_ast_transforms
+src/sql/rewrite.rs:353:87: replace - with / in apply_ast_transforms
+src/sql/rewrite.rs:359:31: replace < with == in apply_ast_transforms
+src/sql/rewrite.rs:359:31: replace < with <= in apply_ast_transforms
+src/sql/rewrite.rs:371:22: replace < with <= in apply_ast_transforms
+src/sql/rewrite.rs:431:49: replace && with || in unquote
+src/sql/rewrite.rs:431:28: replace && with || in unquote

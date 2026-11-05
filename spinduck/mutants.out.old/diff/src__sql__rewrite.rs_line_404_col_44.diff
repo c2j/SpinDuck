@@ -1,0 +1,21 @@
+--- src/sql/rewrite.rs
++++ replace != with == in apply_ast_transforms
+@@ -396,17 +396,17 @@
+                     let inner_expr = &args[0];
+                     let inner = match find_innermost_calls(inner_expr, &["TO_DATE"])
+                         .into_iter()
+                         .next()
+                     {
+                         Some((s0, e0, _, a0)) => {
+                             // 原位替换 TO_DATE 调用，保留调用点前后的算术表达式（如 + v_days）
+                             let dargs = split_top_level_commas(&a0);
+-                            if dargs.len() != 2 {
++                            if dargs.len() == /* ~ changed by cargo-mutants ~ */ 2 {
+                                 return Err(EngineError::business(
+                                     133,
+                                     "TO_DATE requires 2 arguments",
+                                 ));
+                             }
+                             let sp = format!(
+                                 "strptime({}, '{}')",
+                                 dargs[0],

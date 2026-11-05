@@ -1,0 +1,350 @@
+
+*** src/ir/mod.rs:1292:5: replace ident_path -> String with String::new()
+
+*** mutation diff:
+--- src/ir/mod.rs
++++ replace ident_path -> String with String::new()
+@@ -1284,20 +1284,17 @@
+                 27,
+                 format!("unsupported operator: {op}"),
+             ))
+         }
+     })
+ }
+ 
+ fn ident_path(name: &ogsql_parser::ast::ObjectName) -> String {
+-    name.iter()
+-        .map(|i| i.value.clone())
+-        .collect::<Vec<_>>()
+-        .join(".")
++    String::new() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ fn ident0(name: &ogsql_parser::ast::ObjectName) -> String {
+     name.first().map(|i| i.value.clone()).unwrap_or_default()
+ }
+ 
+ fn ident1(name: &ogsql_parser::ast::ObjectName) -> String {
+     name.get(1).map(|i| i.value.clone()).unwrap_or_default()
+
+
+*** cargo test --no-run --verbose --package=spinduck@0.1.0 --no-default-features
+       Fresh unicode-ident v1.0.27
+       Fresh siphasher v1.0.4
+       Fresh rand_core v0.6.4
+       Fresh cfg-if v1.0.5
+       Fresh proc-macro2 v1.0.107
+       Fresh rand v0.8.8
+       Fresh hashbrown v0.17.1
+       Fresh quote v1.0.47
+       Fresh serde_core v1.0.229
+       Fresh rustversion v1.0.23
+       Fresh phf_generator v0.11.3
+       Fresh libc v0.2.191
+       Fresh equivalent v1.0.3
+       Fresh zmij v1.0.23
+       Fresh phf_shared v0.11.3
+       Fresh winnow v0.7.15
+       Fresh syn v3.0.9
+       Fresh syn v2.0.119
+       Fresh indexmap v2.14.2
+       Fresh toml_write v0.1.2
+       Fresh multiversion_no_op v1.0.0
+       Fresh itoa v1.0.18
+       Fresh simdutf8 v0.1.5
+       Fresh memchr v2.8.3
+       Fresh serde_derive v1.0.229
+       Fresh phf_macros v0.11.3
+       Fresh thiserror-impl v2.0.21
+       Fresh scopeguard v1.2.0
+       Fresh serde_json v1.0.154
+       Fresh errno v0.3.14
+       Fresh bitflags v2.13.2
+       Fresh once_cell v1.21.4
+       Fresh serde v1.0.229
+       Fresh thiserror v2.0.21
+       Fresh phf v0.11.3
+       Fresh encoding_rs v0.8.44
+       Fresh rustix v1.1.6
+       Fresh fastrand v2.5.0
+       Fresh serde_spanned v0.6.9
+       Fresh toml_datetime v0.6.11
+       Fresh ogsql-parser v0.11.0 (/Users/c2j/Projects/Desktop_Projects/DOTA/SpinDuck/lib/ogsql-parser)
+       Fresh getrandom v0.4.3
+       Fresh toml_edit v0.22.27
+       Fresh tempfile v3.27.0
+       Fresh toml v0.8.23
+       Dirty spinduck v0.1.0 (/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp): the file `src/ir/mod.rs` has changed (1793848101.938520848s, 5s after last build at 1793848096.308026957s)
+   Compiling spinduck v0.1.0 (/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp)
+     Running `/Users/c2j/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc --crate-name spinduck_core --edition=2021 src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("cli", "default", "gauss", "golden", "native"))' -C metadata=a42076e067a8ddd9 -C extra-filename=-875aaa79d956b9c4 --out-dir /private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps -C incremental=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/incremental -L dependency=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps --extern ogsql_parser=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libogsql_parser-55f5be64e2faa867.rlib --extern serde=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libserde-cfab43a3e739c542.rlib --extern serde_json=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libserde_json-26b370ce3fe3e703.rlib --extern tempfile=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libtempfile-b312b72a4c5868bf.rlib --extern thiserror=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libthiserror-86c985e4b09c9ee2.rlib --extern toml=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libtoml-99e703806ba23da5.rlib`
+     Running `/Users/c2j/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc --crate-name spinduck_core --edition=2021 src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("cli", "default", "gauss", "golden", "native"))' -C metadata=d13fe3befbe2e55a -C extra-filename=-8994f97a9b086fa4 --out-dir /private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps -C incremental=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/incremental -L dependency=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps --extern ogsql_parser=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libogsql_parser-55f5be64e2faa867.rmeta --extern serde=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libserde-cfab43a3e739c542.rmeta --extern serde_json=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libserde_json-26b370ce3fe3e703.rmeta --extern thiserror=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libthiserror-86c985e4b09c9ee2.rmeta --extern toml=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libtoml-99e703806ba23da5.rmeta`
+warning: unused variable: `name`
+    --> src/ir/mod.rs:1291:15
+     |
+1291 | fn ident_path(name: &ogsql_parser::ast::ObjectName) -> String {
+     |               ^^^^ help: if this is intentional, prefix it with an underscore: `_name`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `spinduck` (lib) generated 1 warning (run `cargo fix --lib -p spinduck` to apply 1 suggestion)
+     Running `/Users/c2j/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc --crate-name golden_gauss --edition=2021 tests/golden_gauss.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("cli", "default", "gauss", "golden", "native"))' -C metadata=4f5aa4e5e936c550 -C extra-filename=-b158140281ea8da2 --out-dir /private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps -C incremental=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/incremental -L dependency=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps --extern ogsql_parser=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libogsql_parser-55f5be64e2faa867.rlib --extern serde=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libserde-cfab43a3e739c542.rlib --extern serde_json=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libserde_json-26b370ce3fe3e703.rlib --extern spinduck_core=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libspinduck_core-8994f97a9b086fa4.rlib --extern tempfile=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libtempfile-b312b72a4c5868bf.rlib --extern thiserror=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libthiserror-86c985e4b09c9ee2.rlib --extern toml=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libtoml-99e703806ba23da5.rlib`
+     Running `/Users/c2j/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc --crate-name compiler_contracts --edition=2021 tests/compiler_contracts.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("cli", "default", "gauss", "golden", "native"))' -C metadata=48ba1c94de172904 -C extra-filename=-b71f2d837239004b --out-dir /private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps -C incremental=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/incremental -L dependency=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps --extern ogsql_parser=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libogsql_parser-55f5be64e2faa867.rlib --extern serde=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libserde-cfab43a3e739c542.rlib --extern serde_json=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libserde_json-26b370ce3fe3e703.rlib --extern spinduck_core=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libspinduck_core-8994f97a9b086fa4.rlib --extern tempfile=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libtempfile-b312b72a4c5868bf.rlib --extern thiserror=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libthiserror-86c985e4b09c9ee2.rlib --extern toml=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libtoml-99e703806ba23da5.rlib`
+     Running `/Users/c2j/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc --crate-name ir_expr_forms --edition=2021 tests/ir_expr_forms.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("cli", "default", "gauss", "golden", "native"))' -C metadata=bd3a862b7b0352ab -C extra-filename=-6c157ecc698324fe --out-dir /private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps -C incremental=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/incremental -L dependency=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps --extern ogsql_parser=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libogsql_parser-55f5be64e2faa867.rlib --extern serde=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libserde-cfab43a3e739c542.rlib --extern serde_json=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libserde_json-26b370ce3fe3e703.rlib --extern spinduck_core=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libspinduck_core-8994f97a9b086fa4.rlib --extern tempfile=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libtempfile-b312b72a4c5868bf.rlib --extern thiserror=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libthiserror-86c985e4b09c9ee2.rlib --extern toml=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libtoml-99e703806ba23da5.rlib`
+     Running `/Users/c2j/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc --crate-name gauss_e2e --edition=2021 tests/gauss_e2e.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --emit=dep-info,link -C embed-bitcode=no -C debuginfo=2 -C split-debuginfo=unpacked --test --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("cli", "default", "gauss", "golden", "native"))' -C metadata=bef15baf1a073161 -C extra-filename=-7b042fdf011a84d7 --out-dir /private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps -C incremental=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/incremental -L dependency=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps --extern ogsql_parser=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libogsql_parser-55f5be64e2faa867.rlib --extern serde=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libserde-cfab43a3e739c542.rlib --extern serde_json=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libserde_json-26b370ce3fe3e703.rlib --extern spinduck_core=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libspinduck_core-8994f97a9b086fa4.rlib --extern tempfile=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libtempfile-b312b72a4c5868bf.rlib --extern thiserror=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libthiserror-86c985e4b09c9ee2.rlib --extern toml=/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/libtoml-99e703806ba23da5.rlib`
+warning: `spinduck` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.65s
+  Executable `/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/spinduck_core-875aaa79d956b9c4`
+  Executable `/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/compiler_contracts-b71f2d837239004b`
+  Executable `/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/gauss_e2e-7b042fdf011a84d7`
+  Executable `/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/golden_gauss-b158140281ea8da2`
+  Executable `/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/ir_expr_forms-6c157ecc698324fe`
+
+*** result: Success
+
+*** cargo test --verbose --package=spinduck@0.1.0 --no-default-features
+       Fresh unicode-ident v1.0.27
+       Fresh siphasher v1.0.4
+       Fresh rand_core v0.6.4
+       Fresh cfg-if v1.0.5
+       Fresh proc-macro2 v1.0.107
+       Fresh rand v0.8.8
+       Fresh quote v1.0.47
+       Fresh serde_core v1.0.229
+       Fresh rustversion v1.0.23
+       Fresh libc v0.2.191
+       Fresh phf_generator v0.11.3
+       Fresh equivalent v1.0.3
+       Fresh hashbrown v0.17.1
+       Fresh syn v3.0.9
+       Fresh syn v2.0.119
+       Fresh zmij v1.0.23
+       Fresh indexmap v2.14.2
+       Fresh phf_shared v0.11.3
+       Fresh scopeguard v1.2.0
+       Fresh itoa v1.0.18
+       Fresh multiversion_no_op v1.0.0
+       Fresh serde_derive v1.0.229
+       Fresh phf_macros v0.11.3
+       Fresh thiserror-impl v2.0.21
+       Fresh winnow v0.7.15
+       Fresh memchr v2.8.3
+       Fresh simdutf8 v0.1.5
+       Fresh toml_write v0.1.2
+       Fresh serde v1.0.229
+       Fresh encoding_rs v0.8.44
+       Fresh thiserror v2.0.21
+       Fresh phf v0.11.3
+       Fresh serde_json v1.0.154
+       Fresh errno v0.3.14
+       Fresh bitflags v2.13.2
+       Fresh fastrand v2.5.0
+       Fresh toml_datetime v0.6.11
+       Fresh serde_spanned v0.6.9
+       Fresh getrandom v0.4.3
+       Fresh ogsql-parser v0.11.0 (/Users/c2j/Projects/Desktop_Projects/DOTA/SpinDuck/lib/ogsql-parser)
+       Fresh rustix v1.1.6
+       Fresh once_cell v1.21.4
+       Fresh toml_edit v0.22.27
+       Fresh tempfile v3.27.0
+       Fresh toml v0.8.23
+warning: unused variable: `name`
+    --> src/ir/mod.rs:1291:15
+     |
+1291 | fn ident_path(name: &ogsql_parser::ast::ObjectName) -> String {
+     |               ^^^^ help: if this is intentional, prefix it with an underscore: `_name`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `spinduck` (lib) generated 1 warning (run `cargo fix --lib -p spinduck` to apply 1 suggestion)
+warning: `spinduck` (lib test) generated 1 warning (1 duplicate)
+       Fresh spinduck v0.1.0 (/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running `/private/var/folders/xh/8xyzggmj4jg02gnjyxwwbnb00000gn/T/cargo-mutants-spinduck-cgSnAx.tmp/target/debug/deps/spinduck_core-875aaa79d956b9c4`
+
+running 95 tests
+test cli::args::tests::should_treat_empty_argv_as_help ... ok
+test cli::args::tests::should_infer_literal_types ... ok
+test cli::args::tests::should_parse_compile_with_multiple_paths ... ok
+test cli::args::tests::should_parse_explain_with_file_and_routine ... ok
+test cli::args::tests::should_reject_unknown_subcommand ... ok
+test cli::args::tests::should_reject_compile_without_path ... ok
+test cli::args::tests::should_reject_unknown_flag ... ok
+test cli::args::tests::should_parse_materialize_with_optional_where ... ok
+test cli::args::tests::should_require_table_and_cols_for_sync ... ok
+test cli::args::tests::should_parse_call_with_flags_and_args ... ok
+test cli::run::tests::should_print_usage_and_exit_2_on_usage_error ... ok
+test error::cond_tests::should_match_named_conditions_by_error_code ... ok
+test error::cond_tests::should_match_others_wildcard ... ok
+test error::tests::should_format_error_with_code_and_domain ... ok
+test error::tests::should_raise_named_exceptions_for_select_into_rowcount ... ok
+test error::tests::should_tag_fault_domain_at_construction_point ... ok
+test exec::tests::should_probe_row_count_for_select_into_semantics ... ok
+test exec::tests::should_record_calls_with_named_binds ... ok
+test cli::run::tests::should_pass_rules_probe_when_versions_match ... ok
+test exec::tests::should_reset_stream_for_cursor_reopen ... ok
+test cli::run::tests::should_fail_rules_probe_on_version_drift ... ok
+test cli::tests::should_capture_compile_error_with_code_and_file ... ok
+test cli::tests::should_report_registered_routine_count_per_file ... ok
+test exec::tests::should_return_empty_stream_when_script_exhausted ... ok
+test cli::tests::should_scan_sql_files_recursively_in_stable_order ... ok
+test rules::tests::should_fall_back_to_default_mapping_when_no_file ... ok
+test cli::tests::should_summarize_reports_by_outcome ... ok
+test cli::run::tests::should_report_compile_summary_and_reason_histogram ... ok
+test rules::tests::should_load_seed_rules_from_toml ... ok
+test rules::tests::should_check_probe_version_alignment ... ok
+test runtime::cursor::tests::should_report_closed_cursor_attrs ... ok
+test runtime::cursor::tests::should_fetch_rows_until_exhausted ... ok
+test rules::tests::should_overlay_override_seed_value ... ok
+test rules::tests::should_overlay_project_rules_by_addition_and_override ... ok
+test runtime::frame::tests::should_apply_three_valued_logic_for_and_or ... ok
+test runtime::frame::tests::should_evaluate_ne_as_inequality_not_inverted ... ok
+test runtime::frame::tests::should_propagate_null_for_comparison_and_arith ... ok
+test rules::tests::should_resolve_spin_type_via_registry ... ok
+test cli::run::tests::should_explain_routine_as_stable_ir_lines ... FAILED
+test runtime::interp::tests::should_assign_variables_with_loose_string_coercion ... FAILED
+test runtime::interp::tests::should_concat_strings_for_log_message_pattern ... FAILED
+test runtime::interp::tests::should_raise_business_error_with_message ... ok
+test runtime::interp::tests::should_exit_loop_on_notfound_pattern ... FAILED
+test runtime::interp::m5::should_stop_propagation_when_no_handler_anywhere ... ok
+test runtime::interp::tests::should_execute_dml_with_named_binds ... FAILED
+test runtime::interp::tests::should_return_value ... ok
+test runtime::interp::tests::should_reject_sql_statements_at_m2_scope ... ok
+test runtime::interp::m5::should_catch_no_data_found_with_named_handler ... FAILED
+test runtime::interp::m5::should_re_raise_from_handler_to_outer_trap ... FAILED
+test runtime::interp::m5::should_propagate_unmatched_error_to_outer_others ... FAILED
+test runtime::interp::tests::should_run_if_else_branches ... FAILED
+test sql::render::tests::should_escape_single_quote_in_string_literal ... ok
+test sql::render::tests::should_reject_record_field ... ok
+test runtime::interp::tests::should_raise_too_many_rows_on_multi_rows ... ok
+test runtime::interp::tests::should_raise_no_data_found_on_zero_rows ... ok
+test sql::render::tests::should_reject_transform_marker_function ... ok
+test sql::render::tests::should_render_bin_op_with_parentheses ... ok
+test sql::render::tests::should_render_concat_and_comparison_as_sql_operators ... ok
+test sql::render::tests::should_render_decimal_literal_with_scale ... ok
+test sql::render::tests::should_render_function_call_with_rules_rename ... ok
+test runtime::interp::tests::should_select_into_single_row_assigns_positionally ... FAILED
+test sql::render::tests::should_render_int_literal ... ok
+test sql::rewrite::tests::should_cast_single_arg_to_char_to_varchar ... ok
+test sql::rewrite::tests::should_dedupe_binds_for_repeated_variables ... ok
+test sql::rewrite::tests::should_keep_string_literals_and_quoted_idents_unsubstituted ... ok
+test sql::rewrite::tests::should_resolve_placeholder_names_case_insensitively ... ok
+test sql::rewrite::tests::should_rewrite_two_arg_to_char_with_oracle_format ... ok
+test sql::rewrite::transform_tests::should_convert_oracle_format_tokens ... ok
+test sql::rewrite::tests::should_substitute_ident_tokens_with_named_placeholders ... ok
+test sql::rewrite::transform_tests::should_keep_commas_inside_literal_arguments ... ok
+test sql::rewrite::transform_tests::should_not_touch_function_like_text_inside_string_literals ... ok
+test sql::rewrite::transform_tests::should_transform_decode_to_case_with_default ... ok
+test sql::rewrite::transform_tests::should_rename_simple_functions_via_token_pass ... ok
+test sql::rewrite::transform_tests::should_transform_every_occurrence_in_one_statement ... ok
+test sql::rewrite::transform_tests::should_transform_nested_decode_innermost_first ... ok
+test sql::rewrite::transform_tests::should_transform_to_char_of_to_date_with_interval ... ok
+test sql::rewrite::transform_tests::should_transform_to_char_with_oracle_format ... ok
+test sql::rewrite::transform_tests::should_transform_to_number_to_cast ... ok
+test tests::should_expose_version_from_cargo_metadata ... ok
+test types::tests::should_map_bare_number_to_decimal38x6 ... ok
+test types::tests::should_map_char_with_semantic_loss_to_varchar ... ok
+test types::tests::should_map_number_with_precision_to_decimal ... ok
+test types::tests::should_map_varchar2_to_varchar ... ok
+test types::tests::should_report_duckdb_names_for_ddl ... ok
+test types::tests::should_return_none_for_unknown_type_name ... ok
+test value::tests::should_assess_type_fit_for_each_value_kind ... ok
+test value::tests::should_cast_numeric_string_to_decimal_loosely ... ok
+test value::tests::should_coerce_string_to_int_and_bool_to_varchar ... ok
+test value::tests::should_concat_numeric_to_varchar_natively ... ok
+test value::tests::should_display_record_with_field_names ... ok
+test value::tests::should_display_scalars_in_plain_form ... ok
+test value::tests::should_reject_record_to_scalar_coercion ... ok
+test value::tests::should_report_invalid_numeric_literal_with_business_code ... ok
+test value::tests::should_return_null_for_empty_string_to_numeric ... ok
+test runtime::interp::tests::should_stop_infinite_loop_at_step_budget ... ok
+
+failures:
+
+---- cli::run::tests::should_explain_routine_as_stable_ir_lines stdout ----
+
+thread 'cli::run::tests::should_explain_routine_as_stable_ir_lines' (9140727) panicked at src/cli/run.rs:397:9:
+assertion `left == right` failed: 0	assign	 := ( * 2)
+
+  left: "0\tassign\t := ( * 2)\n"
+ right: "0\tassign\tp_o := (p_i * 2)\n"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- runtime::interp::tests::should_assign_variables_with_loose_string_coercion stdout ----
+
+thread 'runtime::interp::tests::should_assign_variables_with_loose_string_coercion' (9140760) panicked at src/runtime/interp.rs:526:9:
+assertion `left == right` failed
+  left: None
+ right: Some(Str("prc_trd_hz_byfund"))
+
+---- runtime::interp::tests::should_concat_strings_for_log_message_pattern stdout ----
+
+thread 'runtime::interp::tests::should_concat_strings_for_log_message_pattern' (9140761) panicked at src/runtime/interp.rs:540:9:
+assertion `left == right` failed
+  left: None
+ right: Some(Str("删除出错!SQLERRM"))
+
+---- runtime::interp::tests::should_exit_loop_on_notfound_pattern stdout ----
+
+thread 'runtime::interp::tests::should_exit_loop_on_notfound_pattern' (9140763) panicked at src/runtime/interp.rs:589:9:
+assertion `left == right` failed
+  left: None
+ right: Some(Int(3))
+
+---- runtime::interp::tests::should_execute_dml_with_named_binds stdout ----
+
+thread 'runtime::interp::tests::should_execute_dml_with_named_binds' (9140762) panicked at src/runtime/interp.rs:734:25:
+no entry found for key
+
+---- runtime::interp::m5::should_catch_no_data_found_with_named_handler stdout ----
+
+thread 'runtime::interp::m5::should_catch_no_data_found_with_named_handler' (9140756) panicked at src/runtime/interp.rs:838:9:
+assertion `left == right` failed
+  left: None
+ right: Some(Str("fallback"))
+
+---- runtime::interp::m5::should_re_raise_from_handler_to_outer_trap stdout ----
+
+thread 'runtime::interp::m5::should_re_raise_from_handler_to_outer_trap' (9140758) panicked at src/runtime/interp.rs:905:9:
+assertion `left == right` failed
+  left: None
+ right: Some(Str("outer_caught"))
+
+---- runtime::interp::m5::should_propagate_unmatched_error_to_outer_others stdout ----
+
+thread 'runtime::interp::m5::should_propagate_unmatched_error_to_outer_others' (9140757) panicked at src/runtime/interp.rs:868:9:
+assertion `left == right` failed
+  left: None
+ right: Some(Int(1))
+
+---- runtime::interp::tests::should_run_if_else_branches stdout ----
+
+thread 'runtime::interp::tests::should_run_if_else_branches' (9140769) panicked at src/runtime/interp.rs:563:9:
+assertion `left == right` failed
+  left: None
+ right: Some(Str("pos"))
+
+---- runtime::interp::tests::should_select_into_single_row_assigns_positionally stdout ----
+
+thread 'runtime::interp::tests::should_select_into_single_row_assigns_positionally' (9140770) panicked at src/runtime/interp.rs:659:9:
+assertion `left == right` failed
+  left: None
+ right: Some(Str("F0001"))
+
+
+failures:
+    cli::run::tests::should_explain_routine_as_stable_ir_lines
+    runtime::interp::m5::should_catch_no_data_found_with_named_handler
+    runtime::interp::m5::should_propagate_unmatched_error_to_outer_others
+    runtime::interp::m5::should_re_raise_from_handler_to_outer_trap
+    runtime::interp::tests::should_assign_variables_with_loose_string_coercion
+    runtime::interp::tests::should_concat_strings_for_log_message_pattern
+    runtime::interp::tests::should_execute_dml_with_named_binds
+    runtime::interp::tests::should_exit_loop_on_notfound_pattern
+    runtime::interp::tests::should_run_if_else_branches
+    runtime::interp::tests::should_select_into_single_row_assigns_positionally
+
+test result: FAILED. 85 passed; 10 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p spinduck --lib`
+
+*** result: Failure(101)

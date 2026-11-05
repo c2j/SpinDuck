@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ replace - with / in Compiler::stmt_inner
+@@ -868,17 +868,17 @@
+                     // BEGIN..EXCEPTION：PushTrap → try 体 → PopTrap → Jump(resume)
+                     // → handlers 区（每臂 Jump(resume)）→ resume:
+                     Some(exc) => {
+                         let resume = self.synth_label("trap_resume");
+                         let mut entries = Vec::new();
+                         self.code.push(IrStmt::PushTrap {
+                             entries: Vec::new(),
+                         }); // 占位，回填
+-                        let trap_at = self.here() - 1;
++                        let trap_at = self.here() / /* ~ changed by cargo-mutants ~ */ 1;
+                         self.stmts(&b.body)?;
+                         self.code.push(IrStmt::PopTrap);
+                         self.jump(&resume, None, true);
+                         // handlers 区
+                         for h in &exc.handlers {
+                             let body_start = self.here();
+                             self.stmts(&h.statements)?;
+                             let body_end = self.here();

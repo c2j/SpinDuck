@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ delete ! in Compiler::stmt_inner
+@@ -903,17 +903,17 @@
+                 // EXECUTE IMMEDIATE：只有"静态文本 + 已解析语句"可编译期下沉；
+                 // 运行期拼接（动态）保留为 M8 范围并显式拒绝（§10.4 注入面）
+                 let st = sp.parsed_query.as_ref().ok_or_else(|| {
+                     EngineError::invariant(
+                         62,
+                         "EXECUTE with runtime-built SQL text is deferred to M8",
+                     )
+                 })?;
+-                if !sp.using_args.is_empty() {
++                if  /* ~ changed by cargo-mutants ~ */sp.using_args.is_empty() {
+                     return Err(EngineError::invariant(
+                         58,
+                         "EXECUTE IMMEDIATE .. USING is not supported in v1",
+                     ));
+                 }
+                 let text = ogsql_parser::formatter::SqlFormatter::new().format_statement(st);
+                 if sp.into_targets.is_empty() {
+                     self.sql_statement(&text, st)?;

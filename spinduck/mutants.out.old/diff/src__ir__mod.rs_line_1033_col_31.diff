@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ replace == with != in Compiler::assign_target
+@@ -1025,17 +1025,17 @@
+         self.assign_target(e).ok()
+     }
+ 
+     fn assign_target(&mut self, e: &Expr) -> Result<AssignTarget, EngineError> {
+         match e {
+             Expr::PlVariable(name) => Ok(AssignTarget::Var(VarName(ident_path(name)))),
+             Expr::ColumnRef(name) => {
+                 // 首段为帧内记录变量 → RecordField（§3.2 消歧；M2 帧为编译期可见集合）
+-                if name.len() == 2 {
++                if name.len() != /* ~ changed by cargo-mutants ~ */ 2 {
+                     Ok(AssignTarget::Field {
+                         rec: VarName(ident0(name)),
+                         field: ident1(name),
+                     })
+                 } else {
+                     Ok(AssignTarget::Var(VarName(ident_path(name))))
+                 }
+             }

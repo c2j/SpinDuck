@@ -39,6 +39,9 @@ impl DuckExecutor {
         match v {
             SpinValue::Null => Value::Null,
             SpinValue::Bool(b) => Value::Boolean(*b),
+            // 小整数按 INTEGER 绑定：DuckDB 对整型参数类型敏感
+            // （如 round(DECIMAL, BIGINT) 无候选而 round(DECIMAL, INTEGER) 有）
+            SpinValue::Int(i) if i32::try_from(*i).is_ok() => Value::Int(*i as i32),
             SpinValue::Int(i) => Value::BigInt(*i),
             SpinValue::Decimal(unscaled, precision, scale) => {
                 // Decimal::new(width, scale, unscaled)（duckdb 1.10505 API）

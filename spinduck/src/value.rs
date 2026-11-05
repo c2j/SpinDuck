@@ -42,10 +42,8 @@ impl SpinValue {
             SpinValue::Null => "NULL".into(),
             SpinValue::Bool(b) => b.to_string(),
             SpinValue::Int(i) => i.to_string(),
-            SpinValue::Decimal(v, _, s) => {
-                let exp = format!("e-{}", *s as usize);
-                format!("{v:>0width$}{exp}", width = 1)
-            }
+            // 十进制按普通小数展示（CLI OUT 渲染与日志可读性；不用科学计数法）
+            SpinValue::Decimal(..) => self.as_str_loose(),
             SpinValue::Str(s) => s.clone(),
             SpinValue::Blob(b) => format!("<blob {}B>", b.len()),
             SpinValue::Record(fields) => format!(
@@ -67,9 +65,17 @@ impl SpinValue {
             SpinValue::Bool(b) => b.to_string(),
             SpinValue::Int(i) => i.to_string(),
             SpinValue::Decimal(v, _, s) => {
-                let div = 10i128.pow(*s as u32);
-                let frac = format!("{:0>w$}", v % div, w = *s as usize);
-                format!("{}.{}", v / div, frac)
+                // 负数必须整体带符号：`-0.005` 而非 `0.0-5`
+                let neg = *v < 0;
+                let abs = v.unsigned_abs();
+                let div = 10u128.pow(*s as u32);
+                let (ip, frac) = (abs / div, abs % div);
+                let sign = if neg { "-" } else { "" };
+                if *s == 0 {
+                    format!("{sign}{ip}")
+                } else {
+                    format!("{sign}{ip}.{frac:0>w$}", w = *s as usize)
+                }
             }
             SpinValue::Blob(_) => "<blob>".into(),
             SpinValue::Record(_) => "<record>".into(),
@@ -163,6 +169,66 @@ mod tests {
     fn should_reject_record_to_scalar_coercion() {
         let rec = SpinValue::Record(vec![("a".into(), SpinValue::Int(1))]);
         assert!(coerce(&rec, &SpinType::Varchar).is_err());
+    }
+
+    #[test]
+    fn should_display_scalars_in_plain_form() {
+        assert_eq!(SpinValue::Null.display(), "NULL");
+        assert_eq!(SpinValue::Bool(true).display(), "true");
+        assert_eq!(SpinValue::Int(-7).display(), "-7");
+        assert_eq!(SpinValue::Str("F0001".into()).display(), "F0001");
+        assert_eq!(SpinValue::Blob(vec![1, 2, 3]).display(), "<blob 3B>");
+        // 十进制：普通小数形态，非科学计数法
+        assert_eq!(SpinValue::Decimal(260, 38, 2).display(), "2.60");
+        assert_eq!(SpinValue::Decimal(-5, 38, 3).display(), "-0.005");
+    }
+
+    #[test]
+    fn should_assess_type_fit_for_each_value_kind() {
+        use SpinType as T;
+        let dec = T::Decimal {
+            precision: 15,
+            scale: 2,
+        };
+        assert!(SpinValue::Null.fits(&T::Int));
+        assert!(SpinValue::Bool(true).fits(&T::Bool));
+        assert!(SpinValue::Int(1).fits(&T::BigInt));
+        assert!(SpinValue::Int(1).fits(&dec));
+        assert!(SpinValue::Decimal(100, 38, 2).fits(&dec));
+        assert!(SpinValue::Str("x".into()).fits(&T::Varchar));
+        assert!(SpinValue::Blob(vec![0]).fits(&T::Blob));
+        // 不匹配的组合必须为 false（否则隐式转换被绕过）
+        assert!(!SpinValue::Int(1).fits(&T::Varchar));
+        assert!(!SpinValue::Str("x".into()).fits(&T::Int));
+        assert!(!SpinValue::Bool(true).fits(&T::Int));
+        assert!(!SpinValue::Blob(vec![0]).fits(&T::Varchar));
+        assert!(!SpinValue::Record(vec![]).fits(&T::Varchar));
+    }
+
+    #[test]
+    fn should_report_invalid_numeric_literal_with_business_code() {
+        let e = coerce(
+            &SpinValue::Str("abc".into()),
+            &SpinType::Decimal {
+                precision: 15,
+                scale: 2,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.code.to_string(), "BIZ-0112");
+        assert!(e.message.contains("abc"));
+    }
+
+    #[test]
+    fn should_coerce_string_to_int_and_bool_to_varchar() {
+        assert_eq!(
+            coerce(&SpinValue::Str("42".into()), &SpinType::Int).unwrap(),
+            SpinValue::Decimal(42, 38, 0)
+        );
+        assert_eq!(
+            coerce(&SpinValue::Bool(false), &SpinType::Varchar).unwrap(),
+            SpinValue::Str("false".into())
+        );
     }
 
     #[test]

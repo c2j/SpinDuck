@@ -1,0 +1,28 @@
+--- src/sql/rewrite.rs
++++ replace apply_rename with ()
+@@ -174,24 +174,17 @@
+ /// 简单重命名（同参数序；`@` 前缀的解析级变换在此跳过）。
+ fn apply_rename(
+     out: &mut String,
+     sql_text: &str,
+     start: usize,
+     end: usize,
+     functions: &BTreeMap<String, String>,
+ ) {
+-    let upper = sql_text[start..end].to_ascii_uppercase();
+-    if let Some(mapped) = functions.get(&upper) {
+-        if !mapped.starts_with('@') {
+-            out.push_str(mapped);
+-            return;
+-        }
+-    }
+-    out.push_str(&sql_text[start..end]);
++    () /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// 括号配平 + 引号感知的函数调用扫描：返回 (名称起点, 右括号终点, 名称, 参数文本)。
+ /// 只返回"最内层"调用（参数文本中不再包含待变换函数名），保证拼接正确。
+ fn find_innermost_calls(text: &str, names: &[&str]) -> Vec<(usize, usize, String, String)> {
+     let mut out = Vec::new();
+     let bytes = text.as_bytes();
+     let mut i = 0usize;

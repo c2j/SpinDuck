@@ -458,6 +458,29 @@ mod transform_tests {
     }
 
     #[test]
+    fn should_not_touch_function_like_text_inside_string_literals() {
+        // 字符串里的 to_char(...) 不是函数调用，必须原样保留
+        let sql = "SELECT 'to_char(x, ''YYYY'')' AS s FROM t";
+        let r = apply_ast_transforms(sql).unwrap();
+        assert_eq!(r, sql, "{r}");
+    }
+
+    #[test]
+    fn should_transform_every_occurrence_in_one_statement() {
+        let r = apply_ast_transforms("SELECT to_number(a), to_number(b) FROM t").unwrap();
+        assert_eq!(r.matches("CAST(").count(), 2, "{r}");
+        assert!(!r.to_ascii_uppercase().contains("TO_NUMBER("), "{r}");
+    }
+
+    #[test]
+    fn should_keep_commas_inside_literal_arguments() {
+        // 字面量里的逗号不能当作参数分隔符
+        let r = apply_ast_transforms("SELECT decode(k, ',', 'x', 'y') FROM t").unwrap();
+        assert!(r.contains("WHEN ',' THEN 'x'"), "{r}");
+        assert!(r.contains("ELSE 'y'"), "{r}");
+    }
+
+    #[test]
     fn should_transform_to_number_to_cast() {
         let r = apply_ast_transforms("SELECT to_number(t.bs) * 2 FROM t").unwrap();
         assert!(r.contains("CAST(t.bs AS DECIMAL(38,6))"), "{r}");

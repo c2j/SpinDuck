@@ -1009,6 +1009,38 @@ mod kernel_tests {
         let _ = VarName("x".into());
     }
 
+    /// 端到端探针：PL 上下文的内建函数下沉内核（ABS/SUBSTR/COALESCE/ROUND）。
+    #[test]
+    fn should_evaluate_builtin_functions_in_pl_context_on_real_kernel() {
+        use crate::engine::Engine;
+        use crate::value::SpinValue;
+
+        let rules = RuleRegistry::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/rewrite-rules.toml"),
+        )
+        .expect("加载种子规则");
+        let mut eng = Engine::new(
+            Box::new(crate::sql::DuckExecutor::open_in_memory().unwrap()),
+            rules,
+        );
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_builtin(p_o OUT VARCHAR2) IS \
+             DECLARE v_s VARCHAR2(20); \
+             BEGIN \
+               v_s := SUBSTR('ABCDEF', 1, 2) || '00' || ABS(-3) || ROUND(2.345, 2); \
+               p_o := v_s; \
+             END;",
+        )
+        .unwrap();
+        let r = eng.call("prc_builtin", &[SpinValue::Null]).unwrap();
+        let got = r.outs.get("p_o").cloned().unwrap_or(SpinValue::Null);
+        assert_eq!(
+            got.as_str_loose(),
+            "AB0032.35",
+            "内建函数应在 PL 上下文内经内核求值"
+        );
+    }
+
     /// 端到端探针：FOR rec IN <query>（隐式游标脱糖，§7.3.4）真实内核语义。
     #[test]
     fn should_run_for_loop_over_query_on_real_kernel() {

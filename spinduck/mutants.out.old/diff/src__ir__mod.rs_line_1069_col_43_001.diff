@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ replace match guard op.eq_ignore_ascii_case("NOT") with false in Compiler::expr
+@@ -1061,17 +1061,17 @@
+                     Ok(IrExpr::Var(VarName(ident_path(name))))
+                 }
+             }
+             Expr::BinaryOp { left, op, right } => Ok(IrExpr::Bin {
+                 op: binop(op)?,
+                 l: Box::new(self.expr(left)?),
+                 r: Box::new(self.expr(right)?),
+             }),
+-            Expr::UnaryOp { op, expr } if op.eq_ignore_ascii_case("NOT") => {
++            Expr::UnaryOp { op, expr } if false /* ~ changed by cargo-mutants ~ */ => {
+                 Ok(IrExpr::Not(Box::new(self.expr(expr)?)))
+             }
+             Expr::IsNull { expr, negated } => {
+                 let inner = self.expr(expr)?;
+                 Ok(if *negated {
+                     IrExpr::Not(Box::new(IrExpr::IsNull(Box::new(inner))))
+                 } else {
+                     IrExpr::IsNull(Box::new(inner))

@@ -1,0 +1,24 @@
+--- src/ir/mod.rs
++++ delete match arm PlStatement::While(w) in collect_stmt
+@@ -294,20 +294,17 @@
+             collect_slice(&i.then_stmts, set);
+             for ei in &i.elsifs {
+                 collect_expr(&ei.condition, set);
+                 collect_slice(&ei.stmts, set);
+             }
+             collect_slice(&i.else_stmts, set);
+         }
+         PlStatement::Loop(l) => collect_slice(&l.body, set),
+-        PlStatement::While(w) => {
+-            collect_expr(&w.condition, set);
+-            collect_slice(&w.body, set);
+-        }
++         /* ~ changed by cargo-mutants ~ */
+         PlStatement::Exit { condition, .. } | PlStatement::Continue { condition, .. } => {
+             if let Some(c) = condition {
+                 collect_expr(c, set);
+             }
+         }
+         PlStatement::Return {
+             expression: Some(e),
+         } => collect_expr(e, set),

@@ -1,0 +1,35 @@
+--- src/sql/rewrite.rs
++++ replace oracle_format_to_strftime -> String with String::new()
+@@ -319,31 +319,17 @@
+     if !cur.trim().is_empty() {
+         out.push(cur.trim().to_string());
+     }
+     out
+ }
+ 
+ /// Oracle 日期格式串 → strftime 格式串（已知 token 最长匹配，其余原样保留）。
+ pub fn oracle_format_to_strftime(fmt: &str) -> String {
+-    let mut out = fmt.to_string();
+-    for (o, p) in [
+-        ("YYYYMMDDHH24MISS", "%Y%m%d%H%M%S"),
+-        ("YYYY-MM-DD", "%Y-%m-%d"),
+-        ("YYYYMMDD", "%Y%m%d"),
+-        ("HH24", "%H"),
+-        ("YYYY", "%Y"),
+-        ("MM", "%m"),
+-        ("DD", "%d"),
+-        ("MI", "%M"),
+-        ("SS", "%S"),
+-    ] {
+-        out = out.replace(o, p);
+-    }
+-    out
++    String::new() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// 解析级变换（文本拼接实现；AST 化为 M8+ 优化路径）：
+ /// DECODE(a,k1,v1,...,def) → CASE a WHEN k1 THEN v1 ... [ELSE def] END
+ /// TO_NUMBER(x) → CAST(x AS DECIMAL(38,6))
+ /// TO_CHAR(x,'fmt') → strftime(<x|strptime(d,fmt_in)>, fmt_out)
+ pub fn apply_ast_transforms(text: &str) -> Result<String, EngineError> {
+     let names = ["DECODE", "TO_NUMBER", "TO_CHAR"];

@@ -1,0 +1,21 @@
+--- src/sql/rewrite.rs
++++ replace < with <= in apply_ast_transforms
+@@ -351,17 +351,17 @@
+     loop {
+         let calls = find_innermost_calls(&t, &names);
+         let Some((start, end, name, args_raw)) = calls.into_iter().min_by_key(|c| c.1 - c.0) else {
+             break;
+         };
+         let args = split_top_level_commas(&args_raw);
+         let replaced = match name.as_str() {
+             "DECODE" => {
+-                if args.len() < 3 {
++                if args.len() <= /* ~ changed by cargo-mutants ~ */ 3 {
+                     return Err(EngineError::business(
+                         130,
+                         "DECODE requires at least 3 arguments",
+                     ));
+                 }
+                 let mut cs = format!("CASE {} ", args[0]);
+                 let mut i = 1usize;
+                 while i + 1 < args.len() {

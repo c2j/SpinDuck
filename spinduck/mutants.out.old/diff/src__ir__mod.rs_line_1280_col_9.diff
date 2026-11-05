@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ delete match arm "AND" in binop
+@@ -1272,17 +1272,17 @@
+         "/" => BinOp::Div,
+         "||" => BinOp::Concat,
+         "=" => BinOp::Eq,
+         "<>" | "!=" => BinOp::Ne,
+         "<" => BinOp::Lt,
+         "<=" => BinOp::Le,
+         ">" => BinOp::Gt,
+         ">=" => BinOp::Ge,
+-        "AND" => BinOp::And,
++         /* ~ changed by cargo-mutants ~ */
+         "OR" => BinOp::Or,
+         _ => {
+             return Err(EngineError::invariant(
+                 27,
+                 format!("unsupported operator: {op}"),
+             ))
+         }
+     })

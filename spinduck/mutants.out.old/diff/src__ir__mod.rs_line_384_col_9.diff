@@ -1,0 +1,45 @@
+--- src/ir/mod.rs
++++ replace Compiler::jump with ()
+@@ -376,41 +376,17 @@
+         self.code.len()
+     }
+ 
+     fn mark(&mut self, label: &str) {
+         self.labels.insert(label.to_string(), self.here());
+     }
+ 
+     fn jump(&mut self, label: &str, cond: Option<IrExpr>, if_cond: bool) {
+-        let at = self.here();
+-        let known = self.labels.get(label).copied();
+-        match (known, cond) {
+-            (Some(to), None) => self.code.push(IrStmt::Jump(to)),
+-            (Some(to), Some(c)) if if_cond => self.code.push(IrStmt::JumpIf { cond: c, to }),
+-            (Some(to), Some(c)) => self.code.push(IrStmt::JumpIfNot { cond: c, to }),
+-            (None, None) => {
+-                self.code.push(IrStmt::Jump(usize::MAX));
+-                self.fixups.push((at, label.to_string()));
+-            }
+-            (None, Some(c)) => {
+-                self.code.push(if if_cond {
+-                    IrStmt::JumpIf {
+-                        cond: c,
+-                        to: usize::MAX,
+-                    }
+-                } else {
+-                    IrStmt::JumpIfNot {
+-                        cond: c,
+-                        to: usize::MAX,
+-                    }
+-                });
+-                self.fixups.push((at, label.to_string()));
+-            }
+-        }
++        () /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn resolve_fixups(&mut self) -> Result<(), EngineError> {
+         let fixups = std::mem::take(&mut self.fixups);
+         for (at, label) in fixups {
+             let resolved = *self.labels.get(&label).ok_or_else(|| {
+                 EngineError::invariant(20, format!("unknown goto/exit label: {label}"))
+             })?;

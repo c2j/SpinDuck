@@ -1,0 +1,24 @@
+--- src/sql/rewrite.rs
++++ delete match arm '\'' in find_innermost_calls
+@@ -205,20 +205,17 @@
+                 } else {
+                     in_string = false;
+                 }
+             }
+             i += 1;
+             continue;
+         }
+         match c {
+-            '\'' => {
+-                in_string = true;
+-                i += 1;
+-            }
++             /* ~ changed by cargo-mutants ~ */
+             _ => {
+                 if c.is_ascii_alphabetic() || c == '_' {
+                     let start = i;
+                     while i < text.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                         i += 1;
+                     }
+                     let word = &text[start..i];
+                     let upper = word.to_ascii_uppercase();

@@ -1,0 +1,14 @@
+--- src/ir/mod.rs
++++ replace ident1 -> String with String::new()
+@@ -1295,10 +1295,10 @@
+         .join(".")
+ }
+ 
+ fn ident0(name: &ogsql_parser::ast::ObjectName) -> String {
+     name.first().map(|i| i.value.clone()).unwrap_or_default()
+ }
+ 
+ fn ident1(name: &ogsql_parser::ast::ObjectName) -> String {
+-    name.get(1).map(|i| i.value.clone()).unwrap_or_default()
++    String::new() /* ~ changed by cargo-mutants ~ */
+ }

@@ -1,0 +1,27 @@
+--- src/ir/mod.rs
++++ replace fold_bin -> IrExpr with Default::default()
+@@ -1203,23 +1203,17 @@
+ }
+ 
+ /// 条件链左结合组合（AND）：`a AND b AND c`。
+ fn and_chain(parts: Vec<IrExpr>) -> IrExpr {
+     fold_bin(BinOp::And, parts)
+ }
+ 
+ fn fold_bin(op: BinOp, parts: Vec<IrExpr>) -> IrExpr {
+-    let mut it = parts.into_iter();
+-    let first = it.next().expect("chain requires at least one item");
+-    it.fold(first, |acc, next| IrExpr::Bin {
+-        op,
+-        l: Box::new(acc),
+-        r: Box::new(next),
+-    })
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ fn lit(l: &ogsql_parser::ast::Literal) -> SpinValue {
+     use ogsql_parser::ast::Literal as L;
+     match l {
+         L::Integer(i) => SpinValue::Int(*i),
+         // 小数按十进制字面量承载（禁止降级为字符串：`x * 0.0008` 曾因字符串
+         // 常量在 DuckDB 侧类型推断失败）

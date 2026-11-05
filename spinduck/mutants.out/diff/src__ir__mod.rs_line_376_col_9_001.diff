@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ replace Compiler::here -> usize with 1
+@@ -368,17 +368,17 @@
+ 
+ /// 嵌套深度上限。取 32 而非 64：解析器与编译器递归帧较大，64 层在默认测试栈
+ /// （2 MiB）下会栈溢出（abort），护栏必须先于溢出生效（tests/compiler_contracts.rs
+ /// 锁定 31 通过 / 32 拒绝）。
+ const MAX_DEPTH: usize = 32;
+ 
+ impl Compiler {
+     fn here(&self) -> usize {
+-        self.code.len()
++        1 /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     fn mark(&mut self, label: &str) {
+         self.labels.insert(label.to_string(), self.here());
+     }
+ 
+     fn jump(&mut self, label: &str, cond: Option<IrExpr>, if_cond: bool) {
+         let at = self.here();

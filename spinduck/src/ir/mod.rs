@@ -366,7 +366,10 @@ pub(crate) struct Compiler {
     synth: usize,
 }
 
-const MAX_DEPTH: usize = 64;
+/// 嵌套深度上限。取 32 而非 64：解析器与编译器递归帧较大，64 层在默认测试栈
+/// （2 MiB）下会栈溢出（abort），护栏必须先于溢出生效（tests/compiler_contracts.rs
+/// 锁定 31 通过 / 32 拒绝）。
+const MAX_DEPTH: usize = 32;
 
 impl Compiler {
     fn here(&self) -> usize {
@@ -471,9 +474,9 @@ impl Compiler {
 
     fn stmt_inner(&mut self, st: &PlStatement) -> Result<(), EngineError> {
         match st {
-            PlStatement::Null | PlStatement::Commit { .. } => {
-                self.code.push(IrStmt::TxCommit);
-            }
+            // NULL 是空语句（不得产生事务边界）；只有 COMMIT 才是提交标记
+            PlStatement::Null => self.code.push(IrStmt::Nop),
+            PlStatement::Commit { .. } => self.code.push(IrStmt::TxCommit),
             PlStatement::Rollback { .. } => self.code.push(IrStmt::TxRollback),
             PlStatement::Savepoint { .. }
             | PlStatement::ReleaseSavepoint { .. }
@@ -1101,13 +1104,24 @@ impl Compiler {
                     kind,
                 })
             }
-            Expr::FunctionCall { name, args, .. } => Ok(IrExpr::FuncCall {
-                name: ident_path(name),
-                args: args
-                    .iter()
-                    .map(|a| self.expr(a))
-                    .collect::<Result<Vec<_>, _>>()?,
-            }),
+            Expr::FunctionCall { name, args, .. } => {
+                // 规则改名（如 NVL→coalesce）：只对非 `@` 变换标记生效；`@` 标记的
+                // 解析级变换在内建函数下沉时由 apply_ast_transforms 处理
+                let raw = ident_path(name);
+                let mapped = self
+                    .funcs
+                    .get(&raw.to_ascii_uppercase())
+                    .filter(|v| !v.starts_with('@'))
+                    .cloned()
+                    .unwrap_or(raw);
+                Ok(IrExpr::FuncCall {
+                    name: mapped,
+                    args: args
+                        .iter()
+                        .map(|a| self.expr(a))
+                        .collect::<Result<Vec<_>, _>>()?,
+                })
+            }
             Expr::Parenthesized(inner) => self.expr(inner),
             Expr::UnaryOp { op, expr } if op == "-" => Ok(IrExpr::Bin {
                 op: BinOp::Sub,

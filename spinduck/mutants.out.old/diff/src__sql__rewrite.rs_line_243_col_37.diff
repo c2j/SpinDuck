@@ -1,0 +1,21 @@
+--- src/sql/rewrite.rs
++++ delete match arm '(' in find_innermost_calls
+@@ -235,17 +235,17 @@
+                                         j += 1;
+                                     } else {
+                                         s2 = false;
+                                     }
+                                 }
+                             } else {
+                                 match ch {
+                                     '\'' => s2 = true,
+-                                    '(' => depth += 1,
++                                     /* ~ changed by cargo-mutants ~ */
+                                     ')' => {
+                                         depth -= 1;
+                                         if depth == 0 {
+                                             break;
+                                         }
+                                     }
+                                     _ => {}
+                                 }

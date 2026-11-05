@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ replace -= with += in Compiler::stmt
+@@ -463,17 +463,17 @@
+     }
+ 
+     fn stmt(&mut self, st: &PlStatement) -> Result<(), EngineError> {
+         self.depth += 1;
+         if self.depth > MAX_DEPTH {
+             return Err(EngineError::invariant(21, "PL nesting too deep"));
+         }
+         let r = self.stmt_inner(st);
+-        self.depth -= 1;
++        self.depth += /* ~ changed by cargo-mutants ~ */ 1;
+         r
+     }
+ 
+     fn stmt_inner(&mut self, st: &PlStatement) -> Result<(), EngineError> {
+         match st {
+             // NULL 是空语句（不得产生事务边界）；只有 COMMIT 才是提交标记
+             PlStatement::Null => self.code.push(IrStmt::Nop),
+             PlStatement::Commit { .. } => self.code.push(IrStmt::TxCommit),

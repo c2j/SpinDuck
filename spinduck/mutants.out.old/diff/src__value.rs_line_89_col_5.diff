@@ -1,0 +1,42 @@
+--- src/value.rs
++++ replace coerce -> Result<SpinValue, EngineError> with Ok(Default::default())
+@@ -81,38 +81,17 @@
+             SpinValue::Record(_) => "<record>".into(),
+         }
+     }
+ }
+ 
+ /// 隐式转换（规则文件 `[implicit]` 驱动的统一入口）。
+ /// 返回 Err(EngineError) 表示不可转换（产生 BIZ 域诊断）。
+ pub fn coerce(v: &SpinValue, target: &SpinType) -> Result<SpinValue, EngineError> {
+-    if v.fits(target) {
+-        return Ok(v.clone());
+-    }
+-    match (v, target) {
+-        // 字符串 → 数值（宽松）
+-        (SpinValue::Str(s), SpinType::Int | SpinType::BigInt) => parse_numeric(s, 0),
+-        (SpinValue::Str(s), SpinType::Decimal { scale, .. }) => parse_numeric(s, *scale),
+-        // 数值 → 字符串（拼接/落 VARCHAR 列）
+-        (SpinValue::Int(_) | SpinValue::Decimal(..), SpinType::Varchar) => {
+-            Ok(SpinValue::Str(v.as_str_loose()))
+-        }
+-        (SpinValue::Bool(b), SpinType::Varchar) => Ok(SpinValue::Str(b.to_string())),
+-        // RECORD 字段整体作为标量传出是不合法的
+-        (SpinValue::Record(_), _) => Err(EngineError::business(
+-            110,
+-            "cannot coerce RECORD to scalar type",
+-        )),
+-        _ => Err(EngineError::business(
+-            111,
+-            format!("cannot coerce {:?} to {:?}", v, target),
+-        )),
+-    }
++    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ fn parse_numeric(s: &str, scale: u8) -> Result<SpinValue, EngineError> {
+     let t = s.trim();
+     if t.is_empty() {
+         return Ok(SpinValue::Null);
+     }
+     if let Ok(i) = t.parse::<i64>() {

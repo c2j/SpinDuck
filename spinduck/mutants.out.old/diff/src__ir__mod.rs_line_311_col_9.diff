@@ -1,0 +1,23 @@
+--- src/ir/mod.rs
++++ delete match arm PlStatement::Return{expression:Some(e),} in collect_stmt
+@@ -303,19 +303,17 @@
+             collect_expr(&w.condition, set);
+             collect_slice(&w.body, set);
+         }
+         PlStatement::Exit { condition, .. } | PlStatement::Continue { condition, .. } => {
+             if let Some(c) = condition {
+                 collect_expr(c, set);
+             }
+         }
+-        PlStatement::Return {
+-            expression: Some(e),
+-        } => collect_expr(e, set),
++         /* ~ changed by cargo-mutants ~ */
+         PlStatement::Block(b) => collect_slice(&b.body, set),
+         _ => {}
+     }
+ }
+ 
+ fn collect_expr(e: &Expr, set: &mut crate::sql::VarScope) {
+     match e {
+         Expr::PlVariable(name) => {

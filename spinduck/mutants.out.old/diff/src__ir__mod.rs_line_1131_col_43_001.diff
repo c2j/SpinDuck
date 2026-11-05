@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ replace match guard op == "+" with false in Compiler::expr
+@@ -1123,17 +1123,17 @@
+                 })
+             }
+             Expr::Parenthesized(inner) => self.expr(inner),
+             Expr::UnaryOp { op, expr } if op == "-" => Ok(IrExpr::Bin {
+                 op: BinOp::Sub,
+                 l: Box::new(IrExpr::Const(SpinValue::Int(0))),
+                 r: Box::new(self.expr(expr)?),
+             }),
+-            Expr::UnaryOp { op, expr } if op == "+" => self.expr(expr),
++            Expr::UnaryOp { op, expr } if false /* ~ changed by cargo-mutants ~ */ => self.expr(expr),
+             // BETWEEN 闭区间（§3.2 求值口径与 SQL 一致）：NOT BETWEEN 为区间外
+             Expr::Between {
+                 expr,
+                 low,
+                 high,
+                 negated,
+             } => {
+                 let x = self.expr(expr)?;

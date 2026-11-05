@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ delete ! in parse_decimal_literal
+@@ -1249,17 +1249,17 @@
+     };
+     let (ip, fp) = match body.split_once('.') {
+         Some((a, b)) => (a, b),
+         None => (body, ""),
+     };
+     if ip.is_empty() && fp.is_empty() {
+         return None;
+     }
+-    if !ip.chars().all(|c| c.is_ascii_digit()) || !fp.chars().all(|c| c.is_ascii_digit()) {
++    if  /* ~ changed by cargo-mutants ~ */ip.chars().all(|c| c.is_ascii_digit()) || !fp.chars().all(|c| c.is_ascii_digit()) {
+         return None;
+     }
+     let scale = fp.len().min(18) as u8;
+     let digits = format!("{ip}{fp}");
+     let unscaled: i128 = digits.parse().ok()?;
+     let signed = if neg { -unscaled } else { unscaled };
+     Some(SpinValue::Decimal(signed, 38, scale))
+ }

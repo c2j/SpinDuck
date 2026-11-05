@@ -1,0 +1,21 @@
+--- src/ir/mod.rs
++++ replace or_chain -> IrExpr with Default::default()
+@@ -1194,17 +1194,17 @@
+                 format!("PL expression not yet supported in M2 evaluator: {other:?}"),
+             )),
+         }
+     }
+ }
+ 
+ /// 条件链左结合组合（OR）：`a OR b OR c`。
+ fn or_chain(parts: Vec<IrExpr>) -> IrExpr {
+-    fold_bin(BinOp::Or, parts)
++    Default::default() /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// 条件链左结合组合（AND）：`a AND b AND c`。
+ fn and_chain(parts: Vec<IrExpr>) -> IrExpr {
+     fold_bin(BinOp::And, parts)
+ }
+ 
+ fn fold_bin(op: BinOp, parts: Vec<IrExpr>) -> IrExpr {

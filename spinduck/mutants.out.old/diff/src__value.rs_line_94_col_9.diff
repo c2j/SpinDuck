@@ -1,0 +1,21 @@
+--- src/value.rs
++++ delete match arm (SpinValue::Str(s), SpinType::Int | SpinType::BigInt) in coerce
+@@ -86,17 +86,17 @@
+ /// 隐式转换（规则文件 `[implicit]` 驱动的统一入口）。
+ /// 返回 Err(EngineError) 表示不可转换（产生 BIZ 域诊断）。
+ pub fn coerce(v: &SpinValue, target: &SpinType) -> Result<SpinValue, EngineError> {
+     if v.fits(target) {
+         return Ok(v.clone());
+     }
+     match (v, target) {
+         // 字符串 → 数值（宽松）
+-        (SpinValue::Str(s), SpinType::Int | SpinType::BigInt) => parse_numeric(s, 0),
++         /* ~ changed by cargo-mutants ~ */
+         (SpinValue::Str(s), SpinType::Decimal { scale, .. }) => parse_numeric(s, *scale),
+         // 数值 → 字符串（拼接/落 VARCHAR 列）
+         (SpinValue::Int(_) | SpinValue::Decimal(..), SpinType::Varchar) => {
+             Ok(SpinValue::Str(v.as_str_loose()))
+         }
+         (SpinValue::Bool(b), SpinType::Varchar) => Ok(SpinValue::Str(b.to_string())),
+         // RECORD 字段整体作为标量传出是不合法的
+         (SpinValue::Record(_), _) => Err(EngineError::business(

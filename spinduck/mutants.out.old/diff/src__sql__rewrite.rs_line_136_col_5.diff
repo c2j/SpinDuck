@@ -1,0 +1,56 @@
+--- src/sql/rewrite.rs
++++ replace rewrite_tokens_with_rules -> Result<SqlUnit, EngineError> with Ok(Default::default())
+@@ -128,52 +128,17 @@
+ /// token 级重命名 + 命名占位符（一次遍历）。
+ /// `functions`：`[functions]` 映射；值以 `@` 开头的（@case/@to_number/@to_char）
+ /// 不在此处理，由 [`apply_ast_transforms`] 解析级完成。
+ pub fn rewrite_tokens_with_rules(
+     sql_text: &str,
+     var_names: &BTreeSet<String>,
+     functions: &BTreeMap<String, String>,
+ ) -> Result<SqlUnit, EngineError> {
+-    let tokens = Tokenizer::new(sql_text)
+-        .tokenize()
+-        .map_err(|e| EngineError::invariant(40, format!("tokenizer: {e}")))?;
+-    let mut out = String::with_capacity(sql_text.len() + 64);
+-    let mut binds: Vec<(String, VarName)> = Vec::new();
+-    let mut seen: BTreeSet<String> = BTreeSet::new();
+-    let mut cursor = 0usize;
+-    for tws in &tokens {
+-        let gap = sql_text
+-            .get(cursor..tws.span.start)
+-            .ok_or_else(|| EngineError::invariant(41, "token span out of order".to_string()))?;
+-        out.push_str(gap);
+-        match &tws.token {
+-            Token::Ident(value) => {
+-                let lower = value.to_ascii_lowercase();
+-                if var_names.contains(&lower) {
+-                    let ph = format!("$v_{lower}");
+-                    out.push_str(&ph);
+-                    if seen.insert(ph.clone()) {
+-                        binds.push((ph, VarName(lower)));
+-                    }
+-                    cursor = tws.span.end;
+-                    continue;
+-                }
+-                apply_rename(&mut out, sql_text, tws.span.start, tws.span.end, functions);
+-            }
+-            // 关键字（如 SYSDATE）走 Keyword 变体，用源码切片做重命名判定
+-            Token::Keyword(_) => {
+-                apply_rename(&mut out, sql_text, tws.span.start, tws.span.end, functions);
+-            }
+-            _ => out.push_str(&sql_text[tws.span.start..tws.span.end]),
+-        }
+-        cursor = tws.span.end;
+-    }
+-    out.push_str(&sql_text[cursor..]);
+-    Ok(SqlUnit { text: out, binds })
++    Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// 简单重命名（同参数序；`@` 前缀的解析级变换在此跳过）。
+ fn apply_rename(
+     out: &mut String,
+     sql_text: &str,
+     start: usize,
+     end: usize,
