@@ -24,10 +24,22 @@ pub struct RuleRegistry {
     pub probe_duckdb: String,
 }
 
+/// 内置种子规则（决策 2025-11-05）：`config/rewrite-rules.toml` 编译期嵌入，
+/// `RuleRegistry::default()` 直接加载——引擎在零外部配置时即具备 NVL/TO_CHAR/
+/// CLOB→VARCHAR 等方言能力；项目/命令行规则文件叠加在其上（overlay 语义）。
+pub const BUILT_IN_RULES_TOML: &str = include_str!("../../config/rewrite-rules.toml");
+
 impl Default for RuleRegistry {
-    /// 程序化默认值：rownum 改写默认开启（DuckDB 无 rownum，不改写必然报错）；
-    /// 其余空表/关闭，与 `RuleRegistry::default()` 旧语义兼容。
+    /// 默认 = 内置种子规则（嵌入副本与仓库 config 单元测试互验，见
+    /// `should_embed_built_in_rules`）；加载失败回退空表并保留可测路径。
     fn default() -> Self {
+        Self::from_toml_str(BUILT_IN_RULES_TOML).unwrap_or_else(|_| Self::empty_registry())
+    }
+}
+
+impl RuleRegistry {
+    /// 程序化空表（内置加载失败的回退路径；测试用构造器）。
+    fn empty_registry() -> Self {
         Self {
             types: BTreeMap::new(),
             functions: BTreeMap::new(),
@@ -78,7 +90,7 @@ impl RuleRegistry {
                 .and_then(|x| x.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            ..Default::default()
+            ..Self::empty_registry()
         };
         if let Some(t) = v.get("types").and_then(|x| x.as_table()) {
             for (k, val) in t {
@@ -112,6 +124,13 @@ impl RuleRegistry {
     pub fn overlay(&mut self, raw: &str) -> Result<(), crate::error::EngineError> {
         let v: toml::Value = toml::from_str(raw)
             .map_err(|e| crate::error::EngineError::env(12, format!("overlay parse: {e}")))?;
+        // 版本锚定字段同样可覆盖（rules probe 的漂移检测依赖）
+        if let Some(x) = v.get("target_duckdb").and_then(|x| x.as_str()) {
+            self.target_duckdb = x.to_string();
+        }
+        if let Some(x) = v.get("probe_duckdb").and_then(|x| x.as_str()) {
+            self.probe_duckdb = x.to_string();
+        }
         if let Some(t) = v.get("types").and_then(|x| x.as_table()) {
             for (k, val) in t {
                 if let Some(s) = val.as_str() {

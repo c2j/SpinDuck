@@ -92,8 +92,9 @@ docker logs spinduck-gaussdb | grep spinduck-init
   （`lib/fastaas/prototype-1.7/dota-scheduler/dota-adapter/docker/`），
   去除了 DOTA 业务 schema 自动应用（SpinDuck 测试自建全部对象）
 
-连接信息：`127.0.0.1:5433`，db `postgres`，user `gaussdb`，password `Enmo@123`
-（口令仅开发容器；测试/CLI 经环境变量 `SPINDUCK_OG_PASSWORD` 注入，不进命令行）。
+连接信息：`127.0.0.1:5433`，db `postgres`，user `gaussdb`；口令由本目录
+`.env` 注入（`cp .env.example .env` 后设置 `GS_PASSWORD`，`.env` 不入库），
+测试/CLI 经环境变量 `SPINDUCK_OG_PASSWORD` 传入，不进命令行。
 
 ## 第 2 步：构建并运行对比
 
@@ -103,27 +104,27 @@ export CARGO_HOME=../.cargo-home
 
 # 语料级黄金对比（考题基线函数逐字，最有说服力）
 SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
-SPINDUCK_OG_PASSWORD='Enmo@123' \
+SPINDUCK_OG_PASSWORD="$SPINDUCK_OG_PASSWORD" \
 cargo test --features gauss --test golden_corpus_gauss -- --nocapture
 
 # 语料级热点用例：核心过程 pkg_split_trade_step3_sh.prc_trd_hz_byfund
 SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
-SPINDUCK_OG_PASSWORD='Enmo@123' \
+SPINDUCK_OG_PASSWORD="$SPINDUCK_OG_PASSWORD" \
 cargo test --features gauss --test golden_corpus_hz_byfund -- --nocapture
 
 # 语料级重量用例：核心过程 pkg_split_trade_step3_sh.prc_trd_deal_purchase
 SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
-SPINDUCK_OG_PASSWORD='Enmo@123' \
+SPINDUCK_OG_PASSWORD="$SPINDUCK_OG_PASSWORD" \
 cargo test --features gauss --test golden_corpus_purchase -- --nocapture
 
 # toy 聚合管线用例（含物化 → CALL → 回写 → 读回全链路）
 SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
-SPINDUCK_OG_PASSWORD='Enmo@123' \
+SPINDUCK_OG_PASSWORD="$SPINDUCK_OG_PASSWORD" \
 cargo test --features gauss --test golden_gauss
 
 # GaussDB 物化/回写通道（V7）
 SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
-SPINDUCK_OG_PASSWORD='Enmo@123' \
+SPINDUCK_OG_PASSWORD="$SPINDUCK_OG_PASSWORD" \
 cargo test --features gauss --test gauss_e2e
 ```
 
@@ -183,7 +184,7 @@ test golden_corpus_min_tax_matches_a_mode_baseline ... ok
 | 症状 | 原因与处置 |
 |---|---|
 | 容器一直 `health: starting` 后 `unhealthy` | `datcompatibility != A`：卷是用 PG 模式初始化的旧卷，`down -v` 重建 |
-| 连接报 `authentication failed` | 口令非 `Enmo@123`（或卷复用了其它口令初始化），`down -v` 重建 |
+| 连接报 `authentication failed` | 口令与 `.env` 的 `GS_PASSWORD` 不一致（或卷复用了旧口令初始化），`down -v` 重建 |
 | 报 `sha256 authentication` 相关 | 容器环境变量被改动，须保留 `GS_HOST_AUTH_METHOD=md5` 与 `OTHER_PG_CONF` |
 | 端口 5433 被占 | 修改 compose 端口映射，同步设置 `SPINDUCK_OG_PORT` |
 | 参照侧函数部署报 `subprogram body is not ended correctly` | 参照侧 DDL 语法限制：`CREATE PROCEDURE` 不接受 PG `$$` 体、DECLARE 内游标声明受限（validation V10/V13）；语料用例统一用 `CREATE FUNCTION`，toy 用例参照侧走 `routine_gauss.sql` |

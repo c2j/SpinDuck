@@ -13,7 +13,8 @@
 #     md5 + password_encryption_type=1 使纯 Rust 客户端可用（仅开发环境）
 #
 # 连接信息（SpinDuck 测试/CLI）：
-#   host: 127.0.0.1  port: 5433  db: postgres  user: gaussdb  password: Enmo@123
+#   host: 127.0.0.1  port: 5433  db: postgres  user: gaussdb
+#   password: 由本目录 .env 注入（GS_PASSWORD=…，见 .env.example；不入库）
 #
 # 停止 / 重置（重置后下次 up 重新初始化，仍为 A 模式）：
 #   docker compose -f golden/gaussdb-docker/docker-compose.yml down
@@ -26,13 +27,15 @@ services:
     entrypoint: ["/bin/bash", "/spinduck/spinduck-entrypoint.sh"]
     command: ["gaussdb"]
     environment:
-      GS_PASSWORD: Enmo@123
+      # 口令从 .env 注入（缺失即启动失败，杜绝明文入库/默认口令静默生效）
+      GS_PASSWORD: ${GS_PASSWORD:?GS_PASSWORD must be set (cp .env.example .env)}
       GS_NODENAME: spinduck_node
       GS_PORT: 5432
       GS_HOST_AUTH_METHOD: md5
       OTHER_PG_CONF: "password_encryption_type = 1"
     ports:
-      - "5433:5432"
+      # 仅回环：开发机不向局域网暴露 A 模式实例
+      - "127.0.0.1:5433:5432"
     volumes:
       - gauss_data:/var/lib/opengauss/data
       - ./spinduck-entrypoint.sh:/spinduck/spinduck-entrypoint.sh:ro

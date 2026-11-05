@@ -139,7 +139,19 @@ fn run_inner(
         };
         sink.on_event(spinduck_trace_event(st));
         match st {
-            IrStmt::Nop | IrStmt::TxCommit | IrStmt::TxRollback => *pc += 1,
+            IrStmt::Nop => *pc += 1,
+            // 事务语句即时作用于当前事务并重开（最外层统一边界见 engine.call）；
+            // 不再是空操作——异常处理器中的 ROLLBACK 由此具备撤销已执行 DML 的语义
+            IrStmt::TxCommit => {
+                ex.execute("COMMIT", &BindMap::new())?;
+                ex.execute("BEGIN TRANSACTION", &BindMap::new())?;
+                *pc += 1;
+            }
+            IrStmt::TxRollback => {
+                ex.execute("ROLLBACK", &BindMap::new())?;
+                ex.execute("BEGIN TRANSACTION", &BindMap::new())?;
+                *pc += 1;
+            }
             IrStmt::Assign { target, expr } => {
                 let v = {
                     let env = crate::runtime::frame::EvalEnv {
@@ -232,6 +244,26 @@ fn run_inner(
                 ex.execute(sql, &bound)?;
                 *pc += 1;
             }
+            IrStmt::SqlExecDynamic { text_expr } => {
+                let v = {
+                    let env = crate::runtime::frame::EvalEnv {
+                        frame,
+                        ex,
+                        cat,
+                        depth,
+                    };
+                    eval(text_expr, &env)?
+                };
+                eprintln!("[ARM] text={:?}", v.as_str_loose());
+                let (sql, _) = prepare_dynamic_sql(&v.as_str_loose(), frame, ex, cat, depth)?;
+                sink.on_event(TraceEvent::SqlExec {
+                    sql: sql.clone(),
+                    binds: BindMap::new(),
+                    elapsed_us: 0,
+                });
+                ex.execute(&sql, &BindMap::new())?;
+                *pc += 1;
+            }
             IrStmt::CallRoutine {
                 name,
                 args,
@@ -311,7 +343,7 @@ fn run_inner(
                         (sql.clone(), m)
                     }
                     CursorSource::Dynamic { query_expr } => {
-                        // 动态 OPEN FOR：求值文本 → 解析/格式化 → 方言变换 → SQL
+                        // 动态 OPEN FOR：与 EXECUTE IMMEDIATE 同一条管线（统一收口）
                         let v = {
                             let env = crate::runtime::frame::EvalEnv {
                                 frame,
@@ -321,33 +353,9 @@ fn run_inner(
                             };
                             eval(query_expr, &env)?
                         };
-                        let text = v.as_str_loose();
-                        let tokens = ogsql_parser::token::tokenizer::Tokenizer::new(&text)
-                            .tokenize()
-                            .map_err(|e| EngineError::invariant(46, format!("tokenizer: {e}")))?;
-                        let cleaned = ogsql_parser::parser::Parser::new(tokens).parse();
-                        let fmt = ogsql_parser::formatter::SqlFormatter::new();
-                        let sql = cleaned
-                            .iter()
-                            .map(|st| fmt.format_statement(st))
-                            .collect::<Vec<_>>()
-                            .join(";\n");
-                        // 规则改名（nvl→coalesce 等）与静态语句同口径
-                        let named = crate::sql::rewrite_tokens_with_rules(
-                            &sql,
-                            &Default::default(),
-                            cat.sql_functions(),
-                        )?;
-                        let sql = crate::sql::apply_ast_transforms(&named.text)?;
-                        // 动态 SQL 中的 SQL 上下文例程调用：运行期规划 + 物化缓存
-                        let (marked, sites) = crate::sql::plan_sites(
-                            &sql,
-                            &Default::default(),
-                            &Default::default(),
-                            &cat.routine_names(),
-                        )?;
-                        materialize_fn_sites(&sites, frame, ex, cat, depth)?;
-                        (marked, BindMap::new())
+                        let (sql, _) =
+                            prepare_dynamic_sql(&v.as_str_loose(), frame, ex, cat, depth)?;
+                        (sql, BindMap::new())
                     }
                 };
                 let stream = ex.query(&sql, &binds)?;
@@ -452,6 +460,49 @@ fn run_inner(
 
 fn assign(frame: &mut Frame, target: &AssignTarget, v: SpinValue) -> Result<(), EngineError> {
     frame.assign(target, v)
+}
+
+/// 动态 SQL 统一管线（决策 2025-11-05 收口）：文本求值 → ogsql 解析 →
+/// 规则改名 → 方言变换 → 函数下沉规划 → 物化缓存。EXECUTE IMMEDIATE 与
+/// OPEN FOR 共用；解析失败显式报错（BIZ-061），不执行未解析文本。
+fn prepare_dynamic_sql(
+    text: &str,
+    frame: &Frame,
+    ex: &dyn SqlExecutor,
+    cat: &crate::catalog::RoutineCatalog,
+    depth: usize,
+) -> Result<(String, Vec<crate::sql::FnSite>), EngineError> {
+    eprintln!("[DYNT] enter len={}", text.len());
+    let tokens = ogsql_parser::token::tokenizer::Tokenizer::new(text)
+        .tokenize()
+        .map_err(|e| EngineError::business(61, format!("动态 SQL tokenize 失败: {e}")))?;
+    let stmts = ogsql_parser::parser::Parser::new(tokens).parse();
+    if stmts.is_empty() {
+        let head: String = text.chars().take(80).collect();
+        return Err(EngineError::business(
+            61,
+            format!("动态 SQL 解析失败（ogsql-parser 不支持的形态请向其上游提 issue）：{head}"),
+        ));
+    }
+    let fmt = ogsql_parser::formatter::SqlFormatter::new();
+    let sql = stmts
+        .iter()
+        .map(|st| fmt.format_statement(st))
+        .collect::<Vec<_>>()
+        .join(";\n");
+    // 规则改名（nvl→coalesce 等）与静态语句同口径
+    let named =
+        crate::sql::rewrite_tokens_with_rules(&sql, &Default::default(), cat.sql_functions())?;
+    let sql = crate::sql::apply_ast_transforms(&named.text)?;
+    let (marked, sites) = crate::sql::plan_sites(
+        &sql,
+        &Default::default(),
+        &Default::default(),
+        &cat.routine_names(),
+    )?;
+    eprintln!("[DYNT] planned sites={}", sites.len());
+    materialize_fn_sites(&sites, frame, ex, cat, depth)?;
+    Ok((marked, sites))
 }
 
 /// SQL 上下文例程调用下沉物化（§8.3 路径②）。
@@ -607,6 +658,7 @@ fn spinduck_trace_event(st: &IrStmt) -> TraceEvent {
 fn variant_name(st: &IrStmt) -> &'static str {
     match st {
         IrStmt::Nop => "Nop",
+        IrStmt::SqlExecDynamic { .. } => "SqlExecDynamic",
         IrStmt::Assign { .. } => "Assign",
         IrStmt::Jump(_) => "Jump",
         IrStmt::JumpIfNot { .. } => "JumpIfNot",

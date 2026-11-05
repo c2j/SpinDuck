@@ -161,17 +161,16 @@ fn should_compile_static_execute_immediate() {
 }
 
 #[test]
-fn should_reject_runtime_built_execute_immediate() {
-    // 动态拼接保留到 M8：必须编译期显式拒绝，不静默降级
+fn should_compile_runtime_built_execute_immediate() {
+    // 决策 2025-11-05（统一收口）：运行期拼接文本经同一条解析管线执行；
+    // 解析失败在运行期显式报 BIZ-061，不再编译期整体拒绝
     let mut eng = engine();
-    let e = eng
-        .register(
-            "CREATE OR REPLACE PROCEDURE p_dyn2 IS \
-             DECLARE v_sql VARCHAR2(100); \
-             BEGIN v_sql := 'truncate table t'; EXECUTE IMMEDIATE v_sql; END;",
-        )
-        .unwrap_err();
-    assert_eq!(e.code.to_string(), "ENG-0062");
+    eng.register(
+        "CREATE OR REPLACE PROCEDURE p_dyn2 IS \
+         DECLARE v_sql VARCHAR2(100); \
+         BEGIN v_sql := 'truncate table t'; EXECUTE IMMEDIATE v_sql; END;",
+    )
+    .unwrap();
 }
 
 #[test]

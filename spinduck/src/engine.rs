@@ -324,14 +324,26 @@ impl Engine {
             frame.set(&VarName(p.name.to_ascii_lowercase()), v.clone());
         }
         let mut sink = crate::exec::TraceNoopSink;
-        let out = crate::runtime::run_with_catalog(
+        // 统一事务边界（§3.5）：最外层调用在显式事务内执行——过程内
+        // TxCommit/TxRollback 即时提交/回滚当前事务并重开；正常完成统一
+        // COMMIT；未处理异常统一 ROLLBACK（DuckDB ACID 提供原子性）
+        self.ex
+            .execute("BEGIN TRANSACTION", &crate::exec::BindMap::new())?;
+        let out = match crate::runtime::run_with_catalog(
             &routine.prog,
             &mut frame,
             self.ex.as_ref(),
             &mut sink,
             &self.catalog,
             0,
-        )?;
+        ) {
+            Ok(out) => out,
+            Err(e) => {
+                let _ = self.ex.execute("ROLLBACK", &crate::exec::BindMap::new());
+                return Err(e);
+            }
+        };
+        self.ex.execute("COMMIT", &crate::exec::BindMap::new())?;
         let mut result = CallResult::default();
         for p in &routine.params {
             if p.mode != crate::catalog::ParamMode::In {

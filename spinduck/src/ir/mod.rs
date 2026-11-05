@@ -144,6 +144,13 @@ pub enum IrStmt {
         /// SQL 上下文例程调用下沉计划（§8.3；空 = 无）
         fn_sites: Vec<crate::sql::FnSite>,
     },
+    /// EXECUTE IMMEDIATE（动态文本）：运行期求值文本后与动态游标走**同一条**
+    /// 解析管线（ogsql 解析 → 规则改名 → 方言变换 → 函数下沉）——统一收口
+    /// （决策记录 2025-11-05：撤销 ENG-0062 整体拒绝；解析失败显式报错，
+    /// ogsql-parser 不支持的形态向其上游提 issue）
+    SqlExecDynamic {
+        text_expr: Box<IrExpr>,
+    },
     /// PERFORM <expr>：求值并丢弃
     Perform {
         expr: IrExpr,
@@ -1027,42 +1034,24 @@ impl Compiler {
                 }
             }
             PlStatement::Execute(sp) => {
-                // EXECUTE IMMEDIATE：只有"静态文本 + 已解析语句"可编译期下沉；
-                // 运行期拼接（动态）保留为 M8 范围并显式拒绝（§10.4 注入面）
-                let st = sp.parsed_query.as_ref().ok_or_else(|| {
-                    EngineError::invariant(
-                        62,
-                        "EXECUTE with runtime-built SQL text is deferred to M8",
-                    )
-                })?;
+                // EXECUTE IMMEDIATE：统一走动态管线（与 OPEN FOR 同口径，
+                // 决策记录 2025-11-05）。USING/INTO 为 v1 未支持的接缝，显式拒绝
                 if !sp.using_args.is_empty() {
                     return Err(EngineError::invariant(
                         58,
                         "EXECUTE IMMEDIATE .. USING is not supported in v1",
                     ));
                 }
-                let text = ogsql_parser::formatter::SqlFormatter::new().format_statement(st);
-                if sp.into_targets.is_empty() {
-                    self.sql_statement(&text, st)?;
-                } else {
-                    let mut into = Vec::with_capacity(sp.into_targets.len());
-                    for t in &sp.into_targets {
-                        into.push(self.assign_target(t)?);
-                    }
-                    let unit = rewrite_sql(
-                        &text,
-                        &self.vars,
-                        &self.funcs,
-                        &self.routine_names,
-                        self.update_strip_alias,
-                    )?;
-                    self.code.push(IrStmt::SqlQuery {
-                        sql: unit.text,
-                        binds: unit.binds,
-                        into,
-                        fn_sites: unit.fn_sites,
-                    });
+                if !sp.into_targets.is_empty() {
+                    return Err(EngineError::business(
+                        61,
+                        "EXECUTE IMMEDIATE .. INTO 不支持（v1）：动态取数请使用显式游标 OPEN FOR",
+                    ));
                 }
+                let text_expr = self.expr(&sp.string_expr)?;
+                self.code.push(IrStmt::SqlExecDynamic {
+                    text_expr: Box::new(text_expr),
+                });
             }
             // —— M2 之后的里程碑纳入（编译期显式拒绝，禁止静默错误翻译）——
             other => {

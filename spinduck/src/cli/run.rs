@@ -43,7 +43,11 @@ fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError> {
             Ok(EXIT_OK)
         }
         Command::RulesProbe { path } => {
-            let rules = RuleRegistry::load(&path)?;
+            let mut rules = RuleRegistry::default();
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| EngineError::env(12, format!("read rules: {e}")))?;
+            rules.overlay(&raw)?;
+            let rules = rules;
             writeln!(
                 out,
                 "rules: {} target_duckdb={} probe_duckdb={} match={}",
@@ -210,10 +214,13 @@ fn failure_histogram(reports: &[FileReport]) -> Vec<(String, usize)> {
 fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, EngineError> {
     use crate::cli::args::parse_literal;
     use crate::engine::Engine;
-    let rules = match &parts.rules {
-        Some(p) => RuleRegistry::load(p)?,
-        None => RuleRegistry::default(),
-    };
+    // 内置种子规则恒为基座；--rules 为项目覆盖（叠加语义，§6 只增不删）
+    let mut rules = RuleRegistry::default();
+    if let Some(p) = &parts.rules {
+        let raw = std::fs::read_to_string(p)
+            .map_err(|e| EngineError::env(12, format!("read rules: {e}")))?;
+        rules.overlay(&raw)?;
+    }
     let ex = match &parts.db {
         Some(p) => crate::sql::DuckExecutor::open(&p.to_string_lossy())?,
         None => crate::sql::DuckExecutor::open_in_memory()?,

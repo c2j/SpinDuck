@@ -285,13 +285,13 @@ fn should_reject_unsupported_statements_explicitly() {
         )
         .unwrap_err();
     assert_eq!(e.code.to_string(), "ENG-0022");
-    let e = eng
-        .register(
-            "CREATE OR REPLACE PROCEDURE p_ba IS \
-             DECLARE v_sql VARCHAR2(50); BEGIN EXECUTE IMMEDIATE v_sql; END;",
-        )
-        .unwrap_err();
-    assert_eq!(e.code.to_string(), "ENG-0062");
+    // 决策 2025-11-05：EXECUTE IMMEDIATE 与 OPEN FOR 统一走动态管线，
+    // 运行期变量文本不再编译期拒绝（解析失败在运行期显式报 BIZ-061）
+    eng.register(
+        "CREATE OR REPLACE PROCEDURE p_ba IS \
+         DECLARE v_sql VARCHAR2(50); BEGIN EXECUTE IMMEDIATE v_sql; END;",
+    )
+    .unwrap();
 }
 
 #[test]

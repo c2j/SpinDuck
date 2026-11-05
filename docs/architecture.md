@@ -894,3 +894,6 @@ materialize(物化快照+时间戳)
 - 回写不承诺高斯侧触发器行为（属源端语义，未验证）
 - 大表物化内存/磁盘上界沿用 §10.3 配置；Parquet 缓存位于 §11.1 `data/` 旁
   （`data/parquet_cache/<db>/<table>/<分区>`）
+
+
+> 决策记录 2025-11-05（PR#1 评审）：① COMMIT/ROLLBACK 实现统一事务边界（最外层显式事务，Tx 语句即时提交/回滚并重开，未处理异常统一 ROLLBACK，DuckDB ACID 承载原子性），不降级；② ENG-0062 撤销整体拒绝，动态文本统一经 ogsql 解析管线（解析失败 BIZ-061；解析器不支持的形态向 ogsql-parser 上游提 issue）；③ 内置规则 `config/rewrite-rules.toml` 编译期嵌入，`RuleRegistry::default()` 直接加载，CLI/项目规则叠加其上；④ 容器口令经 `.env` 注入（`${GS_PASSWORD:?}`），端口仅回环。

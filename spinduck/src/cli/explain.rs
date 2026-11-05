@@ -20,6 +20,7 @@ pub fn render(prog: &IrProg) -> Vec<String> {
 fn describe(st: &IrStmt) -> (&'static str, String) {
     match st {
         IrStmt::Nop => ("nop", String::new()),
+        IrStmt::SqlExecDynamic { .. } => ("execute_dynamic", String::new()),
         IrStmt::Assign { target, expr } => (
             "assign",
             format!("{} := {}", target_text(target), expr_text(expr)),

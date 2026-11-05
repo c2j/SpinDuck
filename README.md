@@ -56,7 +56,7 @@ cargo build --features gauss                # 追加 GaussDB 连接器
 # 先启动参照容器（复现包见 golden/README.md）
 docker compose -f golden/gaussdb-docker/docker-compose.yml up -d
 export SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
-       SPINDUCK_OG_USER=gaussdb SPINDUCK_OG_PASSWORD='Enmo@123' SPINDUCK_OG_DB=postgres
+       SPINDUCK_OG_USER=gaussdb SPINDUCK_OG_PASSWORD="$GS_PASSWORD" SPINDUCK_OG_DB=postgres
 
 ./target/debug/spinduck materialize --db /tmp/w.duckdb --table mid_yjqs_detail
 ./target/debug/spinduck materialize --db /tmp/w.duckdb --table mid_yjqs_detail \
@@ -92,7 +92,7 @@ export SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
 | `%ROWTYPE` 整行记录 + 显式 `FETCH c INTO rec` | ✅ |
 | PL 上下文 `@` 标记函数（`TO_CHAR`/`TO_DATE`/`INTERVALTONUM`） | ✅ SQL-first 下沉（`SqlFn`，保留日期中间类型；`日期±n` 自动 `to_days`） |
 | **SQL 上下文例程调用**（`UPDATE SET f(col)` / 游标 WHERE / INSERT VALUES 中的 PL 函数） | ✅ 参数元组缓存化下沉（`sqlfn`，确定性前提 + 10 万元组上界） |
-| `%NOTFOUND` 空游标 / `SQLERRM` / `UPDATE` 去别名（DuckDB 方言） | ✅ |
+| `EXECUTE IMMEDIATE`（动态文本，与 OPEN FOR 同一解析管线）/ 过程内 COMMIT·ROLLBACK（统一事务边界）/ `%NOTFOUND` 空游标 / `SQLERRM` / `UPDATE` 去别名 | ✅ |
 | 黄金对比 | ✅ `golden/`：toy 用例 + 语料级逐字函数（stock_kind / min_tax）+ 核心过程（purchase / **hz_byfund**） |
 | `RETURN NEXT` / `PIPE ROW` / 集合类型（嵌套表/数组元素赋值）/ 带参游标 | ⛔ 待做（语料仅 3+1 例，编译期显式拒绝） |
 | 例程目录持久化 | ⛔ 待做（当前进程内内存目录） |
@@ -109,7 +109,7 @@ cargo clippy --all-features -- -D warnings
 cargo test --all-features                     # 单元 + 集成 + 内核探针 + CLI 契约
 
 # GaussDB 相关（openGauss 容器）
-SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 SPINDUCK_OG_PASSWORD='Enmo@123' \
+SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 SPINDUCK_OG_PASSWORD="$GS_PASSWORD" \
   cargo test --features gauss --test gauss_e2e --test golden_gauss --test golden_corpus_gauss
 ```
 

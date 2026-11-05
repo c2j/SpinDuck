@@ -1,3 +1,5 @@
+#![cfg(feature = "native")]
+
 //! 回归守护（AGENTS §4.3）：`IN ()` 空列表脱糖。
 //!
 //! `fold_bin` 曾对空部件链 `it.next().expect(...)` panic；现空表按 Oracle
