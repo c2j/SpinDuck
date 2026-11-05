@@ -1,13 +1,11 @@
 //! M4.5 端到端：openGauss 容器实测（物化 → CALL 过程 → 回写 → 校验）。
-//! 门控：feature gauss + 环境变量 SPINDUCK_OG_HOST（缺省跳过）。
+//! 门控：feature gauss + 环境变量 SPINDUCK_OG_HOST（缺省跳过——跳过不等于通过）。
 //!
-//! 容器与认证准备（validation.md V6 补充）：
-//!   docker run -d --name spinduck-og --privileged \
-//!     -e GS_PASSWORD=Enmo@1234 -p 15432:5432 opengauss/opengauss:5.0.0
-//!   # password_encryption_type=0 + hba md5 + 密码重存（PG 协议 md5 兼容）
-//!   SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=15432 \
-//!   SPINDUCK_OG_USER=gaussdb SPINDUCK_OG_PASSWORD=Enmo@5678 \
-//!   cargo test --features gauss gauss_e2e
+//! 容器环境（自包含复现包，见 golden/README.md）：
+//!   docker compose -f golden/gaussdb-docker/docker-compose.yml up -d
+//!   SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
+//!   SPINDUCK_OG_USER=gaussdb SPINDUCK_OG_PASSWORD='Enmo@123' \
+//!   cargo test --features gauss --test gauss_e2e
 
 #![cfg(feature = "gauss")]
 
@@ -29,7 +27,7 @@ fn og() -> Option<GaussConn> {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(5432),
             &std::env::var("SPINDUCK_OG_USER").unwrap_or_else(|_| "gaussdb".into()),
-            &std::env::var("SPINDUCK_OG_PASSWORD").unwrap_or_else(|_| "Enmo@5678".into()),
+            &std::env::var("SPINDUCK_OG_PASSWORD").unwrap_or_else(|_| "Enmo@123".into()),
             &std::env::var("SPINDUCK_OG_DB").unwrap_or_else(|_| "postgres".into()),
         )
         .expect("connect openGauss"),

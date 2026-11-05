@@ -53,8 +53,10 @@ cargo build --features gauss                # 追加 GaussDB 连接器
 连接信息走环境变量（口令不进命令行）：
 
 ```bash
-export SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=15432 \
-       SPINDUCK_OG_USER=gaussdb SPINDUCK_OG_PASSWORD='…' SPINDUCK_OG_DB=postgres
+# 先启动参照容器（复现包见 golden/README.md）
+docker compose -f golden/gaussdb-docker/docker-compose.yml up -d
+export SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
+       SPINDUCK_OG_USER=gaussdb SPINDUCK_OG_PASSWORD='Enmo@123' SPINDUCK_OG_DB=postgres
 
 ./target/debug/spinduck materialize --db /tmp/w.duckdb --table mid_yjqs_detail
 ./target/debug/spinduck materialize --db /tmp/w.duckdb --table mid_yjqs_detail \
@@ -102,8 +104,8 @@ cargo clippy --all-features -- -D warnings
 cargo test --all-features                     # 单元 + 集成 + 内核探针 + CLI 契约
 
 # GaussDB 相关（openGauss 容器）
-SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=15432 SPINDUCK_OG_PASSWORD='…' \
-  cargo test --features gauss --test gauss_e2e --test golden_gauss
+SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 SPINDUCK_OG_PASSWORD='Enmo@123' \
+  cargo test --features gauss --test gauss_e2e --test golden_gauss --test golden_corpus_gauss
 ```
 
 测试分层（`AGENTS.md` §4）：单元（`src/**`）、集成（`tests/`，假执行器）、
@@ -129,5 +131,6 @@ SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=15432 SPINDUCK_OG_PASSWORD='…' \
   `KERNEL-0010` Catalog Error（宏路径只覆盖纯表达式函数）。
 - `materialize` 逐行 INSERT：万级可用，百万级需批量通道。
 - GaussDB 侧若为 sha256 口令认证，纯 Rust `postgres` 驱动不支持（v1 需 md5 或
-  自建 TLS 通道）；openGauss 容器需 `password_encryption_type=0` + hba `md5`。
+  自建 TLS 通道）；golden 复现包的容器经镜像环境变量启用 md5
+  （`GS_HOST_AUTH_METHOD=md5` + `password_encryption_type=1`，见 golden/README.md）。
 - 黄金基线当前由 openGauss 5.0.0 产出（GaussDB 实例不可达），差异见 V10。

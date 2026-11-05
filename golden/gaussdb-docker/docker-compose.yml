@@ -1,0 +1,59 @@
+# SpinDuck 黄金对比用 GaussDB（openGauss 5.0.0，Oracle A 兼容模式）——自包含复现环境。
+#
+# 启动（首次约 40–60s 初始化）：
+#   docker compose -f golden/gaussdb-docker/docker-compose.yml up -d
+#
+# 等待 healthy 并确认 A 模式：
+#   docker compose -f golden/gaussdb-docker/docker-compose.yml ps
+#   docker logs spinduck-gaussdb | grep spinduck-init
+#
+# 环境要点（与 lib/fastaas dota-adapter 交付脚本同源，见本目录入口脚本头部注释）：
+#   - datcompatibility=A 由镜像 initdb 默认给出，healthcheck 强制校验
+#   - openGauss 默认 sha256 SASL 纯 Rust postgres 驱动不识别；
+#     md5 + password_encryption_type=1 使纯 Rust 客户端可用（仅开发环境）
+#
+# 连接信息（SpinDuck 测试/CLI）：
+#   host: 127.0.0.1  port: 5433  db: postgres  user: gaussdb  password: Enmo@123
+#
+# 停止 / 重置（重置后下次 up 重新初始化，仍为 A 模式）：
+#   docker compose -f golden/gaussdb-docker/docker-compose.yml down
+#   docker compose -f golden/gaussdb-docker/docker-compose.yml down -v
+services:
+  gaussdb:
+    image: opengauss/opengauss:5.0.0
+    container_name: spinduck-gaussdb
+    restart: unless-stopped
+    entrypoint: ["/bin/bash", "/spinduck/spinduck-entrypoint.sh"]
+    command: ["gaussdb"]
+    environment:
+      GS_PASSWORD: Enmo@123
+      GS_NODENAME: spinduck_node
+      GS_PORT: 5432
+      GS_HOST_AUTH_METHOD: md5
+      OTHER_PG_CONF: "password_encryption_type = 1"
+    ports:
+      - "5433:5432"
+    volumes:
+      - gauss_data:/var/lib/opengauss/data
+      - ./spinduck-entrypoint.sh:/spinduck/spinduck-entrypoint.sh:ro
+    healthcheck:
+      # 仅当 datcompatibility=A 才 healthy（防止未来镜像默认漂移被静默放过）
+      test:
+        [
+          "CMD-SHELL",
+          "export LD_LIBRARY_PATH=/usr/local/opengauss/lib:$$LD_LIBRARY_PATH && /usr/local/opengauss/bin/gsql -U gaussdb -W $$GS_PASSWORD -d postgres -t -A -c \"SELECT datcompatibility FROM pg_database WHERE datname = current_database()\" | tr -d '[:space:]' | grep -qx A",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
+volumes:
+  gauss_data:
+    driver: local

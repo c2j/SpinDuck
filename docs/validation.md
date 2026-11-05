@@ -326,6 +326,9 @@ refused`），因此无法取得 GaussDB 基线。门禁改用**同内核血统�
 （`GS_HOST_AUTH_METHOD=md5` + `password_encryption_type=1`——无需手改配置文件，
 纠正 V7 时代 `password_encryption_type=0` 的手工改造），端口 5433，DOTA schema 自动应用。
 SpinDuck 全部 GaussDB 通道（gauss_e2e / golden / golden_corpus）切换至该容器实跑。
+复现包已收敛进仓库：容器脚本（compose + 入口）位于 `golden/gaussdb-docker/`，
+完整复现说明见 `golden/README.md`；本节所述旧容器（`spinduck-og`，15432，
+`password_encryption_type=0` 手工改造）已被其取代。
 
 **新规则（rules-as-data）**：`[patterns] rownum_first_row = true`（config/rewrite-rules.toml）。
 `rownum = 1` 首行谓词 → `LIMIT 1`（AST 级 AND 链剥除，OR/NOT 内保守保留；已有 LIMIT 时
