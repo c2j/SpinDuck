@@ -1,0 +1,20 @@
+# 研发态项目声明（§12.1 项目模式唯一入口）。
+[project]
+name = "case_split_agg"
+kernel = "1.5.5"
+
+[paths]
+ddl = "sql/ddl"                    # 表/视图/序列源码（表在 ddl/，视图在 ddl/views/）
+routines = "sql/routines"          # 过程/函数/PACKAGE 源码
+stubs = ["sql/stubs"]              # 外部依赖桩包
+rules = ["rules/spinduck-rules.toml"]
+probes = "probes"
+home = ".spinduck"                 # 开发态 SPINDUCK_HOME（gitignore）
+
+[cases]
+datasets = "cases/datasets"
+baselines = "cases/baselines"
+include = ["cases/*.case.toml"]
+
+[engine]
+threads = 4

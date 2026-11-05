@@ -845,6 +845,11 @@ audit_retention_days = 180          # 部署参数预览（engine.toml 生成模
 运行态与引擎二进制不入库；同一项目目录在研发态（cli 零参数）与部署态
 （engine.toml 显式配置）间无缝衔接。
 
+**实现状态**：`spinduck_core::project`（`ProjectConfig` / `CaseConfig`）已实现本
+结构的声明识别（路径解析、用例枚举、数据集/基线定位、物化清单）；黄金对比
+harness（`spinduck/tests/common`）是首个消费者，`golden/case_*` 全部按本布局
+组织。`spinduck init/load/register/golden` CLI 命令面属后续里程碑（P1/P3）。
+
 ---
 
 ## 13. 数据接入与回写（GaussDB 物化，V1 I/O 层）

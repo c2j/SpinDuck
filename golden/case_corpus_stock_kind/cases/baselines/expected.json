@@ -1,0 +1,11 @@
+{
+  "case": "corpus_stock_kind",
+  "baseline_kernel": "openGauss 5.0.0 Oracle A 模式（golden/gaussdb-docker）",
+  "source": "考题基线 5_函数/1_FNC_GET_STOCK_KIND.sql 逐字（sql/routines/routine.sql）",
+  "scenarios": [
+    {"why": "沪A股票区间命中", "value": "01"},
+    {"why": "沪A基金区间命中", "value": "02"},
+    {"why": "未配置区间", "value": "AAAA"},
+    {"why": "市场无配置", "value": "AAAA"}
+  ]
+}

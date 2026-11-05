@@ -1,0 +1,17 @@
+{
+  "case": "corpus_purchase",
+  "baseline_kernel": "openGauss 5.0.0 Oracle A 模式（golden/gaussdb-docker）",
+  "source": "考题基线 7_核心存储过程包/PKG_SPLIT_TRADE_STEP3_SH.sql 的 prc_trd_deal_purchase 逐字",
+  "call": "pkg_split_trade_step3_sh.prc_trd_deal_purchase('20250715', out)",
+  "p_o_succeed": "0",
+  "scenarios": [
+    {
+      "why": "回购/申购业务拆分（含异常行 A999 跳过）",
+      "rows": [
+        ["F001", "0130000001", "A0001", "X001", "20250715100001", "2.000", "0.000", "10000.000", "100", "20250715", "B", "20251013", "10500.000", "10560.000", "5.560", "6.220", "90", "90", "0501", "S0001"],
+        ["F002", "0130000002", "A0002", "X002", "20250715100002", "4.000", "0.000", "20000.000", "200", "20250715", "B", "20260111", "21000.000", "21120.000", "5.560", "6.220", "180", "180", "0501", "S0002"]
+      ]
+    }
+  ],
+  "exception_path": "第三行（A999，股东未维护）两侧一致：WHEN OTHERS → inst_log（桩 no-op）→ GOTO error_row 跳过"
+}

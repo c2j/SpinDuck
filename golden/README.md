@@ -11,23 +11,65 @@
 golden/
 ├── README.md                      ← 本文件（复现说明）
 ├── gaussdb-docker/                ← 参照数据库容器（自包含，见下）
-│   ├── docker-compose.yml
-│   └── spinduck-entrypoint.sh
 ├── case_split_agg/                ← 用例 1：聚合管线（toy，自建例程）
 ├── case_corpus_stock_kind/        ← 用例 2：语料级（考题基线函数逐字）
 ├── case_corpus_min_tax/           ← 用例 3：语料级（考题基线函数逐字）
 └── case_corpus_purchase/          ← 用例 4：语料级重量（核心过程 prc_trd_deal_purchase）
 ```
 
-每个用例目录包含：
+每个用例目录即一个 **§12.1 项目模式单元**（`spinduck.toml` 声明唯一入口，
+`spinduck_core::project` 识别；黄金 harness 是它的首个消费者）：
 
-| 文件 | 作用 |
-|---|---|
-| `schema.sql` | 建表（字段类型取自考题基线 `1_表结构`，保持类型语义） |
-| `seed.sql` | 种子数据 |
-| `routine.sql` | **被测侧**例程（Oracle/GaussDB PL 语法，SpinDuck 编译执行） |
-| `routine_gauss.sql` | **参照侧**等价例程（仅 toy 用例需要；语料用例被测/参照共用同一份逐字源码） |
-| `expected.json` | 参照侧产出的期望结果（提交入库，防基线漂移） |
+```
+case_corpus_purchase/
+├── spinduck.toml                  # 项目声明（[project]/[paths]/[cases]/[engine]）
+├── sql/
+│   ├── ddl/tables.sql             # 表（被测侧与参照侧都建）
+│   ├── ddl/views/*.sql            # 视图（仅参照侧建；被测侧建同名占位视图）
+│   ├── routines/*.sql             # 过程/函数/PACKAGE 源码（两侧共用）
+│   └── stubs/*.sql                # 外部依赖桩包
+├── rules/spinduck-rules.toml      # 项目规则覆盖（本用例为空 = 全用种子规则）
+├── probes/README.md               # 规则探针（项目级；本用例由引擎测试层覆盖）
+├── cases/
+│   ├── datasets/seed.sql          # 样例数据
+│   ├── baselines/expected.json    # 参照侧黄金输出（提交入库，防基线漂移）
+│   ├── baselines/reference_routine.sql   # 参照侧专用例程（仅 toy 用例）
+│   └── *.case.toml                # 用例定义：例程 × 场景 × 输入表 × 期望输出
+├── reports/                       # 生成产物（评审用；当前无）
+└── .spinduck/                     # 本地运行态（gitignore）
+```
+
+用例定义示例（`cases/purchase.case.toml`）：
+
+```toml
+[case]
+name = "corpus_purchase"
+kind = "procedure"                 # procedure=比对输出表；function=比对返回值
+routine = "pkg_split_trade_step3_sh.prc_trd_deal_purchase"
+baseline = "expected.json"
+expect_succeed = "0"
+reference_call_sql = "SELECT fn_agg_fund({args})"   # 可选：参照侧专用调用模板
+
+[case.data]
+materialize = ["mid_yjqs_detail", "par_fund_partner", ...]  # 需物化的输入表
+
+[case.output]
+sql = "SELECT ... FROM dat_trd_repurchase ORDER BY security_id"
+
+[[case.scenarios]]
+why = "回购/申购业务拆分（含异常行跳过）"
+args = ["'20250715'", "null"]
+```
+
+约定：
+
+- `sql/ddl/*.sql` 是**表**（两侧都建）；`sql/ddl/views/*.sql` 是**视图**
+  （仅参照侧建——被测侧建同名占位视图满足 `%TYPE` 声明，视图体不参与求值）。
+- 输出表**不**进 `[case.data].materialize` 清单：参照侧执行后该表有数据，
+  被测侧必须保持为空，由过程自己写入。
+- 基线统一为 `{"scenarios":[{"why","value"|"rows"}]}`；数值按值归一
+  （scale/尾零差异不算失败）。
+- 未设 `SPINDUCK_OG_HOST` 时用例打印 `SKIP` 并返回——**跳过不等于通过**。
 
 ## 第 1 步：启动参照数据库容器
 

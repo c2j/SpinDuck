@@ -1,0 +1,15 @@
+{
+  "case": "split_agg",
+  "baseline_kernel": "openGauss 5.0.0 Oracle A 模式（golden/gaussdb-docker）",
+  "generated_by": "SELECT bcrq, fund_code, scdm, cjsl, cjje, fee FROM dat_inst_fund_cjqs ORDER BY fund_code, scdm",
+  "reference_call": "SELECT fn_agg_fund({args})",
+  "scenarios": [
+    {
+      "why": "单日聚合管线",
+      "rows": [
+        ["20240105", "F001", "600000", "300.0000", "3250.00", "2.60"],
+        ["20240105", "F002", "000001", "50.0000", "1012.50", "0.81"]
+      ]
+    }
+  ]
+}

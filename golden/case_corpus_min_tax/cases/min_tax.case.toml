@@ -1,0 +1,26 @@
+[case]
+name = "corpus_min_tax"
+kind = "function"
+routine = "fnc_com_get_min_tax"
+baseline = "expected.json"
+
+
+[case.data]
+# 需从参照侧物化的输入表（输出表不物化，保持被测侧为空）
+materialize = ["par_sys_marketrate"]
+
+[[case.scenarios]]
+why = "精确 stock_kind 命中（2023 过期行必须排除）"
+args = ["'83'", "'P1'", "'0102'", "'20240630'", "null", "null"]
+
+[[case.scenarios]]
+why = "组内兜底 0100"
+args = ["'83'", "'P2'", "'0105'", "'20240630'", "null", "null"]
+
+[[case.scenarios]]
+why = "全局兜底 0000"
+args = ["'83'", "'P3'", "'0200'", "'20240630'", "null", "null"]
+
+[[case.scenarios]]
+why = "无配置 → EXCEPTION OTHERS + nvl 归 0"
+args = ["'83'", "'P4'", "'0900'", "'20240630'", "null", "null"]

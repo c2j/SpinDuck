@@ -1,0 +1,21 @@
+[case]
+name = "split_agg"
+kind = "procedure"
+routine = "prc_agg_fund"
+baseline = "expected.json"
+# 参照侧等价例程（PG 风格函数形态，见 cases/baselines/reference_routine.sql）
+reference_routine = "reference_routine.sql"
+reference_call_sql = "SELECT fn_agg_fund({args})"
+expect_succeed = "0"
+
+[case.output]
+sql = "SELECT bcrq, fund_code, scdm, cjsl, cjje, fee FROM dat_inst_fund_cjqs ORDER BY fund_code, scdm"
+
+
+[case.data]
+# 需从参照侧物化的输入表（输出表不物化，保持被测侧为空）
+materialize = ["mid_yjqs_detail"]
+
+[[case.scenarios]]
+why = "单日聚合管线"
+args = ["'20240105'"]

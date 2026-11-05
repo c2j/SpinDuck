@@ -1,0 +1,26 @@
+[case]
+name = "corpus_stock_kind"
+kind = "function"
+routine = "fnc_get_stock_kind"
+baseline = "expected.json"
+
+
+[case.data]
+# 需从参照侧物化的输入表（输出表不物化，保持被测侧为空）
+materialize = ["dic_stock_kind_sub"]
+
+[[case.scenarios]]
+why = "沪A股票区间命中"
+args = ["'600000'", "'20240105'", "'83'"]
+
+[[case.scenarios]]
+why = "沪A基金区间命中"
+args = ["'000001'", "'20240105'", "'83'"]
+
+[[case.scenarios]]
+why = "未配置区间"
+args = ["'510050'", "'20240105'", "'83'"]
+
+[[case.scenarios]]
+why = "市场无配置"
+args = ["'600000'", "'20240105'", "'99'"]

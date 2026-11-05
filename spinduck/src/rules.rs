@@ -38,6 +38,21 @@ impl Default for RuleRegistry {
 
 impl RuleRegistry {
     /// 加载种子规则文件（config/rewrite-rules.toml）。
+    /// 加载项目规则覆盖（§12.1 `[paths].rules`）：逐文件叠加在已加载的种子规则上。
+    /// 只允许追加/覆盖值；文件缺失视为配置错误（路径来自 spinduck.toml）。
+    pub fn with_project_rules(
+        mut self,
+        files: &[std::path::PathBuf],
+    ) -> Result<Self, crate::error::EngineError> {
+        for f in files {
+            let raw = std::fs::read_to_string(f).map_err(|e| {
+                crate::error::EngineError::env(32, format!("读取项目规则 {}: {e}", f.display()))
+            })?;
+            self.overlay(&raw)?;
+        }
+        Ok(self)
+    }
+
     pub fn load(path: &Path) -> Result<Self, crate::error::EngineError> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| crate::error::EngineError::env(10, format!("rules file: {e}")))?;

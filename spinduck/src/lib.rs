@@ -11,6 +11,7 @@ pub mod error;
 pub mod exec;
 pub mod io;
 pub mod ir;
+pub mod project;
 pub mod rules;
 pub mod runtime;
 pub mod sql;
