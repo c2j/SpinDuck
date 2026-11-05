@@ -178,6 +178,86 @@ impl Engine {
         }
     }
 
+    /// 例程目录表（内核内持久化，§3.6 / §12 P6）。
+    ///
+    /// 只存**可重放的源 DDL 文本**：IR 是编译产物（含跳转地址），跨版本不可信；
+    /// 源文本 + 当前规则重新编译才是可靠恢复路径。
+    const CATALOG_DDL: &'static str = "CREATE TABLE IF NOT EXISTS spinduck_routines (\
+         name VARCHAR PRIMARY KEY, kind VARCHAR NOT NULL, source VARCHAR NOT NULL, \
+         registered_at TIMESTAMP DEFAULT current_timestamp)";
+
+    /// 注册例程并把源 DDL 落到内核目录表（重启后 [`reload_catalog`](Self::reload_catalog) 恢复）。
+    pub fn register_persistent(&mut self, sql_text: &str) -> Result<usize, EngineError> {
+        let n = self.register(sql_text)?;
+        if n == 0 {
+            return Ok(0); // 非例程语句（建表等）不写目录
+        }
+        self.ensure_catalog_table()?;
+        let source = format_statements(sql_text)?.join("\n");
+        for name in self.catalog.names() {
+            let kind = match self.catalog.lookup(&name).map(|r| r.kind) {
+                Some(crate::catalog::RoutineKind::Procedure) => "PROCEDURE",
+                Some(crate::catalog::RoutineKind::Function) => "FUNCTION",
+                None => continue,
+            };
+            let mut binds = crate::exec::BindMap::new();
+            binds.insert("$name".to_string(), SpinValue::Str(name));
+            binds.insert("$kind".to_string(), SpinValue::Str(kind.to_string()));
+            binds.insert("$src".to_string(), SpinValue::Str(source.clone()));
+            self.ex.execute(
+                "INSERT INTO spinduck_routines(name, kind, source) VALUES ($name, $kind, $src) \
+                 ON CONFLICT (name) DO UPDATE SET kind = excluded.kind, source = excluded.source",
+                &binds,
+            )?;
+        }
+        Ok(n)
+    }
+
+    /// 从内核目录表恢复全部例程（源文本重新编译；返回恢复的例程数）。
+    pub fn reload_catalog(&mut self) -> Result<usize, EngineError> {
+        let has_table = self
+            .ex
+            .query(
+                "SELECT count(*) FROM information_schema.tables \
+                 WHERE table_name = 'spinduck_routines'",
+                &crate::exec::BindMap::new(),
+            )
+            .map(|mut s| {
+                s.fetch_many(1)
+                    .first()
+                    .and_then(|r| r.first().cloned())
+                    .map(|v| v.as_str_loose() == "1")
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !has_table {
+            return Ok(0);
+        }
+        let mut s = self.ex.query(
+            "SELECT DISTINCT source FROM spinduck_routines ORDER BY source",
+            &crate::exec::BindMap::new(),
+        )?;
+        let mut total = 0;
+        loop {
+            let rows = s.fetch_many(64);
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                if let Some(src) = row.first().map(|v| v.as_str_loose()) {
+                    total += self.register(&src)?;
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    fn ensure_catalog_table(&mut self) -> Result<(), EngineError> {
+        self.ex
+            .execute(Self::CATALOG_DDL, &crate::exec::BindMap::new())?;
+        Ok(())
+    }
+
     /// 调用例程（§12 P5）：IN 按值、OUT/INOUT 按位取回、函数返回标量。
     pub fn call(&mut self, name: &str, args: &[SpinValue]) -> Result<CallResult, EngineError> {
         let routine = self
@@ -222,6 +302,18 @@ impl Engine {
         }
         Ok(result)
     }
+}
+
+/// SQL 文本 → 各语句的规范化文本（目录表重放用，依赖 ogsql formatter）。
+fn format_statements(sql_text: &str) -> Result<Vec<String>, EngineError> {
+    let tokens = Tokenizer::new(sql_text)
+        .tokenize()
+        .map_err(|e| EngineError::invariant(63, format!("tokenizer: {e}")))?;
+    let stmts = ogsql_parser::parser::Parser::new(tokens).parse();
+    Ok(stmts
+        .iter()
+        .map(|st| ogsql_parser::formatter::SqlFormatter::new().format_statement(st))
+        .collect())
 }
 
 /// TraceSink 的空实现（引擎默认；CLI/监控注入真实 sink）。
@@ -369,5 +461,60 @@ mod kernel_tests {
         let mut r = r.unwrap();
         let rows = r.fetch_many(1);
         assert_eq!(rows[0][0], SpinValue::Int(0));
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod persist_tests {
+    use super::*;
+    use crate::exec::BindMap;
+    use crate::sql::DuckExecutor;
+
+    const DDL: &str = "CREATE OR REPLACE PROCEDURE prc_persist(p_i IN NUMBER, p_o OUT NUMBER) IS \
+                       BEGIN p_o := p_i * 5; END;";
+
+    #[test]
+    fn should_persist_routines_and_reload_in_new_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("w.duckdb");
+        let path = db.to_string_lossy().into_owned();
+
+        {
+            let ex = DuckExecutor::open(&path).unwrap();
+            let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+            let n = eng.register_persistent(DDL).unwrap();
+            assert_eq!(n, 1);
+            assert_eq!(eng.catalog.len(), 1);
+        } // 连接关闭，释放文件锁
+
+        let ex = DuckExecutor::open(&path).unwrap();
+        let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+        assert!(eng.catalog.is_empty(), "新实例目录应为空");
+        let n = eng.reload_catalog().unwrap();
+        assert_eq!(n, 1, "从内核表恢复 1 个例程");
+        let r = eng
+            .call("prc_persist", &[SpinValue::Int(3), SpinValue::Null])
+            .unwrap();
+        assert_eq!(r.outs.get("p_o"), Some(&SpinValue::Int(15)));
+    }
+
+    #[test]
+    fn should_upsert_routine_source_without_duplicating_rows() {
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+        eng.register_persistent(DDL).unwrap();
+        eng.register_persistent(DDL).unwrap();
+        let mut s = eng
+            .ex
+            .query("SELECT count(*) FROM spinduck_routines", &BindMap::new())
+            .unwrap();
+        assert_eq!(s.fetch_many(1)[0][0], SpinValue::Int(1));
+    }
+
+    #[test]
+    fn should_report_zero_reload_when_catalog_table_absent() {
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+        assert_eq!(eng.reload_catalog().unwrap(), 0);
     }
 }

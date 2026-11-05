@@ -256,10 +256,22 @@ PopFrame）。语义要点：
 
 ### 3.6 目录与持久化
 
-例程定义存 DuckDB 内部表
-`spinduck_routines(id, name, kind, params_json, ast_json, ir_blob, source)`。
+例程定义存 DuckDB 内部表 `spinduck_routines(name, kind, source, registered_at)`。
 好处：随 `.duckdb` 文件持久化、免额外存储、可版本化；避免与 DuckDB 自身
 catalog 钩子纠缠（扩展级 catalog 注册在非扩展形态下不可用）。
+
+**实现口径（M7 落地）**：只持久化**可重放的源 DDL 文本**，不存 `ir_blob`/`ast_json`。
+理由：IR 是编译产物（含解析后的跳转地址与标签表），一旦编译器演进或版本升级，
+旧 IR 的语义不再是"当时的语义"，重放会得到难以诊断的行为；而"源文本 + 当前规则
+重新编译"总是产生与当前版本一致的确定结果，且升级路径天然正确（升级 = 重新编译，
+失败 = 明确的编译错误而不是运行期怪象）。
+
+- 写入：`Engine::register_persistent(sql)` 在注册成功后按例程名 UPSERT 源文本
+  （`ON CONFLICT (name) DO UPDATE`）；包体（PACKAGE BODY）内多个例程共享同一段
+  源文本，恢复时按 `SELECT DISTINCT source` 去重，避免重复注册。
+- 读取：`Engine::reload_catalog()` 在目录表缺失时返回 0（不是错误——空库首次运行），
+  存在时逐条重新注册并返回例程数。
+- 版本申报：`registered_at` 仅作审计，不参与一致性判断。
 
 PACKAGE：spec+body 配对校验（ogsql 已有包一致性分析可复用），包级变量放在
 `PackageState`（按 session 生命周期管理——与 GaussDB 会话级包状态语义一致，

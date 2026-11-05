@@ -254,10 +254,15 @@ fn materialize_cmd(parts: MaterializeParts, out: &mut dyn Write) -> Result<i32, 
 }
 
 #[cfg(not(feature = "gauss"))]
-fn materialize_cmd(_parts: MaterializeParts, _out: &mut dyn Write) -> Result<i32, EngineError> {
+fn materialize_cmd(parts: MaterializeParts, _out: &mut dyn Write) -> Result<i32, EngineError> {
     Err(EngineError::env(
         12,
-        "materialize requires feature `gauss`".to_string(),
+        format!(
+            "materialize {} -> {} (where: {:?}) requires feature `gauss`",
+            parts.table,
+            parts.db.display(),
+            parts.where_clause
+        ),
     ))
 }
 
@@ -271,10 +276,15 @@ fn sync_cmd(parts: SyncParts, out: &mut dyn Write) -> Result<i32, EngineError> {
 }
 
 #[cfg(not(feature = "gauss"))]
-fn sync_cmd(_parts: SyncParts, _out: &mut dyn Write) -> Result<i32, EngineError> {
+fn sync_cmd(parts: SyncParts, _out: &mut dyn Write) -> Result<i32, EngineError> {
     Err(EngineError::env(
         12,
-        "sync requires feature `gauss`".to_string(),
+        format!(
+            "sync {} ({}) from {} requires feature `gauss`",
+            parts.table,
+            parts.cols.join(","),
+            parts.db.display()
+        ),
     ))
 }
 

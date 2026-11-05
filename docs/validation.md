@@ -258,3 +258,19 @@ refused`），因此无法取得 GaussDB 基线。门禁改用**同内核血统�
 **已知限制**：`materialize` 逐行 INSERT（万级可行，百万级需批量通道，未做）；
 参照侧 `expected.json` 依赖 openGauss 实时生成，若后续能访问 GaussDB，应重跑并
 对比（替换参照实现不改变夹具与断言）。
+
+## V11. 例程目录持久化（M7）
+
+`spinduck_routines(name, kind, source, registered_at)` 随 `.duckdb` 文件持久化，
+只存**可重放源 DDL**（设计理由见 architecture §3.6）。
+
+| 探针 | 结果 |
+|---|---|
+| 文件库注册例程 → 关闭连接 → 新实例 `reload_catalog()` | 恢复 1 个例程，`CALL` 返回 OUT=15（`p_i*5`, 3→15） |
+| 同一例程重复 `register_persistent` 两次 | 目录表仍 1 行（`ON CONFLICT DO UPDATE`） |
+| 空库（无目录表）`reload_catalog()` | 返回 0，不报错 |
+| 包体（PACKAGE BODY）多例程 | 共享同一源文本，恢复时按 `DISTINCT source` 去重 |
+
+**未做的取舍**：不持久化 IR/AST 快照。理由——IR 含跳转地址与标签表，跨编译器版本
+重放等价性不可证；源文本重编译才能保证"升级后行为 = 新版本定义的行为"，编译失败
+也会显式暴露而不是运行期错乱。

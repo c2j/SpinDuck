@@ -9,6 +9,8 @@
 //!   SPINDUCK_OG_USER=gaussdb SPINDUCK_OG_PASSWORD=Enmo@5678 \
 //!   cargo test --features gauss gauss_e2e
 
+#![cfg(feature = "gauss")]
+
 use spinduck_core::engine::Engine;
 use spinduck_core::error::EngineError;
 use spinduck_core::exec::{BindMap, Row, RowStream, SqlExecutor};
@@ -135,7 +137,6 @@ impl SqlExecutor for HandleExec {
 }
 
 #[test]
-#[cfg(feature = "gauss")]
 fn gauss_e2e_materialize_process_sync_back() {
     let Some(mut og) = og() else {
         eprintln!("SKIP: SPINDUCK_OG_HOST not set");
@@ -196,7 +197,6 @@ fn gauss_e2e_materialize_process_sync_back() {
 }
 
 #[test]
-#[cfg(feature = "gauss")]
 fn gauss_e2e_materialize_with_where_clause() {
     let Some(mut og) = og() else {
         eprintln!("SKIP: SPINDUCK_OG_HOST not set");
