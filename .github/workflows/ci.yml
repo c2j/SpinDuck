@@ -100,7 +100,11 @@ jobs:
         # 大写 A + 十六进制体 + 数字 + `@`：openGauss 口令校验要求四类字符齐全
         # （大写/小写/数字/特殊字符，见镜像 initdb 报错），长度 ≥8。`@` 与官方示例
         # `openGauss@123` 同类，且在 double-quote shell 上下文与 compose 插值中无需转义。
-        run: echo "value=A$(openssl rand -hex 12)9z@" >> "$GITHUB_OUTPUT"
+        # add-mask 让步骤 env 转储与后续日志一律打码（Actions 只自动掩码 secrets 上下文）。
+        run: |
+          pwd_value="A$(openssl rand -hex 12)9z@"
+          echo "::add-mask::${pwd_value}"
+          echo "value=${pwd_value}" >> "$GITHUB_OUTPUT"
       - name: Bring up A-mode container（compose 校验 datcompatibility=A 才 healthy）
         working-directory: golden/gaussdb-docker
         env:
@@ -117,4 +121,26 @@ jobs:
         working-directory: spinduck
         env:
           SPINDUCK_OG_PASSWORD: ${{ steps.gspwd.outputs.value }}
-        run: cargo test --features gauss
+        # 红时把参照侧的证据一起落进日志：容器 stdout、实例 pg_log、runner 侧
+        # OOM 痕迹。此前一次 run 只留了客户端的 `[ENV-0020] connection closed`，
+        # 无法区分"内核被 runner OOM kill"与"参照例程自身报错"（validation V21）。
+        run: |
+          set +e
+          cargo test --features gauss -- --nocapture
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::group::gaussdb container stdout (tail 200)"
+            docker logs --tail 200 spinduck-gaussdb || true
+            echo "::endgroup::"
+            echo "::group::gaussdb pg_log (2 newest files, tail 120)"
+            docker exec spinduck-gaussdb bash -c \
+              'ls -t /var/lib/opengauss/data/pg_log/*.log 2>/dev/null | head -2 | xargs -r tail -n 120' || true
+            echo "::endgroup::"
+            echo "::group::runner memory evidence"
+            docker stats --no-stream spinduck-gaussdb || true
+            free -m || true
+            dmesg -T 2>/dev/null | grep -iE 'oom|killed process' | tail -30 || true
+            echo "::endgroup::"
+          fi
+          exit "$rc"

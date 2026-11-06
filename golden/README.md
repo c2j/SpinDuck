@@ -201,6 +201,7 @@ CASES_PROBE=1 cargo test --features native --test cases_native -- --nocapture
 | 日志刷 `The supplied GS_PASSWORD is not meet requirements` | 口令没过 initdb 复杂度校验：须大写 + 小写 + 数字 + 特殊字符四类齐全、长度 ≥8（CI 的一次性口令生成器同口径，见 `.github/workflows/ci.yml` golden job 与 validation V21） |
 | 连接报 `authentication failed` | 口令与 `.env` 的 `GS_PASSWORD` 不一致（或卷复用了旧口令初始化），`down -v` 重建 |
 | 报 `sha256 authentication` 相关 | 容器环境变量被改动，须保留 `GS_HOST_AUTH_METHOD=md5` 与 `OTHER_PG_CONF` |
+| 参照侧语句报 `[ENV-0020] … connection closed` | 参照实例的后端进程没了，不是被测引擎的问题：先看 `docker logs spinduck-gaussdb` 与 `data/pg_log/*.log`。镜像默认按**宿主**内存推导 `max_process_memory`（实测开发机 12GB / shared_buffers 1GB），CI runner 上推导值随宿主漂移，实例总内存超过容器限额时由内核 OOM kill，客户端只剩一句 connection closed。compose 现固定 `max_process_memory = 2GB` + `shared_buffers = 256MB` + 限额 3GB（validation V21）；旧卷无需 `down -v`，镜像每次启动把这几行追加进 `postgresql.conf` 末尾，后写覆盖先写 |
 | 端口 5433 被占 | 修改 compose 端口映射，同步设置 `SPINDUCK_OG_PORT` |
 | 参照侧函数部署报 `subprogram body is not ended correctly` | 参照侧 DDL 语法限制：`CREATE PROCEDURE` 不接受 PG `$$` 体、DECLARE 内游标声明受限（validation V10/V13）；语料用例统一用 `CREATE FUNCTION`，toy 用例参照侧走 `routine_gauss.sql` |
 

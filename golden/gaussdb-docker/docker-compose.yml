@@ -32,7 +32,13 @@ services:
       GS_NODENAME: spinduck_node
       GS_PORT: 5432
       GS_HOST_AUTH_METHOD: md5
-      OTHER_PG_CONF: "password_encryption_type = 1"
+      # 内存口径写死，不跟随宿主 MemTotal：镜像默认按宿主内存推导
+      # max_process_memory（本机实测 12GB）与 shared_buffers（1GB），CI runner
+      # 与开发机的推导值不同会让同一份语料参照侧行为漂移，且实例总内存超过
+      # deploy 限额时是内核直接 OOM kill（客户端只看到 "connection closed"）。
+      # 固定为 2GB/256MB 后，超限由 openGauss 自身看护报可读错误；限额 3GB
+      # 留裕量（实测语料参照侧峰值 RSS 1.44GB）。
+      OTHER_PG_CONF: "password_encryption_type = 1\nmax_process_memory = 2GB\nshared_buffers = 256MB"
     ports:
       # 仅回环：开发机不向局域网暴露 A 模式实例
       - "127.0.0.1:5433:5432"
@@ -52,10 +58,12 @@ services:
       start_period: 40s
     deploy:
       resources:
+        # 3G > max_process_memory 2GB：超限先由 openGauss 看护报错，而不是被内核
+        # OOM kill 后只留下客户端的 "connection closed"（见上方 OTHER_PG_CONF 注释）。
         limits:
-          memory: 2G
+          memory: 3G
         reservations:
-          memory: 512M
+          memory: 1G
 
 volumes:
   gauss_data:

@@ -636,16 +636,6 @@ doctest 阶段红（测试二进制 17 组 292 passed / 0 failed 全绿，只有
 292 passed + doctest 0 例通过。CI 的 clippy/test/golden 是**独立 job**，不同享该目录，
 不受此竞态影响。
 
-**CI golden job 首跑到引导步（2026-11-06 修复）**：前三次 run 的 golden job 先红在
-submodule pathspec（f80b319 已修），修好后第一次真正走到容器引导即红在
-`Error: The supplied GS_PASSWORD is not meet requirements`——镜像 initdb 要求
-**四类字符齐全**（大写/小写/数字/特殊字符），而 workflow 的一次性口令生成器
-`A$(openssl rand -hex 12)9z` 只有三类。现补尾部 `@`（与官方示例 `openGauss@123` 同类，
-在 double-quote 与 compose 插值中无需转义）。push 前已在本地 A 模式容器
-（`spinduck-gaussdb`，127.0.0.1:5433）实跑 `cargo test --features gauss` 的黄金面：
-`golden_gauss` 1 + `golden_corpus_gauss` 2 + `golden_corpus_purchase` 1 + `gauss_e2e` 2
-= **6 passed / 0 failed**，无 SKIP（缺容器时会打印 SKIP，此处为真实比对通过）。
-
 ### V21.1 语料形态清单与覆盖门禁（86 构造 / 135 条形态断言）
 
 **清单是数据，不是散文**：`scripts/extract_corpus_forms.py` 扫描语料 `sql/` 全部
@@ -773,3 +763,44 @@ submodule pathspec（f80b319 已修），修好后第一次真正走到容器引
 `SQLERRM` 文本由内核给出，形态断言只钉前 8 字符，内核升级（V6 门禁）须复核；
 处理器进入前的会话复位撤销的是"上次 COMMIT 之后的本段 DML"，不是 Oracle 的语句级回滚。
 
+### V21.7 golden job 的两轮 CI 实录（口令四类字符 → 参照侧 connection closed）
+
+**第一轮（run 42181608285）**：golden job 第一次真正走到容器引导即红在
+`Error: The supplied GS_PASSWORD is not meet requirements`——镜像 initdb 要求
+**四类字符齐全**（大写/小写/数字/特殊字符），而一次性口令生成器
+`A$(openssl rand -hex 12)9z` 只有三类。补尾部 `@`（官方示例 `openGauss@123` 同类，在
+double-quote 与 compose 插值中无需转义）。同轮顺带修 `.gitignore` 的 `.env.*` 误吞
+`golden/gaussdb-docker/.env.example`（compose 与 README 都引用该模板，新克隆拿不到）。
+
+**第二轮（run 42186167205）**：format / clippy / test / audit 四 job 全绿；golden
+容器 healthy 后跑完全部套件，**只有 `golden_corpus_purchase` 红**，且红在参照侧：
+`CALL pkg_split_trade_step3_sh.prc_trd_deal_purchase('20250715', null):`
+`[ENV-0020] ENV: gaussdb: connection closed`（该用例 0.29s 即失败，早于本地 0.42–1.53s，
+形态是"后端进程已不在"，不是比对不符）。同 job 内 `golden_gauss` 1 + `golden_corpus_gauss`
+2 + `gauss_e2e` 2 与全部 native 套件（219 lib + 73）均绿。
+
+**本地复现矩阵**（全部用隔离容器与新卷，未动开发机上在用的 `spinduck-gaussdb`）：
+
+| 组合 | 结果 |
+|---|---|
+| arm64 镜像 + 新卷 + 2G 限额，purchase 单跑 | 绿（0.40s） |
+| arm64 镜像 + 新卷 + 2G 限额，`--features gauss` 全量 | 绿（17 组 0 failed） |
+| amd64 镜像（Rosetta）+ 新卷 + 2G 限额，purchase 单跑 | 绿（0.53s） |
+| amd64 镜像 + 新卷 + 2G 限额，全量 gauss 套件 | 绿（17 组 0 failed） |
+| amd64 镜像 + 新卷 + 固定 GUC（`max_process_memory=2GB`/`shared_buffers=256MB`）+ 3G 限额，全量 | 绿 |
+
+purchase 用例期间容器 RSS 峰值实测：2G 限额下 51.75%（≈1.06 GiB），固定 GUC + 3G
+限额下 1.44 GiB——**计算量本身不逼近限额**。
+
+**定位到的环境差**：镜像默认按**宿主**内存推导 `max_process_memory`（本机容器内实测
+12GB）与 `shared_buffers`（1GB），这两个值不随仓库固定；CI runner 的宿主内存不同，推导
+结果也不同，而实例总内存越过容器限额时是内核直接 OOM kill 后端，客户端只剩一句
+`connection closed`。本地三轮未能复现 runner 侧失败，根因证据尚未拿到——不猜测、不掩盖：
+golden job 现在红时自动落三段证据（容器 stdout 尾部 200 行、实例 `pg_log` 最新两文件
+尾部 120 行、runner 侧 `free -m` + `dmesg` 的 OOM 行），下一轮无论绿红都有可判读的事实。
+
+**本轮 compose 侧的确定性改动**（已用隔离容器验证不影响任何套件结果）：`OTHER_PG_CONF`
+固定 `max_process_memory = 2GB` + `shared_buffers = 256MB`，`deploy` 限额 2G→3G、
+预留 512M→1G——限额高于实例口径，越限先由 openGauss 看护报错而非被内核杀掉。镜像每次
+启动把这几行**追加**进 `postgresql.conf` 末尾（后写覆盖先写），旧卷无需 `down -v`。
+一次性口令另加 `::add-mask::`，此前步骤 env 转储会把口令原文打进公开 runner 日志。
