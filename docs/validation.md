@@ -448,7 +448,7 @@ A999 股东未维护 → inst_log 桩 → 跳过，两侧一致）。
 | COMMIT/ROLLBACK 不降级 | 最外层 `BEGIN`…`COMMIT`/`ROLLBACK` 包络；`TxCommit/TxRollback` 即时作用并重开 | `guard_tx_semantics`：COMMIT 后续写持久化；ROLLBACK 撤销 DML；未处理异常统一回滚 |
 | 动态文本统一收口 | `EXECUTE IMMEDIATE` 与 `OPEN FOR` 共用 `prepare_dynamic_sql`（ogsql `parse_sql` 带错误通道 → 规则改名 → 变换 → 函数下沉）；撤销 ENG-0062 | `guard_execute_dynamic`：运行期拼接 INSERT 落行；乱码文本显式失败 |
 | 内置规则默认加载 | `include_str!` 嵌入种子规则，`default()` 直接可用；`--rules`/项目规则叠加（含 `target_duckdb/probe_duckdb` 覆盖） | 零 `--rules` 时 `NVL→coalesce` 生效（compile 路径）；`rules probe` 漂移检测仍红（回归守护） |
-| 口令经 `.env` 注入 | compose `${GS_PASSWORD:?}` + `127.0.0.1` 绑定 + `.env.example`；README/golden 文档去明文 | `grep Enmo@123`（golden/README/docs/spinduck）= 0 |
+| 口令经 `.env` 注入 | compose `${GS_PASSWORD:?}` + `127.0.0.1` 绑定 + `.env.example`；README/golden 文档去明文 | 对旧明文口令字面量全库 `grep -r` = 0 命中（字面量本身不再抄进本表） |
 | fastaas 子模块保留 | 现状（私有项目）；CI 可达性留待仓库私有化时评估 | — |
 
 **回归**：运行期递归缺陷修复——`RuleRegistry::default()` ↔ `from_toml_str` 曾相互递归（内置规则引入后触发栈溢出），`from_toml_str` 改用显式空基座。
