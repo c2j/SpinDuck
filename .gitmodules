@@ -1,0 +1,6 @@
+[submodule "lib/ogsql-parser"]
+	path = lib/ogsql-parser
+	url = https://github.com/c2j/ogsql-parser.git
+[submodule "lib/fastaas"]
+	path = lib/fastaas
+	url = git@github.com:NO3623/fastaas.git

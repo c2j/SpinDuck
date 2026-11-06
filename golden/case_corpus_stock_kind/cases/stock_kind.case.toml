@@ -1,0 +1,62 @@
+[case]
+name = "corpus_stock_kind"
+kind = "function"
+routine = "fnc_get_stock_kind"
+baseline = "expected.json"
+
+
+[case.data]
+# 需从参照侧物化的输入表（输出表不物化，保持被测侧为空）
+materialize = ["dic_stock_kind_sub"]
+
+[[case.scenarios]]
+why = "沪A股票区间命中"
+args = ["'600000'", "'20240105'", "'83'"]
+
+[[case.scenarios]]
+why = "沪A基金区间命中"
+args = ["'000001'", "'20240105'", "'83'"]
+
+[[case.scenarios]]
+why = "未配置区间"
+args = ["'510050'", "'20240105'", "'83'"]
+
+[[case.scenarios]]
+why = "市场无配置"
+args = ["'600000'", "'20240105'", "'99'"]
+
+# ── 原生断言集（口径同 min_tax.case.toml）──────────────────────────────────────
+
+[[case.assert]]
+why = "BETWEEN 命中代码区间（字符串区间比较，返回 dic_stock_kind_sub.stock_kind 码）"
+kind = "call"
+target = "fnc_get_stock_kind"
+args = ["'600000'", "'20240105'", "'83'"]
+want = "01"
+
+[[case.assert]]
+why = "同一 market_code 下第二段区间（'000001' 落在 01 号区间）"
+kind = "call"
+target = "fnc_get_stock_kind"
+args = ["'000001'", "'20240105'", "'83'"]
+want = "02"
+
+[[case.assert]]
+why = "区间未覆盖 → 内层 SELECT INTO 无行 → EXCEPTION OTHERS 兜底 'AAAA'"
+kind = "call"
+target = "fnc_get_stock_kind"
+args = ["'510050'", "'20240105'", "'83'"]
+want = "AAAA"
+
+[[case.assert]]
+why = "市场码无配置 → 同上兜底"
+kind = "call"
+target = "fnc_get_stock_kind"
+args = ["'600000'", "'20240105'", "'99'"]
+want = "AAAA"
+
+[[case.assert]]
+why = "深市区间独立于沪市（rownum = 1 只取首行，不做区间合并）"
+kind = "rows"
+target = "SELECT market_code, begin_code, end_code, stock_kind FROM dic_stock_kind_sub ORDER BY market_code, begin_code"
+want = "[01, 000001, 003999, 01] [83, 000001, 003999, 02] [83, 600000, 609999, 01]"

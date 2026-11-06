@@ -1,0 +1,63 @@
+[package]
+name = "spinduck"
+version = "0.1.0"
+edition = "2021"
+description = "GaussDB stored-procedure engine on DuckDB kernel"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "spinduck_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spinduck"
+path = "src/bin/spinduck.rs"
+required-features = ["cli"]
+
+[features]
+default = ["native"]
+native = ["dep:duckdb"]
+cli = ["dep:duckdb", "native"]
+golden = ["native"]
+gauss = ["dep:postgres", "native"]
+
+[dependencies]
+ogsql-parser = { path = "../lib/ogsql-parser" }
+duckdb = { version = "=1.10505.0", features = ["bundled"], optional = true }
+postgres = { version = "0.19", optional = true }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[test]]
+name = "guard_types_name_parsing"
+path = "tests/guard/guard_types_name_parsing.rs"
+
+[[test]]
+name = "guard_ir_in_list_empty"
+path = "tests/guard/guard_ir_in_list_empty.rs"
+
+[[test]]
+name = "guard_tx_semantics"
+path = "tests/guard/guard_tx_semantics.rs"
+
+[[test]]
+name = "guard_execute_dynamic"
+path = "tests/guard/guard_execute_dynamic.rs"
+
+[[test]]
+name = "guard_error_domain"
+path = "tests/guard/guard_error_domain.rs"
+
+[[test]]
+name = "guard_sql_pipeline_parity"
+path = "tests/guard/guard_sql_pipeline_parity.rs"
+
+[[test]]
+name = "guard_register_silent_drop"
+path = "tests/guard/guard_register_silent_drop.rs"
+

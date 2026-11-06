@@ -1,0 +1,28 @@
+{
+  "case": "corpus_purchase",
+  "baseline_kernel": "openGauss 5.0.0 Oracle A 模式（golden/gaussdb-docker）",
+  "source": "原考题文件 2_FNC_GET_PURCHASE_JS_DAYS.sql 的 fnc_get_purchase_js_days 逐字（黄金层不比业务过程，见 purchase.case.toml 注释）",
+  "call": "SELECT fnc_get_purchase_js_days('20250715', '0130000001')",
+  "scenarios": [
+    {
+      "why": "申购 90 天品种：JS 结算天数 = 起息日与结算日在 +1 交易日平移后的间隔",
+      "value": "90"
+    },
+    {
+      "why": "申购 180 天品种：跨年后仍按实际间隔（含 2 月）",
+      "value": "180"
+    },
+    {
+      "why": "品种无配置 → SELECT INTO 走 WHEN OTHERS，purchase_days 归 '0'（varchar2 隐式转数值）",
+      "value": "0"
+    },
+    {
+      "why": "有品种但日期不在生效区间（BETWEEN 落空）→ 同归 '0' 分支",
+      "value": "0"
+    },
+    {
+      "why": "跨年边界：20251201 + 90 天落在 2026 年，间隔仍是 90",
+      "value": "90"
+    }
+  ]
+}

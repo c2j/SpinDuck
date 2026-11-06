@@ -1,0 +1,12 @@
+{
+  "case": "corpus_min_tax",
+  "baseline_kernel": "openGauss 5.0.0 Oracle A 模式（golden/gaussdb-docker）",
+  "source": "考题基线 5_函数/2_FNC_COM_GET_MIN_TAX.sql 逐字（sql/routines/routine.sql）",
+  "note": "缺失场景经 EXCEPTION OTHERS + nvl 归 0；数值按值归一（scale 差异不算失败）",
+  "scenarios": [
+    {"why": "精确 stock_kind 命中（2023 过期行必须排除）", "value": "1.5000"},
+    {"why": "组内兜底 0100", "value": "2.5000"},
+    {"why": "全局兜底 0000", "value": "4.0000"},
+    {"why": "无配置 → EXCEPTION OTHERS + nvl 归 0", "value": "0.0000"}
+  ]
+}

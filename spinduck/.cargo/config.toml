@@ -1,0 +1,6 @@
+# Win7 目标：静态链接 CRT（仅 nightly 发版构建使用，见 AGENTS.md §10）
+[target.x86_64-win7-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-win7-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

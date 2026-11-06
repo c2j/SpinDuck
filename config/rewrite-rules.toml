@@ -1,0 +1,137 @@
+# SpinDuck 兼容性改写规则表（种子数据）
+#
+# 设计约定（docs/architecture.md §9）：本文件是改写规则的数据载体，不是代码。
+# 引擎启动时加载；项目可用自定义文件覆盖/追加（--rules <path>）。
+# 每条规则必须附一条实测探针测试（docs/validation.md）——规则以实测为准，
+# 禁止凭其他数据库经验假设（教训见 validation.md R3）。
+# status = "verified"（有 DuckDB 实测探针）| "assumed"（待验证，CI 告警）。
+
+# 目标内核版本（M1 固定 duckdb-rs crate 与之对齐）
+target_duckdb = "1.5.5"
+# 规则探针的实际执行版本：当前所有探针在 1.4.4 上完成（validation.md V6）。
+# 已于 2026-11-04 在 1.5.5 上完成全清单复测（validation.md V6），两模拟器全链路通过。
+probe_duckdb = "1.5.5"  # 2026-11-04 全清单复测通过（validation.md V6），两模拟器 1.5.5 全链路 OK
+
+version = 1
+
+# ── 函数映射：GaussDB/Oracle → DuckDB ─────────────────────────────
+[functions]
+# 简单映射（同名参数序）；verified@1.5.5 除非另注
+DECODE_NESTED = "@case"   # verified@1.5.5：decode 缺失，嵌套形式→CASE 语法变换
+TO_CHAR = "@to_char"   # verified@1.5.5：缺失，解析级 strftime+格式串转换
+NVL     = "coalesce"     # verified@1.5.5：nvl 仍缺失（V6）
+# verified@A模式容器+1.5.5 双侧实测（validation V14，2026-11-05）：step4 语料链路
+TO_DATE = "@to_date"         # → strptime(x, <strftime 掩码>)；已知限制：返回 TIMESTAMP 而非 DATE
+INTERVALTONUM = "@intertonum" # → date_diff('day', b, a)；参数形态限定 `日期A - 日期B`
+DECODE  = "@case"   # verified@1.5.5：缺失，解析级 CASE 变换        # 特殊：DECODE(a,b,x,c,y,z) → CASE a WHEN b THEN x WHEN c THEN y ELSE z END（语法变换，非重命名）
+SYSDATE = "CURRENT_TIMESTAMP"  # 探针@1.5.5：now() 需括号，CURRENT_TIMESTAMP 免括号可直接 token 重命名
+SUBSTR  = "SUBSTRING"
+LISTAGG = "@unsupported"  # WITHIN GROUP 语法不兼容，运行时报错并给出迁移指引（M8 处理）
+TO_NUMBER = "@cast_decimal"  # verified@1.5.5：仍无原生实现（V6）
+
+# ── 日期运算与格式串 ─────────────────────────────────────────────
+[dates]
+# Oracle 格式串 → strftime/strptime 格式（可扩展）
+[dates.formats]
+"YYYYMMDD" = "%Y%m%d"
+"YYYY-MM-DD" = "%Y-%m-%d"
+"YYYYMMDDHH24MISS" = "%Y%m%d%H%M%S"
+
+# 语句模式（AST 识别后改写）
+[dates.patterns]
+# to_char(to_date(d, F) + n, F) → strftime(strptime(d, F') + INTERVAL (n) DAY, F')
+to_char_to_date_plus = "strftime(strptime($d, $fmt_in) + INTERVAL ($n) DAY, $fmt_out)"
+
+# ── 类型映射：GaussDB → DuckDB LogicalType ──────────────────────
+# 为什么需要（三个边界）：
+#   ① DDL 建表：GaussDB 类型名（NUMBER/VARCHAR2/CLOB...）在 DuckDB 不存在；
+#   ② 例程签名与变量声明：catalog 元数据、帧槽分配、参数绑定都需 LogicalType；
+#   ③ 值绑定/取回：coerce(value, target_type) 的目标类型权威答案，
+#      解释器与改写器共用本表。
+# 注意：部分映射携带语义损失，必须显式评审而非自动兜底：
+#   CLOB→VARCHAR（DuckDB 无 LOB，能力降级）；CHAR→VARCHAR（GaussDB 定长补
+#   空格语义丢失）；NUMBER 无精度→DECIMAL（变长→定长，影响聚合精度）。
+#   每条 verified 需探针覆盖"建表 + 绑定 + 取回"三环节。
+[types]
+"NUMBER"     = "DECIMAL"
+"NUMERIC"    = "DECIMAL"
+"DECIMAL"    = "DECIMAL"
+"VARCHAR2"   = "VARCHAR"
+"NVARCHAR2"  = "VARCHAR"
+"CHAR"       = "VARCHAR"
+"TEXT"       = "VARCHAR"
+"CLOB"       = "VARCHAR"   # DuckDB 无 LOB；大文本按 String（限制见设计文档）
+"BLOB"       = "BLOB"
+"BYTEA"      = "BLOB"
+"DATE"       = "DATE"
+"TIMESTAMP"  = "TIMESTAMP"
+"BOOLEAN"    = "BOOLEAN"
+# SERIAL → SEQUENCE + DEFAULT nextval（语句级改写，见 patterns）
+
+# ── 建表（DDL load）层规则 ──────────────────────────────────────
+[ddl]
+strip_casts = []  # verified@1.5.5：DEFAULT 内 ::character varying 已原生可解析，无需剥离（1.4 需剥离，V6）
+sequence_maxvalue_bigint = true          # verified@1.5.5：MAXVALUE 超 i64 报 Parser Error，必须截断（V6）
+strip_hint_comments = true               # /*FORCE*/ 等 hint 注释剥离
+
+# ── 语句模式改写 ────────────────────────────────────────────────
+[patterns]
+# 各条目：匹配（AST/文本）→ 改写动作；全部需探针测试。
+# 注意：本段当前值为"语义描述"形态；M3.5 实现规则应用器时必须固化为
+# 机器可读 schema（matcher: ast-path|text-regex, action: rewrite|reject,
+# probe: 测试文件路径），届时本段整体重构，字段向后兼容策略随 PR 评审。
+"ROWNUM = 1"        = "LIMIT 1（保留子查询内 ORDER BY）"      # validation R15
+"FROM SYS_DUMMY"    = "删除 FROM（配合折叠优化，见设计 §7.4）"
+# TRUNCATE：verified@1.5.5 原生支持，无需改写（1.4 需 DELETE，历史记录见 validation V6）
+"UPDATE SET a.b = .." = "剥离 SET 目标限定前缀，保留表别名"     # validation R4
+"(+) 外连接标记"     = "→ LEFT/RIGHT JOIN（ogsql AST 已保留标记）"
+"seq.NEXTVAL"       = "nextval('seq')（DuckDB 原生序列）"
+"a || b"            = "concat(a, b)（A 模式 NULL 视作空串，DuckDB || 传播 NULL）"
+
+# ── 语句模式改写（编译期 AST 级，机器可读开关）────────────────
+# 状态：verified —— openGauss 5.0.0（Oracle A 模式容器）+ DuckDB 1.5.5 双侧
+# 实测见 validation V13（2026-11-05）。
+# `rownum = 1` 首行谓词 → LIMIT 1。DuckDB 无 rownum，不改写语句必然报错。
+# 已知损失：平铺 `ORDER BY … rownum = 1` 在 Oracle 中先取首行再排序（结果不定），
+# 改写后按排序取首行（确定且通常是业务意图）；内层 ORDER BY 子查询 + 外层
+# rownum = 1（语料主流形态，42 处/14 文件）两侧语义一致。
+rownum_first_row = true
+# 状态：verified —— DuckDB 不支持 UPDATE .. SET 限定列名（A 模式语料惯用
+# `UPDATE tbl t SET t.col = …`）；改写为去别名形态（RHS/WHERE 同步去限定）。
+update_strip_alias = true
+# 状态：verified —— `seq.NEXTVAL` → `nextval('seq')`。DuckDB 无「序列.属性」形态，
+# 不改写会把序列名当表名（Binder Error: Referenced table "seq" not found）。
+# 语料 12 处（INSERT 列表 1 处、SELECT … INTO 11 处）；探针
+# spinduck/src/sql/patterns.rs::tests::should_rewrite_sequence_nextval_to_kernel_function
+sequence_nextval = true
+# 状态：verified —— Oracle `(+)` 外连接标记 → ANSI `LEFT JOIN … ON`。DuckDB 在
+# 解析阶段就拒绝 `(+)`（Parser Error），不改写整条语句不可执行。
+# 语料 8 处（PKG_SPLIT_TRADE_STEP2.sql:168/780 等），形态一律「逗号 FROM + 末表带标记」；
+# 前置表折成 CROSS JOIN 作为 LEFT 侧（ON 里跨逗号引用会被内核判为非法表引用）。
+# 已知不覆盖：标记侧非末表、同一语句两侧各有标记（FULL 语义）——保守原样交内核报错。
+# 探针 spinduck/src/sql/patterns.rs::tests::should_convert_oracle_outer_join_marker_to_left_join
+oracle_outer_join = true
+# 状态：verified —— A 模式 `||` 把 NULL 侧当空串（openGauss 5.0.0 基线实测
+# `'A' || NULL` = 'A'、`1 || 2` = '12'、`NULL || NULL` = NULL），DuckDB 的 `||`
+# 传播 NULL（同题实测 'A'）。语料 292 处 `||`，其中日志/错误串（如
+# `'组合申购赎回ETF子过程调用错误:' || p_o_succeed`）拼接的 OUT 参常为 NULL，
+# 不改写会把整串变成 NULL。映射为内核 `concat(…)`：忽略 NULL 参数、数值自动转串
+# （顺带覆盖 [implicit] concat_numeric_to_varchar 登记的数值拼接口径），
+# 全 NULL 得空串——运行态口径 '' ≡ NULL，与基线一致（validation V21）。
+# 实现只做局部文本替换（不回解析整句），无法识别的操作数形态原样交内核。
+# 探针 spinduck/src/sql/rewrite/concat.rs::tests::should_rewrite_concat_of_column_and_literal_to_concat_call
+concat_null_as_empty = true
+
+# ── 隐式类型转换（解释器与改写器共用）────────────────────────────
+[implicit]
+concat_numeric_to_varchar = false  # verified@1.5.5：'x'||DECIMAL 原生可用，无需 CAST（V6 修订 R12）
+lpad_numeric_cast = true           # verified@1.5.5：lpad(DECIMAL,..) 仍无隐式转换，必须 CAST（V6）
+assignment_loose = true            # 赋值宽松转换（数字↔字符串），产生 lint 提示
+empty_string_as_null = false       # 默认关闭；开启时改写层显式处理（见设计 §5 风险表）
+
+# ── 不可降级特性（遇之明确报错，禁止静默错误翻译）───────────────
+[rejects]
+constructs = [
+  "DISTRIBUTE BY", "分区表 DDL", "DATABASE LINK",
+  "DBMS_* 包", "AUTONOMOUS 事务", "BULK COLLECT / FORALL（v1）",
+]

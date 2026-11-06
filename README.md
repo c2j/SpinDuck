@@ -1,1 +1,173 @@
 # SpinDuck
+
+把 **GaussDB / openGauss 存储过程**跑在 **DuckDB** 上的独立执行引擎。
+
+- **不是** SQL 方言翻译器，而是完整的过程执行引擎：PL 语法解析（复用
+  `lib/ogsql-parser`）→ 内部 IR → 树遍历解释器；控制流、变量、游标、异常、
+  事务标记全部在 Rust 内实现，SQL 语句下发 DuckDB 执行。
+- **内核锚定**：DuckDB **1.5.5**（`duckdb` crate `=1.10505.0`，bundled 静态链接）。
+- **数据通路**：GaussDB 只读物化进 DuckDB → 引擎处理 → 结果回写 GaussDB
+  （PG 线协议，`postgres` crate）。
+
+设计文档：[`docs/architecture.md`](docs/architecture.md)（机制）；
+实证记录：[`docs/validation.md`](docs/validation.md)（V1–V10）；
+工程规范：[`AGENTS.md`](AGENTS.md)。
+
+## 快速开始
+
+```bash
+cd spinduck
+export CARGO_HOME=../.cargo-home            # 本仓库自带依赖缓存
+
+cargo build --features cli                  # 默认 native（DuckDB bundled）
+cargo build --features gauss                # 追加 GaussDB 连接器
+
+./target/debug/spinduck version
+./target/debug/spinduck help
+```
+
+### 1. 语料编译体检
+
+```bash
+./target/debug/spinduck compile ../lib/fastaas/exam/清算拆分优化考题/基线代码
+# OK   …/PKG_SPLIT_QQ.sql  routines=3
+# summary: files=136 ok=136 failed=0 routines=54
+```
+
+逐文件独立编译、输出 `OK/FAIL` 与失败原因直方图；`FAIL` 时退出码为 1。
+非 UTF-8（GBK）源码按有损 UTF-8 解码并标注 `(non-utf8)`。
+
+### 2. 注册并调用例程
+
+```bash
+./target/debug/spinduck call --db /tmp/w.duckdb \
+  --file ../golden/case_split_agg/sql/routines/routine.sql \
+  prc_agg_fund "'20240105'"
+# OUT … / RETURN …
+```
+
+参数按字面量推断：`42`（整数）、`1.25`（小数）、`'abc'`（字符串）、`null`、`true`。
+
+### 3. GaussDB 物化 / 回写
+
+连接信息走环境变量（口令不进命令行）：
+
+```bash
+# 先启动参照容器（复现包见 golden/README.md）
+docker compose -f golden/gaussdb-docker/docker-compose.yml up -d
+export SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
+       SPINDUCK_OG_USER=gaussdb SPINDUCK_OG_PASSWORD="$GS_PASSWORD" SPINDUCK_OG_DB=postgres
+
+./target/debug/spinduck materialize --db /tmp/w.duckdb --table mid_yjqs_detail
+./target/debug/spinduck materialize --db /tmp/w.duckdb --table mid_yjqs_detail \
+  --where "bcrq = '20240105'"                       # 按分区键增量
+./target/debug/spinduck sync --db /tmp/w.duckdb --table dat_inst_fund_cjqs \
+  --cols bcrq,fund_code,scdm,cjsl,cjje,fee
+```
+
+### 4. 规则探针
+
+```bash
+./target/debug/spinduck rules probe ../config/rewrite-rules.toml
+# rules: … target_duckdb=1.5.5 probe_duckdb=1.5.5 match=true
+```
+
+### 5. 链路校验（verify）
+
+在项目根（含 `spinduck.toml`）声明本项目对外可调用的存过全名，`verify` 从这些入口
+出发沿调用链逐对象核验——语料是否齐全、链路对象是否真在核内、声明的场景能否执行：
+
+```toml
+# spinduck.toml
+[[entry]]
+routine = "pkg_split_trade_step2.prc_pre_deal_shjycf"   # 必须 package.procedure 全名
+
+[[entry]]
+routine = "pkg_qq_split.prc_general_deal_inst_sh_buy"
+kind = "function"                                       # 缺省 procedure
+```
+
+```bash
+./target/debug/spinduck verify ../golden/exam_split_trade
+# manifest: …/.spinduck/conf/spinduck.toml (updated)
+# == entry pkg_qq_split.prc_general_deal_inst_sh_buy
+#   PASS Entry pkg_qq_split.prc_general_deal_inst_sh_buy — 入口在例程目录命中且种类一致
+#   PASS Relation mid_yjqs_detail — 内核存在（main.mid_yjqs_detail）
+#   FAIL Routine pkg_x.prc_gone — 链路断点：被 pkg_y.prc_z 调用，但语料中未登记
+#   SKIP Scenario - — 无 *.case.toml 声明该入口，可执行性未验证
+# verify: entries=8 checks=64 failed=1 skipped=2
+```
+
+出现 `FAIL` 退出码为 1。核验同时把可调用面与资产绝对路径写成运行态快照
+`<home>/conf/spinduck.toml`（唯一写入者 = `verify`，禁止手改）；把该目录单独交给
+运行侧即可脱离研发态目录复现同一核验结论。
+
+## 能力矩阵
+
+| 能力 | 状态 |
+|---|---|
+| PL 编译：赋值/IF/ELSIF/CASE/LOOP/WHILE/FOR(range)/GOTO/标签/嵌套块 | ✅ |
+| PL 表达式：算术/比较/布尔三值/`BETWEEN`/`IN`/一元负/括号/函数调用 | ✅ |
+| 声明段：变量（含初值）、静态游标、`%TYPE`/`%ROWTYPE` 类型名 | ✅（类型名仅解析，运行期按值） |
+| 游标：`OPEN`/`FETCH INTO`/`%FOUND`/`%NOTFOUND`/`%ROWCOUNT`/`%ISOPEN`/`CLOSE` | ✅ |
+| `FOR rec IN <query>` / `FOR rec IN <cursor>` | ✅（脱糖为隐式游标） |
+| 异常：`EXCEPTION WHEN <cond>` 匹配、未捕获上抛、`SQLSTATE` 匹配 | ✅ |
+| 例程：`CREATE PROCEDURE`/`FUNCTION`/`PACKAGE BODY`、IN/OUT/INOUT、过程间调用 | ✅ |
+| SQL 上下文函数分派 | ✅ 表达式级→内核宏；②内联/①UDF 见 `architecture.md` §8.3 |
+| `EXECUTE IMMEDIATE`（静态文本与运行期拼接同一管线） | ✅ 与 OPEN FOR 共用解析/改写管线；`USING` 绑定 ⛔ 待做（`ENG-0058`，变量须先拼进文本） |
+| 事务标记 `COMMIT`/`ROLLBACK` | ✅ 统一事务边界：最外层调用包 `BEGIN…COMMIT`，过程内 `COMMIT`/`ROLLBACK` 即时生效并重开（`architecture.md` §3.5） |
+| GaussDB 物化/回写 | ✅（文本承载，回写为 append） |
+| `rownum = 1` 首行谓词 | ✅ `[patterns] rownum_first_row`（AST 级，语料 42 处：顶层 SELECT 与 `INSERT … SELECT` 子查询；UPDATE/DELETE 无对应语法位，原样下发由内核报错） |
+| 记录变量限定字段下发 SQL（`INSERT … VALUES (r.field)`） | ✅ `BindSrc::Field`（`$v_<rec>__<field>` 绑定） |
+| `%ROWTYPE` 整行记录 + 显式 `FETCH c INTO rec` | ✅ |
+| PL 上下文 `@` 标记函数（`TO_CHAR`/`TO_DATE`/`INTERVALTONUM`） | ✅ SQL-first 下沉（`SqlFn`，保留日期中间类型；`日期±n` 自动 `to_days`） |
+| **SQL 上下文例程调用**（`UPDATE SET f(col)` / 游标 WHERE / INSERT VALUES 中的 PL 函数） | ✅ 参数元组缓存化下沉（`sqlfn`，确定性前提 + 10 万元组上界） |
+| `%NOTFOUND` 空游标 / `SQLERRM` / `UPDATE` 去别名 / `SELECT INTO` 行数语义（0 行 `NO_DATA_FOUND`、>1 行 `TOO_MANY_ROWS`，静态与动态同口径） | ✅ |
+| 黄金对比 | ✅ `golden/`：toy 用例 + 语料级逐字函数（stock_kind / min_tax）+ 核心过程（purchase） |
+| 用例原生断言层（无容器） | ✅ `[[case.assert]]`（`rows`/`call`/`out`/`error` 四维，进程内内核逐值比对）+ 语料形态覆盖门禁 `config/corpus_forms.toml`（`architecture.md` §12.1、validation V21） |
+| 入口链路核验 `spinduck verify` | ✅ `[[entry]]` 全名声明 → 例程断点 / 表·序列缺失 / 场景可执行逐条判定 + 运行态 `conf/` 快照（`architecture.md` §11.1、§12.1） |
+| `RETURN NEXT` / `PIPE ROW` / 集合类型（嵌套表/数组元素赋值）/ 带参游标 | ⛔ 待做（语料仅 3+1 例，编译期显式拒绝） |
+| 例程目录持久化 | ✅ 内核内 `spinduck_routines` 表存源 DDL 文本，`reload_catalog` 按当前规则重放编译（`--db` 落盘后跨进程恢复） |
+
+语料实证：考题基线 **136/136 文件编译通过（54 例程）**；`exam` 全树 183/187
+（余 4 例为集合元素赋值与带参游标，显式拒绝）。详见 `docs/validation.md` V9。
+
+## 测试与门禁
+
+```bash
+cd spinduck
+cargo fmt --all
+cargo clippy --all-features -- -D warnings
+cargo test --all-features                     # 单元 + 集成 + 内核探针 + CLI 契约
+
+# GaussDB 相关（openGauss 容器）
+SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 SPINDUCK_OG_PASSWORD="$GS_PASSWORD" \
+  cargo test --features gauss --test gauss_e2e --test golden_gauss --test golden_corpus_gauss
+```
+
+测试分层（`AGENTS.md` §4）：单元（`src/**`）、集成（`tests/`，假执行器）、
+内核探针（真实 DuckDB）、CLI 契约、黄金对比（openGauss 基线）。
+
+## 关键约束
+
+1. **接缝纪律**：DuckDB API 只出现在 `sql/exec_native.rs`；编译器/解释器只依赖
+   `SqlExecutor`/`TraceSink` 两个 trait。
+2. **变量替换**：PL 变量在 SQL 文本内改写为命名占位符 `$v_<name>`（字符串字面量
+   与引号标识符不替换），按名绑定，避免 `?` 位置错配。
+3. **错误域**：`ENG-####`（引擎缺陷）/`KERNEL-####`（内核）/`BIZ-####`（业务，
+   含 `NO_DATA_FOUND`/`TOO_MANY_ROWS`）/`ENV-####`（环境），在产生点标注。
+4. **规则数据化**：方言差异（函数映射、类型映射、格式串、拒绝清单）在
+   `config/rewrite-rules.toml`，引擎只实现规则应用；规则变更随探针测试同 PR。
+5. **平台**：Linux glibc ≥ 2.28 / macOS 12+ / Windows 10+；Win7 仅发版交叉编译
+   （见 `AGENTS.md` §10）。
+
+## 已知限制
+
+- `RETURN NEXT`/`PIPE ROW`/集合类型/带参游标未实现（编译期显式拒绝，不静默错译）。
+- SQL 上下文的**过程级**函数（含控制流）只能 PL 上下文调用；SQL 内调用会得到
+  `KERNEL-0010` Catalog Error（宏路径只覆盖纯表达式函数）。
+- `materialize` 逐行 INSERT：万级可用，百万级需批量通道。
+- GaussDB 侧若为 sha256 口令认证，纯 Rust `postgres` 驱动不支持（v1 需 md5 或
+  自建 TLS 通道）；golden 复现包的容器经镜像环境变量启用 md5
+  （`GS_HOST_AUTH_METHOD=md5` + `password_encryption_type=1`，见 golden/README.md）。
+- 黄金基线当前由 openGauss 5.0.0 产出（GaussDB 实例不可达），差异见 V10。

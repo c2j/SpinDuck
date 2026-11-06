@@ -1,0 +1,3 @@
+# 项目规则覆盖（P2 产出）：叠加在引擎种子规则之上，只允许追加/覆盖，禁止删除。
+# 本用例不需要覆盖：全部行为由种子规则（config/rewrite-rules.toml）承担。
+# 需要项目级规则时，在此追加 [functions]/[types]/[patterns] 条目并补 probes/。

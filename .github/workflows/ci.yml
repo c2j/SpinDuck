@@ -1,0 +1,253 @@
+# AGENTS §9 门禁：format / clippy / audit + test(native) + golden(gauss 容器)。
+# 说明：`cargo test --all-features` 含 gauss 黄金层，缺 A 模式容器必红（§4.1
+# 禁止跳过即绿）——故 CI 拆为 test(native) 与 golden(容器内实跑) 两个 job，
+# 文本契约见 AGENTS §9（决策记录 2025-11-05 第二轮复审）。
+#
+# 工作目录约定：crate 在 spinduck/（仓库根无 Cargo.toml），故 defaults 设为
+# spinduck；**git 操作（子模块）必须在仓库根**，逐步骤显式 `working-directory: .`
+# ——否则 `git submodule update --init lib/ogsql-parser` 在 spinduck/ 下报
+# pathspec 不匹配（CI run 42060549897 实测红）。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    # crate 在 spinduck/（仓库根无 Cargo.toml）
+    working-directory: spinduck
+
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # fmt 只读 crate 内文件，不需要子模块
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init ogsql-parser submodule（path 依赖，编译必需；fastaas 为私有项目不拉取）
+        working-directory: .
+        run: git submodule update --init lib/ogsql-parser
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-features --tests -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init ogsql-parser submodule
+        working-directory: .
+        run: git submodule update --init lib/ogsql-parser
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --features native
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked
+      # 内核锚定（AGENTS §1：duckdb = "=1.10505.0"）带来的构建期依赖：
+      # zip 6.0.0 是 libduckdb-sys 的 build-dependency（bundled 解压缩包用），
+      # 不进运行时产物，也无法在不违反内核版本锚定的前提下漂浮升级。
+      # 四条公告均为该构建期 zip 的解压/符号链接边界缺陷 → 显式忽略并留档
+      # （决策与复评节奏见 docs/architecture.md「审计豁免」；内核升级 PR 时复评）。
+      - name: cargo audit（构建期 zip 豁免清单）
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2026-0367 \
+            --ignore RUSTSEC-2026-0368 \
+            --ignore RUSTSEC-2026-0369 \
+            --ignore RUSTSEC-2026-0429
+
+  golden:
+    # 黄金对比：复用 golden/gaussdb-docker compose（与本地完全同口径：
+    # 自定义 entrypoint A 模式引导 + healthcheck 强校验 + 127.0.0.1 绑定）。
+    # 口令由步骤内随机生成经 GS_PASSWORD/SPINDUCK_OG_PASSWORD 注入，不落仓库。
+    #
+    # runs-on 必须是 amd64（ubuntu-latest），换 arm64 这条路已被 CI 实测堵死
+    # （run 42249019674，validation V21.12）：官方镜像 `opengauss/opengauss:5.0.0`
+    # 在 runner 上解析到的是 amd64 用户态，arm64 runner 连容器都起不来——
+    # `/var/lib/opengauss/entrypoint.sh: line 356: /usr/local/bin/gosu: cannot
+    # execute binary file: Exec format error`，PID 1 直接失败，参照实例不存在。
+    # 另：开发机那份 arm64 镜像是经 docker.m.daocloud.io 镜像站拿到的**另一个
+    # artifact**（同 tag 不等于同构建），所以"本地 arm64 绿 / runner amd64 红"
+    # 从来就不是同一份 openGauss 在两种 CPU 上的对比。
+    #
+    # 因此参照侧可执行面在 CI 上只有 amd64 官方构建一种。它跑不了考题业务过程
+    # （单句 `CALL pkg_split_trade_step3_sh.prc_trd_deal_purchase(...)` 会让
+    # postmaster 以 0 退出、服务端不记任何错误，3/3 轮，见 V21.9–V21.12），
+    # 所以按 2026-11-06 的口径，黄金层不比这条过程的业务执行：过程行为由
+    # `[[case.assert]]` 在进程内内核逐值锁定（`--features native`，零外部环境），
+    # 黄金层的参照侧只比语料里最简函数。这是"参照产品平台限制"决定的被测面划分，
+    # 不是把断言改松——没有一条断言被删，也没有一条期望值被放宽。
+    runs-on: ubuntu-latest
+    env:
+      SPINDUCK_OG_HOST: 127.0.0.1
+      SPINDUCK_OG_PORT: "5433"
+      SPINDUCK_OG_USER: gaussdb
+      SPINDUCK_OG_DB: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init ogsql-parser submodule
+        working-directory: .
+        run: git submodule update --init lib/ogsql-parser
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate one-off GaussDB password（仅本次 runner 生命周期）
+        id: gspwd
+        working-directory: .
+        # 大写 A + 十六进制体 + 数字 + `@`：openGauss 口令校验要求四类字符齐全
+        # （大写/小写/数字/特殊字符，见镜像 initdb 报错），长度 ≥8。`@` 与官方示例
+        # `openGauss@123` 同类，且在 double-quote shell 上下文与 compose 插值中无需转义。
+        # add-mask 让步骤 env 转储与后续日志一律打码（Actions 只自动掩码 secrets 上下文）。
+        run: |
+          pwd_value="A$(openssl rand -hex 12)9z@"
+          echo "::add-mask::${pwd_value}"
+          echo "value=${pwd_value}" >> "$GITHUB_OUTPUT"
+      - name: Bring up A-mode container（compose 校验 datcompatibility=A 才 healthy）
+        working-directory: golden/gaussdb-docker
+        env:
+          GS_PASSWORD: ${{ steps.gspwd.outputs.value }}
+        run: |
+          # 参照实例跑在什么架构上是一等变量，必须打印验证而不是相信 runs-on 标签：
+          # 本 job 上一轮就是因为只看了标签（ubuntu-24.04-arm）而没看镜像用户态，
+          # 起了一个 Exec format error 的容器（V21.12）。现在是 x86_64 + amd64 构建
+          # 这一种口径。顺带把 docker/compose 版本落地——取证脚本的口径（默认 events
+          # 输出、cgroup v2 路径）依赖它们。
+          echo "runner 架构: $(uname -m)"
+          echo "docker: $(docker --version 2>&1)"
+          echo "compose: $(docker compose version 2>&1 | head -1)"
+          docker compose up -d
+          for i in $(seq 1 60); do
+            st=$(docker inspect -f '{{.State.Health.Status}}' spinduck-gaussdb || true)
+            [ "$st" = "healthy" ] && { echo "A-mode ready"; break; }
+            [ "$i" = 60 ] && { docker logs spinduck-gaussdb | tail -50; exit 1; }
+            sleep 5
+          done
+      - name: Reference-instance fingerprint（口径是否真的生效，红绿都落日志）
+        working-directory: golden/gaussdb-docker
+        env:
+          GS_PASSWORD: ${{ steps.gspwd.outputs.value }}
+        # compose 的 OTHER_PG_CONF 只在**空数据目录首次 initdb** 时追加进
+        # postgresql.conf（镜像 entrypoint 里它位于 `DATABASE_ALREADY_EXISTS` 为空的
+        # 分支）。因此"实例内存预算到底是多少"在 runner 上是个必须打印验证的事实，
+        # 不能靠读 compose 假设（validation V21.8）。
+        # 最后一行打印 openGauss 内存看护初始化失败的行数：实测口径写死（2GB/4GB）
+        # 时必打印、跟随宿主（12GB）时不打印，所以非零不代表 runner 出问题；它的
+        # 含义是实例超限不会报可读 SQL 错误，只会静默被杀——限额必须明显高于预算。
+        run: |
+          docker exec spinduck-gaussdb bash -c 'export LD_LIBRARY_PATH=/usr/local/opengauss/lib:$LD_LIBRARY_PATH
+          for q in "SHOW max_process_memory" "SHOW shared_buffers" "SHOW server_encoding"; do
+            printf "%-24s = " "$q"
+            /usr/local/opengauss/bin/gsql -U gaussdb -W"$GS_PASSWORD" -d postgres -t -A -c "$q" 2>&1 | tr -d "\r" | head -1
+          done
+          echo "cgroup: limit=$(cat /sys/fs/cgroup/memory.max)"'
+          echo -n "memory-protect 初始化失败行数（0 = 实例级内存看护已开）: "
+          docker logs spinduck-gaussdb 2>&1 | grep -icE 'Failed to initialize the memory protect' || true
+          # PID 1 基线必须登记：compose 有 restart: unless-stopped，实例被杀后
+          # 容器会原地复活，事后单看 status=running 判不出死过。
+          docker inspect -f 'pid1_baseline: restart_count={{.RestartCount}} started={{.State.StartedAt}} id={{.Id}}' spinduck-gaussdb | tee /tmp/og_pid1_baseline.txt
+          # 判"崩溃能不能落 core"要看 PID 1 的 rlimit，不是新 exec 出来的 shell 的：
+          # docker exec 起的进程继承 dockerd 默认值（runner 上实测 unlimited），与 PID 1
+          # 可以不同。core_pattern 是全局的，runner 上是 systemd-coredump 管道，所以
+          # core 不进目录而进 coredumpctl——取证必须查 coredumpctl，不是 find *.core。
+          ogpid=$(docker inspect -f '{{.State.Pid}}' spinduck-gaussdb)
+          echo "PID1（宿主 pid=$ogpid）core 上限：$(sudo cat /proc/$ogpid/limits 2>/dev/null | grep -i 'core file size' || echo '(读不到)')"
+          echo "宿主 core_pattern：$(sudo cat /proc/sys/kernel/core_pattern 2>/dev/null || echo '(不可读)')"
+      - name: Run golden + gauss suites
+        working-directory: spinduck
+        env:
+          SPINDUCK_OG_PASSWORD: ${{ steps.gspwd.outputs.value }}
+        # 本步骤跑全部 golden + gauss 用例（A 模式容器实跑）。红时调
+        # scripts/ci/gauss_incident_evidence.sh 一次落全九组服务端证据，事件取自
+        # 本步骤自己起的那一路 docker events 实时流（宿主侧只读订阅，不进容器）。
+        #
+        # 曾经在这里前面另有一步"单跑 purchase 的判定"（V21.10 为区分"是否依赖套件
+        # 先前 11 分钟的建库/删库状态"而加，判定 B：不依赖，单跑即致死，amd64 三轮
+        # 一致）。2026-11-06 口径把考题业务过程的执行从黄金层拿走之后，那一步没有
+        # 主语了（黄金层不再 CALL 那条过程），故删除；崩溃本身仍是未决问题，登记在
+        # validation V21.9–V21.12，判读结论（postmaster 以 0 自行退出、非 OOM、非
+        # 信号崩溃、非取证手段导致、非套件状态导致）不因删除而改写。
+        #
+        # 内存证据保留打印：V21.9 起已四次用实测否掉 OOM 假说（峰值 670MB / 限额 6GB、
+        # OOMKilled=false），继续打印是为了让"再猜一次内存"必须当场被数据反驳，
+        # 而不是靠回忆。memory.peak 单调不减，前后各读一次即覆盖全程最大值。
+        run: |
+          set +e
+          # 记录每个 pg_log 文件的字节偏移作为"测试开始"标记：失败时只输出增量
+          # 窗口（上一轮用 `ls -t | head -2 | tail -120`，读到的全是 initdb 时代的
+          # 行，失败窗口的服务端记录一条都没进来）。偏移法不依赖时区比较，也不
+          # 会被"整份历史文件里的旧 ERROR"淹没。
+          docker exec spinduck-gaussdb bash -c 'cd /var/lib/opengauss/data/pg_log && mkdir -p /tmp && for f in *.log; do echo "$f $(wc -c < "$f")"; done > /tmp/ci_pglog_offsets; cat /tmp/ci_pglog_offsets'
+          # docker events/logs 的 --since 用 RFC3339：纯数字在不同 docker 版本里
+          # 按秒或纳秒解释，窗口口径不能靠猜。
+          t0_iso=$(date -u +%Y-%m-%dT%H:%M:%S)
+          # 宿主侧 cgroup 路径不靠猜目录名：读容器 PID 1 的 /proc/<pid>/cgroup，
+          # cgroup v2 下只有一行 `0::<相对路径>`。这样无论 dockerd 用 systemd 还是
+          # cgroupfs 驱动都拿到同一个口径，比 find -name "docker-<cid>.scope" 可靠。
+          cpid=$(docker inspect -f '{{.State.Pid}}' spinduck-gaussdb)
+          cgrouprel=$(sudo awk -F'::' '$1=="0"{print $2}' "/proc/$cpid/cgroup" 2>/dev/null | head -1)
+          peakfile=""
+          if [ -n "$cgrouprel" ] && [ "$cgrouprel" != "/" ] && sudo test -r "/sys/fs/cgroup$cgrouprel/memory.peak"; then
+            cand="/sys/fs/cgroup$cgrouprel"
+            # 交叉校验目录归属：Engine API 里的容器限额（HostConfig.Memory，不进
+            # 容器）必须和该目录的 memory.max 一致。不一致说明拼出来的不是这个容器
+            # 的 cgroup（读到的会是宿主全局峰值，比"没测到"更糟——会被当证据判读）。
+            want=$(docker inspect -f '{{.HostConfig.Memory}}' spinduck-gaussdb)
+            got=$(sudo cat "$cand/memory.max" 2>/dev/null)
+            if [ "$got" = "max" ] || [ "$want" = "0" ] || [ "$want" = "$got" ]; then
+              peakfile="$cand"
+            else
+              echo "cgroup 目录校验未通过（$cand/memory.max=$got，Engine API 限额=$want），改用 docker stats"
+            fi
+          fi
+          echo -n "宿主侧 cgroup 目录: "
+          echo "${peakfile:-未找到（改用 docker stats，走 Engine API 不进容器）；pid=$cpid cgroup=${cgrouprel:-未读到}}"
+          # memory.peak 是 cgroup v2 的高位水位（单调不减），测试前后各读一次就覆盖
+          # 全程最大值——后台采样器读的是同一个数，纯属多余，还平白多开一个进程。
+          # 拿不到 cgroup 目录时退回 docker stats，那读到的只是当前值，口径必须标注。
+          peak_before=$(sudo cat "$peakfile/memory.peak" 2>/dev/null)
+          echo "套件开始前：memory.peak=${peak_before:-n/a} 字节"
+          # 生命周期事件实时流：宿主侧只读订阅，不进容器命名空间（V21.11 立的口径）
+          docker events --since "$t0_iso" > /tmp/ci_events_suite.txt 2>&1 &
+          ev_pid=$!
+          cargo test --features gauss -- --nocapture
+          rc=$?
+          kill "$ev_pid" 2>/dev/null
+          if [ -n "$peakfile" ]; then
+            echo "套件结束后：memory.peak=$(sudo cat "$peakfile/memory.peak" 2>/dev/null) 字节（开始前 ${peak_before:-n/a}）/ current=$(sudo cat "$peakfile/memory.current" 2>/dev/null) / 限额=$(sudo cat "$peakfile/memory.max" 2>/dev/null)"
+          else
+            # 回退路径拿到的是**当前值**不是高位水位——V21.8 那轮把 452MiB 当峰值
+            # 判读就是这么误读的，标签必须防止同样的错误。
+            echo "套件结束后：cgroup 不可用，docker stats 当前值（≠峰值）= $(docker stats --no-stream --format '{{.MemUsage}}' spinduck-gaussdb 2>/dev/null)"
+          fi
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            # syslogger 落盘有延迟，立刻读会漏掉失败窗口最后几行
+            sleep 5
+            # 取证走 scripts/ci/gauss_incident_evidence.sh 一份脚本：上一次两处各写
+            # 一份必然漂移（那一轮套件那份只 grep oom、没查 coredumpctl）。
+            # 脚本内部一律 set +e 且末尾 exit 0，不会把取证变成新的红因。
+            bash "$GITHUB_WORKSPACE/scripts/ci/gauss_incident_evidence.sh" \
+              spinduck-gaussdb "$t0_iso" /tmp/ci_pglog_offsets /tmp/og_pid1_baseline.txt \
+              /tmp/ci_events_suite.txt
+          fi
+          exit "$rc"
