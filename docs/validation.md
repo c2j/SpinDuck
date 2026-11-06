@@ -363,6 +363,11 @@ SpinDuck 全部 GaussDB 通道（gauss_e2e / golden / golden_corpus）切换至�
 
 ## V14. 语料级重量用例：核心过程 prc_trd_deal_purchase（A 模式容器逐行比对）
 
+*（本节记录的两侧一致结果当时确实在 A 模式容器上跑到。2026-11-06 起黄金层的被比对象
+改为调用链上的 `fnc_get_purchase_js_days`，这条过程的 20 列逐行结果改由
+`[[case.assert]]` 在进程内内核锁定，参照实例不再 `CALL` 它——原因与分工见 V21.12。
+本节覆盖点与守护测试仍是有效记录，未被撤回。）*
+
 **用例**：`golden/case_corpus_purchase/`——考题调用链第 4 步
 `pkg_split_trade_step3_sh.prc_trd_deal_purchase`（1090 行核心包中 315 行过程），
 源码逐字副本入夹具（核心包 + 依赖函数 `FNC_GET_PURCHASE_JS_DAYS` /
@@ -1176,3 +1181,21 @@ postmaster 在过程 CALL 中以 0 自行退出的内部成因（V21.9–V21.11 
 用户态，两种解释——tag 无 arm64 manifest，或 runner 的解析策略——都无法从本机区分）。
 若将来拿到官方修复或源码级复现，恢复过程级黄金比对的入口只有 `purchase.case.toml` 的
 `kind`/`routine` 与 `cases/baselines/expected.json`，不需要动引擎代码。
+
+**处置首轮 CI 实测（run 42254187059，head `138aa7f`，五个 job 全绿）**——收缩后的黄金层
+在 Hub amd64 构建上就是能跑通的，以下都是那一轮的日志事实：
+
+| 项 | 实测值 |
+|---|---|
+| 平台 | `runner 架构: x86_64`、`Docker version 29.4.2`、`Docker Compose v5.1.3` |
+| 容器引导 | 16:38:04 起 → 16:38:48 `A-mode ready`（44s，一次成功，无 Exec format error） |
+| 口径指纹 | `max_process_memory=4GB`、`shared_buffers=512MB`、`server_encoding=SQL_ASCII`、cgroup `memory.max=6442450944`、memory-protect 失败行数 2（与 V21.10 同形态） |
+| PID1 基线 | `restart_count=0 started=16:38:22.575…`；套件结束后仍无更替 ⇒ 全程零崩溃，取证脚本未被调用 |
+| 套件 | `cargo test --features gauss` 298 passed / 0 failed / **0 ignored**；`golden_corpus_purchase … ok`（0.80s，5 场景）与另三条黄金用例同绿 |
+| 内存 | `memory.peak` 668438528 → 672178176 字节（限额的 10.4%） |
+| 常驻四 job | format / clippy / `--features native`（292 passed，0 ignored）/ audit 全绿 |
+
+同一份 amd64 构建、同一份 compose 口径、同一个 runner 镜像（红绿两轮 golden job 都是
+`ubuntu26/20261101.186`，故 docker/compose 版本不是混淆变量）：此前 3/3 轮红在过程
+`CALL`，本轮绿——这组对照把"崩溃主语就是那条过程"钉得更死了：被测面上唯一被拿掉的
+变量，也是唯一改变结果的变量。
