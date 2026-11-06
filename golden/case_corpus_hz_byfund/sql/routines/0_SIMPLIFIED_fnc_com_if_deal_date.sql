@@ -1,5 +1,0 @@
-CREATE OR REPLACE FUNCTION fnc_com_if_deal_date(p_market_code VARCHAR2, p_i_date VARCHAR2)
-RETURN NUMBER IS
-BEGIN
-  RETURN 0;
-END;
