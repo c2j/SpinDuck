@@ -769,9 +769,13 @@ doctest 阶段红（测试二进制 17 组 292 passed / 0 failed 全绿，只有
 - "不入库"的范围已核实到文件级：`golden/exam_split_trade/` 共 163 个文件，其中只有
   `docs/4-数据库与连接信息.md` 含远端库凭据；`sql/` 147 个逐字件（36 例程 + 107 表/视图
   DDL + 4 外部依赖桩，与 `config/corpus_forms.toml` 的 `files = 147` 同口径）、`cases/`（4）、
-  `rules/`（1）、`spinduck.toml` 经 IPv4 / 连接串 / 口令关键字复核均无凭据。故按用户指示
-  整目录不提交是**当前口径**；若日后要把八个核心过程的逐字源码入库，只需排除该一个 docs
-  件，不必改动引擎。
+  `rules/`（1）、`spinduck.toml` 经 IPv4 / 连接串 / 口令关键字复核均无凭据。
+  **2026-11-07 定案**：整目录（含那 162 个无凭据件）一律不入库——"只排除那个 docs 件、其余
+  入库"的备选方案已被明确否决，落点问题不再重开。因此入库面就是 4 个语料用例
+  （`case_corpus_min_tax` / `case_corpus_purchase` / `case_corpus_stock_kind` / `case_split_agg`）+
+  `config/corpus_forms.toml` 的脱敏形态清单；八个核心过程的逐字源码只作为**本地验证件**存在，
+  `golden/exam_split_trade/` 由 `.git/info/exclude` 挡在库外。日后要扩大入库面，需重新走一轮
+  口径确认，而不是沿用本节读作"随时可入库"。
 
 ### V21.6 未覆盖面（登记，不声称已支持）
 
