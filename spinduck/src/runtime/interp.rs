@@ -75,6 +75,7 @@ pub fn run_with_catalog(
         sink,
         cat,
         depth,
+        current_error: None,
     };
     loop {
         match run_inner(prog, &mut env, &mut traps, &mut pc, &mut steps) {
@@ -95,10 +96,18 @@ pub fn run_with_catalog(
                             // 处理器可见 SQLERRM（错误消息）
                             let body_start = h.body_start;
                             traps.pop();
+                            // 内核域错误已作废最外层显式事务：进入处理器体前先复位会话，
+                            // 否则处理器内第一条 SQL 即连锁失败
+                            if e.domain == crate::error::FaultDomain::Kernel {
+                                flow::reset_session(&mut env)?;
+                            }
                             env.frame.set(
                                 &VarName("__sqlerrm".to_string()),
                                 SpinValue::Str(e.message.clone()),
                             );
+                            // 裸 RAISE; 的重抛源（已知口径：处理器结束后不清除，
+                            // 见 validation.md V21）
+                            env.current_error = Some(e.clone());
                             pc = body_start;
                             handled = true;
                             break;
@@ -124,6 +133,8 @@ pub(super) struct Env<'a> {
     pub sink: &'a mut dyn TraceSink,
     pub cat: &'a crate::catalog::RoutineCatalog,
     pub depth: usize,
+    /// 进入异常处理器体时写入的当前错误——裸 `RAISE;` 的重抛源。
+    pub current_error: Option<EngineError>,
 }
 
 /// 内层执行驱动（traps/pc/steps 由外层持有，支持跨重试持久化）。

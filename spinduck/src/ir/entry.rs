@@ -102,7 +102,12 @@ pub fn compile_routine_with_names(
             _ => {}
         }
     }
-    c.stmts(&block.body)?;
+    // 例程级 EXCEPTION 段（语料主流形态：`IS BEGIN … EXCEPTION WHEN OTHERS … END;`）
+    // 与块级走同一 trap 编译；此前 PlBlock.exception_block 被静默丢弃。
+    match &block.exception_block {
+        Some(exc) => c.trap_section(&block.body, exc)?,
+        None => c.stmts(&block.body)?,
+    }
     c.resolve_fixups()?;
     Ok(IrProg { code: c.code })
 }
@@ -193,7 +198,7 @@ fn collect_expr(e: &Expr, set: &mut crate::sql::VarScope) {
 /// `[patterns]`（rownum 首行 / UPDATE 去别名）→ 调用点下沉规划 → token 规则改名
 /// → AST 级变换。动态路径以空 VarScope 调用（USING v1 不支持，PL 变量须先
 /// 拼接为字面量），其余口径与静态一致。
-pub(crate) fn rewrite_sql(
+pub fn rewrite_sql(
     sql_text: &str,
     vars: &crate::sql::VarScope,
     rules: &RuleRegistry,

@@ -28,7 +28,13 @@ fn describe(st: &IrStmt) -> (&'static str, String) {
         IrStmt::Jump(to) => ("jump", to.to_string()),
         IrStmt::JumpIfNot { cond, to } => ("jump_if_not", format!("{} -> {to}", expr_text(cond))),
         IrStmt::JumpIf { cond, to } => ("jump_if", format!("{} -> {to}", expr_text(cond))),
-        IrStmt::Raise { message } => ("raise", expr_text(message)),
+        IrStmt::Raise { message } => (
+            "raise",
+            message
+                .as_ref()
+                .map(expr_text)
+                .unwrap_or_else(|| "<current>".to_string()),
+        ),
         IrStmt::Return { value } => (
             "return",
             value

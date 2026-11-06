@@ -6,6 +6,7 @@
 //! 重命名）、`scan`（调用点扫描）、`split`（顶层切分/引号）、`ast`（解析级变换）。
 
 mod ast;
+mod concat;
 mod scan;
 mod split;
 mod tokens;
@@ -16,5 +17,5 @@ mod tests;
 mod transform_tests;
 
 pub use ast::{apply_ast_transforms, oracle_format_to_strftime, strip_update_alias};
-pub(crate) use split::split_top_level_commas;
+pub use concat::rewrite_concat;
 pub use tokens::{rewrite_tokens, rewrite_tokens_with_rules, SqlBindSrc, SqlUnit, VarScope};

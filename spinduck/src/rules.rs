@@ -5,7 +5,8 @@
 //! - `[functions]`：全表进 map，SQL 上下文改名/下沉（`sql::rewrite_tokens_with_rules`）。
 //! - `[types]`：全表进 map，但 `spin_type` 目前**无生产调用点**（语料建表走参照侧
 //!   schema 物化）；接入点在 DDL 翻译，见 `spin_type` 文档与 validation.md V18。
-//! - `[patterns]`：仅 `rownum_first_row`、`update_strip_alias` 两个布尔开关，
+//! - `[patterns]`：`rownum_first_row`、`update_strip_alias`、`sequence_nextval`、
+//!   `oracle_outer_join`、`concat_null_as_empty` 布尔开关，
 //!   由 `should_wire_every_seed_pattern_key` 做漂移守护——新增布尔键必须接线。
 //! - `target_duckdb` / `probe_duckdb`：`probe_versions_match`（V6 门禁）。
 //! - `[dates.formats]`：载入 `date_formats`，映射表本体仍在
@@ -13,7 +14,8 @@
 //!   `should_keep_seed_date_formats_in_sync_with_strftime_mapper` 守护两侧不漂移。
 //! - `[implicit]` `[ddl]` `[rejects]` `version`：语料事实与探针期望的
 //!   数据登记，当前无改写器消费；`implicit_concat_numeric_to_varchar` 保留为
-//!   可读字段（种子值 false，用于黄金比对口径追溯）。
+//!   可读字段（种子值 false，用于黄金比对口径追溯）——数值拼接转串的实际口径
+//!   已由 `[patterns] concat_null_as_empty` 的 `concat(…)` 承担。
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -33,6 +35,15 @@ pub struct RuleRegistry {
     /// `[patterns] update_strip_alias`：`UPDATE t SET t.c = …` → 去别名限定
     /// （DuckDB 不支持 UPDATE .. SET 的限定列名）
     pub patterns_update_strip_alias: bool,
+    /// `[patterns] sequence_nextval`：`seq.NEXTVAL` → `nextval('seq')`
+    /// （DuckDB 无 `序列.属性` 形态，不改写会把序列名当表名解析）
+    pub patterns_sequence_nextval: bool,
+    /// `[patterns] oracle_outer_join`：Oracle `(+)` 外连接标记 → ANSI `LEFT JOIN … ON`
+    /// （DuckDB 不识别 `(+)`，解析阶段即报 Parser Error）
+    pub patterns_oracle_outer_join: bool,
+    /// `[patterns] concat_null_as_empty`：A 模式文本拼接（NULL 视作空串）→ 内核 `concat(…)`
+    /// （DuckDB 的 `||` 传播 NULL，与基线实测 `'A' || NULL = 'A'` 相反）
+    pub patterns_concat_null_as_empty: bool,
     /// `[dates.formats]`：Oracle 整串日期格式 → strftime 格式。
     /// 映射表本体在 `sql::oracle_format_to_strftime`（逐令牌变换，覆盖语料全部格式），
     /// 本字段登记语料事实并做漂移守护（`should_keep_seed_date_formats_in_sync_with_strftime_mapper`）；
@@ -65,6 +76,9 @@ impl RuleRegistry {
             implicit_concat_numeric_to_varchar: false,
             patterns_rownum_first_row: true,
             patterns_update_strip_alias: true,
+            patterns_sequence_nextval: true,
+            patterns_oracle_outer_join: true,
+            patterns_concat_null_as_empty: true,
             date_formats: BTreeMap::new(),
             target_duckdb: String::new(),
             probe_duckdb: String::new(),
@@ -139,6 +153,15 @@ impl RuleRegistry {
             if let Some(b) = p.get("update_strip_alias").and_then(|x| x.as_bool()) {
                 reg.patterns_update_strip_alias = b;
             }
+            if let Some(b) = p.get("sequence_nextval").and_then(|x| x.as_bool()) {
+                reg.patterns_sequence_nextval = b;
+            }
+            if let Some(b) = p.get("oracle_outer_join").and_then(|x| x.as_bool()) {
+                reg.patterns_oracle_outer_join = b;
+            }
+            if let Some(b) = p.get("concat_null_as_empty").and_then(|x| x.as_bool()) {
+                reg.patterns_concat_null_as_empty = b;
+            }
         }
         reg.date_formats = date_formats_of(&v);
         Ok(reg)
@@ -175,6 +198,15 @@ impl RuleRegistry {
             }
             if let Some(b) = p.get("update_strip_alias").and_then(|x| x.as_bool()) {
                 self.patterns_update_strip_alias = b;
+            }
+            if let Some(b) = p.get("sequence_nextval").and_then(|x| x.as_bool()) {
+                self.patterns_sequence_nextval = b;
+            }
+            if let Some(b) = p.get("oracle_outer_join").and_then(|x| x.as_bool()) {
+                self.patterns_oracle_outer_join = b;
+            }
+            if let Some(b) = p.get("concat_null_as_empty").and_then(|x| x.as_bool()) {
+                self.patterns_concat_null_as_empty = b;
             }
         }
         for (k, val) in date_formats_of(&v) {
@@ -347,12 +379,15 @@ BINARY_DOUBLE = "DOUBLE"
             let field = match k.as_str() {
                 "rownum_first_row" => reg.patterns_rownum_first_row,
                 "update_strip_alias" => reg.patterns_update_strip_alias,
+                "sequence_nextval" => reg.patterns_sequence_nextval,
+                "oracle_outer_join" => reg.patterns_oracle_outer_join,
+                "concat_null_as_empty" => reg.patterns_concat_null_as_empty,
                 other => panic!("未接线的 [patterns] 布尔键: {other}"),
             };
             assert_eq!(field, seed_val, "[patterns] {k} 与规则字段漂移");
             wired += 1;
         }
-        assert_eq!(wired, 2, "种子 [patterns] 布尔键数量变化：必须同步接线");
+        assert_eq!(wired, 5, "种子 [patterns] 布尔键数量变化：必须同步接线");
     }
 
     #[test]

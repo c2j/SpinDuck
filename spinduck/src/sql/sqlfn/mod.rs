@@ -6,11 +6,13 @@
 //! - 例程在语句执行期间**确定性**（结果只依赖入参）——语料中为查表类函数；
 //! - 同一语句中重复的相同调用（同 name+实参文本）合并为一次物化；
 //! - 参数元组上界 [`MAX_TUPLES`]；
-//! - 上下文互相引用的调用（A 的 WHERE 调 B、B 的 WHERE 调 A）显式拒绝。
+//! - 实参内的嵌套调用逐层下沉（内层先物化，外层元组查询引用内层缓存子查询）；
+//! - 上下文互相引用的调用（A 的 WHERE 调 B、B 的 WHERE 调 A）显式拒绝（BIZ-0160）。
 //!
 //! 规模拆分（AGENTS §3，单文件 ≤500 行）：`plan`（调用点扫描与计划构造）、
-//! `region`（语句上下文区间与参数元组查询）。
+//! `region`（语句上下文区间与参数元组查询）、`lower`（片段区间切分与就地下沉）。
 
+mod lower;
 mod plan;
 mod region;
 
@@ -39,34 +41,38 @@ pub struct FnSite {
     pub binds: Vec<(String, BindSrc)>,
 }
 
+/// 语句中的一个例程调用点（含实参区间与嵌套父链）。
 struct Occurrence {
     start: usize,
     end: usize,
     name: String,
     args: Vec<String>,
     args_key: String,
+    /// 各实参在语句文本中的绝对区间（按调用括号内的顶层逗号切分）
+    arg_spans: Vec<(usize, usize)>,
+    /// 包裹本调用的**例程**调用索引（`collect_occurrences` 返回列表内）；顶层为 `None`
+    parent: Option<usize>,
+    /// 归属的下沉计划索引（去重后回填）
+    plan: usize,
 }
 
 struct CallPlan {
     name: String,
     args: Vec<String>,
+    /// 首个调用点的实参绝对区间（元组查询按区间就地下沉嵌套调用）
+    arg_spans: Vec<(usize, usize)>,
+    /// 首个调用点在语句文本中的区间（定位所属查询块）
+    occ_span: (usize, usize),
+    /// 实参下沉后的文本（内层调用已替换为其缓存子查询）
+    lowered_args: Vec<String>,
     distinct_sql: String,
     binds: Vec<(String, BindSrc)>,
     sub_orig: String,
-    occurrences: Vec<(usize, usize)>,
     depends_on: Vec<usize>,
 }
 
-/// 语句的上下文区间：FROM/WHERE（SELECT）、表/WHERE（UPDATE）；
-/// INSERT 无上下文（参数元组即单行）。
+/// 语句是否具备"表行"上下文：`SELECT`/`UPDATE` 与 `INSERT … SELECT` 有；
+/// `INSERT … VALUES` 是单行求值，参数元组即实参本身。
 struct Region {
     has_context: bool,
-    ctx_start: usize,
-    ctx_end: usize,
-}
-
-impl Region {
-    fn contains(&self, pos: usize) -> bool {
-        self.has_context && pos >= self.ctx_start && pos < self.ctx_end
-    }
 }

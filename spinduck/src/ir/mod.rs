@@ -16,12 +16,11 @@ mod stmt;
 mod types;
 
 pub(crate) use control::Compiler;
-pub(crate) use entry::rewrite_sql;
 pub use entry::{
     compile_block, compile_block_with, compile_routine_with, compile_routine_with_names,
-    compile_stmts, compile_stmts_with,
+    compile_stmts, compile_stmts_with, rewrite_sql,
 };
-pub(crate) use expr::{ident0, ident1, ident_path};
+pub(crate) use expr::{ident0, ident1, ident_path, parse_decimal_literal};
 pub(crate) use types::CompiledCursorSql;
 pub use types::{
     AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, Label, TrapEntry, VarName,

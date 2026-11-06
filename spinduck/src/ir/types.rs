@@ -111,8 +111,9 @@ pub enum IrStmt {
         cond: IrExpr,
         to: usize,
     },
+    /// `RAISE [msg]`；`message: None` 是裸 `RAISE;`——重抛处理器当前正在处理的错误。
     Raise {
-        message: IrExpr,
+        message: Option<IrExpr>,
     },
     Return {
         value: Option<IrExpr>,

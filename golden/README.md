@@ -17,8 +17,8 @@ golden/
 └── case_corpus_purchase/          ← 用例 4：语料级重量（核心过程 prc_trd_deal_purchase）
 ```
 
-每个用例目录即一个 **§12.1 项目模式单元**（`spinduck.toml` 声明唯一入口，
-`spinduck_core::project` 识别；黄金 harness 是它的首个消费者）：
+每个用例目录即一个 **§12.1 项目模式单元**（`spinduck.toml` 声明项目资产与可调用面
+`[[entry]]`，`spinduck_core::project` 识别；黄金 harness 是它的首个消费者）：
 
 ```
 case_corpus_purchase/
@@ -34,7 +34,7 @@ case_corpus_purchase/
 │   ├── datasets/seed.sql          # 样例数据
 │   ├── baselines/expected.json    # 参照侧黄金输出（提交入库，防基线漂移）
 │   ├── baselines/reference_routine.sql   # 参照侧专用例程（仅 toy 用例）
-│   └── *.case.toml                # 用例定义：例程 × 场景 × 输入表 × 期望输出
+│   └── *.case.toml                # 用例定义：例程 × 场景 × 输入表 × 期望输出 × `[[case.assert]]` 断言
 ├── reports/                       # 生成产物（评审用；当前无）
 └── .spinduck/                     # 本地运行态（gitignore）
 ```
@@ -107,11 +107,6 @@ SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
 SPINDUCK_OG_PASSWORD="$SPINDUCK_OG_PASSWORD" \
 cargo test --features gauss --test golden_corpus_gauss -- --nocapture
 
-# 语料级热点用例：核心过程 pkg_split_trade_step3_sh.prc_trd_hz_byfund
-SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
-SPINDUCK_OG_PASSWORD="$SPINDUCK_OG_PASSWORD" \
-cargo test --features gauss --test golden_corpus_hz_byfund -- --nocapture
-
 # 语料级重量用例：核心过程 pkg_split_trade_step3_sh.prc_trd_deal_purchase
 SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
 SPINDUCK_OG_PASSWORD="$SPINDUCK_OG_PASSWORD" \
@@ -162,14 +157,33 @@ test golden_corpus_min_tax_matches_a_mode_baseline ... ok
   2 字符——黄金口径取 `swh_all_kind.kind_id='0'` 确定性路径（purchase_yj 两侧同为
   NULL）；CASE 路径须先修基线列宽。
 
-## 用例 5（case_corpus_hz_byfund）的资产纪律
+## 原生断言层（`[[case.assert]]`，不需要容器）
 
-- 依赖闭包（43 表 / 4 视图 / 16 例程 / 1 桩包）从考题基线**逐字复制**，只做目录重组；
-  表按文件放 `sql/ddl/tables/`，视图放 `sql/ddl/views/`（两侧都建真实视图）。
-- 种子自实现：覆盖主聚合两笔成交、债券类型缺失、风险金维度空集、QFII 关闭。
-- 比对两个输出表：`dat_fund_cjqs` 逐行 + `dat_fund_xw_venture` 行数。
-- 该过程含 `UPDATE … SET f(col)` / 游标 WHERE 中的 PL 函数调用，依赖
-  `sqlfn` 参数元组缓存化下沉（validation V15）。
+黄金层比对必须有 A 模式容器；**用例自身的结果断言不需要**。四个 `case_*` 项目在
+`cases/*.case.toml` 里用 `[[case.assert]]` 显式声明断言集（`rows` 行集 / `call` 返回值 /
+`out` OUT 参 / `error` 错误契约），部署口径与 `verify` 同源，跑在进程内 DuckDB 1.5.5 上：
+
+```bash
+cd spinduck
+export CARGO_HOME=../.cargo-home
+cargo test --features native --test cases_native
+
+# 新增断言取实测值（不参与门禁语义；提交前必须以实测值填回 want）
+CASES_PROBE=1 cargo test --features native --test cases_native -- --nocapture
+```
+
+- 项目里一条 `[[case.assert]]` 都没有 = 显式变红（空覆盖不接受）。
+- 链路核验也不需要容器：`case_corpus_purchase/spinduck.toml` 声明了 1 条
+  `[[entry]]`，`cargo run --features cli -- verify ../golden/case_corpus_purchase`
+  在进程内内核上逐对象核验（`entries=1 checks=11 failed=0`），同时把运行态快照
+  落到 `.spinduck/conf/spinduck.toml`（gitignore）。其余三个用例的主角是无包限定的
+  独立例程，按"入口必须全名定位"不声明 `[[entry]]`，由断言层兜住。
+- 断言期望值与容器基线（`expected.json`）互不替代：前者锁"本引擎在样例数据上的
+  行为"，后者锁"参照实现的行为"；改动导致前者变化时按 AGENTS §4.3 说明差异含义。
+- 已退役：原用例 5（`case_corpus_hz_byfund`，热点过程 `prc_trd_hz_byfund` 的容器逐行
+  比对）随 V21 移出仓库；其 SQL 形态（`UPDATE … SET f(col)`、游标 WHERE 里的 PL 函数
+  调用，即 `sqlfn` 参数元组缓存化下沉）由 `spinduck/tests/corpus_sql_forms.rs` 与
+  `case_corpus_purchase` 的原生断言覆盖，机制说明见 `docs/architecture.md` §8.3。
 
 ## 期望基线（expected.json）的维护规则
 

@@ -4,6 +4,8 @@
 //! 之后与 `INSERT|MERGE INTO` 之后的首个标识符；`EXTRACT/SUBSTRING/… FROM x`
 //! 的 `FROM` 不是关系位（按括号属主排除）；名字紧跟左括号 = 表函数，跳过。
 //! 已知误报面：把关系名写成函数调用的语料会被跳过，由场景执行兜住。
+//! SQL 上下文例程调用下沉出的结果表（`FnSite::table`）是引擎运行期对象，
+//! 不属于项目链路——按 IR 记录的名字排除，不靠命名模式猜测。
 
 use crate::ir::{CursorSource, IrExpr, IrProg, IrStmt};
 use std::collections::BTreeSet;
@@ -23,28 +25,50 @@ pub struct ObjectRef {
     pub name: String,
 }
 
+/// IR 一次线性遍历的采集结果（链路核验的三个输入面）。
+#[derive(Default)]
+struct Walk {
+    /// 被调用的例程名（小写）
+    refs: BTreeSet<String>,
+    /// SQL 文本，文档序
+    texts: Vec<String>,
+    /// 下沉结果表名：内核里不存在、也不该被核验的项目对象
+    plan_tables: BTreeSet<String>,
+}
+
+fn walk(prog: &IrProg) -> Walk {
+    let mut w = Walk::default();
+    walk_code(&prog.code, &mut w);
+    w
+}
+
 /// 程序内全部例程引用（链路断点判定输入）。
 ///
 /// 与运行期分派同口径：`CALL`（裸名或全名）与**带包限定**的表达式函数调用计入；
 /// 裸名 `FuncCall` 是内建/内核函数（解释器一律下内核求值），不计入链路。
 pub fn routine_refs(prog: &IrProg) -> BTreeSet<String> {
-    let mut refs = BTreeSet::new();
-    walk_code(&prog.code, &mut refs, &mut Vec::new());
-    refs
+    walk(prog).refs
 }
 
-/// 程序内全部 SQL 文本（语句、静态游标、SQL 上下文下沉的元组查询），文档序。
-pub fn sql_texts(prog: &IrProg) -> Vec<String> {
-    let mut texts = Vec::new();
-    walk_code(&prog.code, &mut BTreeSet::new(), &mut texts);
-    texts
+/// 程序内全部链路对象引用（下沉结果表除外）。
+pub fn chain_object_refs(prog: &IrProg) -> BTreeSet<ObjectRef> {
+    let w = walk(prog);
+    let mut out = BTreeSet::new();
+    for text in &w.texts {
+        out.extend(
+            sql_object_refs(text)
+                .into_iter()
+                .filter(|r| !(r.kind == ObjectKind::Relation && w.plan_tables.contains(&r.name))),
+        );
+    }
+    out
 }
 
 /// 线性遍历指令序列。
 ///
 /// `PushTrap` / `PopTrap` 只是标记：处理器体与主语句同处一个 `code` 区
 /// （`TrapEntry` 存的是索引区间），线性遍历已覆盖，递归展开会重复计数。
-fn walk_code(code: &[IrStmt], refs: &mut BTreeSet<String>, texts: &mut Vec<String>) {
+fn walk_code(code: &[IrStmt], w: &mut Walk) {
     for st in code {
         match st {
             IrStmt::Nop
@@ -58,41 +82,42 @@ fn walk_code(code: &[IrStmt], refs: &mut BTreeSet<String>, texts: &mut Vec<Strin
             IrStmt::Assign { expr, .. }
             | IrStmt::JumpIfNot { cond: expr, .. }
             | IrStmt::JumpIf { cond: expr, .. }
-            | IrStmt::Raise { message: expr }
-            | IrStmt::Perform { expr } => walk_expr(expr, refs),
-            IrStmt::Return { value: Some(expr) } => walk_expr(expr, refs),
+            | IrStmt::Perform { expr } => walk_expr(expr, &mut w.refs),
+            IrStmt::Raise {
+                message: Some(expr),
+            } => walk_expr(expr, &mut w.refs),
+            IrStmt::Raise { message: None } => {}
+            IrStmt::Return { value: Some(expr) } => walk_expr(expr, &mut w.refs),
             IrStmt::Return { value: None } => {}
             IrStmt::SqlQuery { sql, fn_sites, .. } | IrStmt::SqlExec { sql, fn_sites, .. } => {
-                texts.push(sql.clone());
-                walk_sites(fn_sites, refs, texts);
+                w.texts.push(sql.clone());
+                walk_sites(fn_sites, w);
             }
-            IrStmt::SqlExecDynamic { text_expr, .. } => walk_expr(text_expr, refs),
+            IrStmt::SqlExecDynamic { text_expr, .. } => walk_expr(text_expr, &mut w.refs),
             IrStmt::OpenCursor { source, .. } => match source {
                 CursorSource::Static { sql, fn_sites, .. } => {
-                    texts.push(sql.clone());
-                    walk_sites(fn_sites, refs, texts);
+                    w.texts.push(sql.clone());
+                    walk_sites(fn_sites, w);
                 }
-                CursorSource::Dynamic { query_expr } => walk_expr(query_expr, refs),
+                CursorSource::Dynamic { query_expr } => walk_expr(query_expr, &mut w.refs),
             },
             IrStmt::CallRoutine { name, args, .. } => {
-                refs.insert(name.to_ascii_lowercase());
+                w.refs.insert(name.to_ascii_lowercase());
                 for a in args {
-                    walk_expr(a, refs);
+                    walk_expr(a, &mut w.refs);
                 }
             }
         }
     }
 }
 
-/// SQL 上下文例程调用下沉点：名字进例程引用，元组查询进 SQL 文本。
-fn walk_sites(
-    fn_sites: &[crate::sql::FnSite],
-    refs: &mut BTreeSet<String>,
-    texts: &mut Vec<String>,
-) {
+/// SQL 上下文例程调用下沉点：名字进例程引用，元组查询进 SQL 文本，
+/// 结果表名记入内部对象集合（供链路对象引用剔除）。
+fn walk_sites(fn_sites: &[crate::sql::FnSite], w: &mut Walk) {
     for s in fn_sites {
-        refs.insert(s.name.to_ascii_lowercase());
-        texts.push(s.distinct_sql.clone());
+        w.refs.insert(s.name.to_ascii_lowercase());
+        w.texts.push(s.distinct_sql.clone());
+        w.plan_tables.insert(s.table.to_ascii_lowercase());
     }
 }
 
@@ -121,7 +146,7 @@ fn walk_expr(expr: &IrExpr, refs: &mut BTreeSet<String>) {
 }
 
 /// SQL 文本里的链路对象引用（去重排序）。
-pub fn sql_object_refs(sql: &str) -> BTreeSet<ObjectRef> {
+fn sql_object_refs(sql: &str) -> BTreeSet<ObjectRef> {
     let toks = tokens(&sql.to_ascii_lowercase());
     let mut out = BTreeSet::new();
     let mut owners: Vec<String> = Vec::new();
@@ -388,7 +413,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            sql_texts(&prog),
+            walk(&prog).texts,
             vec![
                 "DELETE FROM T_A",
                 "SELECT k FROM T_C",
@@ -427,7 +452,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            sql_texts(&prog),
+            walk(&prog).texts,
             vec!["SELECT 1 FROM T_BODY", "DELETE FROM T_HANDLER"],
             "按文档序各计一次：处理器体不得漏采，也不得重复"
         );
@@ -439,6 +464,34 @@ mod tests {
         assert_eq!(
             names("INSERT INTO T_LOG (A, B) VALUES ($v_a, $v_b)"),
             vec!["Relation:t_log"]
+        );
+    }
+
+    #[test]
+    fn should_exclude_lowering_plan_tables_from_object_refs() {
+        // SQL 上下文例程调用下沉后，语句里会出现引擎内部结果表（`FnSite::table`）：
+        // 它由运行期临时建立，不属项目链路，核验不得报它"缺 DDL"
+        let prog = IrProg {
+            code: vec![IrStmt::SqlExec {
+                sql: "UPDATE T_A t SET t.c = (SELECT sd_v FROM sd_fn0 WHERE sd_a0 IS NOT DISTINCT FROM (t.k))".into(),
+                binds: vec![],
+                fn_sites: vec![FnSite {
+                    table: "sd_fn0".into(),
+                    name: "pkg_d.fn_e".into(),
+                    args: vec![],
+                    distinct_sql: "SELECT DISTINCT k FROM T_B".into(),
+                    binds: vec![],
+                }],
+            }],
+        };
+        let got: Vec<String> = chain_object_refs(&prog)
+            .into_iter()
+            .map(|r| format!("{:?}:{}", r.kind, r.name))
+            .collect();
+        assert_eq!(
+            got,
+            vec!["Relation:t_a", "Relation:t_b"],
+            "链路表与下沉元组查询的源表计入，结果表本身不计入"
         );
     }
 

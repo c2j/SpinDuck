@@ -7,6 +7,43 @@ use ogsql_parser::ast::plpgsql::PlStatement;
 use ogsql_parser::ast::Expr;
 
 impl Compiler {
+    /// `body … EXCEPTION WHEN …` 段的编译（唯一实现点）：
+    /// PushTrap → body → PopTrap → Jump(resume) → handlers（每臂末 Jump(resume)）→ resume。
+    /// 块级（`BEGIN..EXCEPTION`）与例程级（过程体尾部 EXCEPTION 段）共用。
+    pub(crate) fn trap_section(
+        &mut self,
+        body: &[PlStatement],
+        exc: &ogsql_parser::ast::plpgsql::PlExceptionBlock,
+    ) -> Result<(), EngineError> {
+        let resume = self.synth_label("trap_resume");
+        self.code.push(IrStmt::PushTrap {
+            entries: Vec::new(),
+        }); // 占位，回填
+        let trap_at = self.here() - 1;
+        self.stmts(body)?;
+        self.code.push(IrStmt::PopTrap);
+        self.jump(&resume, None, true);
+        let mut entries = Vec::new();
+        for h in &exc.handlers {
+            let body_start = self.here();
+            self.stmts(&h.statements)?;
+            let body_end = self.here();
+            self.jump(&resume, None, true);
+            entries.push(TrapEntry {
+                conds: h
+                    .conditions
+                    .iter()
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect(),
+                body_start,
+                body_end,
+            });
+        }
+        self.mark(&resume);
+        self.code[trap_at] = IrStmt::PushTrap { entries };
+        Ok(())
+    }
+
     pub(crate) fn stmt_inner(&mut self, st: &PlStatement) -> Result<(), EngineError> {
         match st {
             // NULL 是空语句（不得产生事务边界）；只有 COMMIT 才是提交标记
@@ -402,12 +439,28 @@ impl Compiler {
                 });
             }
             PlStatement::Raise(ra) => {
-                let msg = ra
-                    .message
-                    .clone()
-                    .map(|m| IrExpr::Const(SpinValue::Str(m)))
-                    .unwrap_or_else(|| IrExpr::Const(SpinValue::Str("EXCEPTION".into())));
-                self.code.push(IrStmt::Raise { message: msg });
+                // 语料两种形态：`RAISE;`（重抛，10 处）与 `RAISE '<msg>'`；
+                // `RAISE <条件名>` / `RAISE_APPLICATION_ERROR` 语料零命中，显式拒绝
+                // 而不是编造常量消息（旧实现把裸 RAISE 变成 "EXCEPTION" 假错误）。
+                let ra = &ra.node;
+                match (&ra.message, &ra.condname, &ra.sqlstate) {
+                    (Some(m), None, None) => self.code.push(IrStmt::Raise {
+                        message: Some(IrExpr::Const(SpinValue::Str(m.clone()))),
+                    }),
+                    (None, None, None) => self.code.push(IrStmt::Raise { message: None }),
+                    (_, Some(name), _) => {
+                        return Err(EngineError::business(
+                            202,
+                            format!("RAISE {name} (named condition) is not supported in v1"),
+                        ))
+                    }
+                    (_, _, Some(state)) => {
+                        return Err(EngineError::business(
+                            202,
+                            format!("RAISE WITH SQLSTATE {state} is not supported in v1"),
+                        ))
+                    }
+                }
             }
             PlStatement::Block(b) => {
                 // `<<label>>` 语句标签（GOTO 目标）：先 mark 再编译块体
@@ -416,38 +469,7 @@ impl Compiler {
                 }
                 match &b.exception_block {
                     None => self.stmts(&b.body)?,
-                    // BEGIN..EXCEPTION：PushTrap → try 体 → PopTrap → Jump(resume)
-                    // → handlers 区（每臂 Jump(resume)）→ resume:
-                    Some(exc) => {
-                        let resume = self.synth_label("trap_resume");
-                        let mut entries = Vec::new();
-                        self.code.push(IrStmt::PushTrap {
-                            entries: Vec::new(),
-                        }); // 占位，回填
-                        let trap_at = self.here() - 1;
-                        self.stmts(&b.body)?;
-                        self.code.push(IrStmt::PopTrap);
-                        self.jump(&resume, None, true);
-                        // handlers 区
-                        for h in &exc.handlers {
-                            let body_start = self.here();
-                            self.stmts(&h.statements)?;
-                            let body_end = self.here();
-                            self.jump(&resume, None, true);
-                            entries.push(TrapEntry {
-                                conds: h
-                                    .conditions
-                                    .iter()
-                                    .map(|c| c.to_ascii_lowercase())
-                                    .collect(),
-                                body_start,
-                                body_end,
-                            });
-                        }
-                        self.mark(&resume);
-                        // 回填 PushTrap.entries
-                        self.code[trap_at] = IrStmt::PushTrap { entries };
-                    }
+                    Some(exc) => self.trap_section(&b.body, exc)?,
                 }
             }
             PlStatement::Execute(sp) => {

@@ -86,6 +86,7 @@ strip_hint_comments = true               # /*FORCE*/ 等 hint 注释剥离
 "UPDATE SET a.b = .." = "剥离 SET 目标限定前缀，保留表别名"     # validation R4
 "(+) 外连接标记"     = "→ LEFT/RIGHT JOIN（ogsql AST 已保留标记）"
 "seq.NEXTVAL"       = "nextval('seq')（DuckDB 原生序列）"
+"a || b"            = "concat(a, b)（A 模式 NULL 视作空串，DuckDB || 传播 NULL）"
 
 # ── 语句模式改写（编译期 AST 级，机器可读开关）────────────────
 # 状态：verified —— openGauss 5.0.0（Oracle A 模式容器）+ DuckDB 1.5.5 双侧
@@ -98,6 +99,28 @@ rownum_first_row = true
 # 状态：verified —— DuckDB 不支持 UPDATE .. SET 限定列名（A 模式语料惯用
 # `UPDATE tbl t SET t.col = …`）；改写为去别名形态（RHS/WHERE 同步去限定）。
 update_strip_alias = true
+# 状态：verified —— `seq.NEXTVAL` → `nextval('seq')`。DuckDB 无「序列.属性」形态，
+# 不改写会把序列名当表名（Binder Error: Referenced table "seq" not found）。
+# 语料 12 处（INSERT 列表 1 处、SELECT … INTO 11 处）；探针
+# spinduck/src/sql/patterns.rs::tests::should_rewrite_sequence_nextval_to_kernel_function
+sequence_nextval = true
+# 状态：verified —— Oracle `(+)` 外连接标记 → ANSI `LEFT JOIN … ON`。DuckDB 在
+# 解析阶段就拒绝 `(+)`（Parser Error），不改写整条语句不可执行。
+# 语料 8 处（PKG_SPLIT_TRADE_STEP2.sql:168/780 等），形态一律「逗号 FROM + 末表带标记」；
+# 前置表折成 CROSS JOIN 作为 LEFT 侧（ON 里跨逗号引用会被内核判为非法表引用）。
+# 已知不覆盖：标记侧非末表、同一语句两侧各有标记（FULL 语义）——保守原样交内核报错。
+# 探针 spinduck/src/sql/patterns.rs::tests::should_convert_oracle_outer_join_marker_to_left_join
+oracle_outer_join = true
+# 状态：verified —— A 模式 `||` 把 NULL 侧当空串（openGauss 5.0.0 基线实测
+# `'A' || NULL` = 'A'、`1 || 2` = '12'、`NULL || NULL` = NULL），DuckDB 的 `||`
+# 传播 NULL（同题实测 'A'）。语料 292 处 `||`，其中日志/错误串（如
+# `'组合申购赎回ETF子过程调用错误:' || p_o_succeed`）拼接的 OUT 参常为 NULL，
+# 不改写会把整串变成 NULL。映射为内核 `concat(…)`：忽略 NULL 参数、数值自动转串
+# （顺带覆盖 [implicit] concat_numeric_to_varchar 登记的数值拼接口径），
+# 全 NULL 得空串——运行态口径 '' ≡ NULL，与基线一致（validation V21）。
+# 实现只做局部文本替换（不回解析整句），无法识别的操作数形态原样交内核。
+# 探针 spinduck/src/sql/rewrite/concat.rs::tests::should_rewrite_concat_of_column_and_literal_to_concat_call
+concat_null_as_empty = true
 
 # ── 隐式类型转换（解释器与改写器共用）────────────────────────────
 [implicit]

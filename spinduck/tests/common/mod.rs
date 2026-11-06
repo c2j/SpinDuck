@@ -13,6 +13,9 @@ use spinduck_core::project::{CaseConfig, CaseKind, ProjectConfig};
 use spinduck_core::rules::RuleRegistry;
 use spinduck_core::sql::DuckExecutor;
 use spinduck_core::value::SpinValue;
+use spinduck_core::verify::{
+    clamp_sequence_bounds, deploy_routines, deploy_schema, drop_cache_option,
+};
 use std::path::{Path, PathBuf};
 
 const MAX_STACK: usize = 256 * 1024 * 1024;
@@ -72,7 +75,11 @@ pub fn norm(v: Option<String>) -> String {
     }
 }
 
-/// Oracle 风格 `/` 分隔符拆块 + 序列 MAXVALUE 越界截断（V6 已知项）。
+/// Oracle 风格 `/` 分隔符拆块：参照侧逐字下发语料文本。
+///
+/// 语料一个字不改；只有序列 DDL 的两处形态在**下发时**裁剪（见 `deploy_native`），
+/// 因为超 BIGINT 的边界与 `CACHE` 选项连 A 模式容器也拒绝——被测侧走
+/// `spinduck_core::verify::deploy_schema` 的同名函数，两侧口径一致。
 pub fn split_chunks(text: &str) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut cur = String::new();
@@ -93,9 +100,6 @@ pub fn split_chunks(text: &str) -> Vec<String> {
         chunks.push(c.to_string());
     }
     chunks
-        .into_iter()
-        .map(|c| c.replace("999999999999999999999999999", "9223372036854775807"))
-        .collect()
 }
 
 /// 场景参数：SQL 字面量形态（`'x'` / `null` / 数字）→ `SpinValue`。
@@ -128,12 +132,19 @@ pub fn run_case(name: &str) {
     h.join().expect("golden case panicked");
 }
 
+/// 项目内全部用例逐一比对（`*.case.toml` 按 `[cases].include` 顺序）。
+///
+/// 每个用例独立成轮：参照侧 schema 整体重建、被测侧引擎全新构建——一个项目声明
+/// 多条 `[[entry]]`（考题式接入）时，用例之间的写副作用互不影响。
+/// 无用例定义视为失败：黄金层不得静默返回。
 fn run_case_inner(name: &str) {
     let dir = golden_root().join(name);
     let project = ProjectConfig::load(&dir).unwrap_or_else(|e| err("加载 spinduck.toml", e));
     let case_files = project.case_files().unwrap_or_else(|e| err("枚举 case", e));
-    assert_eq!(case_files.len(), 1, "{name}: 期望恰好一个 *.case.toml");
-    let case = CaseConfig::load(&case_files[0]).unwrap_or_else(|e| err("加载 case.toml", e));
+    assert!(
+        !case_files.is_empty(),
+        "[{name}] 无 *.case.toml：黄金层没有可执行用例（跳过不等于通过）"
+    );
     let Some(mut og) = og() else {
         // §4.1：黄金层禁止"跳过即绿"——缺容器必须让测试显式变红，
         // 否则 V13–V15 结论可被无容器环境静默"复验"
@@ -143,36 +154,64 @@ fn run_case_inner(name: &str) {
              SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 SPINDUCK_OG_PASSWORD=… cargo test --features gauss"
         );
     };
+    for f in &case_files {
+        let case = CaseConfig::load(f).unwrap_or_else(|e| err("加载 case.toml", e));
+        run_one(&project, &case, name, &mut og);
+    }
+}
 
-    // ── 参照侧：A 模式容器整体重建 → 部署 → 种子 → 执行 ──
+/// 一个用例的一轮：参照侧（重建→部署→种子→执行）= 被测侧（构建→物化→执行）= 基线。
+fn run_one(project: &ProjectConfig, case: &CaseConfig, name: &str, og: &mut GaussConn) {
+    reset_reference(project, case, og);
+    let native = run_native(og, case);
+    let mut eng = build_engine(project).unwrap_or_else(|e| err("被测侧构建", e));
+    materialize_inputs(og, &mut eng, case).unwrap_or_else(|e| err("物化输入表", e));
+    let spin = run_spin(&mut eng, case);
+    // 输出表行数一致性（防"输出表未物化"导致的漏比）
+    check_row_counts(name, case, og, &mut eng);
+    let baseline = load_baseline(project, case);
+    for (i, sc) in case.scenarios.iter().enumerate() {
+        let why = if sc.why.is_empty() {
+            format!("场景 {}", i + 1)
+        } else {
+            sc.why.clone()
+        };
+        assert_eq!(
+            spin[i],
+            native[i],
+            "[{name}] {why}: SpinDuck 与 A 模式基线不一致\n  SpinDuck: {}\n  参照侧  : {}",
+            spin[i].describe(),
+            native[i].describe()
+        );
+        assert_eq!(
+            spin[i], baseline[i],
+            "[{name}] {why}: 与提交基线 expected.json 不一致（行为变化需单独评审）"
+        );
+        if let Some(extra) = &case.extra_sql {
+            compare_extra(name, &why, extra, og, &mut eng);
+            println!("OK [{name}] {why} [extra]");
+        }
+        println!("OK [{name}] {why}: {}", spin[i].describe());
+    }
+}
+
+/// 参照侧一轮的起点：A 模式容器整体重建 → 语料部署 → 数据集种子。
+fn reset_reference(project: &ProjectConfig, case: &CaseConfig, og: &mut GaussConn) {
     og.exec_script("DROP SCHEMA IF EXISTS gaussdb CASCADE;")
         .unwrap();
     og.exec_script("CREATE SCHEMA gaussdb;").unwrap();
-    deploy_native(&mut og, &project, &case).unwrap_or_else(|e| err("参照侧部署", e.message));
-    let dataset = project
-        .datasets_dir
-        .read_dir()
-        .map(|rd| {
-            let mut v: Vec<PathBuf> = rd
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("sql"))
-                .collect();
-            v.sort();
-            v
-        })
-        .unwrap_or_default();
-    for f in dataset {
+    deploy_native(og, project, case).unwrap_or_else(|e| err("参照侧部署", e.message));
+    for f in project
+        .dataset_files()
+        .unwrap_or_else(|e| err("枚举数据集", e))
+    {
         og.exec_script(&std::fs::read_to_string(&f).unwrap())
             .unwrap_or_else(|e| err(&format!("种子 {}", f.display()), e));
     }
-    let native = run_native(&mut og, &case);
+}
 
-    // ── 被测侧：DuckDB 表（不含视图）+ 占位视图 → 例程/桩注册 → 物化 → 执行 ──
-    let mut eng = build_engine(&project).unwrap_or_else(|e| err("被测侧构建", e));
-    materialize_inputs(&mut og, &mut eng, &case).unwrap_or_else(|e| err("物化输入表", e));
-    let spin = run_spin(&mut eng, &case);
-
-    // ── 输出表行数一致性（防"输出表未物化"导致的漏比）──
+/// 输出表行数：被测侧必须与参照侧同数量（两侧各自写入，不经物化）。
+fn check_row_counts(name: &str, case: &CaseConfig, og: &mut GaussConn, eng: &mut Engine) {
     for t in &case.outputs {
         let base_n = og
             .fetch_rows(&format!("SELECT count(*) FROM {t}"))
@@ -193,51 +232,30 @@ fn run_case_inner(name: &str) {
             "[{name}] 输出表 {t} 行数不一致"
         );
     }
+}
 
-    // ── 三方比对：参照 = 被测 = 基线 ──
-    let baseline = load_baseline(&project, &case);
-    for (i, sc) in case.scenarios.iter().enumerate() {
-        let why = if sc.why.is_empty() {
-            format!("场景 {}", i + 1)
-        } else {
-            sc.why.clone()
-        };
-        assert_eq!(
-            spin[i],
-            native[i],
-            "[{name}] {why}: SpinDuck 与 A 模式基线不一致\n  SpinDuck: {}\n  参照侧  : {}",
-            spin[i].describe(),
-            native[i].describe()
-        );
-        assert_eq!(
-            spin[i], baseline[i],
-            "[{name}] {why}: 与提交基线 expected.json 不一致（行为变化需单独评审）"
-        );
-        if let Some(extra) = &case.extra_sql {
-            let (_, b_rows) = og
-                .fetch_rows(extra)
-                .unwrap_or_else(|e| err("参照侧附加输出读取", e.message));
-            let base_extra: Vec<Vec<String>> = b_rows
-                .iter()
-                .map(|r| r.iter().map(|c| norm(c.clone())).collect())
-                .collect();
-            let mut rs = eng
-                .ex
-                .query(extra, &BindMap::new())
-                .unwrap_or_else(|e| err("被测侧附加输出读取", e.message));
-            let got_extra: Vec<Vec<String>> = rs
-                .fetch_many(1000)
-                .iter()
-                .map(|r| r.iter().map(|v| norm(Some(v.as_str_loose()))).collect())
-                .collect();
-            assert_eq!(
-                got_extra, base_extra,
-                "[{name}] {why}: 附加输出（`{extra}`）不一致"
-            );
-            println!("OK [{name}] {why} [extra]: rows={}", got_extra.len());
-        }
-        println!("OK [{name}] {why}: {}", spin[i].describe());
-    }
+/// 附加输出（`[case] extra_sql`）：同一 SELECT 在两侧逐行比对。
+fn compare_extra(name: &str, why: &str, extra: &str, og: &mut GaussConn, eng: &mut Engine) {
+    let (_, b_rows) = og
+        .fetch_rows(extra)
+        .unwrap_or_else(|e| err("参照侧附加输出读取", e.message));
+    let base_extra: Vec<Vec<String>> = b_rows
+        .iter()
+        .map(|r| r.iter().map(|c| norm(c.clone())).collect())
+        .collect();
+    let mut rs = eng
+        .ex
+        .query(extra, &BindMap::new())
+        .unwrap_or_else(|e| err("被测侧附加输出读取", e.message));
+    let got_extra: Vec<Vec<String>> = rs
+        .fetch_many(1000)
+        .iter()
+        .map(|r| r.iter().map(|v| norm(Some(v.as_str_loose()))).collect())
+        .collect();
+    assert_eq!(
+        got_extra, base_extra,
+        "[{name}] {why}: 附加输出（`{extra}`）不一致"
+    );
 }
 
 /// 容器侧部署：表 → 视图 → 桩 → 例程 → 参照侧专用例程。
@@ -255,6 +273,7 @@ fn deploy_native(
     }
     for f in files {
         for chunk in split_chunks(&std::fs::read_to_string(&f).unwrap_or_default()) {
+            let chunk = drop_cache_option(&clamp_sequence_bounds(&chunk));
             og.exec_script(&chunk).map_err(|e| {
                 spinduck_core::error::EngineError::env(
                     30,
@@ -312,123 +331,19 @@ fn fetch_rows_norm(og: &mut GaussConn, case: &CaseConfig) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// 被测侧构建：与 `spinduck verify` 走同一部署实现（引擎侧唯一口径）。
 fn build_engine(project: &ProjectConfig) -> Result<Engine, spinduck_core::error::EngineError> {
     let rules = RuleRegistry::load(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/rewrite-rules.toml"),
     )?;
     let rules = rules.with_project_rules(&project.rules_files)?;
     let dex = DuckExecutor::open_in_memory()?;
-    // 表 DDL（不含视图：视图含内核专属函数，且仅 %TYPE 锚定用途）
+    // 参照侧对象在 gaussdb schema 下；被测侧的语料名不限定，保留 schema 供限定引用
     dex.execute("CREATE SCHEMA IF NOT EXISTS gaussdb", &BindMap::new())?;
-    let ddl_funcs = RuleRegistry::load(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/rewrite-rules.toml"),
-    )?
-    .functions;
-    for f in project.ddl_files()? {
-        let ddl = std::fs::read_to_string(&f).unwrap_or_default();
-        execute_table_ddl(&dex, &ddl, &ddl_funcs).map_err(|e| {
-            spinduck_core::error::EngineError::kernel(
-                70,
-                format!("建表 {}: {}", f.display(), e.message),
-            )
-        })?;
-    }
-    // A 模式系统单行表在 DuckDB 的等价物
-    dex.execute(
-        "CREATE TABLE IF NOT EXISTS sys_dummy AS SELECT 1",
-        &BindMap::new(),
-    )?;
-    // 视图：仅占位（%TYPE 声明不参与求值）
-    for f in project.view_files()? {
-        let name = view_name(&f);
-        dex.execute(&format!("CREATE VIEW {name} AS SELECT 1"), &BindMap::new())
-            .map_err(|e| {
-                spinduck_core::error::EngineError::kernel(
-                    71,
-                    format!("占位视图 {name}: {}", e.message),
-                )
-            })?;
-    }
     let mut eng = Engine::new(Box::new(dex), rules);
-    let mut sources: Vec<PathBuf> = project.stub_files()?;
-    sources.extend(project.routine_files()?);
-    for f in sources {
-        let text = std::fs::read_to_string(&f).unwrap_or_default();
-        eng.register(&text).map_err(|e| {
-            spinduck_core::error::EngineError::env(
-                30,
-                format!("注册 {}: {}", f.display(), e.message),
-            )
-        })?;
-    }
+    deploy_schema(&mut eng, project)?;
+    deploy_routines(&mut eng, project)?;
     Ok(eng)
-}
-
-/// 表 DDL 落 DuckDB：先剔除"非字面量 DEFAULT"（如 A 模式 `to_char(sysdate(), …)`，
-/// DuckDB 无对应函数；本侧数据由物化提供，缺省值仅影响被测侧自有 INSERT），
-/// 再走改写管线（nvl/to_char 等在其它位置仍可翻译）。
-fn execute_table_ddl(
-    dex: &DuckExecutor,
-    ddl: &str,
-    funcs: &std::collections::BTreeMap<String, String>,
-) -> Result<(), spinduck_core::error::EngineError> {
-    let mut pre = String::with_capacity(ddl.len());
-    for line in ddl.lines() {
-        let up = line.to_ascii_uppercase();
-        if up.contains("DEFAULT") && line.contains('(') {
-            if let Some(pos) = up.find(" DEFAULT") {
-                pre.push_str(line[..pos].trim_end());
-                pre.push_str(",\n");
-                continue;
-            }
-        }
-        pre.push_str(line);
-        pre.push('\n');
-    }
-    let unit = spinduck_core::sql::rewrite_tokens_with_rules(&pre, &Default::default(), funcs)?;
-    let transformed = spinduck_core::sql::apply_ast_transforms(&unit.text)?;
-    dex.execute(&transformed, &BindMap::new()).map(|_| ())
-}
-
-/// 用表 DDL 同一改写管线建立真实视图（跳过前置 `drop view`）。
-fn create_view(dex: &DuckExecutor, f: &Path) -> Result<(), spinduck_core::error::EngineError> {
-    let raw = std::fs::read_to_string(f).unwrap_or_default();
-    let up = raw.to_ascii_uppercase();
-    let Some(idx) = up.find("CREATE OR REPLACE") else {
-        return Err(spinduck_core::error::EngineError::kernel(
-            71,
-            "缺少 CREATE VIEW",
-        ));
-    };
-    let stmt = raw[idx..].trim().trim_end_matches(';');
-    let funcs = RuleRegistry::load(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/rewrite-rules.toml"),
-    )?
-    .functions;
-    let unit = spinduck_core::sql::rewrite_tokens_with_rules(stmt, &Default::default(), &funcs)?;
-    let sql = spinduck_core::sql::apply_ast_transforms(&unit.text)?;
-    dex.execute(&sql, &BindMap::new())?;
-    Ok(())
-}
-
-/// 视图名（`... VIEW <name> ...` 首个标识符）。
-fn view_name(f: &Path) -> String {
-    let text = std::fs::read_to_string(f).unwrap_or_default();
-    let up = text.to_ascii_uppercase();
-    let mut from = 0usize;
-    while let Some(i) = up[from..].find("VIEW ") {
-        let at = from + i + 5;
-        let word = text[at..]
-            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-            .find(|s| !s.is_empty())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if !matches!(word.as_str(), "if" | "exists" | "as" | "or" | "replace") {
-            return word;
-        }
-        from = at;
-    }
-    "v_placeholder".to_string()
 }
 
 /// 物化输入表：清单来自 `case.toml [case.data].materialize`（输出表不物化）。

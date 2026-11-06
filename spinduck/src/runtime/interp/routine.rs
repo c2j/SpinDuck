@@ -24,27 +24,21 @@ pub(super) fn call(
         .lookup(name)
         .ok_or_else(|| EngineError::business(150, format!("routine {name} not registered")))?
         .clone();
-    if args.len() != routine.params.len() {
-        return Err(EngineError::business(
-            151,
-            format!(
-                "{} expects {} args, got {}",
-                name,
-                routine.params.len(),
-                args.len()
-            ),
-        ));
-    }
+    crate::catalog::check_arity(name, &routine.params, args.len())?;
     let mut callee = Frame::new();
-    for (p, ir_a) in routine.params.iter().zip(args) {
-        let v = {
-            let env_ = EvalEnv {
-                frame: env.frame,
-                ex: env.ex,
-                cat: env.cat,
-                depth: env.depth,
-            };
-            crate::runtime::eval::eval(ir_a, &env_)?
+    for (i, p) in routine.params.iter().enumerate() {
+        let v = match args.get(i) {
+            Some(ir_a) => {
+                let env_ = EvalEnv {
+                    frame: env.frame,
+                    ex: env.ex,
+                    cat: env.cat,
+                    depth: env.depth,
+                };
+                crate::runtime::eval::eval(ir_a, &env_)?
+            }
+            // 省略的尾部实参取声明默认值（BIZ-0151 已在元数校验里排除其余形态）
+            None => p.default.clone().unwrap_or(SpinValue::Null),
         };
         callee.set(&VarName(p.name.to_ascii_lowercase()), v);
     }
@@ -85,20 +79,14 @@ pub(super) fn call_routine_value(
         .lookup(name)
         .ok_or_else(|| EngineError::business(150, format!("routine {name} not registered")))?
         .clone();
-    if args.len() != routine.params.len() {
-        return Err(EngineError::business(
-            151,
-            format!(
-                "{} expects {} args, got {}",
-                name,
-                routine.params.len(),
-                args.len()
-            ),
-        ));
-    }
+    crate::catalog::check_arity(name, &routine.params, args.len())?;
     let mut callee = Frame::new();
-    for (p, v) in routine.params.iter().zip(args) {
-        callee.set(&VarName(p.name.to_ascii_lowercase()), v.clone());
+    for (i, p) in routine.params.iter().enumerate() {
+        let v = match args.get(i) {
+            Some(v) => v.clone(),
+            None => p.default.clone().unwrap_or(SpinValue::Null),
+        };
+        callee.set(&VarName(p.name.to_ascii_lowercase()), v);
     }
     let mut noop = crate::exec::TraceNoopSink;
     let out = run_with_catalog(&routine.prog, &mut callee, ex, &mut noop, cat, depth + 1)?;

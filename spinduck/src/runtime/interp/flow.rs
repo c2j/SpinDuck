@@ -7,6 +7,20 @@ use crate::runtime::eval::{eval, eval_cond, EvalEnv};
 use crate::runtime::interp::{assign, Env, RunOutcome};
 use crate::value::SpinValue;
 
+/// 处理器进入前的会话复位：内核语句失败会作废整个显式事务（DuckDB 无 SAVEPOINT），
+/// 不复位则处理器体内的 SQL 全部连锁报 "Current transaction is aborted"。
+/// 与 Oracle 语句级回滚的已知差异：上次 COMMIT 之后的本段 DML 一并撤销。
+pub(super) fn reset_session(env: &mut Env<'_>) -> Result<(), EngineError> {
+    if let Err(e) = env.ex.execute("ROLLBACK", &BindMap::new()) {
+        // 无活动事务（不经 engine::call 直接 run）时的回滚失败可忽略
+        if !e.message.contains("no transaction is active") {
+            return Err(e);
+        }
+    }
+    env.ex.execute("BEGIN TRANSACTION", &BindMap::new())?;
+    Ok(())
+}
+
 /// COMMIT / ROLLBACK：即时作用于当前事务并重开（最外层统一边界见 `engine::call`）；
 /// 不再是空操作——异常处理器中的 ROLLBACK 由此具备撤销已执行 DML 的语义。
 pub(super) fn tx(env: &mut Env<'_>, commit: bool) -> Result<(), EngineError> {
@@ -38,9 +52,19 @@ pub(super) fn cond(env: &Env<'_>, expr: &IrExpr) -> Result<Option<bool>, EngineE
 }
 
 /// `RAISE <message>`：构造业务错误（BIZ-0200）交回主循环的 trap 展开。
-pub(super) fn raise(env: &Env<'_>, message: &IrExpr) -> Result<EngineError, EngineError> {
-    let v = eval_expr(env, message)?;
-    Ok(EngineError::business(200, v.as_str_loose()))
+pub(super) fn raise(env: &Env<'_>, message: &Option<IrExpr>) -> Result<EngineError, EngineError> {
+    match message {
+        Some(m) => Ok(EngineError::business(
+            200,
+            eval_expr(env, m)?.as_str_loose(),
+        )),
+        // 裸 RAISE;：原样重抛处理器当前正在处理的错误（错误码/故障域/消息全保留）。
+        // 处理器外没有当前错误可抛 → 显式报错，与 Oracle ORA-00438 同口径。
+        None => env
+            .current_error
+            .clone()
+            .ok_or_else(|| EngineError::business(201, "RAISE statement with no active exception")),
+    }
 }
 
 /// `RETURN [<expr>]`。

@@ -17,6 +17,8 @@ pub struct CaseConfig {
     pub entry: Option<String>,
     /// 场景列表（执行参数 + 用途说明）
     pub scenarios: Vec<Scenario>,
+    /// 显式断言集（`[[case.assert]]`，可空）：行集/返回值/OUT 参/错误契约
+    pub asserts: Vec<CaseAssert>,
     /// `procedure` 形态的输出读取 SQL（两侧共用，必须自含 ORDER BY）
     pub output_sql: Option<String>,
     /// 附加输出读取 SQL（两侧逐行比对，不参与基线漂移检查）
@@ -48,6 +50,38 @@ pub enum CaseKind {
 pub struct Scenario {
     pub why: String,
     pub args: Vec<String>,
+}
+
+/// 用例断言的一条（`[[case.assert]]`）：一个粒度、一个可观察面。
+///
+/// 与 `[case.scenarios]` 的分工：场景只证明"可调用"，断言锁定"可观察结果"——
+/// 行集、返回值、OUT 参、错误契约四个维度，全部在进程内内核上执行（零外部环境）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaseAssert {
+    pub why: String,
+    pub kind: AssertKind,
+    /// `Rows`：断言 SQL（自带 ORDER BY 定序）；其余：被测例程全名
+    pub target: String,
+    /// 例程断言的实参（SQL 字面量形态，同 `[case.scenarios].args`）
+    pub args: Vec<String>,
+    /// `Out` 形态的 OUT 参名（归一小写；其余形态忽略）
+    pub param: String,
+    /// 期望文本。`Rows`：归一行集 `"[a, b] [c, d]"`；`Call`/`Out`：归一标量；
+    /// `Error`：`"CODE|消息片段"`（`|` 后片段可省略 = 只比错误码）
+    pub want: String,
+}
+
+/// 断言维度（决定 `target` 的解释方式与期望文本口径）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertKind {
+    /// 内核查表行集（`target` 为 SQL）
+    Rows,
+    /// 例程返回值
+    Call,
+    /// 例程 OUT / INOUT 参
+    Out,
+    /// 例程必须失败，且错误码（可选消息片段）一致
+    Error,
 }
 
 impl CaseConfig {
@@ -111,21 +145,19 @@ impl CaseConfig {
                 .and_then(|x| x.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let args = match s.get("args") {
-                Some(toml::Value::Array(a)) => a
-                    .iter()
-                    .map(|x| match x {
-                        toml::Value::String(v) => v.clone(),
-                        toml::Value::Integer(i) => i.to_string(),
-                        toml::Value::Float(f) => f.to_string(),
-                        toml::Value::Boolean(b) => b.to_string(),
-                        _ => String::new(),
-                    })
-                    .collect(),
-                None => Vec::new(),
-                Some(_) => return Err(EngineError::env(31, "case.toml: scenario.args 必须是数组")),
-            };
+            let args = arg_list(s.get("args"), "scenario.args")?;
             scenarios.push(Scenario { why, args });
+        }
+        let asserts_raw = case.get("assert").and_then(|x| x.as_array());
+        let mut asserts = Vec::new();
+        for (i, a) in asserts_raw
+            .as_ref()
+            .map(|v| v.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+        {
+            asserts.push(parse_assert(a, i + 1)?);
         }
         let output = case
             .get("output")
@@ -148,6 +180,7 @@ impl CaseConfig {
             routine,
             entry,
             scenarios,
+            asserts,
             output_sql,
             extra_sql,
             expect_succeed: case
@@ -171,4 +204,86 @@ impl CaseConfig {
             outputs: str_list(case.get("data").and_then(|d| d.get("outputs"))),
         })
     }
+}
+
+/// SQL 字面量实参列表：保持声明原文（`'20240105'`、`null`、数字）供调用侧解释。
+fn arg_list(v: Option<&toml::Value>, what: &str) -> Result<Vec<String>, EngineError> {
+    match v {
+        None => Ok(Vec::new()),
+        Some(toml::Value::Array(a)) => Ok(a.iter().map(literal_text).collect()),
+        Some(_) => Err(EngineError::env(
+            31,
+            format!("case.toml: {what} 必须是数组"),
+        )),
+    }
+}
+
+/// 标量 TOML 值 → 实参文本（数组/表形态按空串处理，调用侧会显式拒绝）。
+fn literal_text(x: &toml::Value) -> String {
+    match x {
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        toml::Value::Boolean(b) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// `[[case.assert]]` 的缺项/非法值统一报 ENV-0031，消息带条目序号（定位到具体断言块）。
+fn assert_field_err(idx: usize, msg: impl Into<String>) -> EngineError {
+    EngineError::env(
+        31,
+        format!("case.toml: [[case.assert]]#{idx} {}", msg.into()),
+    )
+}
+
+/// 一条 `[[case.assert]]`：`kind`/`target`/`want` 必填，`out` 另需 `param`。
+///
+/// 缺项一律显式报错——空 `want` 等于永真断言（AGENTS §2 Never），不接受静默通过。
+fn parse_assert(v: &toml::Value, idx: usize) -> Result<CaseAssert, EngineError> {
+    let field = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let kind_txt = field("kind");
+    let kind = match kind_txt.as_str() {
+        "rows" => AssertKind::Rows,
+        "call" => AssertKind::Call,
+        "out" => AssertKind::Out,
+        "error" => AssertKind::Error,
+        other => {
+            return Err(assert_field_err(
+                idx,
+                format!("的 kind 不支持 '{other}'（rows|call|out|error）"),
+            ))
+        }
+    };
+    let target = field("target");
+    if target.is_empty() {
+        return Err(assert_field_err(
+            idx,
+            "的 target 必填（rows 为断言 SQL，其余为被测例程全名）",
+        ));
+    }
+    let want = field("want");
+    if want.is_empty() {
+        return Err(assert_field_err(idx, "的 want 必填（空期望即永真断言）"));
+    }
+    let param = field("param").to_ascii_lowercase();
+    if kind == AssertKind::Out && param.is_empty() {
+        return Err(assert_field_err(
+            idx,
+            "的 param 必填（kind=out 需 OUT 参名）",
+        ));
+    }
+    Ok(CaseAssert {
+        why: field("why"),
+        kind,
+        target,
+        args: arg_list(v.get("args"), &format!("[[case.assert]]#{idx} 的 args"))?,
+        param,
+        want,
+    })
 }

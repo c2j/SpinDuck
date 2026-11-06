@@ -170,12 +170,7 @@ impl Engine {
                         let params = p
                             .parameters
                             .iter()
-                            .map(|pp| {
-                                Ok(crate::catalog::RoutineParam {
-                                    name: pp.name.clone(),
-                                    mode: crate::catalog::map_mode_pub(&pp.mode)?,
-                                })
-                            })
+                            .map(crate::catalog::map_param)
                             .collect::<Result<Vec<_>, EngineError>>()?;
                         names.push(full.clone());
                         self.catalog.register(crate::catalog::CompiledRoutine {
@@ -210,12 +205,7 @@ impl Engine {
                         let params = f
                             .parameters
                             .iter()
-                            .map(|pp| {
-                                Ok(crate::catalog::RoutineParam {
-                                    name: pp.name.clone(),
-                                    mode: crate::catalog::map_mode_pub(&pp.mode)?,
-                                })
-                            })
+                            .map(crate::catalog::map_param)
                             .collect::<Result<Vec<_>, EngineError>>()?;
                         names.push(full.clone());
                         self.catalog.register(crate::catalog::CompiledRoutine {
@@ -320,20 +310,14 @@ impl Engine {
             .lookup(name)
             .ok_or_else(|| EngineError::business(150, format!("routine {name} not registered")))?
             .clone();
-        if args.len() != routine.params.len() {
-            return Err(EngineError::business(
-                151,
-                format!(
-                    "routine {} expects {} args, got {}",
-                    name,
-                    routine.params.len(),
-                    args.len()
-                ),
-            ));
-        }
+        crate::catalog::check_arity(name, &routine.params, args.len())?;
         let mut frame = Frame::new();
-        for (p, v) in routine.params.iter().zip(args) {
-            frame.set(&VarName(p.name.to_ascii_lowercase()), v.clone());
+        for (i, p) in routine.params.iter().enumerate() {
+            let v = match args.get(i) {
+                Some(v) => v.clone(),
+                None => p.default.clone().unwrap_or(SpinValue::Null),
+            };
+            frame.set(&VarName(p.name.to_ascii_lowercase()), v);
         }
         let mut sink = crate::exec::TraceNoopSink;
         // 统一事务边界（§3.5）：最外层调用在显式事务内执行——过程内
@@ -486,6 +470,39 @@ mod kernel_tests {
         let rows = s.fetch_many(10);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], SpinValue::Int(42));
+    }
+
+    #[test]
+    fn should_run_handler_after_kernel_error_in_same_session() {
+        // 回归守护（语料 156 处 WHEN OTHERS 记日志形态）：过程被包在最外层显式
+        // 事务内，语句在内核侧失败会使整个事务作废；处理器体若不先复位会话，
+        // 其中的 INSERT/SELECT 全部连锁报 "Current transaction is aborted"。
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+        eng.ex
+            .execute("CREATE TABLE t_log(m VARCHAR)", &BindMap::new())
+            .unwrap();
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE p_log(o OUT VARCHAR2) IS \
+             v DECIMAL(18,2); \
+             BEGIN \
+               v := TO_NUMBER('abc'); \
+               o := 'no'; \
+             EXCEPTION WHEN OTHERS THEN \
+               INSERT INTO t_log VALUES ('logged'); \
+               o := 'caught'; \
+             END;",
+        )
+        .unwrap();
+        let r = eng
+            .call("p_log", &[SpinValue::Null])
+            .unwrap_or_else(|e| panic!("调用失败: {}", e.message));
+        assert_eq!(r.outs["o"].as_str_loose(), "caught");
+        let mut s = eng
+            .ex
+            .query("SELECT COUNT(*) FROM t_log", &BindMap::new())
+            .unwrap();
+        assert_eq!(s.fetch_many(1)[0][0].as_str_loose(), "1");
     }
 
     #[test]

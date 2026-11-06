@@ -253,3 +253,83 @@ fn should_treat_decimal_literals_as_numbers_not_strings() {
         "1000000 * 0.0008 = 800.0000"
     );
 }
+
+#[test]
+fn should_pad_omitted_trailing_params_with_declared_defaults() {
+    // 语料 22 处形参 `DEFAULT <字面量>`（VARCHAR2 DEFAULT NULL / '0' 等）：
+    // 调用方省略尾部实参时按声明默认值补齐，显式传参仍覆盖默认值。
+    let mut eng = engine();
+    eng.register(
+        "CREATE OR REPLACE FUNCTION f_def(p IN NUMBER DEFAULT 7) RETURN NUMBER IS \
+         BEGIN RETURN p * 2; END;",
+    )
+    .unwrap();
+    assert_eq!(
+        eng.call("f_def", &[]).unwrap().return_value,
+        Some(SpinValue::Int(14)),
+        "省略实参取声明默认值"
+    );
+    assert_eq!(
+        eng.call("f_def", &[SpinValue::Int(3)])
+            .unwrap()
+            .return_value,
+        Some(SpinValue::Int(6)),
+        "显式传参覆盖默认值"
+    );
+}
+
+#[test]
+fn should_pad_string_and_null_form_parameter_defaults() {
+    // 语料默认值实测形态只有 NULL / 数值 / 引号串（VARCHAR2 DEFAULT '0' 等）
+    let mut eng = engine();
+    eng.register(
+        "CREATE OR REPLACE FUNCTION f_vcb(p IN VARCHAR2 DEFAULT '0', q IN VARCHAR2 DEFAULT NULL) \
+         RETURN VARCHAR2 IS BEGIN RETURN p || '/' || q; END;",
+    )
+    .unwrap();
+    assert_eq!(
+        eng.call("f_vcb", &[]).unwrap().return_value,
+        Some(SpinValue::Str("0/".into())),
+        "省略位取声明默认值；NULL 侧按 A 模式视作空串"
+    );
+    assert_eq!(
+        eng.call("f_vcb", &[SpinValue::Str("9".into())])
+            .unwrap()
+            .return_value,
+        Some(SpinValue::Str("9/".into()))
+    );
+}
+
+#[test]
+fn should_reject_omitted_argument_without_default() {
+    let mut eng = engine();
+    eng.register(
+        "CREATE OR REPLACE FUNCTION f_two(a IN NUMBER, b IN NUMBER) RETURN NUMBER IS \
+         BEGIN RETURN a + b; END;",
+    )
+    .unwrap();
+    let e = eng.call("f_two", &[SpinValue::Int(1)]).unwrap_err();
+    assert_eq!(e.code.to_string(), "BIZ-0151");
+    assert!(
+        e.message.contains("b"),
+        "消息点名缺位的必传形参: {}",
+        e.message
+    );
+}
+
+#[test]
+fn should_reject_non_literal_form_parameter_default_at_register() {
+    let mut eng = engine();
+    let e = eng
+        .register(
+            "CREATE OR REPLACE FUNCTION f_bad(p IN NUMBER DEFAULT 1 + 1) RETURN NUMBER IS \
+             BEGIN RETURN p; END;",
+        )
+        .unwrap_err();
+    assert_eq!(e.code.to_string(), "BIZ-0203");
+    assert!(
+        e.message.contains("非字面量默认值"),
+        "非字面量 DEFAULT 显式拒绝: {}",
+        e.message
+    );
+}

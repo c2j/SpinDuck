@@ -68,9 +68,10 @@ pub(super) fn materialize_fn_sites(
             ));
         }
         let arity = site.args.len();
-        let mut cols = vec!["v VARCHAR".to_string()];
+        // 列名用 sd_ 保留前缀（与 plan::cache_subquery 同口径，避开 PL 变量命名空间）
+        let mut cols = vec!["sd_v VARCHAR".to_string()];
         for j in 0..arity {
-            cols.push(format!("a{j} VARCHAR"));
+            cols.push(format!("sd_a{j} VARCHAR"));
         }
         ex.execute(
             &format!(

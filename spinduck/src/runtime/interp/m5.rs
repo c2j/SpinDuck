@@ -1,8 +1,8 @@
 // 解释器测试模块（自 interp.rs 拆分，行为不变，AGENTS §3）。
 use super::*;
 use crate::exec::FakeExecutor;
-use crate::ir::compile_stmts;
 use crate::ir::VarName;
+use crate::ir::{compile_block, compile_stmts};
 
 use crate::runtime::{Frame, RunOutcome};
 
@@ -125,6 +125,92 @@ fn should_propagate_unmatched_error_to_outer_others() {
     );
 }
 
+fn bare_raise() -> PlStatement {
+    use ogsql_parser::ast::plpgsql::PlRaiseStmt;
+    use ogsql_parser::ast::Spanned;
+    PlStatement::Raise(Spanned::new(
+        PlRaiseStmt {
+            level: None,
+            message: None,
+            params: vec![],
+            options: vec![],
+            condname: None,
+            sqlstate: None,
+        },
+        None,
+    ))
+}
+
+#[test]
+fn should_re_raise_current_error_when_handler_ends_with_bare_raise() {
+    // 语料主流错误行形态（10 处）：EXCEPTION WHEN OTHERS THEN pack_log.log(…); RAISE;
+    // 裸 RAISE 必须重抛**当前**错误——错误码与故障域与未被捕获时完全一致，
+    // 不得虚构消息（旧实现把 RAISE; 编成常量 "EXCEPTION"，上层链路判据全失）。
+    let ex = FakeExecutor::default(); // 0 行 → NO_DATA_FOUND
+    let pre = assign(var("p_i_date"), lit_str("20240105"));
+    // 对照组：同一 body 无处理器 → 原始错误
+    let (_, base) = run_pl_with(vec![pre.clone(), select_into("v_inner", "p_i_date")], &ex);
+    let base_err = base.unwrap_err();
+
+    let inner = exc_block(
+        vec![select_into("v_inner", "p_i_date")],
+        vec![(
+            vec!["others"],
+            vec![assign(var("v_logged"), lit_str("logged")), bare_raise()],
+        )],
+    );
+    let (f, out) = run_pl_with(vec![pre, inner], &ex);
+    // 处理器体已执行（日志已写），随后原样上抛
+    assert_eq!(
+        f.get(&VarName("v_logged".into())),
+        Some(&SpinValue::Str("logged".into()))
+    );
+    let e = out.unwrap_err();
+    assert_eq!(e.code, base_err.code, "重抛必须保留错误码");
+    assert_eq!(e.domain, base_err.domain, "重抛必须保留故障域");
+    assert_eq!(e.message, base_err.message, "重抛必须保留原始消息");
+}
+
+#[test]
+fn should_report_no_active_exception_for_bare_raise_outside_handler() {
+    // 处理器外的裸 RAISE 无当前错误可抛：显式报错，不得静默成功
+    let ex = FakeExecutor::default();
+    let (_, out) = run_pl_with(vec![bare_raise()], &ex);
+    let e = out.unwrap_err();
+    assert_eq!(e.domain, crate::error::FaultDomain::Business);
+    assert!(
+        e.message.contains("no active exception"),
+        "消息须说明无当前异常，实际: {}",
+        e.message
+    );
+}
+
+#[test]
+fn should_reject_raise_named_condition_as_uncovered_form() {
+    // 错误码 BIZ-0202 探针：`RAISE <条件名>` 语料零命中，必须显式拒绝
+    // （旧实现编造常量消息，把未覆盖面伪装成已支持）
+    use ogsql_parser::ast::plpgsql::PlRaiseStmt;
+    use ogsql_parser::ast::Spanned;
+    let stmt = PlStatement::Raise(Spanned::new(
+        PlRaiseStmt {
+            level: None,
+            message: None,
+            params: vec![],
+            options: vec![],
+            condname: Some("e_bad".into()),
+            sqlstate: None,
+        },
+        None,
+    ));
+    let e = compile_stmts(&[stmt]).unwrap_err();
+    assert_eq!(e.code.to_string(), "BIZ-0202");
+    assert!(
+        e.message.contains("e_bad"),
+        "消息须点出具名条件: {}",
+        e.message
+    );
+}
+
 #[test]
 fn should_re_raise_from_handler_to_outer_trap() {
     let ex = FakeExecutor::default();
@@ -169,4 +255,79 @@ fn should_stop_propagation_when_no_handler_anywhere() {
     let (_, out) = run_pl_with(vec![pre, select_into("v_flag", "p_i_date")], &ex);
     let err = out.unwrap_err();
     assert_eq!(err.code.to_string(), "BIZ-0100");
+}
+
+/// 例程级 EXCEPTION 段（语料主流形态：`IS BEGIN … EXCEPTION WHEN OTHERS … END;`）
+/// 与块级同样编译为 trap；此前 PlBlock.exception_block 被静默丢弃。
+fn routine_block(body: Vec<PlStmtT>, handlers: Vec<(Vec<&str>, Vec<PlStmtT>)>) -> PlBlock {
+    use ogsql_parser::ast::plpgsql::{PlExceptionBlock, PlExceptionHandler};
+    PlBlock {
+        label: None,
+        declarations: vec![],
+        body,
+        exception_block: Some(PlExceptionBlock {
+            handlers: handlers
+                .into_iter()
+                .map(|(conds, stmts)| PlExceptionHandler {
+                    conditions: conds.iter().map(|c| c.to_string()).collect(),
+                    statements: stmts,
+                })
+                .collect(),
+        }),
+        end_label: None,
+    }
+}
+
+#[test]
+fn should_run_routine_level_exception_handler() {
+    let ex = FakeExecutor::default(); // 0 行 → NO_DATA_FOUND
+    let prog = compile_block(&routine_block(
+        vec![
+            assign(var("p_i_date"), lit_str("20240105")),
+            select_into("v_flag", "p_i_date"),
+        ],
+        vec![(
+            vec!["others"],
+            vec![assign(var("v_flag"), lit_str("caught"))],
+        )],
+    ))
+    .expect("compile");
+    let mut f = Frame::new();
+    let out = run(&prog, &mut f, &ex);
+    assert_eq!(out.unwrap(), RunOutcome::Completed);
+    assert_eq!(
+        f.get(&VarName("v_flag".into())),
+        Some(&SpinValue::Str("caught".into())),
+        "例程级 WHEN OTHERS 必须执行处理器体"
+    );
+}
+
+#[test]
+fn should_run_routine_handler_then_finish_without_body_tail() {
+    let ex = FakeExecutor::default();
+    let prog = compile_block(&routine_block(
+        vec![
+            assign(var("p_i_date"), lit_str("20240105")),
+            select_into("v_flag", "p_i_date"),
+            assign(var("v_tail"), lit_str("executed")),
+        ],
+        vec![(
+            vec!["no_data_found"],
+            vec![assign(var("v_caught"), lit_int(1))],
+        )],
+    ))
+    .expect("compile");
+    let mut f = Frame::new();
+    let out = run(&prog, &mut f, &ex);
+    assert_eq!(out.unwrap(), RunOutcome::Completed);
+    assert_eq!(
+        f.get(&VarName("v_caught".into())),
+        Some(&SpinValue::Int(1)),
+        "具名条件同样要匹配例程级处理器"
+    );
+    assert_eq!(
+        f.get(&VarName("v_tail".into())),
+        None,
+        "处理器接管后不再执行 body 尾部（GaussDB 语义：处理器体后直接结束块）"
+    );
 }

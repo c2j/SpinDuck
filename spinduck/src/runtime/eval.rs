@@ -96,23 +96,16 @@ fn eval_funccall(name: &str, args: &[IrExpr], env: &EvalEnv<'_>) -> Result<SpinV
             format!("{name} is a procedure and cannot be used in an expression"),
         ));
     }
-    if args.len() != routine.params.len() {
-        return Err(EngineError::business(
-            151,
-            format!(
-                "{} expects {} args, got {}",
-                name,
-                routine.params.len(),
-                args.len()
-            ),
-        ));
-    }
+    crate::catalog::check_arity(name, &routine.params, args.len())?;
     if env.depth > 100 {
         return Err(EngineError::invariant(63, "call depth exceeded (100)"));
     }
     let mut callee = Frame::new();
-    for (p, ir_a) in routine.params.iter().zip(args) {
-        let v = eval(ir_a, env)?;
+    for (i, p) in routine.params.iter().enumerate() {
+        let v = match args.get(i) {
+            Some(ir_a) => eval(ir_a, env)?,
+            None => p.default.clone().unwrap_or(SpinValue::Null),
+        };
         callee.set(&VarName(p.name.to_ascii_lowercase()), v);
     }
     let out = crate::runtime::run_with_catalog(
@@ -165,7 +158,6 @@ fn eval_bin(op: BinOp, l: &SpinValue, r: &SpinValue) -> Result<SpinValue, Engine
             | BinOp::Sub
             | BinOp::Mul
             | BinOp::Div
-            | BinOp::Concat
             | BinOp::Eq
             | BinOp::Ne
             | BinOp::Lt
@@ -177,6 +169,10 @@ fn eval_bin(op: BinOp, l: &SpinValue, r: &SpinValue) -> Result<SpinValue, Engine
         return Ok(V::Null);
     }
     match op {
+        // A 模式文本拼接：NULL 侧视作空串，全 NULL 才为 NULL（基线实测
+        // `'A' || NULL` = 'A'、`NULL || NULL` = NULL）；SQL 侧同口径改写见
+        // sql::rewrite::concat（'a' || b → concat('a', b)）。
+        BinOp::Concat if matches!((l, r), (V::Null, V::Null)) => Ok(V::Null),
         BinOp::Concat => Ok(V::Str(format!("{}{}", l.as_str_loose(), r.as_str_loose()))),
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => arith(&op, l, r),
         BinOp::Eq => Ok(V::Bool(compare(&op, l, r)?)),
@@ -243,6 +239,28 @@ mod tests {
                 SpinValue::Str("0.2".into())
             ),
             SpinValue::Decimal(2, 38, 2) // 0.02
+        );
+    }
+
+    #[test]
+    fn should_treat_null_as_empty_string_in_concat_per_a_mode() {
+        // 基线实测（openGauss 5.0.0，A 模式）：'A' || NULL = 'A'、NULL || NULL = NULL，
+        // 数值参与拼接自动转串（1 || 2 = '12'）
+        assert_eq!(
+            ev(BinOp::Concat, SpinValue::Str("A".into()), SpinValue::Null),
+            SpinValue::Str("A".into())
+        );
+        assert_eq!(
+            ev(BinOp::Concat, SpinValue::Null, SpinValue::Str("B".into())),
+            SpinValue::Str("B".into())
+        );
+        assert_eq!(
+            ev(BinOp::Concat, SpinValue::Null, SpinValue::Null),
+            SpinValue::Null
+        );
+        assert_eq!(
+            ev(BinOp::Concat, SpinValue::Int(1), SpinValue::Int(2)),
+            SpinValue::Str("12".into())
         );
     }
 

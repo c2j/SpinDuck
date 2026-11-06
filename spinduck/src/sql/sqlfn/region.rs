@@ -1,7 +1,8 @@
 //! 语句上下文区间与参数元组查询构造（自 `sqlfn.rs` 拆分，AGENTS §3；行为一字不改）。
 
 use crate::error::EngineError;
-use crate::sql::sqlfn::{CallPlan, Region};
+use crate::sql::sqlfn::lower::{lower_spans, top_level_and_ranges};
+use crate::sql::sqlfn::{CallPlan, Occurrence, Region};
 use crate::sql::VarScope;
 use ogsql_parser::token::{Token, TokenWithSpan};
 use std::collections::BTreeMap;
@@ -13,36 +14,17 @@ pub(super) fn context_region(
     let head = statement_head(sql_text);
     let kw = top_level_keywords(sql_text, tokens);
     match head.as_str() {
+        // INSERT INTO … SELECT：实参多取自源表列，元组查询必须落到 SELECT 侧上下文；
+        // INSERT … VALUES 是单行求值（顶层无 SELECT 关键字），无表行上下文。
         "insert" => Ok(Region {
-            has_context: false,
-            ctx_start: 0,
-            ctx_end: 0,
+            has_context: kw.contains_key("select"),
         }),
-        "update" => {
-            let start = kw
-                .get("update")
-                .map(|(_, e)| *e)
-                .ok_or_else(|| EngineError::business(159, "UPDATE 缺关键字"))?;
-            Ok(Region {
-                has_context: true,
-                ctx_start: start,
-                ctx_end: sql_text.len(),
-            })
-        }
-        "select" => {
-            let Some((_, from_end)) = kw.get("from") else {
-                return Ok(Region {
-                    has_context: false,
-                    ctx_start: 0,
-                    ctx_end: 0,
-                });
-            };
-            Ok(Region {
-                has_context: true,
-                ctx_start: *from_end,
-                ctx_end: sql_text.len(),
-            })
-        }
+        "update" => Ok(Region {
+            has_context: kw.contains_key("update"),
+        }),
+        "select" => Ok(Region {
+            has_context: kw.contains_key("from"),
+        }),
         other => Err(EngineError::business(
             159,
             format!("SQL 上下文例程调用暂不支持 {other} 语句"),
@@ -55,33 +37,58 @@ pub(super) fn context_region(
 /// 上下文取**该调用所在层级的 SELECT 块**的 FROM/WHERE（动态 SQL 的调用常位于
 /// 派生表内部；用最外层 FROM 会把调用本身带进元组查询，形成自引用）：
 /// - UPDATE（顶层）：表 + WHERE；
-/// - INSERT：无上下文（单行元组）；
-/// - SELECT：调用所在括号深度的最近 FROM/WHERE（边界为所在块）。
+/// - INSERT … VALUES：无上下文（单行元组）；
+/// - SELECT / INSERT … SELECT：调用所在块（`UNION` 分支各自成块）的 FROM/WHERE；
+/// - 片段内的其他调用点按其缓存子查询就地下沉（内层先物化）。
 pub(super) fn distinct_query(
     sql_text: &str,
     tokens: &[TokenWithSpan],
     region: &Region,
     plans: &[CallPlan],
+    occs: &[Occurrence],
     site: usize,
 ) -> Result<String, EngineError> {
     let c = &plans[site];
-    let args = c.args.join(", ");
+    let args = c.lowered_args.join(", ");
     if !region.has_context {
         return Ok(format!("SELECT {args}"));
     }
-    let (site_start, _) = c.occurrences[0];
-    let block = block_context(sql_text, tokens, site_start);
-    let from_seg = match &block.from_seg_override {
-        Some(seg) => format!(" FROM {seg}"),
-        None => match block.from {
-            Some((_, f_end)) => format!(" FROM {}", block.slice(sql_text, f_end, block.from_end)),
-            None => String::new(),
-        },
+    let block = block_context(sql_text, tokens, c.occ_span.0);
+    let from_seg = match block.from {
+        Some((_, f_end)) if f_end < block.from_end => format!(
+            " FROM {}",
+            lower_spans(sql_text, f_end, block.from_end, site, plans, occs)?.trim()
+        ),
+        _ => String::new(),
     };
-    let where_seg = block
-        .where_clause
-        .map(|(w_after, w_end)| non_self_where(&sql_text[w_after..w_end], c))
-        .filter(|w| !w.trim().is_empty());
+    let where_seg = match block.where_clause {
+        Some((w_after, w_end)) => {
+            let mut kept: Vec<String> = Vec::new();
+            for (s, e) in top_level_and_ranges(sql_text, w_after, w_end) {
+                if sql_text[s..e].trim().is_empty() {
+                    continue;
+                }
+                // 含本站点调用的合取项必须剔除（否则元组查询自引用）
+                if occs
+                    .iter()
+                    .any(|o| o.plan == site && o.start >= s && o.end <= e)
+                {
+                    continue;
+                }
+                let seg = lower_spans(sql_text, s, e, site, plans, occs)?;
+                let seg = seg.trim();
+                if !seg.is_empty() {
+                    kept.push(seg.to_string());
+                }
+            }
+            if kept.is_empty() {
+                None
+            } else {
+                Some(kept.join(" AND "))
+            }
+        }
+        None => None,
+    };
     let mut q = format!("SELECT DISTINCT {args}{from_seg}");
     if let Some(w) = where_seg {
         q.push_str(" WHERE ");
@@ -92,16 +99,21 @@ pub(super) fn distinct_query(
 
 /// 站点所在括号层级上的最近 SELECT 块上下文（FROM/WHERE 区间）。
 pub(super) struct BlockCtx {
+    /// FROM 关键字区间；UPDATE 复用为表段起点（`from_end` 即 SET 起点）
     from: Option<(usize, usize)>,
     from_end: usize,
     where_clause: Option<(usize, usize)>,
-    /// UPDATE 的表段（无 FROM 关键字）
-    from_seg_override: Option<String>,
 }
 
 impl BlockCtx {
-    fn slice(&self, text: &str, start: usize, end: usize) -> String {
-        text[start..end].trim().to_string()
+    /// 元组查询取材的文本区域（表段 + WHERE）：其中的其他调用点须先物化。
+    pub(super) fn regions(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        if let Some((kw_start, _)) = self.from {
+            out.push((kw_start, self.from_end));
+        }
+        out.extend(self.where_clause);
+        out
     }
 }
 
@@ -139,12 +151,10 @@ pub(super) fn block_context(
             from: None,
             from_end: 0,
             where_clause: None,
-            from_seg_override: None,
         };
         if let (Some((_, u_end)), Some((set_start, _))) = (kw.get("update"), kw.get("set")) {
             ctx.from = Some((*u_end, *u_end));
             ctx.from_end = *set_start;
-            ctx.from_seg_override = Some(sql_text[*u_end..*set_start].trim().to_string());
         }
         if let Some((_, w_end)) = kw.get("where") {
             ctx.where_clause = Some((*w_end, sql_text.len()));
@@ -155,7 +165,7 @@ pub(super) fn block_context(
     // SELECT：自内向外找第一个带 FROM 的层级（调用可能在无 FROM 的标量子查询里，
     // 实参引用外层列的场合）
     for level in (0..=depths[site_idx]).rev() {
-        let (block_start, block_end) = block_bounds(tokens, &depths, site_idx, level);
+        let (block_start, block_end) = block_bounds(sql_text, tokens, &depths, site_idx, level);
         let mut from = None;
         let mut where_kw = None;
         // 整个块内查找（SELECT 列表中的调用，其 FROM 位于调用之后）
@@ -207,7 +217,6 @@ pub(super) fn block_context(
                 from,
                 from_end,
                 where_clause,
-                from_seg_override: None,
             };
         }
     }
@@ -218,10 +227,10 @@ pub(super) fn block_context(
             from: None,
             from_end: 0,
             where_clause: None,
-            from_seg_override: None,
         };
         if let (Some((_, u_end)), Some((set_start, _))) = (kw.get("update"), kw.get("set")) {
-            ctx.from_seg_override = Some(sql_text[*u_end..*set_start].trim().to_string());
+            ctx.from = Some((*u_end, *u_end));
+            ctx.from_end = *set_start;
         }
         if let Some((_, w_end)) = kw.get("where") {
             ctx.where_clause = Some((*w_end, sql_text.len()));
@@ -232,7 +241,6 @@ pub(super) fn block_context(
         from: None,
         from_end: 0,
         where_clause: None,
-        from_seg_override: None,
     }
 }
 
@@ -265,103 +273,54 @@ pub(super) fn paren_extent(
     None
 }
 
+/// 站点所属查询块的边界。
+///
+/// 边界取"最近者"：同层配平括号，或同层集合运算关键字（`UNION`/`INTERSECT`/
+/// `EXCEPT`）。后者必须参与切块——`INSERT … SELECT … UNION ALL SELECT …` 的每个
+/// 分支各有源表，若不切块则后面的分支会借到第一个分支的 FROM/WHERE。
 pub(super) fn block_bounds(
+    sql_text: &str,
     tokens: &[TokenWithSpan],
     depths: &[i32],
     site_idx: usize,
     level: i32,
 ) -> (usize, usize) {
-    let start = if level == 0 {
-        0
-    } else {
-        tokens[..site_idx]
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(i, t)| matches!(t.token, Token::LParen) && depths[*i] + 1 == level)
-            .map(|(_, t)| t.span.end)
-            .unwrap_or(0)
-    };
-    let end = if level == 0 {
-        tokens.last().map(|t| t.span.end).unwrap_or(0)
-    } else {
-        // '(' 记外层深度、')' 记外层深度：内容层级 L 的配平 ')' 深度为 L-1
-        tokens[site_idx..]
-            .iter()
-            .enumerate()
-            .find(|(i, t)| matches!(t.token, Token::RParen) && depths[site_idx + i] == level - 1)
-            .map(|(_, t)| t.span.start)
-            .unwrap_or_else(|| tokens.last().map(|t| t.span.end).unwrap_or(0))
-    };
+    let at_level = |i: usize| depths[i] == level && is_set_op_word(sql_text, &tokens[i]);
+    let mut start = 0usize;
+    for i in (0..site_idx).rev() {
+        if matches!(tokens[i].token, Token::LParen) && depths[i] + 1 == level {
+            start = tokens[i].span.end;
+            break;
+        }
+        if at_level(i) {
+            start = tokens[i].span.end;
+            break;
+        }
+    }
+    let mut end = tokens.last().map(|t| t.span.end).unwrap_or(0);
+    for i in site_idx..tokens.len() {
+        if matches!(tokens[i].token, Token::RParen) && depths[i] == level - 1 {
+            end = tokens[i].span.start;
+            break;
+        }
+        if at_level(i) {
+            end = tokens[i].span.start;
+            break;
+        }
+    }
     (start, end)
 }
 
-/// 从 WHERE 片段中剔除"包含该调用自身"的顶层合取项。
-pub(super) fn non_self_where(raw: &str, c: &CallPlan) -> String {
-    let my_names: Vec<String> = c.occurrences.iter().map(|_| c.name.clone()).collect();
-    let mut kept = Vec::new();
-    for conj in split_top_level_and(raw) {
-        let low = conj.to_ascii_lowercase();
-        if my_names.iter().any(|n| low.contains(&format!("{n}("))) {
-            continue;
-        }
-        if !conj.trim().is_empty() {
-            kept.push(conj.trim().to_string());
-        }
+fn is_set_op_word(sql_text: &str, tws: &TokenWithSpan) -> bool {
+    if !matches!(tws.token, Token::Ident(_) | Token::Keyword(_)) {
+        return false;
     }
-    kept.join(" AND ")
-}
-
-pub(super) fn split_top_level_and(raw: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut cur = String::new();
-    let mut depth = 0i32;
-    let mut quote = false;
-    let up = raw.to_ascii_uppercase();
-    let bytes = up.as_bytes();
-    let mut i = 0usize;
-    while i < raw.len() {
-        let ch = raw.as_bytes()[i] as char;
-        if quote {
-            if ch == '\'' {
-                quote = false;
-            }
-            cur.push(ch);
-            i += 1;
-            continue;
-        }
-        match ch {
-            '\'' => {
-                quote = true;
-                cur.push(ch);
-            }
-            '(' => {
-                depth += 1;
-                cur.push(ch);
-            }
-            ')' => {
-                depth -= 1;
-                cur.push(ch);
-            }
-            _ => {
-                let at_and = depth == 0
-                    && bytes.get(i) == Some(&b'A')
-                    && up.get(i..i + 3) == Some("AND")
-                    && (i == 0 || !raw.as_bytes()[i - 1].is_ascii_alphanumeric())
-                    && (i + 3 >= raw.len() || !raw.as_bytes()[i + 3].is_ascii_alphanumeric());
-                if at_and {
-                    parts.push(cur.clone());
-                    cur.clear();
-                    i += 3;
-                    continue;
-                }
-                cur.push(ch);
-            }
-        }
-        i += 1;
-    }
-    parts.push(cur);
-    parts
+    matches!(
+        sql_text[tws.span.start..tws.span.end]
+            .to_ascii_lowercase()
+            .as_str(),
+        "union" | "intersect" | "except"
+    )
 }
 
 pub(super) fn statement_head(sql_text: &str) -> String {

@@ -21,6 +21,65 @@ pub enum ParamMode {
 pub struct RoutineParam {
     pub name: String,
     pub mode: ParamMode,
+    /// 声明的 `DEFAULT <字面量>`（登记期编译；无默认值 = 必传）
+    pub default: Option<SpinValue>,
+}
+
+/// 形参声明 → [`RoutineParam`]（模式 + DEFAULT 字面量；包体与独立例程同口径）。
+pub fn map_param(p: &ogsql_parser::ast::RoutineParam) -> Result<RoutineParam, EngineError> {
+    Ok(RoutineParam {
+        name: p.name.clone(),
+        mode: map_mode(&p.mode)?,
+        default: p
+            .default_value
+            .as_deref()
+            .map(default_literal)
+            .transpose()?,
+    })
+}
+
+/// 形参 `DEFAULT` 的字面量口径（语料实测只有 NULL / 数值 / 引号串）：
+/// 与 PL 表达式字面量同一映射（整数→Int、小数→Decimal）；非字面量默认值
+/// （表达式、函数调用、引用先前形参）显式拒绝，不静默按 NULL 处理。
+fn default_literal(raw: &str) -> Result<SpinValue, EngineError> {
+    let t = raw.trim();
+    if t.eq_ignore_ascii_case("null") {
+        return Ok(SpinValue::Null);
+    }
+    if t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("false") {
+        return Ok(SpinValue::Bool(t[..4].eq_ignore_ascii_case("true")));
+    }
+    if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
+        return Ok(SpinValue::Str(t[1..t.len() - 1].replace("''", "'")));
+    }
+    if let Ok(i) = t.parse::<i64>() {
+        return Ok(SpinValue::Int(i));
+    }
+    if let Some(d) = crate::ir::parse_decimal_literal(t) {
+        return Ok(d);
+    }
+    Err(EngineError::business(
+        203,
+        format!("DEFAULT {raw} (非字面量默认值) is not supported in v1"),
+    ))
+}
+
+/// 位置实参的元数校验：调用方省略的必须是**尾部且声明了 DEFAULT** 的形参。
+pub fn check_arity(name: &str, params: &[RoutineParam], got: usize) -> Result<(), EngineError> {
+    if got > params.len() {
+        return Err(arity_err(name, params.len(), got));
+    }
+    match params[got..].iter().find(|p| p.default.is_none()) {
+        Some(p) => Err(EngineError::business(
+            151,
+            format!("{name} 缺少实参 {}（形参未声明 DEFAULT）", p.name),
+        )),
+        None => Ok(()),
+    }
+}
+
+fn arity_err(name: &str, len: usize, got: usize) -> EngineError {
+    EngineError::business(151, format!("{name} expects {len} args, got {got}"))
 }
 
 /// 已编译例程。
@@ -151,12 +210,7 @@ pub fn compile_statement_routine_with_names(
             let params = cs
                 .parameters
                 .iter()
-                .map(|p| {
-                    Ok(RoutineParam {
-                        name: p.name.clone(),
-                        mode: map_mode(&p.mode)?,
-                    })
-                })
+                .map(map_param)
                 .collect::<Result<Vec<_>, EngineError>>()?;
             out.push(CompiledRoutine {
                 name: cs
@@ -183,12 +237,7 @@ pub fn compile_statement_routine_with_names(
             let params = cf
                 .parameters
                 .iter()
-                .map(|p| {
-                    Ok(RoutineParam {
-                        name: p.name.clone(),
-                        mode: map_mode(&p.mode)?,
-                    })
-                })
+                .map(map_param)
                 .collect::<Result<Vec<_>, EngineError>>()?;
             out.push(CompiledRoutine {
                 name: cf

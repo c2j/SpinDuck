@@ -16,3 +16,33 @@ materialize = ["mid_yjqs_detail", "par_fund_partner", "par_fund_seat", "par_sys_
 [[case.scenarios]]
 why = "回购/申购业务拆分（含异常行 A999 跳过）"
 args = ["'20250715'", "null"]
+
+# ── 原生断言集（口径同 min_tax.case.toml）──────────────────────────────────────
+# 被测点是核心过程 prc_trd_deal_purchase（step3_sh 包体，游标 + 多分支费型 + 异常行跳过）。
+
+[[case.assert]]
+why = "p_o_succeed 出口（考题约定的成功标记）"
+kind = "out"
+target = "pkg_split_trade_step3_sh.prc_trd_deal_purchase"
+args = ["'20250715'", "null"]
+param = "p_o_succeed"
+want = "0"
+
+[[case.assert]]
+why = "回购指令表产物（含 A999 异常行的处理口径）"
+kind = "rows"
+target = "SELECT security_id, partner_code, purchase_quantity, purchase_money, purchase_fee, purchase_yj, purchase_days, purchase_kind FROM dat_trd_repurchase ORDER BY security_id"
+want = "[0130000001, A0001, 100, 10000, 2, 0, 90, 0501] [0130000002, A0002, 200, 20000, 4, 0, 180, 0501]"
+
+[[case.assert]]
+why = "产物合计（3 行游标输入 → 2 行指令：异常行 A999 跳过后的量额闭合）"
+kind = "rows"
+target = "SELECT COUNT(*), SUM(purchase_quantity), SUM(purchase_money), SUM(purchase_fee) FROM dat_trd_repurchase"
+want = "[2, 300, 30000, 6]"
+
+[[case.assert]]
+why = "元数不足显式拒绝（OUT 参未声明 DEFAULT，不可省略）"
+kind = "error"
+target = "pkg_split_trade_step3_sh.prc_trd_deal_purchase"
+args = ["'20250715'"]
+want = "BIZ-0151|pkg_split_trade_step3_sh.prc_trd_deal_purchase 缺少实参 p_o_succeed（形参未声明 DEFAULT）"

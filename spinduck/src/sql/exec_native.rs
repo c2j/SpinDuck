@@ -172,4 +172,30 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.domain, crate::error::FaultDomain::Kernel);
     }
+
+    #[test]
+    fn should_keep_session_usable_after_failing_statement() {
+        // 回归守护（语料 WHEN OTHERS 记日志形态）：一条语句在内核侧失败后，
+        // 同一会话必须可继续执行——曾持续报
+        // "TransactionContext Error: Current transaction is aborted"，
+        // 使处理器体内的 INSERT/SELECT 全部连锁失败。
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        ex.execute("CREATE TABLE t(a VARCHAR)", &BindMap::new())
+            .unwrap();
+        ex.execute("INSERT INTO t VALUES ('abc')", &BindMap::new())
+            .unwrap();
+        let err = match ex.query("SELECT CAST(a AS DECIMAL(38,6)) FROM t", &BindMap::new()) {
+            Err(e) => e,
+            Ok(_) => panic!("期望 'abc' → DECIMAL 转换失败"),
+        };
+        assert_eq!(err.domain, crate::error::FaultDomain::Kernel);
+        let n = ex
+            .execute("INSERT INTO t VALUES ('ok')", &BindMap::new())
+            .unwrap_or_else(|e| panic!("失败语句后同会话不可用: {}", e.message));
+        assert_eq!(n.rows_affected, 1);
+        let mut s = ex
+            .query("SELECT COUNT(*) FROM t", &BindMap::new())
+            .unwrap_or_else(|e| panic!("失败语句后同会话不可查询: {}", e.message));
+        assert_eq!(s.fetch_many(1)[0][0].as_str_loose(), "2");
+    }
 }

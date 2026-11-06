@@ -10,7 +10,10 @@ mod deploy;
 mod manifest;
 mod run;
 
-pub use chain::{routine_refs, sql_object_refs, sql_texts, ObjectKind, ObjectRef};
-pub use deploy::{deploy_project, sql_units, verify_project};
+pub use chain::{chain_object_refs, routine_refs, ObjectKind, ObjectRef};
+pub use deploy::{
+    clamp_sequence_bounds, deploy_project, deploy_routines, deploy_schema, deploy_seeds,
+    drop_cache_option, sql_units, strip_defaults, verify_project,
+};
 pub use manifest::{manifest_text, sync_runtime_manifest, ManifestSync};
 pub use run::{kernel_objects, verify_entry, ChainFacts, Check, CheckKind, EntryReport, Status};

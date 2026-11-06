@@ -19,3 +19,30 @@ materialize = ["mid_yjqs_detail"]
 [[case.scenarios]]
 why = "单日聚合管线"
 args = ["'20240105'"]
+
+# ── 原生断言集（口径同 min_tax.case.toml）──────────────────────────────────────
+
+[[case.assert]]
+why = "聚合管线产物（GROUP BY + 金额 ROUND 到分 + fnc_fee 下沉调用）"
+kind = "rows"
+target = "SELECT bcrq, fund_code, scdm, cjsl, cjje, fee FROM dat_inst_fund_cjqs ORDER BY fund_code, scdm"
+want = "[20240105, F001, 600000, 300, 3250, 2.6] [20240105, F002, 000001, 50, 1012.5, 0.81]"
+
+[[case.assert]]
+why = "cjbz = 'N' 的行不入库（过滤谓词生效）"
+kind = "rows"
+target = "SELECT COUNT(*) FROM dat_inst_fund_cjqs WHERE fund_code = 'F002'"
+want = "[1]"
+
+[[case.assert]]
+why = "费用函数独立可调用（SQL 上下文里的例程下沉）"
+kind = "call"
+target = "fnc_fee"
+args = ["12500"]
+want = "10"
+
+[[case.assert]]
+why = "EXCEPTION OTHERS 兜底行不出现（正常路径未误入处理器）"
+kind = "rows"
+target = "SELECT COUNT(*) FROM dat_inst_fund_cjqs WHERE fund_code = 'ERR'"
+want = "[0]"

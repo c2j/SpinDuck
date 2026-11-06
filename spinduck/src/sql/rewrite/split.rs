@@ -1,21 +1,19 @@
 //! 顶层分隔符切分与字面量引号处理（括号/字符串感知）。
 
-/// 顶层逗号切分（括号与字符串感知）。
+/// 顶层逗号切分（括号与字符串感知，字符级遍历：多字节实参必须逐字保留）。
 pub(crate) fn split_top_level_commas(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut in_string = false;
     let mut cur = String::new();
-    let bytes = s.as_bytes();
-    let mut i = 0usize;
-    while i < s.len() {
-        let c = bytes[i] as char;
+    let mut it = s.char_indices().peekable();
+    while let Some((_, c)) = it.next() {
         if in_string {
             cur.push(c);
             if c == '\'' {
-                if i + 1 < s.len() && bytes[i + 1] == b'\'' {
+                if matches!(it.peek(), Some((_, '\''))) {
+                    it.next();
                     cur.push('\'');
-                    i += 1;
                 } else {
                     in_string = false;
                 }
@@ -41,7 +39,6 @@ pub(crate) fn split_top_level_commas(s: &str) -> Vec<String> {
                 _ => cur.push(c),
             }
         }
-        i += 1;
     }
     if !cur.trim().is_empty() {
         out.push(cur.trim().to_string());

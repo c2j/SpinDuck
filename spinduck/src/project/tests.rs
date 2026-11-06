@@ -296,3 +296,111 @@ args = ["'20240105'", "1"]
         e.message
     );
 }
+
+#[test]
+fn should_parse_case_assert_blocks_by_kind() {
+    let c = CaseConfig::from_toml_str(
+        r#"
+[case]
+name = "asserts"
+kind = "procedure"
+routine = "p"
+[case.output]
+sql = "SELECT a FROM t ORDER BY a"
+[[case.scenarios]]
+why = "w"
+args = ["'20250715'"]
+
+[[case.assert]]
+why = "输出表行集（粒度：过程产物）"
+kind = "rows"
+target = "SELECT id, fund FROM t_out ORDER BY id"
+want = "[1, F01] [2, F01]"
+
+[[case.assert]]
+why = "函数返回值（粒度：单值口径）"
+kind = "call"
+target = "pkg.f"
+args = ["'S001'", "1000"]
+want = "0.1"
+
+[[case.assert]]
+why = "OUT 参（粒度：调用面）"
+kind = "out"
+target = "pkg.p"
+args = ["null"]
+param = "o"
+want = "rows=3"
+
+[[case.assert]]
+why = "未处理异常（粒度：错误契约）"
+kind = "error"
+target = "pkg.bad"
+want = "BIZ-0100|no data found"
+"#,
+    )
+    .unwrap();
+    assert_eq!(c.asserts.len(), 4, "四条断言全部识别");
+    assert_eq!(c.asserts[0].kind, AssertKind::Rows);
+    assert_eq!(
+        c.asserts[0].target,
+        "SELECT id, fund FROM t_out ORDER BY id"
+    );
+    assert_eq!(c.asserts[0].want, "[1, F01] [2, F01]");
+    assert_eq!(c.asserts[1].kind, AssertKind::Call);
+    assert_eq!(
+        c.asserts[1].args,
+        vec!["'S001'".to_string(), "1000".to_string()]
+    );
+    assert_eq!(c.asserts[2].kind, AssertKind::Out);
+    assert_eq!(c.asserts[2].param, "o", "OUT 参名按声明取用");
+    assert_eq!(c.asserts[3].kind, AssertKind::Error);
+    assert_eq!(c.asserts[3].want, "BIZ-0100|no data found");
+}
+
+#[test]
+fn should_reject_case_assert_with_unknown_kind_or_missing_fields() {
+    let head = "[case]\nname = \"x\"\nkind = \"function\"\nroutine = \"p\"\n\
+                [[case.scenarios]]\nwhy = \"w\"\nargs = []\n";
+    let cases = [
+        (
+            r#"kind = "rowz"
+target = "SELECT 1"
+want = "1""#,
+            "未知 kind 必须显式拒绝",
+            "kind",
+        ),
+        (
+            r#"kind = "rows"
+target = ""
+want = "1""#,
+            "target 必填",
+            "target",
+        ),
+        (
+            r#"kind = "rows"
+target = "SELECT 1""#,
+            "want 必填（空期望等于永真断言）",
+            "want",
+        ),
+        (
+            r#"kind = "out"
+target = "pkg.p"
+want = "1""#,
+            "out 形态缺 OUT 参名",
+            "param",
+        ),
+    ];
+    for (body, why, needle) in cases {
+        let e =
+            CaseConfig::from_toml_str(&format!("{head}\n[[case.assert]]\nwhy = \"w\"\n{body}\n"))
+                .err()
+                .unwrap_or_else(|| panic!("{why}：应报错，实际解析成功"));
+        assert_eq!(e.code.to_string(), "ENV-0031", "{why}");
+        assert!(
+            e.message.contains(needle),
+            "{why}：消息要点名缺哪项，实际 {}",
+            e.message
+        );
+    }
+}

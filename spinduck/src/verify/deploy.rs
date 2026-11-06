@@ -1,8 +1,8 @@
 //! 语料部署（`verify` 的前置动作）：把项目声明的资产装进内核。
 //!
-//! 口径与黄金 harness 一致（tests/common/mod.rs）：表 DDL 去 `DEFAULT` 后走
-//! 同一改写管线；视图用占位体（存在性核验，不参与语义）；桩包与例程整文件注册；
-//! 数据集种子按语句下发。差异只在目的：verify 不接 GaussDB，纯本地内核。
+//! [`deploy_schema`] / [`deploy_routines`] 是被测侧的**唯一**部署口径：`verify` 与
+//! 黄金 harness（tests/common/mod.rs）都调它们，两侧不再有各自的建表/建视图/注册实现。
+//! 差异只在目的：verify 额外下发本地种子并逐入口核验链路，harness 改为从参照侧物化数据。
 
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -49,13 +49,26 @@ fn load_cases(project: &ProjectConfig) -> Result<Vec<CaseConfig>, EngineError> {
         .collect()
 }
 
-/// 部署项目资产到内核（表 → 占位视图 → 例程 → 种子）。
+/// 部署项目资产到内核（schema → 例程 → 种子）。
+///
+/// 三段各自独立可复用：黄金 harness 只取前两段（数据由参照侧物化，不跑本地种子）。
 pub fn deploy_project(eng: &mut Engine, project: &ProjectConfig) -> Result<(), EngineError> {
+    deploy_schema(eng, project)?;
+    deploy_routines(eng, project)?;
+    deploy_seeds(eng, project)
+}
+
+/// schema 部署：表/序列 DDL → 视图（视图体优先）→ `sys_dummy`。
+///
+/// 部署期归一化只三处，且都是内核不支持、不改变语义的形态：`DEFAULT (…)` 子句、
+/// 超 BIGINT 的序列边界、`CACHE` 选项——语料文件保持逐字，裁剪发生在下发文本上。
+pub fn deploy_schema(eng: &mut Engine, project: &ProjectConfig) -> Result<(), EngineError> {
     let funcs = eng.rules.functions.clone();
     for f in project.ddl_files()? {
         let text = std::fs::read_to_string(&f)
             .map_err(|e| EngineError::env(30, format!("读取 {}: {e}", f.display())))?;
         for unit in sql_units(&strip_defaults(&text)) {
+            let unit = drop_cache_option(&clamp_sequence_bounds(&unit));
             let rewritten =
                 crate::sql::rewrite_tokens_with_rules(&unit, &Default::default(), &funcs)?;
             let sql = crate::sql::apply_ast_transforms(&rewritten.text)?;
@@ -67,22 +80,17 @@ pub fn deploy_project(eng: &mut Engine, project: &ProjectConfig) -> Result<(), E
     for f in project.view_files()? {
         let text = std::fs::read_to_string(&f)
             .map_err(|e| EngineError::env(30, format!("读取 {}: {e}", f.display())))?;
-        let name = view_name(&text);
-        if name.is_empty() {
-            continue;
-        }
-        // 占位视图：核验的是"链路依赖的视图在语料里有声明"，视图体语义归黄金层
-        eng.ex
-            .execute(
-                &format!("CREATE OR REPLACE VIEW {name} AS SELECT 1"),
-                &BindMap::new(),
-            )
-            .map_err(|e| EngineError::kernel(71, format!("占位视图 {name}: {}", e.message)))?;
+        deploy_view(eng, &text, &funcs)?;
     }
     eng.ex.execute(
         "CREATE TABLE IF NOT EXISTS sys_dummy AS SELECT 1",
         &BindMap::new(),
     )?;
+    Ok(())
+}
+
+/// 例程部署：桩包与例程源码逐文件注册。
+pub fn deploy_routines(eng: &mut Engine, project: &ProjectConfig) -> Result<(), EngineError> {
     let mut sources = project.stub_files()?;
     sources.extend(project.routine_files()?);
     for f in sources {
@@ -91,6 +99,11 @@ pub fn deploy_project(eng: &mut Engine, project: &ProjectConfig) -> Result<(), E
         eng.register(&text)
             .map_err(|e| EngineError::env(30, format!("注册 {}: {}", f.display(), e.message)))?;
     }
+    Ok(())
+}
+
+/// 数据集种子：`cases/datasets/*.sql` 按语句下发。
+pub fn deploy_seeds(eng: &mut Engine, project: &ProjectConfig) -> Result<(), EngineError> {
     for f in project.dataset_files()? {
         let text = std::fs::read_to_string(&f)
             .map_err(|e| EngineError::env(30, format!("读取 {}: {e}", f.display())))?;
@@ -103,8 +116,48 @@ pub fn deploy_project(eng: &mut Engine, project: &ProjectConfig) -> Result<(), E
     Ok(())
 }
 
+/// 视图部署：视图体优先，内核不接受时才退回占位视图。
+///
+/// 口径（设计 §12.1）：链路 SQL 会读视图的列，`SELECT 1` 占位只能证明"对象存在"，
+/// 不能证明可执行；因此先按与表 DDL 同一条改写管线下发视图体，失败（GaussDB 专属
+/// 函数、`/*FORCE*/` 之外的内核方言片段等）才降级为占位——核验项仍 PASS，视图体
+/// 语义正确性归黄金层比对。
+fn deploy_view(
+    eng: &mut Engine,
+    text: &str,
+    funcs: &std::collections::BTreeMap<String, String>,
+) -> Result<(), EngineError> {
+    let name = view_name(text);
+    if name.is_empty() {
+        return Ok(());
+    }
+    for unit in sql_units(text) {
+        let up = unit.to_ascii_uppercase();
+        if !up.contains("CREATE VIEW") && !up.contains("CREATE OR REPLACE VIEW") {
+            continue;
+        }
+        let Ok(unit) = crate::sql::rewrite_tokens_with_rules(&unit, &Default::default(), funcs)
+        else {
+            continue;
+        };
+        let Ok(sql) = crate::sql::apply_ast_transforms(&unit.text) else {
+            continue;
+        };
+        if eng.ex.execute(&sql, &BindMap::new()).is_ok() {
+            return Ok(());
+        }
+    }
+    eng.ex
+        .execute(
+            &format!("CREATE OR REPLACE VIEW {name} AS SELECT 1"),
+            &BindMap::new(),
+        )
+        .map(|_| ())
+        .map_err(|e| EngineError::kernel(71, format!("占位视图 {name}: {}", e.message)))
+}
+
 /// 去 `DEFAULT (…)` 子句（与黄金 harness 同口径：DuckDB 对带括号默认值 + 逗号解析不稳）。
-fn strip_defaults(ddl: &str) -> String {
+pub fn strip_defaults(ddl: &str) -> String {
     let mut out = String::with_capacity(ddl.len());
     for line in ddl.lines() {
         let up = line.to_ascii_uppercase();
@@ -138,6 +191,111 @@ fn view_name(text: &str) -> String {
         from = at;
     }
     String::new()
+}
+
+/// 序列选项子句的形态（决定剔除范围）。
+enum OptionForm {
+    /// 只认 `<KW> <整数>`，且该值判为要剪时才剪（`NO MAXVALUE` 一类不动）
+    ValueOnly,
+    /// 内核整体不支持该选项：`<KW> <整数>`、`<KW>`、`NO <KW>` 都剪
+    DropWhole,
+}
+
+/// 序列边界裁剪（部署期归一化，与 [`strip_defaults`] 同族：语料保持逐字）。
+///
+/// DuckDB 的 `MINVALUE` / `MAXVALUE` 只接受 BIGINT 范围内的整数，语料里 27 位的
+/// GaussDB 任意精度上界会让内核直接解析失败。**语义损失**：超出 BIGINT 的边界
+/// 不再约束（实际取用量远低于 2^63，不影响结果等价）；范围内的一字不改。
+pub fn clamp_sequence_bounds(unit: &str) -> String {
+    cut_or_keep(
+        unit,
+        &["MINVALUE", "MAXVALUE"],
+        OptionForm::ValueOnly,
+        &|arg| arg.parse::<i64>().is_err(),
+    )
+}
+
+/// 剔除 `CACHE <n>` / `NO CACHE`（DuckDB `CREATE SEQUENCE` 无该选项）。
+///
+/// **语义损失**：无——`CACHE` 只影响内核预分配号段的节奏，不改变取号顺序与值域。
+pub fn drop_cache_option(unit: &str) -> String {
+    cut_or_keep(unit, &["CACHE"], OptionForm::DropWhole, &|_arg| true)
+}
+
+/// 在 `CREATE SEQUENCE` 语句内按关键字剔除选项子句；无需剔除时原样返回。
+///
+/// 剔除后把空白压平为单空格——序列 DDL 不含字符串字面量，压平只影响排版。
+fn cut_or_keep(
+    unit: &str,
+    kws: &[&str],
+    form: OptionForm,
+    drop_arg: &dyn Fn(&str) -> bool,
+) -> String {
+    let up = unit.to_ascii_uppercase();
+    if !up.contains("CREATE SEQUENCE") {
+        return unit.to_string();
+    }
+    let b = up.as_bytes();
+    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    for kw in kws {
+        let mut at = 0usize;
+        while let Some(rel) = up[at..].find(kw) {
+            let i = at + rel;
+            at = i + kw.len();
+            if !is_token_at(&up, b, i, kw) {
+                continue;
+            }
+            let after = &up[i + kw.len()..];
+            let arg = token_prefix(after.trim_start());
+            let numeric = !arg.is_empty() && arg.bytes().all(|c| c.is_ascii_digit());
+            if numeric && drop_arg(arg) {
+                let lead = after.len() - after.trim_start().len();
+                cuts.push((i, i + kw.len() + lead + arg.len()));
+            } else if matches!(form, OptionForm::DropWhole) {
+                // 无数字参数形态（`CACHE` / `NO CACHE`）：连可能的 `NO` 一起剪，
+                // 后随的下一个选项关键字不属于本子句，不能吃掉
+                let start = preceding_no(&up, i).unwrap_or(i);
+                cuts.push((start, i + kw.len()));
+            }
+        }
+    }
+    if cuts.is_empty() {
+        return unit.to_string();
+    }
+    cuts.sort_unstable();
+    let mut kept = String::with_capacity(unit.len());
+    let mut pos = 0usize;
+    for (s, e) in cuts {
+        kept.push_str(&unit[pos..s]);
+        pos = e;
+    }
+    kept.push_str(&unit[pos..]);
+    kept.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `at` 之前紧邻的标识符恰为 `NO` 时，返回它的起始下标。
+fn preceding_no(up: &str, at: usize) -> Option<usize> {
+    let head = up[..at].trim_end();
+    let start = head.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))? + 1;
+    (&head[start..] == "NO").then_some(start)
+}
+
+/// `kw` 在 `at` 处是否为独立标识符（前后不接标识符字符）。
+fn is_token_at(up: &str, b: &[u8], at: usize, kw: &str) -> bool {
+    if !up[at..].starts_with(kw) {
+        return false;
+    }
+    let prev_ok = at == 0 || !(b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_');
+    let after = at + kw.len();
+    let next_ok = after >= b.len() || !(b[after].is_ascii_alphanumeric() || b[after] == b'_');
+    prev_ok && next_ok
+}
+
+fn token_prefix(s: &str) -> &str {
+    let end = s
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(s.len());
+    &s[..end]
 }
 
 /// SQL 文本 → 可下发语句（Oracle `/` 分块 + 顶层 `;` 切分，引号/注释感知）。
@@ -251,6 +409,54 @@ mod tests {
                 "INSERT INTO t VALUES ('x;y')",
             ],
             "`/` 分块、顶层 `;` 切分；注释与字符串里的分号不算"
+        );
+    }
+
+    #[test]
+    fn should_drop_sequence_bounds_outside_bigint_and_keep_the_rest() {
+        let seq = "CREATE SEQUENCE seq_external_no\n    START WITH 70000000001\n    INCREMENT BY 1\n    MINVALUE 70000000001\n    MAXVALUE 999999999999999999999999999\n    NO CYCLE\n    CACHE 1";
+        let out = clamp_sequence_bounds(seq);
+        assert!(
+            !out.contains("MAXVALUE 9999999"),
+            "溢出 BIGINT 的上界必须裁剪（内核直接解析失败）：{out}"
+        );
+        assert!(
+            out.contains("MINVALUE 70000000001"),
+            "可容纳的下界不得动：{out}"
+        );
+        assert!(out.contains("START WITH 70000000001"), "起点不得动：{out}");
+        assert!(out.contains("NO CYCLE"), "其余选项不得动：{out}");
+        assert_eq!(
+            clamp_sequence_bounds("CREATE SEQUENCE s MAXVALUE 9223372036854775807 NO CYCLE"),
+            "CREATE SEQUENCE s MAXVALUE 9223372036854775807 NO CYCLE",
+            "BIGINT 范围内的边界一字不改"
+        );
+        assert_eq!(
+            clamp_sequence_bounds("CREATE TABLE t (a BIGINT);"),
+            "CREATE TABLE t (a BIGINT);",
+            "非序列语句一字不改"
+        );
+    }
+
+    #[test]
+    fn should_drop_cache_option_only_from_sequence_ddl() {
+        let seq = "CREATE SEQUENCE seq_dispatch_job_id\n    START WITH 20001\n    INCREMENT BY 1\n    NO CYCLE\n    CACHE 1";
+        let out = drop_cache_option(seq);
+        assert!(
+            !out.contains("CACHE 1"),
+            "内核不认 CACHE 选项，须整子句剔除：{out}"
+        );
+        assert!(out.contains("NO CYCLE"), "支持的选项一字不改：{out}");
+        assert!(out.contains("START WITH 20001"), "起点不得动：{}", out);
+        assert_eq!(
+            drop_cache_option("CREATE SEQUENCE s NO CACHE INCREMENT BY 2"),
+            "CREATE SEQUENCE s INCREMENT BY 2",
+            "NO CACHE 形态连同 NO 一起剔除，空白压平"
+        );
+        assert_eq!(
+            drop_cache_option("CREATE TABLE cache_t (a INT);"),
+            "CREATE TABLE cache_t (a INT);",
+            "非序列语句一字不改（表名里含 cache 也不算）"
         );
     }
 }

@@ -33,6 +33,17 @@ fn should_transform_decode_to_case_with_default() {
 }
 
 #[test]
+fn should_preserve_multibyte_literals_in_decode_arguments() {
+    // 中文实参经顶层逗号切分后必须逐字保留（UTF-8 不得按字节当字符处理）
+    let r =
+        apply_ast_transforms("SELECT decode(t.bs, '1', '甲', '2', '乙', '其他') FROM t").unwrap();
+    assert!(
+        r.contains("WHEN '1' THEN '甲'") && r.contains("ELSE '其他' END"),
+        "{r}"
+    );
+}
+
+#[test]
 fn should_transform_nested_decode_innermost_first() {
     let r =
         apply_ast_transforms("SELECT decode(m, '001', decode(v, '0', 0, f), f) FROM t").unwrap();

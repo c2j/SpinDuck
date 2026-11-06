@@ -14,7 +14,7 @@ mod fs;
 #[cfg(test)]
 mod tests;
 
-pub use case::{CaseConfig, CaseKind, Scenario};
+pub use case::{AssertKind, CaseAssert, CaseConfig, CaseKind, Scenario};
 pub use entry::EntryConfig;
 
 use crate::error::EngineError;

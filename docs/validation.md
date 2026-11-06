@@ -401,6 +401,10 @@ A999 股东未维护 → inst_log 桩 → 跳过，两侧一致）。
 
 **用例**：`golden/case_corpus_hz_byfund/`——考题调用链第 3 步、生产性能热点
 `pkg_split_trade_step3_sh.prc_trd_hz_byfund`（763 行过程体）。
+*（该用例的容器逐行比对资产随 V21 退役——黄金层依赖 A 模式容器，不在"Qoder 环境内
+可执行"的口径内；本节记录的引擎能力与守护测试仍然有效，其 SQL 形态由
+`spinduck/tests/corpus_sql_forms.rs` 与 `case_corpus_purchase` 的 `[[case.assert]]`
+原生断言覆盖。）*
 
 **资产纪律（本用例新增要求）**：依赖闭包从考题基线**逐字复制、仅目录重组**，
 不修改任何源码——43 张表（含 `%TYPE` 锚定与视图基表）、4 个视图、16 个例程
@@ -599,3 +603,161 @@ call/golden 口径分裂）。修复：`ProjectConfig::discover`（自语料目�
 `spinduck verify` 得到 `[ENV-0030] spinduck.toml: 至少一条 [[entry]]（verify 的核验起点）`
 并退出 1——黄金层（`cargo test --features gauss`）不消费 `verify`，故无任何回归。
 入口声明随 V21 的语料级案例一并补齐。
+
+## V21. 语料形态覆盖门禁 + 用例原生断言层（零外部依赖）
+
+**口径（2026-11-06 决策）**：考题业务函数**不在 golden 层执行**。可验证性改为三条
+在 Qoder 环境内直接可跑的通道，全部跑在进程内 DuckDB 1.5.5 上：
+
+1. **形态覆盖门禁**——把语料里出现过的每一种 SQL/PL 语句形态内联复刻并逐形态断言
+   （`spinduck/tests/corpus_sql_forms.rs` + `config/corpus_forms.toml`）；
+2. **用例断言集**——非简单的函数/过程/包在自己的 `*.case.toml` 里声明显式断言
+   （`[[case.assert]]`，四维多粒度，`spinduck/tests/cases_native.rs` 消费）；
+3. **链路核验**——`spinduck verify` 从 `[[entry]]` 出发逐对象判定，已入库项目
+   `golden/case_corpus_purchase` 现在无容器即可跑通。
+
+原用例 5（`golden/case_corpus_hz_byfund`，热点过程容器逐行比对）随本轮**移出仓库**；
+其引擎能力与守护测试全部保留（V15 表格仍是机制说明），语料资产不再入库（考题目录含
+远端库凭据，只本地存在）。V20 段末"五个项目尚未声明入口"以本节为准：四个在库用例中
+purchase 已声明并跑通，其余三个的主角是无包限定的独立例程，按"入口必须全名定位"不声明。
+
+**门禁**：`cargo fmt --all -- --check` 干净；`cargo clippy --all-features --tests -- -D warnings`
+干净；`cargo test --features native` **292 passed / 0 failed**（lib 219 + 集成/守护/CLI 73），
+较 V20 的 235 净增 57 条；`cargo audit` 按 CI 的构建期 `zip` 豁免清单
+（§9，四条 RUSTSEC 公告）跑为干净，裸跑仍只报该既有清单、无新增公告。
+
+**环境侧一次性观察（登记，非缺陷）**：在同一 `target/` 里先跑
+`cargo clippy --all-features --tests` 再紧跟 `cargo test --features native`，doctest 阶段
+偶发 `E0463 can't find crate for ogsql_parser/duckdb`——rustdoc 拿到的是
+`-C metadata` 不同的依赖产物路径（`--all-features` 与 `--features native` 两套产物在
+`target/debug/deps` 并存）。`cargo clean -p spinduck -p ogsql-parser -p duckdb` 后连跑
+三次全绿（含 doctest 0 例）。CI 的 clippy/test/audit 是**三个独立 job**，不同享该目录，
+不受此竞态影响。
+
+### V21.1 语料形态清单与覆盖门禁（86 构造 / 135 条形态断言）
+
+**清单是数据，不是散文**：`scripts/extract_corpus_forms.py` 扫描语料 `sql/` 全部
+`.sql`（`files = 147`，其中本项目自实现桩 `files_stub_authored = 14`），按构造正则统计
+命中次数，输出脱敏清单 `config/corpus_forms.toml`——**只含构造名、命中次数、文件代号**
+（代号↔路径映射不入库）。有命中构造 86 项，零命中构造 31 项（`[zero_hits]`，其中
+`reject_*` 5 项对应 `[rejects]` 面）。
+
+消费方 `spinduck/tests/corpus_sql_forms.rs`（9 条测试）按六个维度表登记形态：
+
+| 维度 | 表 | 条数 | 断言面 |
+|---|---|---|---|
+| 标量求值 | `expr::SCALARS` | 52 | `SELECT <形态>` 在进程内内核逐值比对 |
+| 改写产物 | `expr::REWRITES` | 9 | 改写后 SQL 文本含目标方言片段 |
+| 查询形态 | `query::QUERIES` | 16 | 行集（聚合/连接/集合/`rownum`/`WITH`…） |
+| DML/DDL | `dml::STATEMENTS` | 15 | 建表+灌数+语句+读回状态 |
+| PL 函数 | `pl_fn::FNS` | 22 | 注册 → 调用 → 返回值 / `ERR:` 前缀错误契约 |
+| PL 过程·包 | `pl_proc::ROUTINES` | 21 | 表状态 + OUT 参 / 返回值 |
+
+共 135 条形态断言，按 `key` 归并后恰好覆盖 86 个有命中构造（同一构造可由多条形态
+证据支撑）。
+
+两个**门禁**测试把清单和测试表绑成双向闭环：
+
+- `every_corpus_construct_has_an_assertion`：清单有、测试无（未覆盖）或测试有、清单无
+  （凭空造形态）任一成立即变红——新增语料形态必须先重跑抽取脚本，否则红。
+- `reject_faces_are_absent_from_corpus`：`reject_*` 必须在零命中清单里；一旦语料出现
+  `DBMS_*`/`PARTITION BY`/`DISTRIBUTE BY`/`%ROWTYPE 进 SQL`/`autonomous_transaction`，
+  即要求重新评审 `[rejects]`（AGENTS §6：收缩兼容范围需业务确认）。
+
+取实测值探针（不参与门禁语义）：
+`FORMS_PROBE=1 cargo test --features native --test corpus_sql_forms -- --nocapture`。
+
+### V21.2 `[[case.assert]]`：用例自带的多维断言集
+
+声明面（`spinduck/src/project/case.rs`，四维表见 `architecture.md` §12.1）。校验在
+**解析期**：`kind`/`target`/`want` 缺项、`out` 缺 `param` 一律 `ENV-0031`——空 `want`
+等于永真断言，不接受静默通过。守护测试：
+`project::tests::should_parse_case_assert_blocks_by_kind`（四维各一条，含
+`want = "BIZ-0100|no data found"` 的码+片段拆分）、
+`should_reject_case_assert_with_unknown_kind_or_missing_fields`（四条残缺体，逐条比对
+错误码与消息片段）。
+
+消费方 `spinduck/tests/cases_native.rs`（`#![cfg(feature = "native")]`，4 条测试）用与
+`verify` **同源**的执行口径（`deploy_project`：表 DDL → 视图 → 桩 → 例程 → 种子）在进程
+内内核上跑完场景再逐条断言；`assert!(n_asserts > 0)` 让"项目里一条断言都没有"显式变红。
+
+**实测值（`CASES_PROBE=1` 取数、原样填回 `want`；共 20 条，四个项目全绿）**：
+
+| 项目 | 条数 | 关键实测 |
+|---|---|---|
+| `case_split_agg` | 4 | 产物行集 `[20240105, F001, 600000, 300, 3250, 2.6] [20240105, F002, 000001, 50, 1012.5, 0.81]`；`call fnc_fee(12500)` = `10`（SQL 上下文下沉）；`WHERE fund_code='ERR'` = `[0]`（正常路径未误入处理器） |
+| `case_corpus_stock_kind` | 5 | `01` / `02`（BETWEEN 字符区间）、`AAAA` × 2（区间未覆盖 / 市场码无配置 → `EXCEPTION WHEN OTHERS` 兜底）；区间表行集 3 行 |
+| `case_corpus_min_tax` | 7 | `1.5`（精确档，`ORDER BY stock_kind DESC` + `rownum = 1`）、`2.5`（组内 `0100` 退档）、`4`（全局 `0000`）、`0`（三档全缺 → 内层 `NO_DATA_FOUND` 被 `WHEN OTHERS` 吞掉，`RETURN nvl(RESULT,0)`）；**省略两个 `DEFAULT` 形参**仍得 `1.5`；`rows` 两条互为防假绿（有效期谓词命中 `[0102, 1.5] [0100, 2] [0000, 3]`，过期行确实存在 `[4, 20231231]`） |
+| `case_corpus_purchase` | 4 | `out p_o_succeed` = `0`；指令表 8 列 × 2 行（A999 异常行处理口径）；量额合计 `[2, 300, 30000, 6]`（3 行游标输入 → 2 行指令）；`error` = `BIZ-0151|… 缺少实参 p_o_succeed（形参未声明 DEFAULT）` |
+
+**harness 自身的变异验证**（AGENTS §4.4 精神，一次性手工做）：把 `split_agg` 的一条
+`want` 末位 `0.81` 改成 `0.82` → `native_asserts_split_agg` 断言失败并打印差异，改回即绿
+——证明该层不是永真比较。
+
+**两条已登记的断言撤回**（不是"改期望值凑绿"）：
+`prc_trd_hz_byfund` 的 OUT 断言在原生层报
+`KERNEL-0010 Scalar Function with name fnc_com_get_fund_code does not exist`——该过程的
+依赖闭包随用例 5 一起退役，缺的不是断言而是源码；`db_log` 日志桩行集实测为空，钉一个
+空集没有信息量，改用量额合计断言替代。
+
+### V21.3 为跑通语料形态实现/修复的引擎能力（每项挂测试）
+
+| # | 能力 / 缺陷 | 处理 | 测试 |
+|---|---|---|---|
+| 1 | **A 模式 `\|\|` 传播 NULL**：基线 `'A' \|\| NULL = 'A'`，DuckDB 得 NULL，整串被判空 | `[patterns] concat_null_as_empty`（新模块 `sql/rewrite/concat.rs`）：`a \|\| b \|\| c` 折叠为 `concat(a, b, c)`；全 NULL 仍得 NULL（与基线一致，形态实测 `NULL`）；不动字符串字面量内的 `\|\|`；只做局部文本替换，其余字节逐字保留。数值拼接口径顺带由此承担（`[implicit] concat_numeric_to_varchar` 注释同步） | `eval.rs::should_treat_null_as_empty_string_in_concat_per_a_mode`（PL 求值层）、`concat.rs` 5 条（折叠/字面量/嵌套实参/数值）、`expr.rs` 形态 `string_concat` 4 条（`ABC` / `N=2` / `A` / `NULL`） |
+| 2 | **Oracle `(+)` 外连接标记**（语料 8 处）DuckDB 解析期即报错 | `[patterns] oracle_outer_join`：标记所在表转 `LEFT JOIN … ON`，标记前的逗号表折成 `CROSS JOIN`；标记不在最后一位 / 两侧都有标记**不改写**（宁可报错也不给错语义） | `patterns.rs` 5 条（正例 2 + 负例 2 + 开关关闭 1） |
+| 3 | **`seq.NEXTVAL`**（语料 12 处）被当表名解析 | `[patterns] sequence_nextval` → `nextval('seq')`；`xnextval`、字符串字面量不误改 | `patterns.rs` 3 条 |
+| 4 | SQL 上下文里的例程调用**嵌套实参**（`f(g(x))`）此前 `BIZ-0158` 直接拒绝 | 新增 `sql/sqlfn/lower.rs` 逐层下沉：内层先物化，外层元组查询引用内层缓存表；**BIZ-0158 下线**，原拒绝测试 `should_reject_nested_routine_call_in_arguments` 替换为下沉断言（行为变更，非删除覆盖） | `sqlfn/tests.rs`：`should_lower_routine_call_in_another_call_arguments`、`…_nested_in_another_call_arguments`、包限定调用在 SQL 上下文命中、目录未登记的限定调用不下沉 |
+| 5 | 目录只登记 `package.procedure` 限定名时，SQL 里的**裸名调用**不下沉 | 下沉期按"限定名优先、裸名唯一命中"匹配 | `should_match_bare_name_when_only_qualified_key_is_registered` |
+| 6 | **下沉缓存列与 PL 变量同名**（`v`/`a0`）→ 变量绑定抢走缓存列，取值为空 | 缓存列一律走保留命名空间 `sd_`（`sd_fnN`/`sd_v`/`sd_a0…`；语料 `sd_` 零命中，见 §8.3） | 守护 `should_not_bind_cache_columns_when_pl_variable_shares_their_names` |
+| 7 | `INSERT … SELECT` 多分支时参数元组取了**单一上下文** | 按分支各自取上下文；`UNION ALL` 每分支独立物化 | `should_take_insert_select_context_per_branch_for_parameter_tuples` |
+| 8 | 下沉产生的 `sd_fnN` 临时表被链路核验当成**缺失关系** | 链路对象抽取排除下沉计划表 | `verify/chain.rs::should_exclude_lowering_plan_tables_from_object_refs` |
+| 9 | **形参 `DEFAULT`**（语料 22 处）此前省略实参即崩 | 登记期把字面量 DEFAULT 编进目录；调用侧省略的必须是**尾部且声明了 DEFAULT** 的形参，否则 `BIZ-0151`（文案改为点出形参名）；非字面量默认值登记期 `BIZ-0203` 拒绝 | `ir_expr_forms.rs` 4 条（补默认值 ×2、缺参拒绝、非字面量拒绝） |
+| 10 | **例程级异常处理器**缺失；处理器末尾**裸 `RAISE;`** 不重抛 | `interp/m5.rs`：处理器体内的裸 RAISE 重抛**当前**异常（保码、保域、保消息），处理器外裸 RAISE 报 `BIZ-0201`（"无当前异常"），处理器结束后不再执行主语句尾部；`RAISE <具名条件>` 语料零命中 → 编译期 `BIZ-0202` 显式拒绝（旧实现编造常量消息，把未覆盖面伪装成已支持） | `m5.rs` 5 条（处理器运行、处理器后不续跑、重抛保码、处理器外拒绝、具名条件拒绝） |
+| 11 | `decode` 参数里的**多字节字面量**被顶层逗号切分**按字节**当字符处理，中文实参被截断 | 切分按 `char_indices` 推进，字面量逐字保留 | `rewrite/transform_tests.rs::should_preserve_multibyte_literals_in_decode_arguments` |
+| 12 | 内核语句失败会**作废整个显式事务**（DuckDB 无 `SAVEPOINT`）→ `WHEN OTHERS` 处理器体内的 SQL 连锁报 `Current transaction is aborted`（语料 156 处记日志形态的前提） | `interp/flow.rs` 新增"处理器进入前的会话复位"（不经 `engine::call` 直接 run 时无活动事务，回滚失败可忽略）。**已知口径差异**：复位把上次 COMMIT 之后的本段 DML 一并撤销，不等价于 Oracle 语句级回滚 | `exec_native.rs::should_keep_session_usable_after_failing_statement`、`engine.rs::should_run_handler_after_kernel_error_in_same_session`（`o = 'caught'` 且日志表 1 行） |
+| 13 | **`SQLERRM`/`SQLCODE`**（语料 32 处）消息文本取自内核 | 编译期映射为帧变量；口径：内核给文本，随内核版本复核，**只钉前 8 字符**（实测 `SUBSTR(SQLERRM,1,8)` = `Conversi`） | `pl_proc.rs` 形态 `pl_sqlerrm_sqlcode`（OUT 参逐值比对） |
+
+### V21.4 部署路径归一（`verify::deploy`，四处实测结论）
+
+链路核验的"能不能落地"取决于部署文本，而语料 DDL 里有内核不接受的子句。归一序列
+固定为 `strip_defaults → sql_units 切分 → clamp_sequence_bounds → drop_cache_option →
+规则改名 → AST 变换`：
+
+- `drop_cache_option` 只作用于 `CREATE SEQUENCE`（`should_drop_cache_option_only_from_sequence_ddl`
+  断言 `CREATE TABLE cache_t` 一字不变）。
+- `clamp_sequence_bounds` 剥离超 BIGINT 的 `MAXVALUE`、保留 `START WITH` /
+  `INCREMENT BY` / `MINVALUE` / `NO CYCLE`；对语料逐字序列
+  `seq_dispatch_job_id`（`MAXVALUE 999999999999999999999999999` + `CACHE 1`）实测剥离后
+  首次取号仍为 `20001`（`corpus_sql_forms::deploy_path_strips_corpus_sequence_options`）。
+- 视图优先用**真实视图体**建到内核，内核解析不动才回落占位视图并显式打印
+  （`verify_chain.rs` 两条：真体成功 / 占位回落）——异常分支与参照侧同源，不再静默降级。
+- 表 DDL 的 `DEFAULT to_char(sysdate(),…)` 一类非字面量默认值在落内核前剔除
+  （本侧数据由物化/种子提供），与 §3.4.1 的例程 DEFAULT 口径同源但**不同判定点**。
+
+### V21.5 本地考题核验（不入库，仅记录结论）
+
+`cargo run --quiet --features cli -- verify ../golden/exam_split_trade`：
+`entries=10 checks=215 failed=2 skipped=9`，退出码 1。
+
+- 2 处 FAIL 均为 `Relation`：`v_dat_inst_base_info` / `v_dat_inst_base_info_s` 被
+  `PKG_SPLIT_TRADE_STEP9.sql` 引用，而语料 `sql/ddl/views/`（11 个视图）里没有它们的
+  DDL——**语料缺口，不是引擎缺陷**；这正是 `verify` 要暴露的那一类"链路引用了项目里没有
+  的对象"。补齐方式是取得视图 DDL 或写显式桩，不在引擎侧伪造。
+- 9 处 SKIP 是"无 `*.case.toml` 声明该入口"（可执行性未验证，按 §12.1 不计失败）；
+  唯一声明场景的 `exam_bjgsyh#1` PASS（`outs=1`）。
+- 在库项目的同一命令：`verify ../golden/case_corpus_purchase` →
+  `entries=1 checks=11 failed=0`，并把运行态快照落到 `.spinduck/conf/spinduck.toml`。
+
+### V21.6 未覆盖面（登记，不声称已支持）
+
+语料零命中、本轮也**没有**顺手实现的形态。两类证据要分清：`RAISE_APPLICATION_ERROR`
+与 `EXIT <label>` 是本轮对语料**直接 grep 实测 0 处**（抽取脚本没有为它们定义构造，
+故不在清单里）；其余形态以清单 `[zero_hits]` 为证据——`DBMS_*` 包、`BULK COLLECT`/
+`FORALL`、`SAVEPOINT`、`CONNECT BY`、`MERGE`、解析函数 `MOD`/`NUMTOINTERVAL`/`REPLACE`/
+`UPPER`/`LOWER`，以及 `[rejects]` 面对应的 5 项 `reject_*`。另有三处**已知口径差异**
+写在形态 `why`/模块文档里而非改代码掩盖：A 模式 `'' ≡ NULL` 本引擎不采纳
+（`literal_empty_string_null` 实测 `notnull`，黄金比对层按归一化同值处理）；
+`SQLERRM` 文本由内核给出，形态断言只钉前 8 字符，内核升级（V6 门禁）须复核；
+处理器进入前的会话复位撤销的是"上次 COMMIT 之后的本段 DML"，不是 Oracle 的语句级回滚。
+

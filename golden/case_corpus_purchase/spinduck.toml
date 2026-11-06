@@ -18,3 +18,8 @@ include = ["cases/*.case.toml"]
 
 [engine]
 threads = 4
+
+# 对外可调用面（§12.1）：verify 的核验起点。
+[[entry]]
+routine = "pkg_split_trade_step3_sh.prc_trd_deal_purchase"
+kind = "procedure"

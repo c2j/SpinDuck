@@ -253,11 +253,17 @@ PopFrame）。语义要点：
    编译错误，禁止运行期隐式解析。
 2. **OUT/INOUT 跨帧**：实参槽位在编译期登记，被调帧对 OUT 槽位的写回在返回时
    合并进调用帧（同型校验走 §3.3 隐式转换）。
-3. **异常传播**：被调过程未捕获的异常沿显式栈上抛至调用者 handler；PL 栈回放
-   （§10.5/§11.2.2）输出完整帧链。
-4. **事务标记跨帧**：被调过程体内的 COMMIT/ROLLBACK 同样只是边界标记，归调用
+3. **实参省略与形参默认值**：`DEFAULT` 只接受**字面量**（`NULL`/字符串/整数/
+   小数/布尔），登记期编译进目录；调用侧省略的尾部实参按声明顺序取默认值，
+   未声明 `DEFAULT` 的形参一律 `BIZ-0151` 显式拒绝（不静默补 NULL）。非字面量
+   默认值（表达式、`sysdate` 一类）在 v1 登记期即 `BIZ-0203` 拒绝——语料 22 处
+   DEFAULT 全为字面量，据此不引入表达式求值面。
+4. **异常传播**：被调过程未捕获的异常沿显式栈上抛至调用者 handler；PL 栈回放
+   （§10.5/§11.2.2）输出完整帧链。处理器内的裸 `RAISE;` 重抛**当前**异常，
+   不因已进入处理器而失效（与 GaussDB 同口径）。
+5. **事务标记跨帧**：被调过程体内的 COMMIT/ROLLBACK 同样只是边界标记，归调用
    链顶层统一执行（§3.5 延迟事务）。
-5. **递归防护**：帧深度上限 + 编译期调用图检测（复用 ogsql call graph）；
+6. **递归防护**：帧深度上限 + 编译期调用图检测（复用 ogsql call graph）；
    互相递归在编译期报错，运行期深度超限抛 `ENGINE` 域错误。
 
 验证依据：语料中存在两种真实形态——跨包限定调用（`pkg_a.proc_b(...)`）与
@@ -477,7 +483,10 @@ UDF 回调发生在 DuckDB 执行查询的过程中：
 | 路径 | 状态 | 判定依据 |
 |---|---|---|
 | ③ 宏（表达式级） | **已落地** | 纯表达式函数（单 `RETURN <expr>`、无局部变量、纯 IN 参数、非包限定）在 `register` 时登记为 `CREATE OR REPLACE MACRO`；表达式经 `sql::render` 由 IR 渲染，函数名走 `[functions]` 规则映射，`@` 变换标记拒绝渲染 |
-| ② SQL 上下文例程调用 | ✅ 已实现（参数元组缓存化下沉） | `sql/sqlfn/`：编译期按调用点构造 `SELECT DISTINCT <args> [FROM…][WHERE…]`（剔除自身谓词、上下文依赖拓扑、相同调用去重），调用点内联为相关子查询；运行期逐元组调用例程填 `sd_fnN` 临时表。**前提**：例程在语句执行期确定性；元组上界 10 万；上下文互引显式拒绝（BIZ-0160）。见 validation V15 |
+| ② SQL 上下文例程调用 | ✅ 已实现（参数元组缓存化下沉） | `sql/sqlfn/`：编译期按调用点构造 `SELECT DISTINCT <args> [FROM…][WHERE…]`（剔除自身谓词、上下文依赖拓扑、相同调用去重），调用点内联为相关子查询；运行期逐元组调用例程填 `sd_fnN` 临时表。**前提**：例程在语句执行期确定性；元组上界 10 万；上下文互引显式拒绝（BIZ-0160）。**保留命名空间**：下沉产出的表名与列名一律带 `sd_`
+前缀（`sd_fnN` / `sd_v` / `sd_a0…`）——管线在调用点替换之后还要跑一次变量绑定，裸 `v`/`a0`
+会命中同名 PL 变量并被替换成绑定占位符；`sd_` 前缀在语料里零命中，故不会与项目标识符相撞。
+见 validation V15、V21 |
 | ① UDF（过程级） | **主动推迟** | DuckDB 禁止同一连接在查询执行中发起子查询（§8.2-1），回调内必须走同 Database 的第二连接；`SqlExecutor` 接缝当前不暴露 Database 句柄，新增能力属接缝签名变更（AGENTS §1 需 Ask first）。折中约束：过程级函数**只能 PL 上下文调用**，SQL 上下文调用得到内核 Catalog Error（明确失败，不静默降级） |
 
 实现纪律：
@@ -828,7 +837,7 @@ SQL 写错"：同 SQL 在规则探针中通过 = 业务 bug；探针缺失 = 引
 ├── cases/
 │   ├── datasets/                   # 样例数据（seed SQL / CSV / Parquet）
 │   ├── baselines/                  # GaussDB 黄金输出（P3 比对基准）
-│   └── *.case.toml                 # case 定义：数据集 × 例程 × 期望输出
+│   └── *.case.toml                 # case 定义：数据集 × 例程 × 期望输出 + `[[case.assert]]` 断言集
 ├── reports/                        # 生成产物（P0 assess / P3 验收报告；可提交评审）
 └── .spinduck/                      # 本地运行态（gitignore）：dev 库、日志、tmp
                                     #   ——即 SPINDUCK_HOME 的开发态实例（§11）
@@ -885,6 +894,22 @@ SQL 侧对象名取自改写前的静态扫描（`FROM`/`JOIN`/`UPDATE`/`INSERT 
 与 `<seq>.nextval`），字符串字面量与表函数不计——这是**近似口径**，其假阴面（动态
 拼接文本里的表名）由 `Scenario` 的真实执行兜住。退出码：有 `FAIL` → 1。
 
+**用例断言集（`[[case.assert]]`）**：`Scenario` 只回答"可调用"，不回答"结果对不对"，
+因此非简单的函数/过程/包在同一个 `*.case.toml` 里再声明显式断言集——四个维度、逐值
+比对，全部跑在进程内内核上（**不依赖任何外部数据库**，AGENTS §4.1 的 cases 层）：
+
+| `kind` | `target` | 期望文本 `want` |
+|---|---|---|
+| `rows` | 断言 SQL（自带 `ORDER BY` 定序） | 归一行集 `"[a, b] [c, d]"` |
+| `call` | 被测例程全名 | 归一化返回值（NULL 显式为 `NULL`） |
+| `out` | 被测例程全名 + `param` | 该 OUT/IN OUT 参的归一化值 |
+| `error` | 被测例程全名 | `"错误码\|消息片段"`（片段可省略 = 只比码） |
+
+`kind`/`target`/`want` 缺项、`out` 缺 `param` 一律 `ENV-0031` 报错——空 `want` 等于
+永真断言，不接受静默通过。执行口径与 `verify` 同源（`deploy_project`：表 DDL → 视图 →
+桩 → 例程 → 种子），消费者是 `spinduck/tests/cases_native.rs`；取值探针
+`CASES_PROBE=1`，提交前必须以实测值填回 `want`。实测记录见 validation.md V21。
+
 **运行态项目快照（§11.1 `conf/spinduck.toml`）**：`verify` 同时把"运行态所需的
 那部分声明"（项目名/内核版本 + 可调用面 + 资产绝对路径 + `[runtime]` 来源标注）
 写入 `<home>/conf/spinduck.toml`。设计取舍：
@@ -905,8 +930,13 @@ SQL 侧对象名取自改写前的静态扫描（`FROM`/`JOIN`/`UPDATE`/`INSERT 
 **实现状态**：`spinduck_core::project`（`ProjectConfig` / `CaseConfig` /
 `EntryConfig`）已实现本结构的声明识别（路径解析、用例枚举、数据集/基线定位、
 物化清单、`[[entry]]` 可调用面）；黄金对比 harness（`spinduck/tests/common`）是其
-首个消费者，`golden/case_*` 全部按本布局组织。`spinduck verify`（`spinduck_core::verify`：
-链路抽取 `chain` / 部署 `deploy` / 逐对象判定 `run` / 运行态快照 `manifest`）已落地，
+首个消费者，`golden/case_*` 全部按本布局组织。已入库项目里 `golden/case_corpus_purchase`
+声明 1 条入口（包限定过程），`spinduck verify ../golden/case_corpus_purchase` 在**进程内
+内核**上即可跑通全链（`entries=1 checks=11 failed=0`，无需容器）；其余三个项目的主角是
+独立例程（`prc_agg_fund` / `fnc_get_stock_kind` / `fnc_com_get_min_tax`，无包限定），按
+"入口必须全名定位"的口径不声明 `[[entry]]`，其正确性由 `[[case.assert]]` 断言层
+兜住。`spinduck verify`（`spinduck_core::verify`：链路抽取 `chain` / 部署 `deploy` /
+逐对象判定 `run` / 运行态快照 `manifest`）已落地，
 `spinduck init/load/register/golden` 命令面属后续里程碑（P1/P3）。
 
 ---

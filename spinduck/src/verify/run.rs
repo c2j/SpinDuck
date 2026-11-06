@@ -10,7 +10,7 @@ use crate::error::EngineError;
 use crate::exec::{BindMap, SqlExecutor};
 use crate::ir::IrProg;
 use crate::project::{CaseKind, EntryConfig};
-use crate::verify::chain::{routine_refs, sql_object_refs, sql_texts, ObjectKind, ObjectRef};
+use crate::verify::chain::{chain_object_refs, routine_refs, ObjectKind, ObjectRef};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// 核验项类别（`Entry` = 入口声明本身；其余为链路对象）。
@@ -173,9 +173,7 @@ fn walk_chain(entry: &EntryConfig, facts: &ChainFacts, checks: &mut Vec<Check>) 
                 pending.push_back(resolved);
             }
         }
-        for sql in sql_texts(prog) {
-            refs.extend(sql_object_refs(&sql));
-        }
+        refs.extend(chain_object_refs(prog));
     }
     for r in refs {
         let kind = match r.kind {

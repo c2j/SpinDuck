@@ -123,7 +123,8 @@ kind = "function"                                       # 缺省 procedure
 | PL 上下文 `@` 标记函数（`TO_CHAR`/`TO_DATE`/`INTERVALTONUM`） | ✅ SQL-first 下沉（`SqlFn`，保留日期中间类型；`日期±n` 自动 `to_days`） |
 | **SQL 上下文例程调用**（`UPDATE SET f(col)` / 游标 WHERE / INSERT VALUES 中的 PL 函数） | ✅ 参数元组缓存化下沉（`sqlfn`，确定性前提 + 10 万元组上界） |
 | `%NOTFOUND` 空游标 / `SQLERRM` / `UPDATE` 去别名 / `SELECT INTO` 行数语义（0 行 `NO_DATA_FOUND`、>1 行 `TOO_MANY_ROWS`，静态与动态同口径） | ✅ |
-| 黄金对比 | ✅ `golden/`：toy 用例 + 语料级逐字函数（stock_kind / min_tax）+ 核心过程（purchase / **hz_byfund**） |
+| 黄金对比 | ✅ `golden/`：toy 用例 + 语料级逐字函数（stock_kind / min_tax）+ 核心过程（purchase） |
+| 用例原生断言层（无容器） | ✅ `[[case.assert]]`（`rows`/`call`/`out`/`error` 四维，进程内内核逐值比对）+ 语料形态覆盖门禁 `config/corpus_forms.toml`（`architecture.md` §12.1、validation V21） |
 | 入口链路核验 `spinduck verify` | ✅ `[[entry]]` 全名声明 → 例程断点 / 表·序列缺失 / 场景可执行逐条判定 + 运行态 `conf/` 快照（`architecture.md` §11.1、§12.1） |
 | `RETURN NEXT` / `PIPE ROW` / 集合类型（嵌套表/数组元素赋值）/ 带参游标 | ⛔ 待做（语料仅 3+1 例，编译期显式拒绝） |
 | 例程目录持久化 | ✅ 内核内 `spinduck_routines` 表存源 DDL 文本，`reload_catalog` 按当前规则重放编译（`--db` 落盘后跨进程恢复） |

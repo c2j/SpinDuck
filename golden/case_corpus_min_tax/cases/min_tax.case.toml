@@ -24,3 +24,54 @@ args = ["'83'", "'P3'", "'0200'", "'20240630'", "null", "null"]
 [[case.scenarios]]
 why = "无配置 → EXCEPTION OTHERS + nvl 归 0"
 args = ["'83'", "'P4'", "'0900'", "'20240630'", "null", "null"]
+
+# ── 原生断言集（`[[case.assert]]`，进程内 DuckDB 1.5.5，零外部环境）────────────
+# 跑法：cargo test --features native --test cases_native
+# 取值：CASES_PROBE=1 cargo test --features native --test cases_native -- --nocapture
+
+[[case.assert]]
+why = "精确 stock_kind 命中（内层 ORDER BY stock_kind DESC + rownum = 1 取首行）"
+kind = "call"
+target = "fnc_com_get_min_tax"
+args = ["'83'", "'P1'", "'0102'", "'20240630'", "null", "null"]
+want = "1.5"
+
+[[case.assert]]
+why = "组内兜底 '0100'（无精确行时按 stock_kind 退档）"
+kind = "call"
+target = "fnc_com_get_min_tax"
+args = ["'83'", "'P2'", "'0105'", "'20240630'", "null", "null"]
+want = "2.5"
+
+[[case.assert]]
+why = "全局兜底 '0000'"
+kind = "call"
+target = "fnc_com_get_min_tax"
+args = ["'83'", "'P3'", "'0200'", "'20240630'", "null", "null"]
+want = "4"
+
+[[case.assert]]
+why = "三档全缺 → 内层 NO_DATA_FOUND 被 WHEN OTHERS 吞掉，RETURN nvl(RESULT, 0) 归 0"
+kind = "call"
+target = "fnc_com_get_min_tax"
+args = ["'83'", "'P4'", "'0900'", "'20240630'", "null", "null"]
+want = "0"
+
+[[case.assert]]
+why = "省略两个 DEFAULT 形参（语料 22 处类型锚定 DEFAULT 的调用面）"
+kind = "call"
+target = "fnc_com_get_min_tax"
+args = ["'83'", "'P1'", "'0102'", "'20240630'"]
+want = "1.5"
+
+[[case.assert]]
+why = "有效期谓词按字符日期比较：P1 三档全部命中，'2023' 过期行被排除"
+kind = "rows"
+target = "SELECT stock_kind, min_tax FROM par_sys_marketrate WHERE par_code = 'P1' AND '20240630' BETWEEN inure_begin_date AND inure_end_date ORDER BY stock_kind DESC"
+want = "[0102, 1.5] [0100, 2] [0000, 3]"
+
+[[case.assert]]
+why = "过期行确实存在（上一条的排除项非空集，防止区间谓词假绿）"
+kind = "rows"
+target = "SELECT COUNT(*), MIN(inure_end_date) FROM par_sys_marketrate WHERE par_code = 'P1'"
+want = "[4, 20231231]"

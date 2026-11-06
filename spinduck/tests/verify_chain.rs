@@ -300,3 +300,140 @@ fn should_snapshot_manifest_in_home_conf_and_verify_runtime_dir_alone() {
     );
     assert_eq!(code2, 1, "缺口仍在，退出码不变");
 }
+
+#[test]
+fn should_build_views_from_real_body_when_kernel_can_parse_it() {
+    // 视图体只在内核确实不接受时才降级为占位视图（§12.1：链路 SQL 会读视图列）
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "spinduck.toml",
+        "[project]\nname = \"views\"\nkernel = \"1.5.5\"\n\n[[entry]]\nroutine = \"pkg_v.prc_sum\"\n",
+    );
+    write(root, "sql/ddl/tables.sql", DDL);
+    write(
+        root,
+        "sql/ddl/views/v_ok.sql",
+        "CREATE OR REPLACE VIEW v_ok AS SELECT a FROM t_ok;\n",
+    );
+    write(
+        root,
+        "sql/routines/pkg_v.sql",
+        r#"
+CREATE OR REPLACE PACKAGE pkg_v AS
+  PROCEDURE prc_sum(p_i_date IN VARCHAR2, p_o_succeed OUT VARCHAR2);
+END;
+/
+CREATE OR REPLACE PACKAGE BODY pkg_v AS
+  PROCEDURE prc_sum(p_i_date IN VARCHAR2, p_o_succeed OUT VARCHAR2) IS
+    v_n NUMBER;
+  BEGIN
+    SELECT count(*) INTO v_n FROM v_ok WHERE a > 0;
+    p_o_succeed := '0';
+  END;
+END;
+/
+"#,
+    );
+    write(
+        root,
+        "cases/v.case.toml",
+        r#"
+[case]
+name = "v"
+kind = "procedure"
+entry = "pkg_v.prc_sum"
+baseline = "expected.json"
+[case.output]
+sql = "SELECT a FROM t_ok ORDER BY a"
+[[case.scenarios]]
+why = "视图列可读"
+args = ["'20240105'", "null"]
+"#,
+    );
+    write(root, "cases/datasets/seed.sql", SEED);
+
+    let project = ProjectConfig::load(root).unwrap_or_else(|e| panic!("加载: {}", e.message));
+    let reports = verify_project(&project).unwrap_or_else(|e| panic!("verify: {}", e.message));
+    let sum = report(&reports, "pkg_v.prc_sum");
+    assert_eq!(
+        status(sum, CheckKind::Relation, "v_ok"),
+        Status::Pass,
+        "视图须在内核目录可见"
+    );
+    assert_eq!(
+        status(sum, CheckKind::Scenario, "v#1"),
+        Status::Pass,
+        "视图体真实建立后链路 SQL 才能读列；占位视图（SELECT 1）读不到 a：{:?}",
+        sum.checks
+    );
+}
+
+#[test]
+fn should_fall_back_to_placeholder_view_when_kernel_cannot_build_body() {
+    // 语料视图体里有 GaussDB 专属函数：内核建不出来，必须退占位而不是让整个核验失败
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "spinduck.toml",
+        "[project]\nname = \"vforce\"\nkernel = \"1.5.5\"\n\n[[entry]]\nroutine = \"pkg_v.prc_sum\"\n",
+    );
+    write(root, "sql/ddl/tables.sql", DDL);
+    write(
+        root,
+        "sql/ddl/views/v_bad.sql",
+        "CREATE OR REPLACE VIEW v_bad AS SELECT gaussdb_only_fn(a) FROM t_ok;\n",
+    );
+    write(
+        root,
+        "sql/routines/pkg_v.sql",
+        r#"
+CREATE OR REPLACE PACKAGE pkg_v AS
+  PROCEDURE prc_sum(p_i_date IN VARCHAR2, p_o_succeed OUT VARCHAR2);
+END;
+/
+CREATE OR REPLACE PACKAGE BODY pkg_v AS
+  PROCEDURE prc_sum(p_i_date IN VARCHAR2, p_o_succeed OUT VARCHAR2) IS
+  BEGIN
+    SELECT count(*) INTO p_o_succeed FROM v_bad;
+    p_o_succeed := '0';
+  END;
+END;
+/
+"#,
+    );
+    write(
+        root,
+        "cases/v.case.toml",
+        r#"
+[case]
+name = "v"
+kind = "procedure"
+entry = "pkg_v.prc_sum"
+baseline = "expected.json"
+[case.output]
+sql = "SELECT a FROM t_ok ORDER BY a"
+[[case.scenarios]]
+why = "占位视图仍可计数"
+args = ["'20240105'", "null"]
+"#,
+    );
+    write(root, "cases/datasets/seed.sql", SEED);
+
+    let project = ProjectConfig::load(root).unwrap_or_else(|e| panic!("加载: {}", e.message));
+    let reports = verify_project(&project).unwrap_or_else(|e| panic!("verify: {}", e.message));
+    let sum = report(&reports, "pkg_v.prc_sum");
+    assert_eq!(
+        status(sum, CheckKind::Relation, "v_bad"),
+        Status::Pass,
+        "视图体不可建时仍须有对象可核验（占位）"
+    );
+    assert_eq!(
+        sum.failed().len(),
+        0,
+        "退回占位后链路不得判失败：{:?}",
+        sum.checks
+    );
+}
