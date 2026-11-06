@@ -943,7 +943,9 @@ purchase 单跑 → **通过，`RestartCount` 不变**。假说在本地不成�
   或按纳秒解释，窗口口径不能靠猜。
 
 **演练**：workflow YAML 解析通过，13 个 `run` 步骤逐个 `bash -n` 通过；新构造对本地容器
-逐条实跑——`pid1_baseline` 打印正常、`ulimit -c` = 0、崩溃恢复文件数 = 0（本地无崩溃，
+逐条实跑——`pid1_baseline` 打印正常、`ulimit -c` = 0（**更正**：这条读的是 `docker exec`
+新起的 shell，不是 PID 1 的限额，判"能否落 core"必须看宿主 `/proc/<pid>/limits`，见
+V21.10）、崩溃恢复文件数 = 0（本地无崩溃，
 符合预期）、`received …shutdown request` 行数 = 3（initdb 临时实例的两次停服 + 最终
 引导，属正常噪声，判读时看的是"失败之后有没有新增"而不是绝对值）、`docker logs
 --since <RFC3339>` 与 `docker events --since/--until <RFC3339>` 均无参数错误。
@@ -953,3 +955,64 @@ purchase 单跑 → **通过，`RestartCount` 不变**。假说在本地不成�
 FATAL = 静默终止，`ulimit -c = 0` 已排除 core，下一步只能改成"在 runner 上给容器放开
 core 上限 + 指定可落盘路径"或把 purchase 参照侧语料二分；④ 峰值/限额之比作为内存的
 最后确认。仍未定论项：runner 上 purchase 参照侧实例终止的直接成因。
+→ ①②已由 V21.10 回答（判定B；exec 采样器嫌疑排除），③ 的"`ulimit -c = 0` 已排除
+core"是误测，core 在 runner 上可落且进 systemd-coredump。
+
+### V21.10 判定B：干净实例单跑 purchase 即致死，exec 采样器嫌疑排除
+
+runner 两轮（run 42236691856 = `34bbd48`、run 42237764112 = `b719696`，golden job）
+在**测试窗口内零容器侵入**（内存改宿主侧读 `memory.peak`）+ 单跑判定的条件下，结果一致：
+
+| 事实 | 实测值 | 判读 |
+|---|---|---|
+| `SHOW max_process_memory` / `shared_buffers` | 4GB / 512MB | compose 的 `OTHER_PG_CONF` 在 runner 空目录首次 initdb 确实生效（不是"假设生效"） |
+| 容器 cgroup `memory.max` | 6442450944 字节 | 限额 6G 原样落地，未被 runner 抹平 |
+| `server_encoding` / `lc_collate` / `lc_ctype` | SQL_ASCII / C / C | 与本地同口径 → **编码漂移不是**本地绿/runner 红的差异来源 |
+| memory-protect 初始化失败行数 | 2 | 实例级内存看护关闭（与 compose 注释一致），超限不会被拦成可读 SQL 错误 |
+| `Standalone purchase repro` | rc=101，`[ENV-0020] gaussdb: connection closed`，用例自身 finished in 2.46s / 1.85s | 崩溃点就是那一句 `CALL pkg_split_trade_step3_sh.prc_trd_deal_purchase(...)` |
+| PID1 `RestartCount` | 0 → 1（两轮一致） | **判定B**：不依赖套件先前 11 分钟的建库/删库状态，单跑即致死 |
+| `'not properly shut down'` 文件数 | 0 | 与 V21.8/21.9 记录的"重启后报崩溃恢复"不同形态：本轮窗口内没走崩溃恢复 → 更像 postmaster **自行正常退出**（exit 0）而非段错误后恢复 |
+| 重启到 `healthy` | < 7s（`交接给全量套件时 health=healthy`） | `unless-stopped` 把死亡完全掩掉，只有 `RestartCount` 能证明死过 |
+| `StartedAt` | 0→1 之后**未变** | 不能当"死过"的判据；取证脚本的 State 组同时打印 started/finished/restart_count/exit_code，把口径固化下来 |
+
+**误测更正（重要）**：V21.9 里"`ulimit -c` = 0 → 崩溃不可能落 core"这条读的是
+`docker exec` 新起 shell 的限额。runner 上实测 `ulimit -c = unlimited`，宿主
+`core_pattern = |/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h %d %F`。
+也就是说：**崩溃是能拿到 core 和栈的**，只是 core 不落目录而进 `coredumpctl`；
+判 PID 1 的落 core 能力一律读宿主 `/proc/<pid>/limits`（内核维护，进程改不了）。
+
+**本轮改造**（`scripts/ci/gauss_incident_evidence.sh` 新增 + `.github/workflows/ci.yml`；
+无 Rust 变更）：
+
+- 取证收进一个脚本、九组：容器/PID1 状态、PID1 权威 rlimit + `core_pattern`、
+  生命周期事件（die 的 exitCode/信号）、宿主 `dmesg`（segfault / OOM / traps）、
+  `coredumpctl`（含 `Stack trace of thread` 栈顶）、崩溃恢复判定、pg_log 增量、
+  内存口径（peak/current/max + 容器内 postgresql.conf 生效值 + `free -m`）、
+  容器 stdout。`Standalone` 与全量套件红时都调同一个脚本——上一轮两处各写一份，
+  套件那份只 grep 了 oom、压根没查 coredumpctl，这就是口径漂移的代价。
+- 脚本全程 `set +e`、末尾 `exit 0`：取证绝不反过来成为新的红因。
+- 宿主 cgroup 目录解析加**归属校验**（`memory.max` 必须等于 Engine API 的
+  `HostConfig.Memory`；`max`/未设限跳过），不一致即回退 `docker stats`——错位目录
+  读到的宿主全局峰值会被当成容器证据，比读不到更危险。
+- 全量套件删掉后台内存采样器：`memory.peak` 单调不减，测试前后各读一次即覆盖全程，
+  采样器每 5 秒读的是同一个数，还平白多开一个进程。
+- `Standalone` 在 `rc ≠ 0` **或** PID1 变化时取证；判定B 仍然门禁（绿的含义必须是
+  "没有任何一处观察到崩溃"）。
+
+**演练**：YAML 解析通过，13 个 `run` 步骤逐个 `bash -n` 通过；本地用 `cargo` 桩
+（固定 `exit 101`）端到端演练两个步骤骨架——套件步骤按被测 rc 返回 101（门禁行为
+正确），`Standalone` 在 `pre == post` 时返回 0（判定A 不门禁断言失败），且 rc≠0 分支
+确实调用了取证脚本、九组全部打印；脚本对本地健康容器实跑返回 0，Engine API 限额
+6442450944、`received …shutdown request` = 3、崩溃恢复 = 0 与上一轮一致。
+
+**下一轮判读顺序**（脚本输出即按此排列）：① `dmesg` 有 `gaussdb[…]: segfault` →
+信号型崩溃实锤，配 `coredumpctl` 栈顶可直接定位 openGauss 内部函数；② `coredumpctl`
+有 core → 栈顶即崩位；无 core 但 die 的 exitCode ≠ 0 → 看信号；③ exitCode = 0 且
+`received …shutdown request` 无新增 → postmaster 是**主动正常退出**，方向转为"什么让
+它自己退出"而不是段错误；④ 内存仍只作最后排除项（V21.9 已否掉一次）。
+
+**仍未定论**：runner（linux/amd64）上 purchase 参照侧实例终止的直接成因。本地
+（linux/arm64，同镜像 tag、同 4GB/512MB/6G 口径、同 SQL_ASCII）全量 gauss 套件为绿，
+架构是当前最大的未排除变量；本机 registry 只返回 arm64 摘要（`docker pull --platform
+linux/amd64` 报"up to date"并解析到 arm64 镜像），amd64 复现只能在 runner 做——这正是
+取证脚本必须自带 dmesg/coredumpctl 的原因。
