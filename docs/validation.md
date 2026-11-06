@@ -917,9 +917,10 @@ purchase 单跑 → **通过，`RestartCount` 不变**。假说在本地不成�
 
 **本轮改造**（`.github/workflows/ci.yml` golden job；无 Rust 代码变更）：
 
-- 测试窗口内**零容器侵入**：内存采样改到宿主侧（`sudo find /sys/fs/cgroup -name
-  docker-<id>.scope` 读 `memory.peak`，找不到则退到 `docker stats --no-stream`，
-  两者都走 Engine API）。`memory.peak` 本身是高位水位，一次读取即全程最大值；
+- 测试窗口内**零容器侵入**：内存采样改到宿主侧，路径不靠猜目录名——读容器 PID 1 的
+  `/proc/<pid>/cgroup`（cgroup v2 唯一一行 `0::<相对路径>`），拼出
+  `/sys/fs/cgroup<相对>/memory.peak`；读不到才退到 `docker stats --no-stream`。
+  两条路径都不进容器命名空间。`memory.peak` 本身是高位水位，一次读取即全程最大值；
   回退路径读到的是**当前值不是峰值**，两条输出行因此标注不同口径——V21.8 那轮
   "452MiB" 就是把回落后当前值当成峰值判读，标签必须防止同样的误读。
 - fingerprint 步骤登记 **PID 1 基线**（`RestartCount` + `StartedAt` + 容器 ID）并打印

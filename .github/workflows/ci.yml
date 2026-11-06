@@ -211,9 +211,18 @@ jobs:
           # 按秒或纳秒解释，窗口口径不能靠猜。
           t0_iso=$(date -u +%Y-%m-%dT%H:%M:%S)
           cid=$(docker inspect -f '{{.Id}}' spinduck-gaussdb)
-          peakfile=$(sudo find /sys/fs/cgroup -maxdepth 4 -type d -name "docker-${cid}.scope" 2>/dev/null | head -1)
+          # 宿主侧 cgroup 路径不靠猜目录名：读容器 PID 1 的 /proc/<pid>/cgroup，
+          # cgroup v2 下只有一行 `0::<相对路径>`。这样无论 dockerd 用 systemd 还是
+          # cgroupfs 驱动都拿到同一个口径，比 find -name "docker-<cid>.scope" 可靠。
+          cpid=$(docker inspect -f '{{.State.Pid}}' spinduck-gaussdb)
+          cgrouprel=$(sudo awk -F'::' '$1=="0"{print $2}' "/proc/$cpid/cgroup" 2>/dev/null | head -1)
+          peakfile=""
+          if [ -n "$cgrouprel" ] && sudo test -r "/sys/fs/cgroup$cgrouprel/memory.peak"; then
+            peakfile="/sys/fs/cgroup$cgrouprel"
+          fi
           echo -n "宿主侧 cgroup 目录: "
-          echo "${peakfile:-未找到（改用 docker stats，走 Engine API 不进容器）}"
+          echo "${peakfile:-未找到（改用 docker stats，走 Engine API 不进容器）；pid=$cpid cgroup=${cgrouprel:-未读到}}"
+          [ -n "$cid" ] && echo "容器 id=$cid"
           touch /tmp/og_peak_samples.txt
           if [ -n "$peakfile" ]; then
             ( for i in $(seq 1 200); do
