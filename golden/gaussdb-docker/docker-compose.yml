@@ -36,9 +36,25 @@ services:
       # max_process_memory（本机实测 12GB）与 shared_buffers（1GB），CI runner
       # 与开发机的推导值不同会让同一份语料参照侧行为漂移，且实例总内存超过
       # deploy 限额时是内核直接 OOM kill（客户端只看到 "connection closed"）。
-      # 固定为 2GB/256MB 后，超限由 openGauss 自身看护报可读错误；限额 3GB
-      # 留裕量（实测语料参照侧峰值 RSS 1.44GB）。
-      OTHER_PG_CONF: "password_encryption_type = 1\nmax_process_memory = 2GB\nshared_buffers = 256MB"
+      #
+      # 口径取 4GB/512MB + 限额 6GB 的依据（实测，validation V21.8）：同一份语料
+      # 跑全量 gauss 套件，容器 cgroup 内存峰值 linux/amd64 1.74GB、
+      # linux/arm64 1.10GB——2GB 预算 + 3GB 限额的余量只剩 ~1.7 倍，runner 上
+      # 任何放大都会踩线，而 runner 有 16GB 内存，没有必要把参照实例卡这么紧。
+      #
+      # 注意：启动日志里的 "Failed to initialize the memory protect for
+      # cstore_buffers (512 Mbytes) ..." 与小口径同行出现——实测写死 2GB/4GB 时
+      # 必打印，不写死（跟随宿主 12GB）时不打印。也就是说一旦我们把预算写死，
+      # openGauss 的实例级内存看护就是关着的：超限不会被拦成可读 SQL 错误，而是
+      # 直接被内核杀掉（客户端只剩 "[ENV-0020] connection closed"）。这是限额
+      # 必须明显高于预算的理由，不是可以忽略的噪声。
+      #
+      # 生效条件（易踩）：OTHER_PG_CONF 只在**空数据目录首次 initdb** 时追加进
+      # postgresql.conf（镜像 entrypoint 的 opengauss_setup_postgresql_conf 位于
+      # `if [ -z "$DATABASE_ALREADY_EXISTS" ]` 分支内）。改这几行必须 `down -v`
+      # 重建卷，或手工追加到 $PGDATA/postgresql.conf 末尾后重建容器——两者都是
+      # postmaster 级参数，reload 不够。
+      OTHER_PG_CONF: "password_encryption_type = 1\nmax_process_memory = 4GB\nshared_buffers = 512MB"
     ports:
       # 仅回环：开发机不向局域网暴露 A 模式实例
       - "127.0.0.1:5433:5432"
@@ -58,10 +74,12 @@ services:
       start_period: 40s
     deploy:
       resources:
-        # 3G > max_process_memory 2GB：超限先由 openGauss 看护报错，而不是被内核
-        # OOM kill 后只留下客户端的 "connection closed"（见上方 OTHER_PG_CONF 注释）。
+        # 限额 6G 必须明显高于 max_process_memory 4GB：本镜像的实例级内存看护
+        # 起不来（见上方注释），超限不会被拦成可读 SQL 错误，而是内核直接杀掉
+        # 后端进程——客户端只剩 "[ENV-0020] connection closed"。留足余量让这种事
+        # 不发生，才是可诊断的前提（validation V21.8）。
         limits:
-          memory: 3G
+          memory: 6G
         reservations:
           memory: 1G
 

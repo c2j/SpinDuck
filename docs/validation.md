@@ -804,3 +804,78 @@ golden job 现在红时自动落三段证据（容器 stdout 尾部 200 行、�
 预留 512M→1G——限额高于实例口径，越限先由 openGauss 看护报错而非被内核杀掉。镜像每次
 启动把这几行**追加**进 `postgresql.conf` 末尾（后写覆盖先写），旧卷无需 `down -v`。
 一次性口令另加 `::add-mask::`，此前步骤 env 转储会把口令原文打进公开 runner 日志。
+
+### V21.8 失败窗口取证改造（含 V21.7 两处结论的更正）
+
+**runner 第四轮实录**（run 42215030234，head = `5d9b419`，即"固定 2GB 口径 + 红时落证据"
+两轮改动都在生效的那一轮）：
+
+- 同一 job 内 purchase **之前**的参照侧真调用全部成功：`case_corpus_stock_kind` 4 场景、
+  `case_corpus_min_tax` 4 场景（含 EXCEPTION OTHERS 路径）、`golden_gauss`、`gauss_e2e`
+  皆绿，219 条 lib 测试绿。所以 runner 上网络/认证/DDL/PL 部署/包调用链路是通的，
+  失败只在 `prc_trd_deal_purchase` 的 CALL 本身。
+- 失败时刻线：`test result: FAILED. 0 passed; 1 failed ... finished in 1.48s`，
+  panic 于 12:17:25.355。主实例 `pg_log` 里能取到的最后一条是 12:17:23.979 的后台
+  UNDO 记录，其后没有任何 FATAL/PANIC/kill 行。
+- 证据为什么是空的（三条，都已修正）：① 采集距 panic 只有 1.2 秒，syslogger 还没落盘；
+  ② 口径 `ls -t | head -2 | xargs tail -n 120` 取到的"最新两文件"里一份是 initdb 临时
+  实例的收尾（`received fast shutdown request` / `Gaussdb exit(0)`），另一份主实例日志
+  在这 120 行窗口里全是每 60 秒一次的 checkpoint 噪声；③ `dmesg -T 2>/dev/null` 在
+  runner 上把"非 root 读不到内核环形缓冲区"伪装成了"没有 OOM 记录"。
+- 同时读到的旁证：失败后 1.2 秒 `docker stats` = 452MiB/3GiB、CPU 75%、38 个 PID，
+  容器活着（不是 PID 1 被杀）；`free -m` available 14466MB，宿主无压力。
+
+**对 V21.7 的更正**（都是实测，不是措辞问题）：
+
+1. 「旧卷无需 `down -v`，镜像每次启动把这几行追加进 `postgresql.conf`」——**错**。
+   镜像 entrypoint 的 `opengauss_setup_postgresql_conf`（`echo -e "$OTHER_PG_CONF"` 在
+   其中）位于 `if [ -z "$DATABASE_ALREADY_EXISTS" ]` 分支内，只在**空数据目录首次
+   initdb** 时执行。证据：开发机上卷早于该改动的在用容器，改 compose 后 `SHOW
+   max_process_memory` 仍是 12GB / `shared_buffers` 1GB。旧卷改口径的两条可用路径：
+   `down -v` 重建，或把三行手工追加到 `$PGDATA/postgresql.conf` 末尾再
+   `docker compose up -d` 重建容器——实测后者生效（SHOW 变为 4GB / 512MB）。两个参数
+   都是 `postmaster` 上下文（`pg_settings.context` 实测），`reload` 不够。
+2. 「限额高于实例口径后，越限先由 openGauss 看护报可读错误」——**不成立**。写死口径
+   （2GB 与 4GB 都一样）启动日志必现
+   `WARNING: Failed to initialize the memory protect for ... cstore_buffers (512 Mbytes)
+   or shared memory (9xx Mbytes) is larger`，跟随宿主推导（12GB）时不出现。含义是
+   实例级内存看护处于关闭状态，超限仍然是内核静默杀后端。因此正确处置是
+   **限额 ≫ 预算**，而不是指望看护报错。
+
+**新口径 4GB/512MB + 限额 6G 的实测依据**（隔离容器 + 新卷，全量 `--features gauss`，
+298 条 ok 为绿；峰值取容器 cgroup `memory.peak`）：
+
+| 架构 | `max_process_memory`/`shared_buffers` | 限额 | 结果 | 容器内存峰值 |
+|---|---|---|---|---|
+| arm64 | 宿主推导 12GB / 1GB（旧卷在用的开发容器） | 2G | 298 ok | 1.39GB |
+| arm64 | 写死 2GB / 256MB（新卷） | 3G | 298 ok | 1.099GB |
+| amd64 | 写死 2GB / 256MB（新卷） | 3G | 298 ok | 1.707GB |
+| amd64 | 写死 4GB / 512MB（新卷） | 6G | 298 ok | 1.744GB |
+| arm64 | 写死 4GB / 512MB（旧卷手工追加 = shipped compose） | 6G | 298 ok | 1.034GB |
+
+amd64 的峰值比 arm64 高约 55%，而 2GB 预算 + 3G 限额只剩 ~1.7 倍余量；GitHub runner
+实测 16GB（available 14466MB）没有理由把参照实例卡这么紧，故抬到 4GB/6G。
+本地仍未能复现 runner 侧的 purchase 失败——**本轮的目标不是猜中根因，而是让下一轮
+无论绿红都能判读**。
+
+**golden job 的取证改造**（`.github/workflows/ci.yml`，红绿都落日志）：
+
+- 常态 fingerprint 步骤：打印 `SHOW max_process_memory / shared_buffers /
+  server_encoding` + 容器内 cgroup `limit/peak` + 内存看护初始化失败行数。因为
+  `OTHER_PG_CONF` 的生效条件在"卷"上，runner 上的真实预算必须是打印出来的事实。
+- 测试开始前在**容器内**登记每个 `pg_log` 文件的字节偏移；红时先 `sleep 5` 等落盘，
+  再只输出偏移之后的增量（关键行 grep + 尾部 80 行）。偏移法与容器时区无关，也不会
+  把历史 ERROR 混进失败窗口。
+- 红时另落：`docker inspect` 的 `OOMKilled/RestartCount/Health/ExitCode`、
+  `docker events --filter event=die/oom/kill/restart`（必须过滤——不过滤时我自己的
+  `exec_create/exec_die` 会淹没输出）、`sudo dmesg` 的 OOM 行（stderr 不再吞掉）、
+  容器 stdout 尾部 120 行。
+- 全程每 3 秒后台采样 `memory.peak`，绿时也报最大值（"峰值离限额还有多远"是绿
+  run 里唯一有判读价值的内存数字）。
+- 演练方式：从 workflow 原文抽出该步骤的 `run` 文本，只把 `cargo test` 换成
+  `CHECKPOINT + exit 101`，对本地容器实跑——增量段恰好只输出 CHECKPOINT 那 1745
+  字节、无历史行；全部 run 步骤 `bash -n` 通过，workflow YAML 解析通过。
+
+**登记未定论项**：runner 上 purchase 参照侧后端消失的直接成因仍未取到服务端证据。若
+下一轮仍红，按此顺序判读：die/oom 事件 → `dmesg` → 增量 pg_log 里的 FATAL/backtrace →
+峰值与限额之比。本轮无任何 Rust 代码变更（fmt/clippy/native 门禁不受影响）。
