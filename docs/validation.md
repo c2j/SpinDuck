@@ -448,8 +448,18 @@ A999 股东未维护 → inst_log 桩 → 跳过，两侧一致）。
 | COMMIT/ROLLBACK 不降级 | 最外层 `BEGIN`…`COMMIT`/`ROLLBACK` 包络；`TxCommit/TxRollback` 即时作用并重开 | `guard_tx_semantics`：COMMIT 后续写持久化；ROLLBACK 撤销 DML；未处理异常统一回滚 |
 | 动态文本统一收口 | `EXECUTE IMMEDIATE` 与 `OPEN FOR` 共用 `prepare_dynamic_sql`（ogsql `parse_sql` 带错误通道 → 规则改名 → 变换 → 函数下沉）；撤销 ENG-0062 | `guard_execute_dynamic`：运行期拼接 INSERT 落行；乱码文本显式失败 |
 | 内置规则默认加载 | `include_str!` 嵌入种子规则，`default()` 直接可用；`--rules`/项目规则叠加（含 `target_duckdb/probe_duckdb` 覆盖） | 零 `--rules` 时 `NVL→coalesce` 生效（compile 路径）；`rules probe` 漂移检测仍红（回归守护） |
-| 口令经 `.env` 注入 | compose `${GS_PASSWORD:?}` + `127.0.0.1` 绑定 + `.env.example`；README/golden 文档去明文 | 对旧明文口令字面量全库 `grep -r` = 0 命中（字面量本身不再抄进本表） |
+| 口令经 `.env` 注入 | compose `${GS_PASSWORD:?}` + `127.0.0.1` 绑定 + `.env.example`；README/golden 文档去明文 | `git grep` 本仓库跟踪内容 = 0 命中（判定只对内，`lib/fastaas` 是子模块、属另一仓库）。历史提交仍含旧字面量，见下 |
 | fastaas 子模块保留 | 现状（私有项目）；CI 可达性留待仓库私有化时评估 | — |
+
+**口令去明文的边界（写清楚，避免读成"已经彻底清干净"）**：本轮改的是**当前内容**——
+`git grep` 在 HEAD 上对旧开发口令字面量 0 命中，`.env` 由 `.git/info/exclude` 挡在库外，
+`docker-compose.yml` 用 `${GS_PASSWORD:?}` 强制注入。但**历史不可改写**：该字面量仍存在于
+`75ee3fa`、`b9878bc`、`8b3ca69`、`a5835b2`、`1e43fd7`、`b4a9c03` 的旧 blob 里（当时落在
+`README.md`、`golden/README.md`、`golden/gaussdb-docker/docker-compose.yml`、
+`spinduck/tests/gauss_e2e.rs`、`docs/validation.md`）。因此处置只有两条真实路径：① 轮换
+开发机侧口令（该口令只用于本机 A 模式容器，`127.0.0.1` 绑定，不对外）；② 若要让默认分支
+不携带这段历史，走 squash 合并（合并后的 `main` 只含一个干净 tree）。改写已推送分支的历史
+属破坏性操作，需另行决策，本轮未做。
 
 **回归**：运行期递归缺陷修复——`RuleRegistry::default()` ↔ `from_toml_str` 曾相互递归（内置规则引入后触发栈溢出），`from_toml_str` 改用显式空基座。
 
