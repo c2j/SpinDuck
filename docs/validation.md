@@ -973,7 +973,7 @@ runner 两轮（run 42236691856 = `34bbd48`、run 42237764112 = `b719696`，gold
 | PID1 `RestartCount` | 0 → 1（两轮一致） | **判定B**：不依赖套件先前 11 分钟的建库/删库状态，单跑即致死 |
 | `'not properly shut down'` 文件数 | 0 | 与 V21.8/21.9 记录的"重启后报崩溃恢复"不同形态：本轮窗口内没走崩溃恢复 → 更像 postmaster **自行正常退出**（exit 0）而非段错误后恢复 |
 | 重启到 `healthy` | < 7s（`交接给全量套件时 health=healthy`） | `unless-stopped` 把死亡完全掩掉，只有 `RestartCount` 能证明死过 |
-| `StartedAt` | 0→1 之后**未变** | 不能当"死过"的判据；取证脚本的 State 组同时打印 started/finished/restart_count/exit_code，把口径固化下来 |
+| `StartedAt` | 0→1 之后**未变** | 不能当"死过"的判据；取证脚本的 State 组同时打印 started/finished/restart_count/exit_code，把口径固化下来。**V21.11 更正**：这条是 inspect 时序造成的误读——同一个窗口里 baseline `started=15:22:46` 与事后 `started=15:33:27` 明确不同，`StartedAt` 会变。固化下来的口径（同时打印四个字段）不变，但"未变"这个观察本身作废 |
 
 **误测更正（重要）**：V21.9 里"`ulimit -c` = 0 → 崩溃不可能落 core"这条读的是
 `docker exec` 新起 shell 的限额。runner 上实测 `ulimit -c = unlimited`，宿主
@@ -1016,3 +1016,75 @@ runner 两轮（run 42236691856 = `34bbd48`、run 42237764112 = `b719696`，gold
 架构是当前最大的未排除变量；本机 registry 只返回 arm64 摘要（`docker pull --platform
 linux/amd64` 报"up to date"并解析到 arm64 镜像），amd64 复现只能在 runner 做——这正是
 取证脚本必须自带 dmesg/coredumpctl 的原因。
+
+### V21.11 取证脚本自己有一处缺陷被实测抓到；判读走到"postmaster 以 0 退出"
+
+run 42242415215（head = `66f148b`，golden job）是 V21.10 改造后的第一轮实跑，九组证据
+全部落进日志。以下每条都是那一轮的服务端事实，不是推断。
+
+| 证据组 | 实测值 | 判读 |
+|---|---|---|
+| 单跑结果 | rc=101；`[ENV-0020] gaussdb: connection closed`；用例自身 `finished in 0.43s` | 死亡就在 `CALL pkg_split_trade_step3_sh.prc_trd_deal_purchase('20250715', null)` 这一次调用里 |
+| PID1 基线 → 事后 | `restart_count` 0→1；容器 id 不变（`537870f7…`）；`started` 15:22:46.315→15:33:27.799；`finished=15:33:25.134`；`exit_code=0`；`OOMKilled=false` | 15:33:25.134 死亡，2.66s 后被 `unless-stopped` 拉起（同容器新进程）。**V21.10 那条"StartedAt 未变"作废**，已就地更正 |
+| PID1 rlimit（宿主 `/proc/<pid>/limits`） | `Max core file size unlimited`；`Max address space unlimited`；`Max locked memory 8388608` | 崩溃**有条件**落 core；`core_pattern` 是 systemd-coredump 管道，所以 core 只可能出现在 `coredumpctl` |
+| 宿主 `dmesg` | 空 | 没有 `gaussdb[…]: segfault`、没有 `Killed process`、没有 traps |
+| `coredumpctl list --since` | `No coredumps found.` | 没有信号型崩溃；**不是**"没落盘"，是根本没产生 core |
+| 崩溃恢复判定 | `'not properly shut down'` 文件数 0→1（本轮新增）；`'received … shutdown request'` = 1 | 那条 shutdown request 是 initdb 期 entrypoint `gs_ctl -m fast -w stop` 模板服务器留下的**历史记录**；死亡窗口的 pg_log 增量里 `terminat/signal/kill` 零命中 ⇒ 死亡时**没有**收到关停信号 |
+| pg_log 增量 | 崩溃前文件 14118 字节；FATAL/PANIC/ERROR/out of memory/backtrace **一条没有**；最后一行 23:33:24.710（=15:33:24.710Z，死亡前 0.42s）`[BACKEND] LOG: Delete object 2615/16387/0` | 见下面第 2 点 |
+| 重启后新日志 | `database system was interrupted; last known up at 23:33:05`；`redo record is at 0/2349188; shutdown FALSE`；`automatic recovery in progress` | 整个实例非正常终止后走 WAL 恢复，与"后端进程消失"不是一回事 |
+| 内存口径 | cgroup `peak=current=495935488`（新实例，限额的 7.7%）、`max=6442450944`、Engine API 同值；容器内 `postgresql.conf` 生效 `max_process_memory=4GB` + `shared_buffers=512MB` | 内存第四次被同一份数据排除（V21.8/21.9/21.10/本轮） |
+
+**1. 判读顺序走到 ③**（V21.10 立的那四条）。exitCode=0 + 无 segfault + 无 core +
+服务端不记任何错误 + 无新增关停请求 ⇒ 不是 OOM、不是信号型崩溃、不是收到 SIGTERM 的
+正常关停。剩下的形态是 **postmaster 自己走了一条不记账号的退出路径**，问题从"谁杀了它"
+换成"什么让它自己退出去"。
+
+**2. `Delete object 2615/16387/0` 是最后一条被记录的服务端动作，不是罪名**：`2615` =
+`pg_namespace` 的目录 OID（本地 V21.9 已登记），`16387` 是用户范围 OID，对应 harness
+`reset_reference` 自己的 `DROP SCHEMA gaussdb CASCADE`。语料里没有 DDL、没有动态 SQL，
+这条 DROP 之后到死亡之间只剩那一句存过执行；把它当嫌疑犯是日志截断的假象。
+
+**3. 本轮最该记住的是取证工具自己的缺陷**：生命周期事件那一组**从来没输出过**。
+
+- 本地（docker CLI 29.9.2 / API 1.56）复现同一命令得到：
+  `Error parsing format: template: :1:34: executing "" at <.Attributes>: can't evaluate
+  field Attributes in type *events.Message` —— 整条 `docker events` 失败。旧写法把
+  stderr 丢进 `/dev/null`，于是打印为空，而"窗口内确实死过容器"（`restart_count` 0→1、
+  `FinishedAt` 就是死亡时刻）与"没有事件"长得一模一样。**空证据被当成证据判读**，
+  比读不到更坏。
+- 另一条实测：Docker Desktop 上 `--since/--until` 的历史回放把我给的无时区 UTC 串按
+  本机 +08:00 解释，同一窗口事后查询返回 0 行、而实时订阅能拿到 264 行 ⇒
+  **事后查询不能作为生命周期事件的唯一来源**。
+
+处置（`scripts/ci/gauss_incident_evidence.sh` + `.github/workflows/ci.yml`，无 Rust 变更）：
+
+- CI 步骤在测试**之前**起一路 `docker events` 实时订阅写进文件，取证脚本读它。这是宿主侧
+  对 Engine API 的只读订阅，不进容器命名空间、不 `docker exec`，与 V21.9 排除的 exec
+  采样器不是一类侵入。`Standalone` 与全量套件各一路（`/tmp/ci_events_standalone.txt`、
+  `/tmp/ci_events_suite.txt`），作为脚本第 5 个参数传入。
+- 事件命令一律**不带 `--format`**：默认输出自带完整 Actor attributes（含 `exitCode`），
+  没有模板键的版本兼容问题。事后查询降级为兜底，且必须打印返回行数与 stderr。
+- 每个"空"都要有**分母**：实时流总行数、按 action 的计数、`dmesg` 总行数、事后查询返回
+  行数。没有分母的空，判读无从下手——这就是本轮的教训本身。
+- 健康检查每 5s 产生 `exec_create/exec_start/exec_die` 三类事件（本轮实测占 252/264 行），
+  直接 `head -30` 会把真正的 `die` 挤出画面。现在先剔 `exec_*`（注意 `exec_die` 是**子进程**
+  退出，与容器 `die` 是两个 action），再看生命周期，最后给"剔掉 exec 后的全量"兜底。
+- 事件输出经 sed 脱敏（`*PASSWORD*/*SECRET*/*TOKEN*=` 的取值替换）。实测本机 compose
+  健康检查进事件流的是 `-W $GS_PASSWORD` 字面量、未展开，且 CI 口令另有 `::add-mask::`
+  按值兜底；但取证脚本不该把安全性建立在"恰好没展开"这条观察上。
+
+**4. 平台处置：golden job 换 `ubuntu-24.04-arm`**（公开仓库免费的 arm64 hosted runner）。
+理由就是上面那组数据的合取：同一镜像 tag、同一 4GB/512MB/6G 口径、同一 SQL_ASCII，
+amd64（runner）3/3 轮单跑即致死，arm64（开发机）全量 gauss 套件为绿——架构是当前唯一被
+实测分离出来的变量。
+
+**改的是参照产品的运行平台，不是断言**：用例、场景、期望基线、`spin==native`/
+`spin==baseline` 三重比对、判定 B 的门禁逻辑一条未减；换平台后若 arm64 也观察到 PID1
+更替，同一份取证脚本会直接把证据落全。边界写进 workflow 注释，防止被读成"换了平台就
+没事了"——**amd64 参照实例的猝死仍是未决问题**，登记在本节，不因换 runner 关闭。
+
+**仍未定论**：① amd64 上 postmaster 以 0 退出的内部成因（本机 registry 只返回 arm64
+摘要，见 V21.10 末段，只能等平台侧证据或 openGauss 源码级复现）；② 语料里哪一段 SQL
+触发。②若要继续推进，可行路径是在 amd64 上把这条存过的过程体按段二分（游标循环 /
+`<<error_row>>` + `GOTO` / `DELETE…; COMMIT;` 各自单跑）做**参照侧实验**——它不改被测
+断言，也不改 golden 期望。

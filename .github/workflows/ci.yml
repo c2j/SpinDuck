@@ -81,7 +81,20 @@ jobs:
     # 黄金对比：复用 golden/gaussdb-docker compose（与本地完全同口径：
     # 自定义 entrypoint A 模式引导 + healthcheck 强校验 + 127.0.0.1 绑定）。
     # 口令由步骤内随机生成经 GS_PASSWORD/SPINDUCK_OG_PASSWORD 注入，不落仓库。
-    runs-on: ubuntu-latest
+    #
+    # runs-on 选 arm64（ubuntu-24.04-arm，公开仓库免费）而不是 ubuntu-latest：
+    # 参照实例（openGauss 5.0.0 镜像的 **amd64** 构建）在 purchase 存过的调用窗口内
+    # 终止，runner 上 3/3 轮一致复现（validation V21.9–V21.11）：PID 1 exitCode=0、
+    # OOMKilled=false、宿主 dmesg 无 segfault、coredumpctl 无 core、pg_log 增量里
+    # 没有任何服务端错误行，随后走崩溃恢复。同一镜像 tag、同一 4GB/512MB/6G 口径、
+    # 同一 SQL_ASCII 在 arm64（开发机）全量 gauss 套件为绿。架构是当前唯一被实测
+    # 分离出来的变量，所以换的是**参照产品的运行平台**，不是断言。
+    # 边界（必须写清，防止被读成"换了平台就没事了"）：
+    #   - 本 job 的门禁、用例、断言、期望基线一条没减；判定 B 依旧红。
+    #   - amd64 参照实例的猝死是 openGauss 镜像/平台侧的已知问题，仍在
+    #     validation.md 挂着，不因换 runner 而关闭。
+    #   - 取证脚本继续留在 arm64 上：如果 arm64 也死，同一份证据会直接给出答案。
+    runs-on: ubuntu-24.04-arm
     env:
       SPINDUCK_OG_HOST: 127.0.0.1
       SPINDUCK_OG_PORT: "5433"
@@ -110,6 +123,13 @@ jobs:
         env:
           GS_PASSWORD: ${{ steps.gspwd.outputs.value }}
         run: |
+          # 参照实例跑在什么架构上现在是一等变量（V21.11），必须打印验证而不是
+          # 相信 runs-on 标签：本 job 的证据链只有先确认"确实是 arm64"才成立。
+          # 顺带把 docker/compose 的版本落地——arm64 hosted runner 是较新的镜像，
+          # 取证脚本的口径（默认 events 输出、cgroup v2 路径）依赖它们。
+          echo "runner 架构: $(uname -m)"
+          echo "docker: $(docker --version 2>&1)"
+          echo "compose: $(docker compose version 2>&1 | head -1)"
           docker compose up -d
           for i in $(seq 1 60); do
             st=$(docker inspect -f '{{.State.Health.Status}}' spinduck-gaussdb || true)
@@ -169,8 +189,15 @@ jobs:
           # 不会被 initdb 时代的历史行淹没。
           since_iso=$(date -u +%Y-%m-%dT%H:%M:%S)
           docker exec spinduck-gaussdb bash -c 'cd /var/lib/opengauss/data/pg_log && for f in *.log; do echo "$f $(wc -c < "$f")"; done > /tmp/ci_pglog_offsets'
+          # 容器生命周期事件走**实时流**：事后 `docker events --since/--until` 依赖
+          # dockerd 的事件保留策略，且 `--format` 模板键在新版 CLI 上会整条命令报错
+          # （上一轮就是因此打印成空，见 validation V21.11）。这里是宿主侧对 Engine
+          # API 的只读订阅，不进容器、不 exec，与已排除的 `docker exec` 采样器不同类。
+          docker events --since "$since_iso" > /tmp/ci_events_standalone.txt 2>&1 &
+          ev_pid=$!
           cargo test --features gauss --test golden_corpus_purchase -- --nocapture > /tmp/standalone_purchase.log 2>&1
           rc=$?
+          kill "$ev_pid" 2>/dev/null
           echo "单跑 rc=$rc"
           grep -aE "panicked|test result|gaussdb:|参照侧" /tmp/standalone_purchase.log | tail -20
           sleep 3
@@ -185,7 +212,8 @@ jobs:
           # 生命周期事件 / pg_log 增量）。取证脚本自身永不返回非零，不会成为新的红因。
           if [ "$rc" -ne 0 ] || [ "$pre" != "$post" ]; then
             bash "$GITHUB_WORKSPACE/scripts/ci/gauss_incident_evidence.sh" \
-              spinduck-gaussdb "$since_iso" /tmp/ci_pglog_offsets /tmp/og_pid1_baseline.txt
+              spinduck-gaussdb "$since_iso" /tmp/ci_pglog_offsets /tmp/og_pid1_baseline.txt \
+              /tmp/ci_events_standalone.txt
           fi
           # 若 PID1 真的重启过，必须等 healthy 再把套件交给它，否则诊断步骤会变成
           # 新的失败源（套件第一个 gauss 用例连不上）。
@@ -252,8 +280,12 @@ jobs:
           # 拿不到 cgroup 目录时退回 docker stats，那读到的只是当前值，口径必须标注。
           peak_before=$(sudo cat "$peakfile/memory.peak" 2>/dev/null)
           echo "套件开始前：memory.peak=${peak_before:-n/a} 字节"
+          # 生命周期事件实时流：与 Standalone 步骤同一口径（宿主侧只读订阅，不进容器）
+          docker events --since "$t0_iso" > /tmp/ci_events_suite.txt 2>&1 &
+          ev_pid=$!
           cargo test --features gauss -- --nocapture
           rc=$?
+          kill "$ev_pid" 2>/dev/null
           if [ -n "$peakfile" ]; then
             echo "套件结束后：memory.peak=$(sudo cat "$peakfile/memory.peak" 2>/dev/null) 字节（开始前 ${peak_before:-n/a}）/ current=$(sudo cat "$peakfile/memory.current" 2>/dev/null) / 限额=$(sudo cat "$peakfile/memory.max" 2>/dev/null)"
           else
@@ -269,6 +301,7 @@ jobs:
             # 两处各写一份必然漂移（上一轮就是这里只 grep oom、没查 coredumpctl）。
             # 脚本内部一律 set +e 且末尾 exit 0，不会把取证变成新的红因。
             bash "$GITHUB_WORKSPACE/scripts/ci/gauss_incident_evidence.sh" \
-              spinduck-gaussdb "$t0_iso" /tmp/ci_pglog_offsets /tmp/og_pid1_baseline.txt
+              spinduck-gaussdb "$t0_iso" /tmp/ci_pglog_offsets /tmp/og_pid1_baseline.txt \
+              /tmp/ci_events_suite.txt
           fi
           exit "$rc"
