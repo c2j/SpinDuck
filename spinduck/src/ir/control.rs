@@ -110,6 +110,43 @@ impl Compiler {
         Ok(())
     }
 
+    /// `body … EXCEPTION WHEN …` 段的编译（唯一实现点）：
+    /// PushTrap → body → PopTrap → Jump(resume) → handlers（每臂末 Jump(resume)）→ resume。
+    /// 块级（`BEGIN..EXCEPTION`）与例程级（过程体尾部 EXCEPTION 段）共用。
+    pub(crate) fn trap_section(
+        &mut self,
+        body: &[PlStatement],
+        exc: &ogsql_parser::ast::plpgsql::PlExceptionBlock,
+    ) -> Result<(), EngineError> {
+        let resume = self.synth_label("trap_resume");
+        self.code.push(IrStmt::PushTrap {
+            entries: Vec::new(),
+        }); // 占位，回填
+        let trap_at = self.here() - 1;
+        self.stmts(body)?;
+        self.code.push(IrStmt::PopTrap);
+        self.jump(&resume, None, true);
+        let mut entries = Vec::new();
+        for h in &exc.handlers {
+            let body_start = self.here();
+            self.stmts(&h.statements)?;
+            let body_end = self.here();
+            self.jump(&resume, None, true);
+            entries.push(TrapEntry {
+                conds: h
+                    .conditions
+                    .iter()
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect(),
+                body_start,
+                body_end,
+            });
+        }
+        self.mark(&resume);
+        self.code[trap_at] = IrStmt::PushTrap { entries };
+        Ok(())
+    }
+
     pub(crate) fn synth_label(&mut self, hint: &str) -> String {
         self.synth += 1;
         format!("__{hint}_{}", self.synth)
