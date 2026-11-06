@@ -217,8 +217,18 @@ jobs:
           cpid=$(docker inspect -f '{{.State.Pid}}' spinduck-gaussdb)
           cgrouprel=$(sudo awk -F'::' '$1=="0"{print $2}' "/proc/$cpid/cgroup" 2>/dev/null | head -1)
           peakfile=""
-          if [ -n "$cgrouprel" ] && sudo test -r "/sys/fs/cgroup$cgrouprel/memory.peak"; then
-            peakfile="/sys/fs/cgroup$cgrouprel"
+          if [ -n "$cgrouprel" ] && [ "$cgrouprel" != "/" ] && sudo test -r "/sys/fs/cgroup$cgrouprel/memory.peak"; then
+            cand="/sys/fs/cgroup$cgrouprel"
+            # 交叉校验目录归属：Engine API 里的容器限额（HostConfig.Memory，不进
+            # 容器）必须和该目录的 memory.max 一致。不一致说明拼出来的不是这个容器
+            # 的 cgroup（读到的会是宿主全局峰值，比"没测到"更糟——会被当证据判读）。
+            want=$(docker inspect -f '{{.HostConfig.Memory}}' spinduck-gaussdb)
+            got=$(sudo cat "$cand/memory.max" 2>/dev/null)
+            if [ "$got" = "max" ] || [ "$want" = "0" ] || [ "$want" = "$got" ]; then
+              peakfile="$cand"
+            else
+              echo "cgroup 目录校验未通过（$cand/memory.max=$got，Engine API 限额=$want），改用 docker stats"
+            fi
           fi
           echo -n "宿主侧 cgroup 目录: "
           echo "${peakfile:-未找到（改用 docker stats，走 Engine API 不进容器）；pid=$cpid cgroup=${cgrouprel:-未读到}}"

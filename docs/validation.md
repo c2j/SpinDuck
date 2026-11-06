@@ -920,7 +920,10 @@ purchase 单跑 → **通过，`RestartCount` 不变**。假说在本地不成�
 - 测试窗口内**零容器侵入**：内存采样改到宿主侧，路径不靠猜目录名——读容器 PID 1 的
   `/proc/<pid>/cgroup`（cgroup v2 唯一一行 `0::<相对路径>`），拼出
   `/sys/fs/cgroup<相对>/memory.peak`；读不到才退到 `docker stats --no-stream`。
-  两条路径都不进容器命名空间。`memory.peak` 本身是高位水位，一次读取即全程最大值；
+  两条路径都不进容器命名空间。目录归属还要过一道交叉校验：该目录的 `memory.max`
+  必须等于 Engine API 报的容器限额（`HostConfig.Memory`；`max`/未设限时跳过比对），
+  否则说明相对路径解析错位（例如退化成 `/`），读到的会是**宿主全局峰值**——比"没测到"
+  更糟，因为它会被当证据判读。`memory.peak` 本身是高位水位，一次读取即全程最大值；
   回退路径读到的是**当前值不是峰值**，两条输出行因此标注不同口径——V21.8 那轮
   "452MiB" 就是把回落后当前值当成峰值判读，标签必须防止同样的误读。
 - fingerprint 步骤登记 **PID 1 基线**（`RestartCount` + `StartedAt` + 容器 ID）并打印
