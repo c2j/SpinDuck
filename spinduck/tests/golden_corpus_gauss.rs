@@ -4,7 +4,8 @@
 //! 场景/参数/基线全部来自 `cases/*.case.toml` 与 `cases/baselines/expected.json`；
 //! 源码逐字取自考题基线，两侧在同一份种子数据上执行并逐场景比对。
 //!
-//! 未设置 `SPINDUCK_OG_HOST` 时打印 SKIP 并返回——跳过不等于通过。
+//! 缺 A 模式容器时**直接失败**（`common::run_case` panic 并打印起容器命令），不打印
+//! SKIP——跳过不等于通过（AGENTS §4.1）。
 
 #![cfg(feature = "gauss")]
 

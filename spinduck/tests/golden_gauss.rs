@@ -3,7 +3,8 @@
 //! 资产按 §12.1 项目模式组织（`golden/case_split_agg/`）；参照侧等价例程见
 //! `cases/baselines/reference_routine.sql`（PG 风格函数形态 + `reference_call_sql`）。
 //!
-//! 未设置 `SPINDUCK_OG_HOST` 时打印 SKIP 并返回——跳过不等于通过。
+//! 缺 A 模式容器时**直接失败**（`common::run_case` panic 并打印起容器命令），不打印
+//! SKIP——跳过不等于通过（AGENTS §4.1）。
 
 #![cfg(feature = "gauss")]
 

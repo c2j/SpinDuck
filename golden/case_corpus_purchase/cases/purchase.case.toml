@@ -1,24 +1,43 @@
 [case]
 name = "corpus_purchase"
-kind = "procedure"
-routine = "pkg_split_trade_step3_sh.prc_trd_deal_purchase"
+# 黄金层（A 模式容器·两侧实跑比对）的被测面对齐 2026-11-06 口径：**语料级用例不执行
+# 考题业务过程**，只比最简函数。这里选原考题文件 `2_FNC_GET_PURCHASE_JS_DAYS.sql` 的
+# 结算天数函数——它是 `prc_trd_deal_purchase` 调用链上的语料函数，形态与那条过程同源
+# （SELECT INTO + EXCEPTION OTHERS、`to_date(...) + varchar2` 隐式转换、substr、
+# INTERVALTONUM 日期差）。过程本体的行为由下面 `[[case.assert]]` 在进程内内核逐值锁定
+# （`cargo test --features native --test cases_native`），不在参照实例上执行。
+kind = "function"
+routine = "fnc_get_purchase_js_days"
 baseline = "expected.json"
-expect_succeed = "0"
-
-[case.output]
-sql = "SELECT fund_code, security_id, partner_code, seat_code, purchase_no, purchase_fee, purchase_yj, purchase_money, purchase_quantity, purchase_date, buy_sale, repurchase_date, repurchase_money, repurchase_money_js, accrual_daily, accrual_daily_js, purchase_days, purchase_days_js, purchase_kind, gddmzm FROM dat_trd_repurchase ORDER BY security_id"
 
 
 [case.data]
-# 需从参照侧物化的输入表（输出表不物化，保持被测侧为空）
-materialize = ["mid_yjqs_detail", "par_fund_partner", "par_fund_seat", "par_sys_purchase", "par_fund_seat_para", "swh_all_kind", "db_log", "dat_fund_cjqs", "par_fund_info", "dat_xw_venture", "par_fund_etf", "par_sys_bond", "par_sys_securities", "qfqscjhbrbb_temp", "par_fund_autorun_param", "par_fund_check_para", "par_drv_config"]
+# 需从参照侧物化的输入表（函数只读 par_sys_purchase；输出表不物化）
+materialize = ["par_sys_purchase"]
 
 [[case.scenarios]]
-why = "回购/申购业务拆分（含异常行 A999 跳过）"
-args = ["'20250715'", "null"]
+why = "申购 90 天品种：JS 结算天数 = 起息日与结算日在 +1 交易日平移后的间隔"
+args = ["'20250715'", "'0130000001'"]
+
+[[case.scenarios]]
+why = "申购 180 天品种：跨年后仍按实际间隔（含 2 月）"
+args = ["'20250715'", "'0130000002'"]
+
+[[case.scenarios]]
+why = "品种无配置 → SELECT INTO 走 WHEN OTHERS，purchase_days 归 '0'（varchar2 隐式转数值）"
+args = ["'20250715'", "'0139999999'"]
+
+[[case.scenarios]]
+why = "有品种但日期不在生效区间（BETWEEN 落空）→ 同归 '0' 分支"
+args = ["'20191231'", "'0130000001'"]
+
+[[case.scenarios]]
+why = "跨年边界：20251201 + 90 天落在 2026 年，间隔仍是 90"
+args = ["'20251201'", "'0130000001'"]
 
 # ── 原生断言集（口径同 min_tax.case.toml）──────────────────────────────────────
 # 被测点是核心过程 prc_trd_deal_purchase（step3_sh 包体，游标 + 多分支费型 + 异常行跳过）。
+# 这一组在进程内内核（DuckDB 1.5.5）执行，零外部环境；黄金层不比这条过程的业务函数执行。
 
 [[case.assert]]
 why = "p_o_succeed 出口（考题约定的成功标记）"
