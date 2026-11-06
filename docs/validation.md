@@ -871,7 +871,9 @@ amd64 的峰值比 arm64 高约 55%，而 2GB 预算 + 3G 限额只剩 ~1.7 倍�
   `exec_create/exec_die` 会淹没输出）、`sudo dmesg` 的 OOM 行（stderr 不再吞掉）、
   容器 stdout 尾部 120 行。
 - 全程每 3 秒后台采样 `memory.peak`，绿时也报最大值（"峰值离限额还有多远"是绿
-  run 里唯一有判读价值的内存数字）。
+  run 里唯一有判读价值的内存数字）——本节写的是 V21.8 当时的设计，**该采样器已在
+  V21.9 被换掉**：它每 3 秒 `docker exec` 进容器，而它采样出来的答案是否掉内存
+  假说之后，exec 本身升格成了头号嫌疑（PID 1 就是 postmaster）。
 - 演练方式：从 workflow 原文抽出该步骤的 `run` 文本，只把 `cargo test` 换成
   `CHECKPOINT + exit 101`，对本地容器实跑——增量段恰好只输出 CHECKPOINT 那 1745
   字节、无历史行；全部 run 步骤 `bash -n` 通过，workflow YAML 解析通过。
@@ -879,3 +881,71 @@ amd64 的峰值比 arm64 高约 55%，而 2GB 预算 + 3G 限额只剩 ~1.7 倍�
 **登记未定论项**：runner 上 purchase 参照侧后端消失的直接成因仍未取到服务端证据。若
 下一轮仍红，按此顺序判读：die/oom 事件 → `dmesg` → 增量 pg_log 里的 FATAL/backtrace →
 峰值与限额之比。本轮无任何 Rust 代码变更（fmt/clippy/native 门禁不受影响）。
+
+### V21.9 runner 侧内存假设被实测否掉：参照实例是被"静默终止"的
+
+**run 42229183033（head = `8737a68`，golden job 127930349734）**——同一句 panic
+（`CALL pkg_split_trade_step3_sh.prc_trd_deal_purchase('20250715', null): [ENV-0020]
+connection closed`），但 V21.8 的取证第一次给出了可判读的服务端事实，四条都是实测：
+
+1. **口径在 runner 上真的生效**（fingerprint 步骤打印）：`max_process_memory = 4GB`、
+   `shared_buffers = 512MB`、`server_encoding = SQL_ASCII`、cgroup `limit =
+   6442450944`。runner 与新口径的开发机完全同参，"runner 推导值漂移"这条排除。
+   memory-protect 初始化失败行数 = 2，与本地同（V21.8 第 2 条更正成立：看护是关着的）。
+2. **内存假设排除**：测试全程每 3s 采样的容器 cgroup `memory.peak` 最大值
+   **670003200 字节（限额的 10%）**；`State.OOMKilled = false`；`docker events` 抓到的是
+   `container die … exitCode=0`。OOM 需要"超限额 + 137/被杀"，两者都不是。
+3. **失败形态与上一轮不同**：本轮 `RestartCount = 1`、失败后 `health=starting`，
+   重启产生的新 `pg_log` 里 `redo record is at 0/2348360; shutdown FALSE` +
+   `database system was not properly shut down; automatic recovery in progress`
+   ——**整个 PID 1（postmaster）在 CALL 开始后约 0.19 秒退出**，实例走崩溃恢复。
+   上一轮（`5d9b419`，无 exec 采样器）容器 stdout 尾部没有第二次引导、没有
+   `Skipping initialization`，即容器没重启过，只是后端进程消失。同一句客户端报错，
+   两轮是两种服务端形态。
+4. **终止是静默的**：失败窗口增量 15994 字节的 `pg_log` 里 FATAL/PANIC/ERROR/
+   terminat/signal/kill/crash **一条都没有**，最后一行是 22:05:37.417 的 `[UNDO] LOG`。
+   容器内 `ulimit -c = 0`（本轮实测打印）→ 崩溃不可能落 core，也没有 backtrace 可捞。
+   因此"下一轮再 grep 一次日志"不会给出答案，必须换问题设定。
+
+**唯一新增的容器侵入项 = 我自己加的 exec 采样器**（本轮把 `max_process_memory` 抬到
+4GB 之外，还在测试窗口内每 3 秒 `docker exec` 进容器读一次 cgroup；PID 1 是
+postmaster，exec 产生的子进程退出要由它回收）。本地做了直接实验：
+`docker exec … cat /sys/fs/cgroup/memory.peak` 每 0.3s 一次（密度是 CI 的 10 倍）叠加
+purchase 单跑 → **通过，`RestartCount` 不变**。假说在本地不成立，但本地与 runner 的
+内核/docker/调度不同，必须在真环境排除，因为它同时解释"上一轮只死后端、这一轮死整个
+实例"这个差异。
+
+**本轮改造**（`.github/workflows/ci.yml` golden job；无 Rust 代码变更）：
+
+- 测试窗口内**零容器侵入**：内存采样改到宿主侧（`sudo find /sys/fs/cgroup -name
+  docker-<id>.scope` 读 `memory.peak`，找不到则退到 `docker stats --no-stream`，
+  两者都走 Engine API）。`memory.peak` 本身是高位水位，一次读取即全程最大值；
+  回退路径读到的是**当前值不是峰值**，两条输出行因此标注不同口径——V21.8 那轮
+  "452MiB" 就是把回落后当前值当成峰值判读，标签必须防止同样的误读。
+- fingerprint 步骤登记 **PID 1 基线**（`RestartCount` + `StartedAt` + 容器 ID）并打印
+  `ulimit -c` 与宿主 `core_pattern`：`restart: unless-stopped` 下实例死后容器原地复活，
+  没有基线就判不出"死过"。
+- 新增 `Standalone purchase repro` 判定步骤：在全量套件**之前**单独跑同一个
+  purchase 用例，比较前后 PID 1 基线，直接区分两种解释——判定B（单跑就死 = 这条存过
+  独立可为）／判定A（单跑不死 = 依赖套件先前 11 分钟的建库删库状态）。用例自身的断言
+  失败不在这一步门禁（同一判定权留给全量套件），但判定B 必须红——否则套件会在"重启后的
+  干净实例"上转绿，把一次可独立复现的参照侧崩溃掩成一次通过的合并；绿的含义必须是"没有
+  任何一处观察到崩溃"。若单跑真的打死了实例，会等 `healthy` 再交接，避免诊断步骤本身
+  变成新的失败源。
+- 红时新增 `crash-recovery 判定` 组：`database system was not properly shut down`
+  出现文件数（>0 = 异常终止后恢复）与 `received …shutdown request` 行数
+  （>0 = 收到过关停信号，属正常路径）。这两个计数把"被信号停掉"与"猝死"分开。
+- `docker events/logs` 的 `--since` 一律改 RFC3339：纯数字在不同 docker 版本里按秒
+  或按纳秒解释，窗口口径不能靠猜。
+
+**演练**：workflow YAML 解析通过，13 个 `run` 步骤逐个 `bash -n` 通过；新构造对本地容器
+逐条实跑——`pid1_baseline` 打印正常、`ulimit -c` = 0、崩溃恢复文件数 = 0（本地无崩溃，
+符合预期）、`received …shutdown request` 行数 = 3（initdb 临时实例的两次停服 + 最终
+引导，属正常噪声，判读时看的是"失败之后有没有新增"而不是绝对值）、`docker logs
+--since <RFC3339>` 与 `docker events --since/--until <RFC3339>` 均无参数错误。
+
+**下一轮判读顺序**：① `Standalone` 步骤给判定 A 还是 B；② 全量套件里还有没有
+`container die`（若本轮绿 = exec 采样器即因，永久去掉它）；③ 有 die 但 `pg_log` 无
+FATAL = 静默终止，`ulimit -c = 0` 已排除 core，下一步只能改成"在 runner 上给容器放开
+core 上限 + 指定可落盘路径"或把 purchase 参照侧语料二分；④ 峰值/限额之比作为内存的
+最后确认。仍未定论项：runner 上 purchase 参照侧实例终止的直接成因。

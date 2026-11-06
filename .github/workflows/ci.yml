@@ -134,19 +134,71 @@ jobs:
             printf "%-24s = " "$q"
             /usr/local/opengauss/bin/gsql -U gaussdb -W"$GS_PASSWORD" -d postgres -t -A -c "$q" 2>&1 | tr -d "\r" | head -1
           done
-          echo "cgroup: limit=$(cat /sys/fs/cgroup/memory.max) peak=$(cat /sys/fs/cgroup/memory.peak)"'
+          echo "cgroup: limit=$(cat /sys/fs/cgroup/memory.max)"'
           echo -n "memory-protect 初始化失败行数（0 = 实例级内存看护已开）: "
           docker logs spinduck-gaussdb 2>&1 | grep -icE 'Failed to initialize the memory protect' || true
+          # PID 1 基线必须登记：compose 有 restart: unless-stopped，实例被杀后
+          # 容器会原地复活，事后单看 status=running 判不出死过。
+          docker inspect -f 'pid1_baseline: restart_count={{.RestartCount}} started={{.State.StartedAt}} id={{.Id}}' spinduck-gaussdb | tee /tmp/og_pid1_baseline.txt
+          echo "容器内 PID1 的 core 上限：$(docker exec spinduck-gaussdb bash -c 'ulimit -c')（0 = 崩溃不落 core，服务端只能靠日志判读）"
+          echo "宿主 core_pattern：$(sudo cat /proc/sys/kernel/core_pattern 2>/dev/null || echo '(不可读)')"
+      - name: Standalone purchase repro（不门禁，只落事实）
+        working-directory: spinduck
+        env:
+          SPINDUCK_OG_PASSWORD: ${{ steps.gspwd.outputs.value }}
+        # 全量套件里 purchase 是最后一个 gauss 二进制，前面已经跑了 11 分钟的
+        # 建库/删库。"是这条存过本身让参照实例消失，还是只有在那些状态之后才
+        # 消失"这两种解释，此前无法区分——本步骤在套件之前单独跑一次同一个用例，
+        # 用 PID 1 基线的变化做判定。用例自身的断言失败不在此门禁（判定权留给全量
+        # 套件），但"单跑就把实例打死"必须红：否则套件会在重启后的干净实例上转绿，
+        # 把一次可独立复现的参照侧崩溃掩成一次通过的合并。
+        run: |
+          set +e
+          pre=$(docker inspect -f '{{.RestartCount}} {{.State.StartedAt}}' spinduck-gaussdb)
+          echo "单跑前 PID1: restart_count/started = $pre"
+          cargo test --features gauss --test golden_corpus_purchase -- --nocapture > /tmp/standalone_purchase.log 2>&1
+          rc=$?
+          echo "单跑 rc=$rc"
+          grep -aE "panicked|test result|gaussdb:|参照侧" /tmp/standalone_purchase.log | tail -20
+          sleep 3
+          post=$(docker inspect -f '{{.RestartCount}} {{.State.StartedAt}}' spinduck-gaussdb)
+          echo "单跑后 PID1: restart_count/started = $post"
+          if [ "$pre" = "$post" ]; then
+            echo "判定A：单跑 purchase 未影响参照实例存活 —— 崩溃依赖套件先前的状态，不是这条存过独立可为"
+          else
+            echo "判定B：单跑 purchase 之后参照实例 PID1 换过 —— 这条存过可独立复现崩溃"
+          fi
+          echo -n "pg_log 里出现 'not properly shut down'（崩溃恢复）的文件数: "
+          docker exec spinduck-gaussdb bash -c "grep -lE 'database system was not properly shut down' /var/lib/opengauss/data/pg_log/*.log 2>/dev/null | wc -l" || echo "?"
+          # 若 PID1 真的重启过，必须等 healthy 再把套件交给它，否则诊断步骤会变成
+          # 新的失败源（套件第一个 gauss 用例连不上）。
+          for i in $(seq 1 40); do
+            st=$(docker inspect -f '{{.State.Health.Status}}' spinduck-gaussdb || true)
+            [ "$st" = "healthy" ] && break
+            sleep 3
+          done
+          echo "交接给全量套件时 health=$(docker inspect -f '{{.State.Health.Status}}' spinduck-gaussdb)"
+          # 判定B 必须是红：单跑就把参照实例打死，是参照侧可独立复现的崩溃。
+          # 若不门禁，全量套件可能在"重启后的干净实例"上转绿，把一个真实崩溃
+          # 掩成一次通过的合并——绿的含义必须是"没有任何一处观察到崩溃"。
+          # 单跑的用例断言失败本身不在这里门禁（同一判定权留给全量套件）。
+          if [ "$pre" != "$post" ]; then
+            echo "参照实例在单跑 purchase 期间换过 PID 1（$pre -> $post）：拒绝交接，红"
+            exit 1
+          fi
+          exit 0
       - name: Run golden + gauss suites
         working-directory: spinduck
         env:
           SPINDUCK_OG_PASSWORD: ${{ steps.gspwd.outputs.value }}
-        # 参照侧后端消失时客户端只剩一句 `[ENV-0020] connection closed`，判不出
-        # 是内核 OOM、实例自检拦截还是例程自身报错（validation V21.8 第一轮证据
-        # 就是被 `ls -t | head -2 | tail -120` 这种口径截断成了 initdb 时代的日志）。
-        # 现在按"测试开始"标记取增量：容器生命周期事件 + OOMKilled/重启计数 +
-        # 失败时刻之后的 pg_log + cgroup 峰值 + runner 侧 OOM 记录。
-        # sleep 5 不是装饰：syslogger 落盘有延迟，立刻读会漏掉失败窗口那几行。
+        # 参照侧后端消失时客户端只剩一句 `[ENV-0020] connection closed`。上一轮
+        # （V21.8）加了取证之后，runner 上第一次从"后端消失"升级成"整个 PID 1 退出
+        # 0 + 重启后报 database system was not properly shut down"，而内存峰值只有
+        # 670MB/6GB——OOM 解释被实测数据直接否掉。测试窗口内唯一新增的容器侵入项
+        # 就是那把每 3 秒一次的 `docker exec`，本轮把它换成**宿主侧** cgroup 读取：
+        # 采样不再进入容器，`memory.peak` 本身是高位水位，读一次就是全程最大值。
+        # 若这轮容器不再死亡，exec 与死亡的因果就成立（本地 0.3s 密度未能复现，
+        # runner 内核/docker 版本不同，需要在真环境判读）。
         run: |
           set +e
           # 记录每个 pg_log 文件的字节偏移作为"测试开始"标记：失败时只输出增量
@@ -154,31 +206,56 @@ jobs:
           # 行，失败窗口的服务端记录一条都没进来）。偏移法不依赖时区比较，也不
           # 会被"整份历史文件里的旧 ERROR"淹没。
           docker exec spinduck-gaussdb bash -c 'cd /var/lib/opengauss/data/pg_log && mkdir -p /tmp && for f in *.log; do echo "$f $(wc -c < "$f")"; done > /tmp/ci_pglog_offsets; cat /tmp/ci_pglog_offsets'
-          touch /tmp/og_peak_samples.txt
           t0=$(date -u +%s)
-          # 容器 cgroup 内存峰值每 3s 采样一次：这个数在**绿**的时候同样有信息量
-          # （离限额还有多远），而失败之后再读只剩回落后的值——上一轮 runner 上
-          # 读到的 452MiB 正是后端被杀之后的余量，判不出峰值。
-          ( for i in $(seq 1 400); do
-              docker exec spinduck-gaussdb cat /sys/fs/cgroup/memory.peak 2>/dev/null || break
-              sleep 3
-            done ) > /tmp/og_peak_samples.txt &
+          # docker events/logs 的 --since 用 RFC3339：纯数字在不同 docker 版本里
+          # 按秒或纳秒解释，窗口口径不能靠猜。
+          t0_iso=$(date -u +%Y-%m-%dT%H:%M:%S)
+          cid=$(docker inspect -f '{{.Id}}' spinduck-gaussdb)
+          peakfile=$(sudo find /sys/fs/cgroup -maxdepth 4 -type d -name "docker-${cid}.scope" 2>/dev/null | head -1)
+          echo -n "宿主侧 cgroup 目录: "
+          echo "${peakfile:-未找到（改用 docker stats，走 Engine API 不进容器）}"
+          touch /tmp/og_peak_samples.txt
+          if [ -n "$peakfile" ]; then
+            ( for i in $(seq 1 200); do
+                sudo cat "$peakfile/memory.peak" 2>/dev/null || break
+                sleep 5
+              done ) > /tmp/og_peak_samples.txt &
+          else
+            ( for i in $(seq 1 200); do
+                docker stats --no-stream --format '{{.MemUsage}}' spinduck-gaussdb 2>/dev/null || break
+                sleep 5
+              done ) > /tmp/og_peak_samples.txt &
+          fi
           sampler=$!
           cargo test --features gauss -- --nocapture
           rc=$?
           kill "$sampler" 2>/dev/null
           wait "$sampler" 2>/dev/null
-          echo "参照容器内存峰值 max=$(sort -n /tmp/og_peak_samples.txt | tail -1) / limit=$(docker exec spinduck-gaussdb cat /sys/fs/cgroup/memory.max 2>/dev/null)（字节）"
+          if [ -n "$peakfile" ]; then
+            echo "参照容器内存峰值（宿主 cgroup memory.peak，字节；末行最大）: $(sort -n /tmp/og_peak_samples.txt | tail -3 | tr '\n' ' ')"
+          else
+            # 回退到 docker stats 时拿到的是**当前值**不是高位水位，口径必须如实
+            # 标注，否则会把它当成峰值判读（V21.8 那轮 452MiB 的误读就是这么来的）。
+            echo "参照容器内存采样（docker stats MemUsage，当前值≠峰值；最后 3 次）: $(tail -3 /tmp/og_peak_samples.txt | tr '\n' ' ')"
+          fi
+          echo "限额: $(sudo cat "$peakfile/memory.max" 2>/dev/null || docker exec spinduck-gaussdb cat /sys/fs/cgroup/memory.max 2>/dev/null) 字节"
           set -e
           if [ "$rc" -ne 0 ]; then
             # syslogger 落盘有延迟，立刻读会漏掉失败窗口最后几行
             sleep 5
             echo "::group::gaussdb container state"
-            docker inspect -f 'status={{.State.Status}} health={{.State.Health.Status}} pid1_oom_killed={{.State.OOMKilled}} restart_count={{.RestartCount}} exit_code={{.State.ExitCode}}' spinduck-gaussdb || true
-            docker events --since "$t0" --until "$(date -u +%s)" \
+            cat /tmp/og_pid1_baseline.txt || true
+            docker inspect -f 'status={{.State.Status}} health={{.State.Health.Status}} pid1_oom_killed={{.State.OOMKilled}} restart_count={{.RestartCount}} exit_code={{.State.ExitCode}} started={{.State.StartedAt}}' spinduck-gaussdb || true
+            docker events --since "$t0_iso" --until "$(date -u +%Y-%m-%dT%H:%M:%S)" \
               --filter event=die --filter event=oom --filter event=kill --filter event=restart \
               | grep spinduck-gaussdb || echo "(测试期间容器无 die/oom/kill/restart 生命周期事件)"
             docker stats --no-stream spinduck-gaussdb || true
+            echo "::endgroup::"
+            echo "::group::crash-recovery 判定"
+            echo -n "pg_log 中出现 'database system was not properly shut down' 的文件数（>0 = 上一次实例异常终止，走恢复）: "
+            docker exec spinduck-gaussdb bash -c "grep -lE 'database system was not properly shut down' /var/lib/opengauss/data/pg_log/*.log 2>/dev/null | wc -l" || echo "?"
+            echo -n "pg_log 中出现 'received ... shutdown request' 的行数（>0 = 收到过关停信号，属正常关停路径）: "
+            docker exec spinduck-gaussdb bash -c "grep -hE 'received .*shutdown request' /var/lib/opengauss/data/pg_log/*.log 2>/dev/null | wc -l" || echo "?"
             echo "::endgroup::"
             echo "::group::gaussdb pg_log 增量（测试开始之后写入的字节）"
             docker exec spinduck-gaussdb bash -c 'cd /var/lib/opengauss/data/pg_log || exit 0
@@ -196,12 +273,11 @@ jobs:
             done' || true
             echo "::endgroup::"
             echo "::group::runner memory evidence"
-            docker exec spinduck-gaussdb bash -c 'echo "cgroup: limit=$(cat /sys/fs/cgroup/memory.max) peak=$(cat /sys/fs/cgroup/memory.peak)"' || true
             free -m || true
             sudo dmesg -T 2>&1 | grep -iE 'oom|out of memory|killed process' | tail -40 || echo "(dmesg 无 OOM 记录或不可读)"
             echo "::endgroup::"
-            echo "::group::gaussdb container stdout (tail 120)"
-            docker logs --tail 120 spinduck-gaussdb || true
+            echo "::group::gaussdb container stdout（测试开始之后）"
+            docker logs --since "$t0_iso" spinduck-gaussdb 2>&1 | tail -200 || true
             echo "::endgroup::"
           fi
           exit "$rc"

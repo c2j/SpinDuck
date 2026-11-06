@@ -43,8 +43,8 @@ services:
       # 任何放大都会踩线，而 runner 有 16GB 内存，没有必要把参照实例卡这么紧。
       #
       # 注意：启动日志里的 "Failed to initialize the memory protect for
-      # cstore_buffers (512 Mbytes) ..." 与小口径同行出现——实测写死 2GB/4GB 时
-      # 必打印，不写死（跟随宿主 12GB）时不打印。也就是说一旦我们把预算写死，
+      # cstore_buffers (512 Mbytes) ..." 在口径写死时必出现（实测 2GB 与 4GB 都一样），
+      # 不写死（跟随宿主 12GB）时不出现。也就是说一旦我们把预算写死，
       # openGauss 的实例级内存看护就是关着的：超限不会被拦成可读 SQL 错误，而是
       # 直接被内核杀掉（客户端只剩 "[ENV-0020] connection closed"）。这是限额
       # 必须明显高于预算的理由，不是可以忽略的噪声。
