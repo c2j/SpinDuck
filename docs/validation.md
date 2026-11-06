@@ -452,8 +452,9 @@ A999 股东未维护 → inst_log 桩 → 跳过，两侧一致）。
 | fastaas 子模块保留 | 现状（私有项目）；CI 可达性留待仓库私有化时评估 | — |
 
 **口令去明文的边界（写清楚，避免读成"已经彻底清干净"）**：本轮改的是**当前内容**——
-`git grep` 在 HEAD 上对旧开发口令字面量 0 命中，`.env` 由 `.git/info/exclude` 挡在库外，
-`docker-compose.yml` 用 `${GS_PASSWORD:?}` 强制注入。但**历史不可改写**：该字面量仍存在于
+`git grep` 在 HEAD 上对旧开发口令字面量 0 命中，`.env` 由仓库 `.gitignore` 挡在库外、
+`.env.example` 只留占位值，`docker-compose.yml` 用 `${GS_PASSWORD:?}` 强制注入。
+但**旧提交里的字面量不会因为这次编辑而消失**：它仍存在于
 `75ee3fa`、`b9878bc`、`8b3ca69`、`a5835b2`、`1e43fd7`、`b4a9c03` 的旧 blob 里（当时落在
 `README.md`、`golden/README.md`、`golden/gaussdb-docker/docker-compose.yml`、
 `spinduck/tests/gauss_e2e.rs`、`docs/validation.md`）。因此处置只有两条真实路径：① 轮换
@@ -765,6 +766,12 @@ doctest 阶段红（测试二进制 17 组 292 passed / 0 failed 全绿，只有
   唯一声明场景的 `exam_bjgsyh#1` PASS（`outs=1`）。
 - 在库项目的同一命令：`verify ../golden/case_corpus_purchase` →
   `entries=1 checks=11 failed=0`，并把运行态快照落到 `.spinduck/conf/spinduck.toml`。
+- "不入库"的范围已核实到文件级：`golden/exam_split_trade/` 共 163 个文件，其中只有
+  `docs/4-数据库与连接信息.md` 含远端库凭据；`sql/` 147 个逐字件（36 例程 + 107 表/视图
+  DDL + 4 外部依赖桩，与 `config/corpus_forms.toml` 的 `files = 147` 同口径）、`cases/`（4）、
+  `rules/`（1）、`spinduck.toml` 经 IPv4 / 连接串 / 口令关键字复核均无凭据。故按用户指示
+  整目录不提交是**当前口径**；若日后要把八个核心过程的逐字源码入库，只需排除该一个 docs
+  件，不必改动引擎。
 
 ### V21.6 未覆盖面（登记，不声称已支持）
 
