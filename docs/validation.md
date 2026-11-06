@@ -771,7 +771,8 @@ doctest 阶段红（测试二进制 17 组 292 passed / 0 failed 全绿，只有
   DDL + 4 外部依赖桩，与 `config/corpus_forms.toml` 的 `files = 147` 同口径）、`cases/`（4）、
   `rules/`（1）、`spinduck.toml` 经 IPv4 / 连接串 / 口令关键字复核均无凭据。
   **2026-11-07 定案**：整目录（含那 162 个无凭据件）一律不入库——"只排除那个 docs 件、其余
-  入库"的备选方案已被明确否决，落点问题不再重开。因此入库面就是 4 个 `case_corpus_*` 用例 +
+  入库"的备选方案已被明确否决，落点问题不再重开。因此入库面就是 4 个语料用例
+  （`case_corpus_min_tax` / `case_corpus_purchase` / `case_corpus_stock_kind` / `case_split_agg`）+
   `config/corpus_forms.toml` 的脱敏形态清单；八个核心过程的逐字源码只作为**本地验证件**存在，
   `golden/exam_split_trade/` 由 `.git/info/exclude` 挡在库外。日后要扩大入库面，需重新走一轮
   口径确认，而不是沿用本节读作"随时可入库"。
