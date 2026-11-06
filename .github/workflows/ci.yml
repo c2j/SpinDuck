@@ -97,9 +97,10 @@ jobs:
       - name: Generate one-off GaussDB password（仅本次 runner 生命周期）
         id: gspwd
         working-directory: .
-        # 大写 A + 十六进制体 + 数字尾巴：保证大小写与数字三类字符（openGauss
-        # 复杂度校验），且不含需要 shell 转义的符号
-        run: echo "value=A$(openssl rand -hex 12)9z" >> "$GITHUB_OUTPUT"
+        # 大写 A + 十六进制体 + 数字 + `@`：openGauss 口令校验要求四类字符齐全
+        # （大写/小写/数字/特殊字符，见镜像 initdb 报错），长度 ≥8。`@` 与官方示例
+        # `openGauss@123` 同类，且在 double-quote shell 上下文与 compose 插值中无需转义。
+        run: echo "value=A$(openssl rand -hex 12)9z@" >> "$GITHUB_OUTPUT"
       - name: Bring up A-mode container（compose 校验 datcompatibility=A 才 healthy）
         working-directory: golden/gaussdb-docker
         env:

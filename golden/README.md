@@ -198,6 +198,7 @@ CASES_PROBE=1 cargo test --features native --test cases_native -- --nocapture
 | 症状 | 原因与处置 |
 |---|---|
 | 容器一直 `health: starting` 后 `unhealthy` | `datcompatibility != A`：卷是用 PG 模式初始化的旧卷，`down -v` 重建 |
+| 日志刷 `The supplied GS_PASSWORD is not meet requirements` | 口令没过 initdb 复杂度校验：须大写 + 小写 + 数字 + 特殊字符四类齐全、长度 ≥8（CI 的一次性口令生成器同口径，见 `.github/workflows/ci.yml` golden job 与 validation V21） |
 | 连接报 `authentication failed` | 口令与 `.env` 的 `GS_PASSWORD` 不一致（或卷复用了旧口令初始化），`down -v` 重建 |
 | 报 `sha256 authentication` 相关 | 容器环境变量被改动，须保留 `GS_HOST_AUTH_METHOD=md5` 与 `OTHER_PG_CONF` |
 | 端口 5433 被占 | 修改 compose 端口映射，同步设置 `SPINDUCK_OG_PORT` |

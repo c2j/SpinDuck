@@ -52,4 +52,6 @@ Thumbs.db
 # ───────────── 本地环境（口令等绝不入库） ─────────────
 .env
 .env.*
+# 例外：容器口令模板（compose/README 直接引用，值是可首启的占位符，非凭据）
+!golden/gaussdb-docker/.env.example
 *.local

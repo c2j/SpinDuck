@@ -626,13 +626,25 @@ purchase 已声明并跑通，其余三个的主角是无包限定的独立例�
 较 V20 的 235 净增 57 条；`cargo audit` 按 CI 的构建期 `zip` 豁免清单
 （§9，四条 RUSTSEC 公告）跑为干净，裸跑仍只报该既有清单、无新增公告。
 
-**环境侧一次性观察（登记，非缺陷）**：在同一 `target/` 里先跑
-`cargo clippy --all-features --tests` 再紧跟 `cargo test --features native`，doctest 阶段
-偶发 `E0463 can't find crate for ogsql_parser/duckdb`——rustdoc 拿到的是
-`-C metadata` 不同的依赖产物路径（`--all-features` 与 `--features native` 两套产物在
-`target/debug/deps` 并存）。`cargo clean -p spinduck -p ogsql-parser -p duckdb` 后连跑
-三次全绿（含 doctest 0 例）。CI 的 clippy/test/audit 是**三个独立 job**，不同享该目录，
+**环境侧一次性观察（登记，非缺陷）**：在同一 `target/` 里先后跑过
+`--all-features`（clippy）与 `--features gauss` 之后，`cargo test --features native` 的
+**doctest 阶段**报 `E0463 can't find crate for ogsql_parser/duckdb`——rustdoc 拿到的是
+`-C metadata` 不同的依赖产物路径（三套 feature 的产物在 `target/debug/deps` 并存）。
+处置口径实测为两步：`cargo clean -p spinduck -p ogsql-parser -p duckdb` 后**首跑**仍可能在
+doctest 阶段红（测试二进制 17 组 292 passed / 0 failed 全绿，只有 doctest 红），
+再跑一次 `cargo test --features native`（或单跑 `--doc`）即全绿——本机实跑
+292 passed + doctest 0 例通过。CI 的 clippy/test/golden 是**独立 job**，不同享该目录，
 不受此竞态影响。
+
+**CI golden job 首跑到引导步（2026-11-06 修复）**：前三次 run 的 golden job 先红在
+submodule pathspec（f80b319 已修），修好后第一次真正走到容器引导即红在
+`Error: The supplied GS_PASSWORD is not meet requirements`——镜像 initdb 要求
+**四类字符齐全**（大写/小写/数字/特殊字符），而 workflow 的一次性口令生成器
+`A$(openssl rand -hex 12)9z` 只有三类。现补尾部 `@`（与官方示例 `openGauss@123` 同类，
+在 double-quote 与 compose 插值中无需转义）。push 前已在本地 A 模式容器
+（`spinduck-gaussdb`，127.0.0.1:5433）实跑 `cargo test --features gauss` 的黄金面：
+`golden_gauss` 1 + `golden_corpus_gauss` 2 + `golden_corpus_purchase` 1 + `gauss_e2e` 2
+= **6 passed / 0 failed**，无 SKIP（缺容器时会打印 SKIP，此处为真实比对通过）。
 
 ### V21.1 语料形态清单与覆盖门禁（86 构造 / 135 条形态断言）
 
