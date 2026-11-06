@@ -14,7 +14,7 @@ golden/
 ├── case_split_agg/                ← 用例 1：聚合管线（toy，自建例程）
 ├── case_corpus_stock_kind/        ← 用例 2：语料级（考题基线函数逐字）
 ├── case_corpus_min_tax/           ← 用例 3：语料级（考题基线函数逐字）
-└── case_corpus_purchase/          ← 用例 4：语料级重量（核心过程 prc_trd_deal_purchase）
+└── case_corpus_purchase/          ← 用例 4：语料级（黄金层比函数 + 过程断言集）
 ```
 
 每个用例目录即一个 **§12.1 项目模式单元**（`spinduck.toml` 声明项目资产与可调用面
@@ -39,26 +39,31 @@ case_corpus_purchase/
 └── .spinduck/                     # 本地运行态（gitignore）
 ```
 
-用例定义示例（`cases/purchase.case.toml`）：
+用例定义示例（`cases/purchase.case.toml`，节选；`[[case.assert]]` 是同一份资产上的
+原生断言层，见下面同名小节）：
 
 ```toml
 [case]
 name = "corpus_purchase"
-kind = "procedure"                 # procedure=比对输出表；function=比对返回值
-routine = "pkg_split_trade_step3_sh.prc_trd_deal_purchase"
+kind = "function"                  # procedure=比对输出表；function=比对返回值
+routine = "fnc_get_purchase_js_days"
 baseline = "expected.json"
-expect_succeed = "0"
-reference_call_sql = "SELECT fn_agg_fund({args})"   # 可选：参照侧专用调用模板
 
 [case.data]
-materialize = ["mid_yjqs_detail", "par_fund_partner", ...]  # 需物化的输入表
-
-[case.output]
-sql = "SELECT ... FROM dat_trd_repurchase ORDER BY security_id"
+materialize = ["par_sys_purchase"]  # 需物化的输入表
 
 [[case.scenarios]]
-why = "回购/申购业务拆分（含异常行跳过）"
+why = "申购 90 天品种：JS 结算天数 = 起息日与结算日在 +1 交易日平移后的间隔"
+args = ["'20250715'", "'0130000001'"]
+
+# 过程本体不在黄金层执行，改由进程内内核逐值断言（零外部环境）
+[[case.assert]]
+why = "p_o_succeed 出口（考题约定的成功标记）"
+kind = "out"
+target = "pkg_split_trade_step3_sh.prc_trd_deal_purchase"
 args = ["'20250715'", "null"]
+param = "p_o_succeed"
+want = "0"
 ```
 
 约定：
@@ -69,7 +74,10 @@ args = ["'20250715'", "null"]
   被测侧必须保持为空，由过程自己写入。
 - 基线统一为 `{"scenarios":[{"why","value"|"rows"}]}`；数值按值归一
   （scale/尾零差异不算失败）。
-- 未设 `SPINDUCK_OG_HOST` 时用例打印 `SKIP` 并返回——**跳过不等于通过**。
+- `reference_call_sql` / `reference_routine` 是参照侧接缝：两侧例程名或调用形态不同
+  时用（toy 用例在 A 模式侧部署 PG 风格等价函数），语料级用例逐字同源、不用这两个字段。
+- 缺 `SPINDUCK_OG_HOST` 时用例**直接失败**（harness `panic` 并打印起容器的命令），
+  不打印 `SKIP`——**跳过不等于通过**，缺容器必红（AGENTS §4.1）。
 
 ## 第 1 步：启动参照数据库容器
 
@@ -107,7 +115,7 @@ SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
 SPINDUCK_OG_PASSWORD="$SPINDUCK_OG_PASSWORD" \
 cargo test --features gauss --test golden_corpus_gauss -- --nocapture
 
-# 语料级重量用例：核心过程 pkg_split_trade_step3_sh.prc_trd_deal_purchase
+# 语料级用例的黄金层：调用链上的函数 fnc_get_purchase_js_days（过程本体走原生断言层）
 SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
 SPINDUCK_OG_PASSWORD="$SPINDUCK_OG_PASSWORD" \
 cargo test --features gauss --test golden_corpus_purchase -- --nocapture
@@ -123,8 +131,8 @@ SPINDUCK_OG_PASSWORD="$SPINDUCK_OG_PASSWORD" \
 cargo test --features gauss --test gauss_e2e
 ```
 
-未设置 `SPINDUCK_OG_HOST` 时用例打印 `SKIP` 并返回——**跳过不等于通过**，
-CI/验收必须在设置了环境变量的前提下运行。用例根目录可用
+未设置 `SPINDUCK_OG_HOST` 时用例**直接失败**（panic + 打印起容器的命令），不打印
+`SKIP`——**跳过不等于通过**，CI/验收必须在设置了环境变量的前提下运行。用例根目录可用
 `SPINDUCK_GOLDEN_DIR=<dir>` 覆盖（默认仓库内 `golden/`）。
 
 ### 预期输出
@@ -142,20 +150,25 @@ test golden_corpus_min_tax_matches_a_mode_baseline ... ok
    `0.0000`，SpinDuck `0`，值相等不算差异）
 4. 同时断言与 `expected.json` 一致（锁住参照行为，防基线漂移）
 
-## 重量级用例（case_corpus_purchase）的特别约定
+## 语料级用例 4（case_corpus_purchase）的特别约定
 
 - 容器侧**整体重建应用 schema**（`DROP SCHEMA gaussdb CASCADE` + 重建）保证幂等：
   该容器是本复现包专用实例。
-- `src/` 目录保存被测源码**逐字副本**（核心包 + 依赖函数 + 日志桩包），夹具自包含，
-  不引用 `lib/fastaas` 路径。
+- `sql/routines/` 保存被测源码**逐字副本**（核心包 + 依赖函数 + 结算天数函数），
+  `sql/stubs/` 是日志桩包；夹具自包含，不引用 `lib/fastaas` 路径。
 - `sys_dummy` 在 A 模式是系统单行表；被测侧（DuckDB）由测试建 `CREATE TABLE
   sys_dummy AS SELECT 1` 等价物。
 - `%TYPE` 锚定的视图（`v_par_fund_check_para`）容器侧部署真实视图；被测侧建单列
   占位视图（类型声明不参与求值）。
-- 测试在 256MiB 栈的线程中运行（重量级语料函数的解析/编译递归超过测试默认 2MiB）。
+- 黄金 harness（`common::run_case`）在 256MiB 栈的子线程里跑：重量级语料例程的解析/
+  编译递归超过测试线程默认栈。原生断言层（`cases_native`）用默认栈即可，同一份核心包
+  编译通过——两条路径的栈口径不同，别把它们当同一件事。
 - 已知脱敏件缺陷：`par_fund_seat_para.commision_fee_type` 为 varchar(1) 而费型码为
-  2 字符——黄金口径取 `swh_all_kind.kind_id='0'` 确定性路径（purchase_yj 两侧同为
-  NULL）；CASE 路径须先修基线列宽。
+  2 字符——过程断言（`[[case.assert]]` 的 `rows`）取 `swh_all_kind.kind_id='0'` 确定性
+  路径；CASE 路径须先修基线列宽。
+- 黄金层只比 `fnc_get_purchase_js_days`，不 `CALL` 核心过程：参照实例（Hub 的 amd64
+  官方构建）在过程调用中会自行终止，成因挂在 validation V21.9–V21.12。过程行为由
+  `[[case.assert]]` 在进程内内核锁定，两侧分工见 `docs/architecture.md` §12.1。
 
 ## 原生断言层（`[[case.assert]]`，不需要容器）
 
@@ -201,7 +214,7 @@ CASES_PROBE=1 cargo test --features native --test cases_native -- --nocapture
 | 日志刷 `The supplied GS_PASSWORD is not meet requirements` | 口令没过 initdb 复杂度校验：须大写 + 小写 + 数字 + 特殊字符四类齐全、长度 ≥8（CI 的一次性口令生成器同口径，见 `.github/workflows/ci.yml` golden job 与 validation V21） |
 | 连接报 `authentication failed` | 口令与 `.env` 的 `GS_PASSWORD` 不一致（或卷复用了旧口令初始化），`down -v` 重建 |
 | 报 `sha256 authentication` 相关 | 容器环境变量被改动，须保留 `GS_HOST_AUTH_METHOD=md5` 与 `OTHER_PG_CONF` |
-| 参照侧语句报 `[ENV-0020] … connection closed` | 参照实例的**后端进程**没了，不是被测引擎的问题。先看 `docker logs spinduck-gaussdb` 与 `data/pg_log/*.log` 里失败时刻那一段，并确认容器有没有原地重启过（`docker inspect -f '{{.RestartCount}} {{.State.StartedAt}} {{.State.ExitCode}} {{.State.FinishedAt}}'`——compose 带 `restart: unless-stopped`，`status=running` 判不出死过；`StartedAt` 会变，但单独看它无法区分"重启"与"重建"，所以四个字段一起打印）。内存口径：镜像默认按**宿主**内存推导 `max_process_memory`（实测开发机 12GB / shared_buffers 1GB），推导值随宿主漂移会让同一份语料参照侧行为漂移，故 compose 固定 `max_process_memory = 4GB` + `shared_buffers = 512MB` + 限额 6GB（实测全量 gauss 套件容器峰值 amd64 1.74GB、arm64 1.10GB）。**"runner 上是 OOM 杀的"这条已用实测否掉**（V21.9，此后每轮再排除一次，共 4 次）。V21.10 钉死范围：**干净实例、零容器侵入下单独跑 purchase 一个用例即复现**（3/3 轮 `RestartCount` 0→1）。V21.11 钉死形态：`exitCode=0`、宿主 `dmesg` 无 segfault、`coredumpctl` 无 core、pg_log 增量里服务端错误行为零、重启后 `shutdown FALSE` 走崩溃恢复 ⇒ postmaster 是自己退出的，不是被杀的。判"崩溃能否落 core"要读宿主 `/proc/<PID1>/limits`——`docker exec … ulimit -c` 读的是新起 shell 的限额（runner 实测 unlimited，core 进 `coredumpctl`），不是 PID 1 的。**CI 的 golden job 因此跑在 `ubuntu-24.04-arm`（arm64，与开发机同架构），换的是参照产品的运行平台，断言一条未减；amd64 参照实例猝死仍是未决问题，见 validation V21.11**。CI 红时由 `scripts/ci/gauss_incident_evidence.sh` 一次性落全九组证据 |
+| 参照侧语句报 `[ENV-0020] … connection closed` | 参照实例的**后端进程**没了，不是被测引擎的问题。先看 `docker logs spinduck-gaussdb` 与 `data/pg_log/*.log` 里失败时刻那一段，并确认容器有没有原地重启过（`docker inspect -f '{{.RestartCount}} {{.State.StartedAt}} {{.State.ExitCode}} {{.State.FinishedAt}}'`——compose 带 `restart: unless-stopped`，`status=running` 判不出死过；`StartedAt` 会变，但单独看它无法区分"重启"与"重建"，所以四个字段一起打印）。内存口径：镜像默认按**宿主**内存推导 `max_process_memory`（实测开发机 12GB / shared_buffers 1GB），推导值随宿主漂移会让同一份语料参照侧行为漂移，故 compose 固定 `max_process_memory = 4GB` + `shared_buffers = 512MB` + 限额 6GB（实测全量 gauss 套件容器峰值 amd64 1.74GB、arm64 1.10GB）。**"runner 上是 OOM 杀的"这条已用实测否掉**（V21.9，此后每轮再排除一次，共 4 次）。V21.10 钉死范围：**干净实例、零容器侵入下单独跑 purchase 一个用例即复现**（3/3 轮 `RestartCount` 0→1）。V21.11 钉死形态：`exitCode=0`、宿主 `dmesg` 无 segfault、`coredumpctl` 无 core、pg_log 增量里服务端错误行为零、重启后 `shutdown FALSE` 走崩溃恢复 ⇒ postmaster 是自己退出的，不是被杀的。判"崩溃能否落 core"要读宿主 `/proc/<PID1>/limits`——`docker exec … ulimit -c` 读的是新起 shell 的限额（runner 实测 unlimited，core 进 `coredumpctl`），不是 PID 1 的。**CI 换 `ubuntu-24.04-arm` 逃避这条路已被实测堵死**（官方镜像在 arm64 runner 上解析到 amd64 用户态，`gosu: cannot execute binary file: Exec format error`，参照实例起不来；本机 arm64 那份是 registry 镜像站的**另一个构建**，所以"本地绿/CI 红"从来不是同一份 openGauss 在两种 CPU 上的对比，见 V21.12）。现行口径：golden job 跑 amd64，黄金层的参照侧只比语料级**函数**，考题业务过程的多维断言走进程内内核（`cargo test --features native --test cases_native`），断言一条未减；amd64 参照实例猝死作为参照产品/平台问题继续挂账，不再阻塞门禁。CI 红时由 `scripts/ci/gauss_incident_evidence.sh` 一次性落全九组证据 |
 | 取证时 `docker events` 打印为空，但容器明明死过 | 两个坑，都会把"读不到"伪装成"没有事件"：① `--format '{{.Attributes}}'` 在新版 CLI（本机 docker 29.9.2 / API 1.56 实测）整条命令报 `Error parsing format: … can't evaluate field Attributes in type *events.Message`——事件命令一律不带 `--format`，默认输出自带含 `exitCode` 的完整 attributes；② `--since/--until` 的历史回放依赖 dockerd 的事件保留与时区解释（本机把无时区的 UTC 串按 +08:00 解释，同一窗口回放 0 行、实时订阅 264 行），所以**主来源是测试前起好的实时流**，事后查询只兜底。另外：每一组"空"都必须带分母（流总行数 / action 计数 / dmesg 总行数），健康检查的 `exec_create|exec_start|exec_die` 要先剔掉（`exec_die` 是子进程退出，不是容器 `die`），否则真事件被噪声挤出画面 |
 | `SHOW max_process_memory` 与 compose 里写的不一致 | 正常，因为 `OTHER_PG_CONF` 只在**空数据目录首次 initdb** 时追加进 `postgresql.conf`（镜像 entrypoint 的 `opengauss_setup_postgresql_conf` 在 `DATABASE_ALREADY_EXISTS` 为空的那个分支里）。旧卷改口径有两条路：`docker compose down -v && up -d`（丢数据），或手工把三行追加到 `$PGDATA/postgresql.conf` 末尾再 `docker compose up -d` 重建容器（实测有效）。这两个都是 postmaster 级参数，`reload` 不够 |
 | 启动日志 `Failed to initialize the memory protect for ... cstore_buffers (512 Mbytes)` | 口径写死（2GB/4GB）时的常态，跟随宿主推导（12GB）时不出现。含义是 openGauss 的实例级内存看护没起来：超限不会被拦成可读 SQL 错误，而是内核静默杀后端。处置方式不是消除这行，而是让容器限额明显高于 `max_process_memory`（本地/CI 实测行数同为非零，不能拿它当 runner 差异项） |

@@ -82,19 +82,23 @@ jobs:
     # 自定义 entrypoint A 模式引导 + healthcheck 强校验 + 127.0.0.1 绑定）。
     # 口令由步骤内随机生成经 GS_PASSWORD/SPINDUCK_OG_PASSWORD 注入，不落仓库。
     #
-    # runs-on 选 arm64（ubuntu-24.04-arm，公开仓库免费）而不是 ubuntu-latest：
-    # 参照实例（openGauss 5.0.0 镜像的 **amd64** 构建）在 purchase 存过的调用窗口内
-    # 终止，runner 上 3/3 轮一致复现（validation V21.9–V21.11）：PID 1 exitCode=0、
-    # OOMKilled=false、宿主 dmesg 无 segfault、coredumpctl 无 core、pg_log 增量里
-    # 没有任何服务端错误行，随后走崩溃恢复。同一镜像 tag、同一 4GB/512MB/6G 口径、
-    # 同一 SQL_ASCII 在 arm64（开发机）全量 gauss 套件为绿。架构是当前唯一被实测
-    # 分离出来的变量，所以换的是**参照产品的运行平台**，不是断言。
-    # 边界（必须写清，防止被读成"换了平台就没事了"）：
-    #   - 本 job 的门禁、用例、断言、期望基线一条没减；判定 B 依旧红。
-    #   - amd64 参照实例的猝死是 openGauss 镜像/平台侧的已知问题，仍在
-    #     validation.md 挂着，不因换 runner 而关闭。
-    #   - 取证脚本继续留在 arm64 上：如果 arm64 也死，同一份证据会直接给出答案。
-    runs-on: ubuntu-24.04-arm
+    # runs-on 必须是 amd64（ubuntu-latest），换 arm64 这条路已被 CI 实测堵死
+    # （run 42249019674，validation V21.12）：官方镜像 `opengauss/opengauss:5.0.0`
+    # 在 runner 上解析到的是 amd64 用户态，arm64 runner 连容器都起不来——
+    # `/var/lib/opengauss/entrypoint.sh: line 356: /usr/local/bin/gosu: cannot
+    # execute binary file: Exec format error`，PID 1 直接失败，参照实例不存在。
+    # 另：开发机那份 arm64 镜像是经 docker.m.daocloud.io 镜像站拿到的**另一个
+    # artifact**（同 tag 不等于同构建），所以"本地 arm64 绿 / runner amd64 红"
+    # 从来就不是同一份 openGauss 在两种 CPU 上的对比。
+    #
+    # 因此参照侧可执行面在 CI 上只有 amd64 官方构建一种。它跑不了考题业务过程
+    # （单句 `CALL pkg_split_trade_step3_sh.prc_trd_deal_purchase(...)` 会让
+    # postmaster 以 0 退出、服务端不记任何错误，3/3 轮，见 V21.9–V21.12），
+    # 所以按 2026-11-06 的口径，黄金层不比这条过程的业务执行：过程行为由
+    # `[[case.assert]]` 在进程内内核逐值锁定（`--features native`，零外部环境），
+    # 黄金层的参照侧只比语料里最简函数。这是"参照产品平台限制"决定的被测面划分，
+    # 不是把断言改松——没有一条断言被删，也没有一条期望值被放宽。
+    runs-on: ubuntu-latest
     env:
       SPINDUCK_OG_HOST: 127.0.0.1
       SPINDUCK_OG_PORT: "5433"
@@ -123,10 +127,11 @@ jobs:
         env:
           GS_PASSWORD: ${{ steps.gspwd.outputs.value }}
         run: |
-          # 参照实例跑在什么架构上现在是一等变量（V21.11），必须打印验证而不是
-          # 相信 runs-on 标签：本 job 的证据链只有先确认"确实是 arm64"才成立。
-          # 顺带把 docker/compose 的版本落地——arm64 hosted runner 是较新的镜像，
-          # 取证脚本的口径（默认 events 输出、cgroup v2 路径）依赖它们。
+          # 参照实例跑在什么架构上是一等变量，必须打印验证而不是相信 runs-on 标签：
+          # 本 job 上一轮就是因为只看了标签（ubuntu-24.04-arm）而没看镜像用户态，
+          # 起了一个 Exec format error 的容器（V21.12）。现在是 x86_64 + amd64 构建
+          # 这一种口径。顺带把 docker/compose 版本落地——取证脚本的口径（默认 events
+          # 输出、cgroup v2 路径）依赖它们。
           echo "runner 架构: $(uname -m)"
           echo "docker: $(docker --version 2>&1)"
           echo "compose: $(docker compose version 2>&1 | head -1)"
@@ -167,87 +172,22 @@ jobs:
           ogpid=$(docker inspect -f '{{.State.Pid}}' spinduck-gaussdb)
           echo "PID1（宿主 pid=$ogpid）core 上限：$(sudo cat /proc/$ogpid/limits 2>/dev/null | grep -i 'core file size' || echo '(读不到)')"
           echo "宿主 core_pattern：$(sudo cat /proc/sys/kernel/core_pattern 2>/dev/null || echo '(不可读)')"
-      - name: Standalone purchase repro（判定 + 取证 + 门禁）
-        working-directory: spinduck
-        env:
-          SPINDUCK_OG_PASSWORD: ${{ steps.gspwd.outputs.value }}
-        # 全量套件里 purchase 是最后一个 gauss 二进制，前面已经跑了 11 分钟的
-        # 建库/删库。"是这条存过本身让参照实例消失，还是只有在那些状态之后才
-        # 消失"这两种解释，此前无法区分——本步骤在套件之前单独跑一次同一个用例，
-        # 用 PID 1 基线的变化做判定。
-        #
-        # 实测结论（amd64 runner 三轮一致：run 42236691856 / 42237764112 /
-        # 42242415215）：**判定B**。零容器侵入采样、干净实例、单跑 purchase，
-        # `RestartCount` 0→1、客户端 `[ENV-0020] connection closed`。所以崩溃不依赖
-        # 套件先前状态，也不依赖取证手段；`docker exec` 采样器嫌疑排除。既然单跑就能
-        # 稳定复现，崩溃窗口就只有这一次调用，取证范围随之收窄到本步骤——红时必须
-        # 在这里把服务端证据落全。
-        #
-        # 本步骤现在跑在 arm64（见 job 的 runs-on 注释与 V21.11）。那里的预期结果是
-        # **判定A**（与开发机一致）；判定A 不是"问题关闭"，只是"这个平台上没观察到"。
-        # 门禁逻辑一条不动：arm64 上若也出现 PID1 更替，同一份取证脚本会当场把九组
-        # 证据落下来，那时结论就要改写而不是继续换平台。
-        run: |
-          set +e
-          pre=$(docker inspect -f '{{.RestartCount}} {{.State.StartedAt}}' spinduck-gaussdb)
-          echo "单跑前 PID1: restart_count/started = $pre"
-          # 取证窗口起点 + pg_log 字节偏移：崩溃时只输出本窗口写入的服务端日志，
-          # 不会被 initdb 时代的历史行淹没。
-          since_iso=$(date -u +%Y-%m-%dT%H:%M:%S)
-          docker exec spinduck-gaussdb bash -c 'cd /var/lib/opengauss/data/pg_log && for f in *.log; do echo "$f $(wc -c < "$f")"; done > /tmp/ci_pglog_offsets'
-          # 容器生命周期事件走**实时流**：事后 `docker events --since/--until` 依赖
-          # dockerd 的事件保留策略，且 `--format` 模板键在新版 CLI 上会整条命令报错
-          # （上一轮就是因此打印成空，见 validation V21.11）。这里是宿主侧对 Engine
-          # API 的只读订阅，不进容器、不 exec，与已排除的 `docker exec` 采样器不同类。
-          docker events --since "$since_iso" > /tmp/ci_events_standalone.txt 2>&1 &
-          ev_pid=$!
-          cargo test --features gauss --test golden_corpus_purchase -- --nocapture > /tmp/standalone_purchase.log 2>&1
-          rc=$?
-          kill "$ev_pid" 2>/dev/null
-          echo "单跑 rc=$rc"
-          grep -aE "panicked|test result|gaussdb:|参照侧" /tmp/standalone_purchase.log | tail -20
-          sleep 3
-          post=$(docker inspect -f '{{.RestartCount}} {{.State.StartedAt}}' spinduck-gaussdb)
-          echo "单跑后 PID1: restart_count/started = $post"
-          if [ "$pre" = "$post" ]; then
-            echo "判定A：单跑 purchase 未换过参照实例 PID 1 —— 这条存过不足以独立致死，需结合全量套件的窗口继续判读"
-          else
-            echo "判定B：单跑 purchase 之后参照实例 PID1 换过 —— 这条存过可独立复现崩溃"
-          fi
-          # 红 = 一次性把"服务端到底怎么死的"落全（dmesg / coredumpctl / PID1 rlimit /
-          # 生命周期事件 / pg_log 增量）。取证脚本自身永不返回非零，不会成为新的红因。
-          if [ "$rc" -ne 0 ] || [ "$pre" != "$post" ]; then
-            bash "$GITHUB_WORKSPACE/scripts/ci/gauss_incident_evidence.sh" \
-              spinduck-gaussdb "$since_iso" /tmp/ci_pglog_offsets /tmp/og_pid1_baseline.txt \
-              /tmp/ci_events_standalone.txt
-          fi
-          # 若 PID1 真的重启过，必须等 healthy 再把套件交给它，否则诊断步骤会变成
-          # 新的失败源（套件第一个 gauss 用例连不上）。
-          for i in $(seq 1 40); do
-            st=$(docker inspect -f '{{.State.Health.Status}}' spinduck-gaussdb || true)
-            [ "$st" = "healthy" ] && break
-            sleep 3
-          done
-          echo "交接给全量套件时 health=$(docker inspect -f '{{.State.Health.Status}}' spinduck-gaussdb)"
-          # 判定B 必须是红：单跑就把参照实例打死，是参照侧可独立复现的崩溃。
-          # 若不门禁，全量套件可能在"重启后的干净实例"上转绿，把一个真实崩溃
-          # 掩成一次通过的合并——绿的含义必须是"没有任何一处观察到崩溃"。
-          # 单跑的用例断言失败本身不在这里门禁（同一判定权留给全量套件）。
-          if [ "$pre" != "$post" ]; then
-            echo "参照实例在单跑 purchase 期间换过 PID 1（$pre -> $post）：拒绝交接，红"
-            exit 1
-          fi
-          exit 0
       - name: Run golden + gauss suites
         working-directory: spinduck
         env:
           SPINDUCK_OG_PASSWORD: ${{ steps.gspwd.outputs.value }}
-        # purchase 参照侧崩溃的判定与取证已前移到 Standalone 步骤：干净实例、零容器
-        # 侵入采样、单跑同一个用例即可复现（判定B，amd64 runner 三轮一致），所以
-        # "依赖套件先前 11 分钟状态"和"`docker exec` 采样器导致死亡"两种
-        # 解释同时被排除。本步骤只负责其余 gauss 用例与全量套件这一层，红时调用同一
-        # 份取证脚本，口径与那里一致（事件实时流另开一路文件，避免互相覆盖）。
-        # 内存证据保留：V21.9 已用实测否掉 OOM 假说（峰值 670MB / 限额 6GB、
+        # 本步骤跑全部 golden + gauss 用例（A 模式容器实跑）。红时调
+        # scripts/ci/gauss_incident_evidence.sh 一次落全九组服务端证据，事件取自
+        # 本步骤自己起的那一路 docker events 实时流（宿主侧只读订阅，不进容器）。
+        #
+        # 曾经在这里前面另有一步"单跑 purchase 的判定"（V21.10 为区分"是否依赖套件
+        # 先前 11 分钟的建库/删库状态"而加，判定 B：不依赖，单跑即致死，amd64 三轮
+        # 一致）。2026-11-06 口径把考题业务过程的执行从黄金层拿走之后，那一步没有
+        # 主语了（黄金层不再 CALL 那条过程），故删除；崩溃本身仍是未决问题，登记在
+        # validation V21.9–V21.12，判读结论（postmaster 以 0 自行退出、非 OOM、非
+        # 信号崩溃、非取证手段导致、非套件状态导致）不因删除而改写。
+        #
+        # 内存证据保留打印：V21.9 起已四次用实测否掉 OOM 假说（峰值 670MB / 限额 6GB、
         # OOMKilled=false），继续打印是为了让"再猜一次内存"必须当场被数据反驳，
         # 而不是靠回忆。memory.peak 单调不减，前后各读一次即覆盖全程最大值。
         run: |
@@ -286,7 +226,7 @@ jobs:
           # 拿不到 cgroup 目录时退回 docker stats，那读到的只是当前值，口径必须标注。
           peak_before=$(sudo cat "$peakfile/memory.peak" 2>/dev/null)
           echo "套件开始前：memory.peak=${peak_before:-n/a} 字节"
-          # 生命周期事件实时流：与 Standalone 步骤同一口径（宿主侧只读订阅，不进容器）
+          # 生命周期事件实时流：宿主侧只读订阅，不进容器命名空间（V21.11 立的口径）
           docker events --since "$t0_iso" > /tmp/ci_events_suite.txt 2>&1 &
           ev_pid=$!
           cargo test --features gauss -- --nocapture
@@ -303,8 +243,8 @@ jobs:
           if [ "$rc" -ne 0 ]; then
             # syslogger 落盘有延迟，立刻读会漏掉失败窗口最后几行
             sleep 5
-            # 取证与 Standalone 步骤共用 scripts/ci/gauss_incident_evidence.sh：
-            # 两处各写一份必然漂移（上一轮就是这里只 grep oom、没查 coredumpctl）。
+            # 取证走 scripts/ci/gauss_incident_evidence.sh 一份脚本：上一次两处各写
+            # 一份必然漂移（那一轮套件那份只 grep oom、没查 coredumpctl）。
             # 脚本内部一律 set +e 且末尾 exit 0，不会把取证变成新的红因。
             bash "$GITHUB_WORKSPACE/scripts/ci/gauss_incident_evidence.sh" \
               spinduck-gaussdb "$t0_iso" /tmp/ci_pglog_offsets /tmp/og_pid1_baseline.txt \

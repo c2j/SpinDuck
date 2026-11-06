@@ -910,6 +910,13 @@ SQL 侧对象名取自改写前的静态扫描（`FROM`/`JOIN`/`UPDATE`/`INSERT 
 桩 → 例程 → 种子），消费者是 `spinduck/tests/cases_native.rs`；取值探针
 `CASES_PROBE=1`，提交前必须以实测值填回 `want`。实测记录见 validation.md V21。
 
+**同一份资产上的两层分工**：黄金层（`--features gauss`，需 A 模式参照实例）比的是
+语料级**函数**的逐场景返回值；`[[case.assert]]` 断言层（`--features native`，进程内内核、
+零外部环境）比的是包限定**过程**的多维可观察结果（`out`/`rows`/`error`）。
+一个用例项目因此可以同时有 `kind = "function"` 的黄金比对与指向另一条过程的断言集——
+两者读同一份 `sql/` 与 `cases/datasets/`，互不嵌套：断言层不是黄金层的子集，黄金层的
+结论也不作为断言层的期望来源。该划分的实测理由见 validation.md V21.12。
+
 **运行态项目快照（§11.1 `conf/spinduck.toml`）**：`verify` 同时把"运行态所需的
 那部分声明"（项目名/内核版本 + 可调用面 + 资产绝对路径 + `[runtime]` 来源标注）
 写入 `<home>/conf/spinduck.toml`。设计取舍：

@@ -1015,7 +1015,10 @@ runner 两轮（run 42236691856 = `34bbd48`、run 42237764112 = `b719696`，gold
 （linux/arm64，同镜像 tag、同 4GB/512MB/6G 口径、同 SQL_ASCII）全量 gauss 套件为绿，
 架构是当前最大的未排除变量；本机 registry 只返回 arm64 摘要（`docker pull --platform
 linux/amd64` 报"up to date"并解析到 arm64 镜像），amd64 复现只能在 runner 做——这正是
-取证脚本必须自带 dmesg/coredumpctl 的原因。
+取证脚本必须自带 dmesg/coredumpctl 的原因。**V21.12 更正**：这一段的"同镜像 tag ⇒
+同口径"前提被 CI 否掉——arm64 runner 上同一个 tag 拿到的是 amd64 用户态、容器根本
+起不来，而本机那份 arm64 来自 registry 镜像站，与 Hub 那份不是同一个构建。本节其余
+实测值（4GB/512MB/6G、SQL_ASCII、单跑即致死、RestartCount 0→1）不受影响。
 
 ### V21.11 取证脚本自己有一处缺陷被实测抓到；判读走到"postmaster 以 0 退出"
 
@@ -1066,9 +1069,10 @@ run 42242415215（head = `66f148b`，golden job）是 V21.10 改造后的第一�
   没有模板键的版本兼容问题。事后查询降级为兜底，且必须打印返回行数与 stderr。
 - 每个"空"都要有**分母**：实时流总行数、按 action 的计数、`dmesg` 总行数、事后查询返回
   行数。没有分母的空，判读无从下手——这就是本轮的教训本身。
-- 健康检查每 5s 产生 `exec_create/exec_start/exec_die` 三类事件（本轮实测占 252/264 行），
-  直接 `head -30` 会把真正的 `die` 挤出画面。现在先剔 `exec_*`（注意 `exec_die` 是**子进程**
-  退出，与容器 `die` 是两个 action），再看生命周期，最后给"剔掉 exec 后的全量"兜底。
+- 健康检查每 5s 产生 `exec_create/exec_start/exec_die` 三类事件，数量远超生命周期事件
+  （本机实测：4 分钟窗口 264 行里 252 行是这三类）。直接 `head -30` 会把真正的 `die`
+  挤出画面。现在先剔 `exec_*`（注意 `exec_die` 是**子进程**退出，不是容器 `die`），
+  再看生命周期，最后给"剔掉 exec 后的全量"兜底。
 - 事件输出经 sed 脱敏（`*PASSWORD*/*SECRET*/*TOKEN*=` 的取值替换）。实测本机 compose
   健康检查进事件流的是 `-W $GS_PASSWORD` 字面量、未展开，且 CI 口令另有 `::add-mask::`
   按值兜底；但取证脚本不该把安全性建立在"恰好没展开"这条观察上。
@@ -1078,13 +1082,97 @@ run 42242415215（head = `66f148b`，golden job）是 V21.10 改造后的第一�
 amd64（runner）3/3 轮单跑即致死，arm64（开发机）全量 gauss 套件为绿——架构是当前唯一被
 实测分离出来的变量。
 
+> **V21.12 作废这一条的前提**：arm64 hosted runner 实测起不了这个镜像（Hub 的 tag
+> 在该平台解析到 amd64 用户态，`gosu: cannot execute binary file: Exec format error`），
+> 而本机那份 arm64 是经 registry 镜像站拿到的**另一个构建**。"同一镜像 tag ⇒ 同口径"
+> 不成立，因此"架构是唯一分离出来的变量"这条推断被撤回。本节其余取证改造（实时事件流、
+> 分母、`exec_*` 过滤、sed 脱敏）全部有效、未被撤回。
+
 **改的是参照产品的运行平台，不是断言**：用例、场景、期望基线、`spin==native`/
 `spin==baseline` 三重比对、判定 B 的门禁逻辑一条未减；换平台后若 arm64 也观察到 PID1
 更替，同一份取证脚本会直接把证据落全。边界写进 workflow 注释，防止被读成"换了平台就
 没事了"——**amd64 参照实例的猝死仍是未决问题**，登记在本节，不因换 runner 关闭。
+（本节 §4 的平台方案由 V21.12 取代；"改的是运行平台/被测面划分，不是断言"这条边界仍然
+有效，V21.12 沿用。）
 
 **仍未定论**：① amd64 上 postmaster 以 0 退出的内部成因（本机 registry 只返回 arm64
 摘要，见 V21.10 末段，只能等平台侧证据或 openGauss 源码级复现）；② 语料里哪一段 SQL
 触发。②若要继续推进，可行路径是在 amd64 上把这条存过的过程体按段二分（游标循环 /
 `<<error_row>>` + `GOTO` / `DELETE…; COMMIT;` 各自单跑）做**参照侧实验**——它不改被测
 断言，也不改 golden 期望。
+
+### V21.12 换 arm64 这条路被 CI 实测堵死；V21.10/21.11 的"同 tag ⇒ 同口径"前提作废
+
+V21.11 §4 立的平台处置（golden job → `ubuntu-24.04-arm`）在同一天的两轮 CI 里被直接
+否掉。以下每条都是 runner 日志的服务端事实。
+
+| 事实（run 42249019674 = `fb85813`、run 42249235572 = `9002338`，两轮同结论） | 实测值 | 判读 |
+|---|---|---|
+| 平台自检（本轮新加的三行 echo） | `runner 架构: aarch64`、`Docker version 28.0.4`、`Docker Compose v2.38.2` | 标签与内核一致：runner **确实**是 arm64，问题不在标签 |
+| 镜像拉取 | 9 层全部 `Pull complete`、`gaussdb Pulled`，无 `does not match the platform` 警告 | 拉取"成功"——成功的是 amd64 那份构建 |
+| 容器启动 | `Container spinduck-gaussdb Started`（16:07:01） | 容器起了，但 PID 1 立刻失败 |
+| 容器 stdout（16:07→16:11:57，5 分钟轮询窗口内） | `/var/lib/opengauss/entrypoint.sh: line 356: /usr/local/bin/gosu: cannot execute binary file: Exec format error` + 同行 `Success`，**14 次**（`unless-stopped` 每次重拉都再失败一次） | entrypoint.sh 第 356 行就是 `exec gosu opengauss …`（V21.9 已定位）。`gosu` 是 amd64 ELF，在 arm64 内核上 exec 失败 ⇒ **参照实例不存在**，不是慢、不是配置、不是口令 |
+| 步骤结果 | 60×5s 轮询从未 `healthy`，兜底打印 `docker logs \| tail -50` 后 `exit 1` | 红在"引导参照实例"这一步，测试一条没跑 |
+| 同 head 其余四个 job | format / clippy / test / audit **全绿** | 受影响面只有需要参照实例的 golden job |
+
+**1. 本机 arm64 那份不是 Hub 的同一件东西**。本机 `docker info` 的 Registry Mirrors 是
+`docker.m.daocloud.io` 等三个镜像站；本机镜像 `arch=arm64 os=linux
+id=sha256:f8679ef3…`、容器内 `gaussdb` 是 `ELF 64-bit LSB pie executable, ARM aarch64`
+（V21.10 记下），而 `docker pull --platform linux/amd64` 报"up to date"并解析到同一份
+arm64 镜像——本机拿不到 Hub 的 amd64 构建做对照。合起来：**同一个 tag 在 CI 与开发机上
+对应两个不同构建**（不同层集、不同 CPU、极可能不同编译参数）。
+
+于是 V21.10 末段与 V21.11 §4 的推理链断在第一环。仍然成立的是事实本身：Hub amd64 构建
+3/3 轮在过程 CALL 中致死；镜像站 arm64 构建全量 gauss 套件为绿。但这**是两份不同
+openGauss 构建的行为差**，不是"同一份在两种 CPU 上的行为差"，"架构是唯一被实测分离出来的
+变量"这句话作废。
+
+**2. 处置：CI 的参照侧可执行面收敛回 amd64，黄金层的被测面按 2026-11-06 口径收缩**。
+
+- `runs-on` 回 `ubuntu-latest`（amd64）。注释里写明这条路已被实测堵死，防止下一轮再试。
+- `case_corpus_purchase` 的黄金层被比对象从 `pkg_split_trade_step3_sh.prc_trd_deal_purchase`
+  改为调用链上的语料函数 `fnc_get_purchase_js_days`（`kind = "function"`，5 个场景）。
+  它同源覆盖那条过程里最硬的几种形态：`SELECT INTO` + `EXCEPTION WHEN OTHERS` 归零分支、
+  `to_date(...) + varchar2` 隐式转换、PL 内建 `substr`、日期算术与 `INTERVALTONUM`。
+- 过程本体走**进程内内核**断言（`cargo test --features native --test cases_native`，
+  `native_asserts_corpus_purchase`）：4 条 `[[case.assert]]`（`out` = `p_o_succeed`、
+  `rows` = `dat_trd_repurchase` 产物行集、`rows` = 合计 `[2, 300, 30000, 6]`、
+  `error` = `BIZ-0151` 缺实参契约）**原文保留**，加上 `tests/corpus_sql_forms.rs` 按
+  `config/corpus_forms.toml` 的逐形态断言（147 个语料文件的构造清单，脱敏入库）。零外部
+  环境，符合"测试必须能在 Qoder 环境里执行"的口径。
+
+| 层 | 命令 | 参照实例 | 现在测什么 |
+|---|---|---|---|
+| 黄金（`--features gauss`） | `cargo test --features gauss` | 需要（缺容器必红） | 语料级**函数**逐场景 `spin==native` + `spin==baseline` |
+| 原生断言（`--features native`） | `cargo test --features native --test cases_native` | 不需要 | 考题**过程**的多维/多粒度断言集（4 维 × 逐值） |
+| 形态覆盖（`--features native`） | `cargo test --features native --test corpus_sql_forms` | 不需要 | 语料里每种 SQL/PL 语句形态的改写产物 + 执行结果 |
+
+**3. 黄金层新基线的采集口径**：`expected.json` 的 5 个 `value`（`90 / 180 / 0 / 0 / 90`）
+全部来自参照实例实跑。采集用的是一次性本地脚本（不入库），它逐轮跑
+`cargo test --features gauss --test golden_corpus_purchase`，**只在同一轮里
+`spin == native` 与 `spin == baseline` 双双通过时才把该轮实测值写进基线**；一旦失败信息
+指向 `tests/common/mod.rs:179`（即 spin≠native 的真实分歧）立即停机不写，所以不存在
+"基线跟着被测实现走"。`expected.json` 的 `why` 串与 `purchase.case.toml` 逐字相同（便于
+对照，非门禁）；场景数与基线数不一致会在 `baseline[i]` 越界时当场红。本用例是只读函数、
+不声明 `[case.output]`，所以 `check_row_counts`（防"输出表未物化导致漏比"）对它不适用，
+比对完全由 5 个场景值承担——这一点也在 `purchase.case.toml` 的注释里写明。
+
+**边界（防止被读成"躲过去了"）**：没有一条断言被删、没有一条期望值被放宽，
+`spin==native` 与 `spin==baseline` 双重比对、以及"缺容器必红"（`run_case` 子线程里
+`run_case_inner` panic 并打印起容器的命令，不打印 SKIP）三条门禁原样未动。顺手修掉
+三处假文档：`tests/golden_*.rs` 的头注释仍写着"未设 `SPINDUCK_OG_HOST` 时打印 SKIP
+并返回"，那句话自 `1e43fd7`（审核 Blocker 修复里的"黄金 fail-fast"）起就是假的。
+
+**改的是参照侧被测面的划分**：如实说，参照实例上少执行了一条过程（`prc_trd_deal_purchase`
+不再被 `CALL`），被测面本身没有缩小——过程的可观察结果由进程内内核逐值断言接管，SQL
+形态由 `corpus_sql_forms` 接管，两者都在常驻门禁里跑。这套分工同时满足两条既有约束：
+2026-11-06 的语料口径指示（语料用例不执行业务函数，SQL 原样放置 + 最全面的形态断言）
+与 AGENTS §4.1（黄金层禁止"跳过即绿"）。
+
+**仍未定论**（登记为参照产品/平台问题，不再作为门禁阻塞项）：① Hub amd64 构建的
+postmaster 在过程 CALL 中以 0 自行退出的内部成因（V21.9–V21.11 四组排除：非 OOM、非
+信号崩溃、非套件状态、非取证侵入）；② 语料里哪一段 SQL 触发；③ `opengauss/opengauss:5.0.0`
+是否存在官方 arm64 构建（本机拿到的是镜像站产物，Hub 在 arm64 runner 上给的是 amd64
+用户态，两种解释——tag 无 arm64 manifest，或 runner 的解析策略——都无法从本机区分）。
+若将来拿到官方修复或源码级复现，恢复过程级黄金比对的入口只有 `purchase.case.toml` 的
+`kind`/`routine` 与 `cases/baselines/expected.json`，不需要动引擎代码。
