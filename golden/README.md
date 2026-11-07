@@ -95,7 +95,11 @@ docker logs spinduck-gaussdb | grep spinduck-init
 - openGauss 5.0.0，**Oracle A 兼容模式**（`datcompatibility=A`，healthcheck
   强制校验——A 模式在 initdb 固化，若校验失败须 `down -v` 重建卷）
 - md5 认证经镜像环境变量原生配置（`GS_HOST_AUTH_METHOD=md5` +
-  `password_encryption_type=1`），纯 Rust `postgres` 驱动可直接连接
+  `password_encryption_type=1`）——这是旧驱动不支持 sha256 时留下的口径，参照实例
+  与基线均已按此固化，**换驱动后不改**（改它等于同时动参照实例与认证面，属独立
+  决策，见 validation V24）；`gaussdb::sync` 驱动对 md5 与 sha256 两种形态都能连
+- 同 compose 文件里的 `gaussdb-sha256` 服务（`127.0.0.1:5434`，默认 sha256、独立卷）
+  只服务认证探针 `spinduck/tests/gauss_sha256.rs`，不产出黄金基线
 - 入口脚本改编自 dota-adapter 交付脚本
   （`lib/fastaas/prototype-1.7/dota-scheduler/dota-adapter/docker/`），
   去除了 DOTA 业务 schema 自动应用（SpinDuck 测试自建全部对象）

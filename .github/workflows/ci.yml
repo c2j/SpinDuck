@@ -44,6 +44,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # uses: 步骤不跟随 defaults.working-directory；缺这行会静默退化成只缓存 registry（V25）
+          workspaces: spinduck
       - run: cargo clippy --all-features --tests -- -D warnings
 
   test:
@@ -55,6 +58,9 @@ jobs:
         run: git submodule update --init lib/ogsql-parser
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # uses: 步骤不跟随 defaults.working-directory；缺这行会静默退化成只缓存 registry（V25）
+          workspaces: spinduck
       - run: cargo test --features native
 
   audit:
@@ -63,6 +69,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # uses: 步骤不跟随 defaults.working-directory；缺这行会静默退化成只缓存 registry（V25）
+          workspaces: spinduck
       - run: cargo install cargo-audit --locked
       # 内核锚定（AGENTS §1：duckdb = "=1.10505.0"）带来的构建期依赖：
       # zip 6.0.0 是 libduckdb-sys 的 build-dependency（bundled 解压缩包用），
@@ -76,6 +85,11 @@ jobs:
             --ignore RUSTSEC-2026-0368 \
             --ignore RUSTSEC-2026-0369 \
             --ignore RUSTSEC-2026-0429
+      # 审计盲区（非豁免，是覆盖不到）：gauss feature 的 `gaussdb` 是 git 依赖
+      # （rust-opengauss @ b95ed0b9），不在 crates.io advisory 面内，cargo audit
+      # 不产出它的公告。机械化入口只有本地 `cargo test --features gauss-sha256`
+      # （默认 sha256 实例，见 golden/gaussdb-docker）；rev 升级必须人工复核认证与
+      # 线协议改动面（决策记录 ⑫ / validation V24）。
 
   golden:
     # 黄金对比：复用 golden/gaussdb-docker compose（与本地完全同口径：
@@ -111,6 +125,9 @@ jobs:
         run: git submodule update --init lib/ogsql-parser
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # uses: 步骤不跟随 defaults.working-directory；缺这行会静默退化成只缓存 registry（V25）
+          workspaces: spinduck
       - name: Generate one-off GaussDB password（仅本次 runner 生命周期）
         id: gspwd
         working-directory: .

@@ -1,6 +1,6 @@
 [package]
 name = "spinduck"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "GaussDB stored-procedure engine on DuckDB kernel"
 license = "MIT OR Apache-2.0"
@@ -19,12 +19,19 @@ default = ["native"]
 native = ["dep:duckdb"]
 cli = ["dep:duckdb", "native"]
 golden = ["native"]
-gauss = ["dep:postgres", "native"]
+gauss = ["dep:gaussdb", "native"]
+# sha256 认证探针独立开关：不打开时 tests/gauss_sha256.rs 收集 0 个测试，
+# 避免"三条断言因未连实例而直接返回"被读成通过（AGENTS §4.1 禁"跳过即绿"）。
+gauss-sha256 = ["gauss"]
 
 [dependencies]
 ogsql-parser = { path = "../lib/ogsql-parser" }
 duckdb = { version = "=1.10505.0", features = ["bundled"], optional = true }
-postgres = { version = "0.19", optional = true }
+# GaussDB/openGauss 线协议驱动：实现 sha256/md5-sha256/SM3 口令认证（纯 Rust
+# `postgres` 不认，见 validation V24）。只开 `sync`（本仓库全同步，`gaussdb::sync::*`），
+# `default-features = false` 关掉运行时与类型扩展 feature 以收窄依赖面；不开 TLS。
+# rev 锁定与 hepta-dbcli 同基线；git 依赖不进 cargo audit 面，豁免登记见 CI workflow 注释。
+gaussdb = { git = "https://github.com/c2j/rust-opengauss", rev = "b95ed0b96c1ccf11827dde24c8fdf778a1bdbc03", default-features = false, features = ["sync"], optional = true }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

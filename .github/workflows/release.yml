@@ -1,0 +1,245 @@
+# AGENTS §9「Platform Build」（发版触发，非常驻门禁）+ §10 平台矩阵的落地。
+# 触发：push 形如 vX.Y.Z 的 tag；workflow_dispatch 只构建并上传 artifact，**不发布
+# Release**——这是在不产生真实发布物的前提下复验整条矩阵的入口。
+#
+# 本轮目标集 = 3 个（Linux x86_64 / Linux aarch64 / Windows x86_64）。AGENTS §10 表里的
+# macOS 双架构与 Win7（nightly -Zbuild-std + crt-static）**未纳入**，登记为待补，
+# 见 docs/validation.md V25 与 docs/architecture.md 决策记录 ⑬。
+#
+# 为什么 Linux 走 cargo-zigbuild 而不是"在 glibc 2.28 的容器里原生构建"：
+# 后者实测被 Rocky 8 的 aarch64 镜像源挡住（8.10 AppStream repodata 全镜像 404），
+# 而 zig 路线两个目标都实测通过。glibc 上限**不由工具承诺**，由每次运行的
+# scripts/ci/check_max_glibc.py 反查产物的版本化符号来判定（超限即红）。
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "干跑原因（仅构建，不发布）"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY: spinduck
+  # 实测基线（V25）：cargo-zigbuild 0.22.1 在 aarch64 链接期失败
+  # （rustc 传 `-Wl,--fix-cortex-a53-843419`，zig cc 不认），0.23.4 通过。
+  ZIGBUILD_VERSION: "0.23.4"
+  ZIG_VERSION: "0.15.2"
+
+defaults:
+  run:
+    # crate 在 spinduck/（仓库根无 Cargo.toml），与 ci.yml 同约定
+    working-directory: spinduck
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    name: 版本守卫与脚本自检
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.guard.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      # 两个发版脚本是门禁本身的一部分：先跑各自 --self-test，缺一条断言都不许往下走
+      - name: 发版脚本自检（check_max_glibc / check_release_tag）
+        working-directory: .
+        run: |
+          python3 scripts/ci/check_max_glibc.py --self-test
+          python3 scripts/ci/check_release_tag.py --self-test
+      # tag 版本必须等于 spinduck/Cargo.toml 的 version：否则 Release 资产名
+      # （spinduck-<ver>-…）与二进制内 `spinduck version` 自相矛盾
+      - name: tag 与 crate 版本一致性
+        id: guard
+        working-directory: .
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            # 干跑没有 tag，产物版本号取 crate 版本，命名口径与正式发布一致
+            VERSION="$(python3 scripts/ci/check_release_tag.py --print spinduck/Cargo.toml)"
+          else
+            VERSION="$(python3 scripts/ci/check_release_tag.py --tag "${GITHUB_REF_NAME}")"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "产物版本号 = $VERSION"
+
+  linux:
+    name: Build linux-${{ matrix.arch }}
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            # 公开仓库免费的 arm64 hosted runner；这里只是取 native 架构构建，
+            # 与 golden job 那条"openGauss 官方镜像跑不了 arm64"（V21.12）无关
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init ogsql-parser submodule（path 依赖，编译必需）
+        working-directory: .
+        run: git submodule update --init lib/ogsql-parser
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      # 装法用 cargo install --locked（从源码构建，可审计），不 curl 远端脚本管道进 sh
+      - name: Install cargo-zigbuild ${{ env.ZIGBUILD_VERSION }}
+        run: cargo install cargo-zigbuild@${{ env.ZIGBUILD_VERSION }} --locked
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # uses: 步骤不跟随 defaults.working-directory；缺这行会静默退化成只缓存 registry（V25）
+          workspaces: spinduck
+      - name: Build（glibc 符号锚定 2.28）
+        run: >
+          cargo zigbuild --release --locked --features cli
+          --target ${{ matrix.target }}.2.28
+      - name: 反查产物 GLIBC 上限（AGENTS §10 硬约束）
+        working-directory: .
+        run: python3 scripts/ci/check_max_glibc.py spinduck/target/${{ matrix.target }}/release/${{ env.BINARY }}
+      - name: Strip
+        # runner 与目标同架构，strip 即原生的，无需交叉 strip 工具链
+        run: strip target/${{ matrix.target }}/release/${{ env.BINARY }}
+      - name: Package
+        run: |
+          VERSION="${{ needs.meta.outputs.version }}"
+          DIR="${{ env.BINARY }}-${VERSION}-linux-${{ matrix.arch }}"
+          mkdir -p "$DIR"
+          cp "target/${{ matrix.target }}/release/${{ env.BINARY }}" "$DIR/"
+          tar -czf "${DIR}.tar.gz" "$DIR"
+          ls -la "${DIR}.tar.gz"
+      # 冒烟按 AGENTS §9：call 一个探针例程，断言 OUT 回传值——跑的是打包后的字节，
+      # 从 tar 里解出来跑，顺带验证打包本身
+      - name: Smoke（解包后 call 探针例程）
+        run: |
+          VERSION="${{ needs.meta.outputs.version }}"
+          rm -rf /tmp/sd-smoke && mkdir -p /tmp/sd-smoke
+          tar -xzf "${{ env.BINARY }}-${VERSION}-linux-${{ matrix.arch }}.tar.gz" -C /tmp/sd-smoke
+          printf 'CREATE OR REPLACE PROCEDURE prc_smoke(p_i IN NUMBER, p_o OUT NUMBER) IS BEGIN p_o := p_i * 3; END;' \
+            > /tmp/sd-smoke/smoke.sql
+          out="$(/tmp/sd-smoke/${{ env.BINARY }}-${VERSION}-linux-${{ matrix.arch }}/${{ env.BINARY }} \
+                call --file /tmp/sd-smoke/smoke.sql prc_smoke 14 null)"
+          echo "$out"
+          echo "$out" | grep -q 'OUT p_o = 42'
+          /tmp/sd-smoke/${{ env.BINARY }}-${VERSION}-linux-${{ matrix.arch }}/${{ env.BINARY }} version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          # upload-artifact 的 path 相对**仓库根**，不跟随 defaults.run.working-directory
+          path: "spinduck/*.tar.gz"
+          if-no-files-found: error
+
+  windows:
+    name: Build windows-x86_64
+    needs: meta
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Init ogsql-parser submodule
+        working-directory: .
+        run: git submodule update --init lib/ogsql-parser
+        shell: bash
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # uses: 步骤不跟随 defaults.working-directory；缺这行会静默退化成只缓存 registry（V25）
+          workspaces: spinduck
+      # AGENTS §10 的 Windows x86_64 行是"Windows 10+，stable"，不加 crt-static
+      # （静态 CRT 只属 Win7 行）。代价：目标机需 VC++ 2015-2022 x64 运行库，
+      # 该前提写进 README 已知限制，不在 windows-latest 上假装验证过。
+      - name: Build
+        run: cargo build --release --locked --features cli --target x86_64-pc-windows-msvc
+      # README 已知限制里"Windows 产物依赖 VC++ 运行库"目前是文档假设，不该假装验证过：
+      # 这一步把假设变成每次发版的产物侧证据（打印直接导入的 DLL 清单）。
+      # 说明：这只能看到**静态导入**，delay-load 与运行时 LoadLibrary 的依赖不在面上。
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: 反查运行库依赖（dumpbin /dependents）
+        shell: cmd
+        run: dumpbin /dependents target\x86_64-pc-windows-msvc\release\spinduck.exe
+      - name: Package
+        shell: pwsh
+        run: |
+          $VERSION = "${{ needs.meta.outputs.version }}"
+          $DIR = "spinduck-$VERSION-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path $DIR | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/spinduck.exe" -Destination $DIR
+          Compress-Archive -Path $DIR -DestinationPath "$DIR.zip"
+          Get-ChildItem "$DIR.zip" | Format-List Name, Length
+      - name: Smoke（解包后 call 探针例程）
+        shell: bash
+        run: |
+          VERSION="${{ needs.meta.outputs.version }}"
+          rm -rf /tmp/sd-smoke && mkdir -p /tmp/sd-smoke
+          unzip -q "spinduck-${VERSION}-windows-x86_64.zip" -d /tmp/sd-smoke
+          printf 'CREATE OR REPLACE PROCEDURE prc_smoke(p_i IN NUMBER, p_o OUT NUMBER) IS BEGIN p_o := p_i * 3; END;' \
+            > /tmp/sd-smoke/smoke.sql
+          exe="/tmp/sd-smoke/spinduck-${VERSION}-windows-x86_64/spinduck.exe"
+          out="$("$exe" call --file /tmp/sd-smoke/smoke.sql prc_smoke 14 null)"
+          echo "$out"
+          echo "$out" | grep -q 'OUT p_o = 42'
+          "$exe" version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86_64
+          path: "spinduck/*.zip"
+          if-no-files-found: error
+
+  release:
+    name: 发布 GitHub Release
+    needs: [meta, linux, windows]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux-x86_64
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux-aarch64
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-windows-x86_64
+          path: artifacts
+      # AGENTS §10：随包附 SHA-256。清单覆盖全部资产，且数量必须等于目标数，
+      # 少一个平台就红——不允许"部分产物静默缺失"发出去
+      - name: SHA256SUMS 与资产数量核对
+        working-directory: .
+        run: |
+          ls -la artifacts
+          (cd artifacts && sha256sum ./*.tar.gz ./*.zip > ../SHA256SUMS.txt)
+          n=$(find artifacts -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)
+          echo "资产数 $n（期望 3）"
+          [ "$n" -eq 3 ]
+          cat SHA256SUMS.txt
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            SHA256SUMS.txt

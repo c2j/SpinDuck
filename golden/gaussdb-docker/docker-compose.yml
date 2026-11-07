@@ -83,6 +83,46 @@ services:
         reservations:
           memory: 1G
 
+  # 默认口令形态（sha256）实例：只服务 tests/gauss_sha256.rs 的认证探针。
+  # 与上面 gaussdb 服务的区别只有三处——不覆盖 GS_HOST_AUTH_METHOD、不设
+  # password_encryption_type（镜像默认即 2=sha256only，实测 SHOW 确认）、独立卷与
+  # 独立回环端口 5434。参照侧仍是 A 模式 golden 实例：本服务不产出黄金基线，
+  # 只证明纯 Rust 客户端能直连 GaussDB/openGauss 的默认认证形态（validation V24）。
+  # 起两个实例时宿主 /dev/shm 会被两个 postmaster 同时使用；若第二个起不来
+  # （openGauss 共享内存报 No space left），给 docker run 加 --shm-size=2g。
+  gaussdb-sha256:
+    image: opengauss/opengauss:5.0.0
+    container_name: sd-og-sha256
+    restart: unless-stopped
+    environment:
+      GS_PASSWORD: ${GS_PASSWORD:?GS_PASSWORD must be set (cp .env.example .env)}
+      GS_NODENAME: sd_sha256_node
+      GS_PORT: 5432
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - gauss_sha256_data:/var/lib/opengauss/data
+    healthcheck:
+      # 镜像默认 entrypoint 无现成探活命令，用 gsql 自查（口令经容器 env 读取，
+      # 不写进命令行以外的任何地方）
+      test:
+        [
+          "CMD-SHELL",
+          "export LD_LIBRARY_PATH=/usr/local/opengauss/lib:$$LD_LIBRARY_PATH && /usr/local/opengauss/bin/gsql -U gaussdb -W $$GS_PASSWORD -d postgres -t -A -c \"SHOW password_encryption_type\" | tr -d '[:space:]' | grep -qx 2",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+        reservations:
+          memory: 1G
+
 volumes:
   gauss_data:
+    driver: local
+  gauss_sha256_data:
     driver: local

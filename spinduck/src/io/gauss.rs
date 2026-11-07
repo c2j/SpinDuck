@@ -1,13 +1,14 @@
 //! GaussDB 连接器与物化/回写（§13，V1 数据源锁定 GaussDB）。
 //!
-//! 通道：PG 线协议（`postgres` crate，md5 认证；openGauss 容器需
-//! `password_encryption_type=0` + hba md5 + 密码重存，见 validation.md）。
-//! 类型保真：物化/回写均以文本值承载，类型转换由 DuckDB 列类型完成（v1）。
+//! 通道：PG 线协议（`gaussdb::sync`，openGauss 私有口令认证 sha256/md5-sha256/SM3
+//! 均支持；纯 Rust `postgres` 驱动不认 sha256，故 v1 曾要求容器开 md5，见
+//! validation V24）。类型保真：物化/回写仍以文本值承载，类型转换由 DuckDB 列类型
+//! 完成（v1 口径不变）。
 
 use crate::error::EngineError;
 use crate::exec::BindMap;
 use crate::value::SpinValue;
-use postgres::{Client, NoTls};
+use gaussdb::sync::{Client, NoTls};
 
 /// 回写批大小（单次从 DuckDB 取的行数）。
 const SYNC_BATCH: usize = 1000;
@@ -24,9 +25,9 @@ fn env_err(e: impl std::fmt::Display) -> EngineError {
     EngineError::env(20, format!("gaussdb: {e}"))
 }
 
-/// 数据库错误保真呈现：SQLSTATE + 服务端消息（`postgres::Error` 的 Display 只有
+/// 数据库错误保真呈现：SQLSTATE + 服务端消息（`gaussdb::sync::Error` 的 Display 只有
 /// "db error"，定位 DDL/DML 失败必须看 DbError 字段）。
-fn db_err(e: postgres::Error) -> EngineError {
+fn db_err(e: gaussdb::sync::Error) -> EngineError {
     match e.as_db_error() {
         Some(d) => EngineError::env(
             20,
@@ -89,7 +90,9 @@ impl GaussConn {
         let mut schema = Vec::new();
         let mut out = Vec::new();
         for msg in &rows {
-            if let postgres::SimpleQueryMessage::Row(row) = msg {
+            // `SimpleQueryMessage` 只在驱动层导出（sync 门面未列便捷别名），
+            // 走 `sync::driver` 以免为枚举本身多引一条 crate 依赖。
+            if let gaussdb::sync::driver::SimpleQueryMessage::Row(row) = msg {
                 if schema.is_empty() {
                     schema = row.columns().iter().map(|c| c.name().to_string()).collect();
                 }

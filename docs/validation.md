@@ -1453,3 +1453,209 @@ V9 表已补记。
   （V21.5 定案整目录不入库）。只 clone SpinDuck 的人能复现的是上面六条 `/tmp` 探针，
   以及仓库内的 `./spinduck/target/debug/spinduck compile golden/case_corpus_purchase/sql`
   → `files=7 ok=7 failed=0 routines=6`（本轮实跑）。
+
+## V24. 数据通道认证面：sha256 实测可连，驱动由 `postgres` 换为 `gaussdb::sync`
+
+**结论**：README「已知限制」里"GaussDB 侧若为 sha256 口令认证，纯 Rust `postgres`
+驱动不支持（v1 需 md5 或自建 TLS 通道）"这条**已被驱动替换解除**——不需要自建 TLS、
+不需要服务端降级 md5。
+
+### 一手证据（本机 amd64 镜像、stable 1.98）
+
+对照矩阵，同一实例、同一口令、同一 `SELECT`/DDL/DML 序列：
+
+| 被测实例 | 认证形态 | `postgres`（旧驱动） | `gaussdb::sync`（新驱动） |
+|---|---|---|---|
+| 新建默认实例（5434，`SHOW password_encryption_type` = **2**，即 sha256only） | sha256 | `ENV-0020 gaussdb: error parsing response from server`（握手即失败） | 连接成功；`SELECT` 取回 `[1, sd]`；`CREATE/INSERT/SELECT/DROP` 全通 |
+| 现有 golden 容器（5433，`password_encryption_type = 1`，md5） | md5 | 通 | **同样通**——换驱动不打断参照侧 |
+
+驱动侧依据：`crates/tokio-opengauss/src/connect_raw.rs` 有
+`AuthenticationSha256Password` / `AuthenticationMd5Sha256Password` / SM3 三条握手支路，
+算法在 `crates/opengauss-protocol/src/authentication/sha256.rs`。上游仓库
+`c2j/rust-opengauss`，`license = MIT OR Apache-2.0`，`rust-version = 1.85`，
+`gaussdb` crate 版本 0.1.0（未发 crates.io，故只能是 git 依赖）。
+
+### TDD 循环（测试名 + 改动 + 命令结果）
+
+- **Red**：新增 `spinduck/tests/gauss_sha256.rs` 三条断言
+  （`should_connect_and_fetch_rows_on_sha256_auth_instance`、
+  `should_refuse_to_claim_sha256_when_instance_is_md5_only`、
+  `should_execute_ddl_and_dml_on_sha256_auth_instance`），在旧驱动下
+  `3 failed`，理由全是 `connect_parts → ENV-0020 error parsing response from server`。
+  中途一次编译失败（`Option<&Option<String>>` 不是迭代器），先修测试自身再取红。
+- **Green**：`spinduck/Cargo.toml` 移除 `postgres`，加
+  `gaussdb = { git = …, rev = "b95ed0b9…", default-features = false, features = ["sync"], optional = true }`；
+  `gauss = ["dep:gaussdb", "native"]`；`src/io/gauss.rs` 换
+  `gaussdb::sync::{Client, NoTls}` 与 `gaussdb::sync::driver::SimpleQueryMessage`。
+  `SPINDUCK_OG_SHA256_HOST=… SPINDUCK_OG_SHA256_PW_FILE=… cargo test --features gauss-sha256 --test gauss_sha256`
+  → `3 passed / 0 failed`。
+- **第三处门禁修正（Refactor）**：门控初版写"缺环境打印 SKIP 后返回"，实测报
+  `3 passed`——正是 §4.1 禁止的假绿。改为两级：`gauss-sha256` feature 不开时
+  `running 0 tests`（如实"未纳入"），开了却缺 env 直接 `panic!` 变红，与
+  `gauss_e2e.rs` 的"缺容器必红"同规格。三条命令分别实测到 `3 passed` /
+  `FAILED` / `0 passed`。
+
+### 门禁复跑
+
+- `cargo fmt --all` + `cargo clippy --all-features -- -D warnings` 干净。
+- `cargo test --features native` = **293 passed / 0 failed / 0 ignored**（与 V22/V23 持平，本轮未增减 native 层测试）。
+- md5 回归面：`cargo test --features gauss --test gauss_e2e` → `2 passed`；
+  `--test golden_gauss --test golden_corpus_gauss` → `1 passed` + `2 passed`。
+- sha256 复现口径改由 compose 服务承担并实测过一次端到端：
+  `GS_PASSWORD=… docker compose up -d gaussdb-sha256`（全新卷 `gauss_sha256_data`）
+  → healthcheck 转 healthy，`SHOW password_encryption_type` = **2**
+  → 同一条探针 `3 passed / 0 failed`。探针用的临时容器与卷、`/tmp` 下的口令文件
+  （0400，均自运行容器 env 派生）已在取证后删除，仓库内不驻留口令。
+- `cargo audit`：一次成功运行报 `4 vulnerabilities`，四条码
+  `RUSTSEC-2026-0367/0368/0369/0429` 与 CI 现有豁免清单**逐条相同**（即未见新增条目），
+  明细里抓到 `zip` 6.0.0 → `RUSTSEC-2026-0369`（CVSS 9.1，需 ≥9.0.0），同属既有豁免；
+  其后多次运行取公告库网络失败（`error sending request for …/advisory-db.git`），
+  故"四条确属构建期 zip"这一条本轮未能重取明细，需 CI 侧或网络恢复后复验。
+
+### 未做的事（明确不声称）
+
+- **未撤 golden 容器的 md5 后门**：撤掉即同时改参照实例与认证面，黄金基线需重跑，
+  属独立决策；本轮只把 sha256 能力加进来并钉住探针。
+- **未启用 TLS**：`tls-native-tls` 会把 native-tls 栈（Linux→动态 OpenSSL、
+  Windows→schannel）拉进 §10 平台矩阵，Win7 目标是 `-Zbuild-std + crt-static`，
+  未经探针；v1 继续 `NoTls`。
+- **未开类型扩展 feature**（`with-chrono-0_4`/`with-rust_decimal-1`/`with-serde_json-1`/
+  `with-uuid-1`）：物化/回写仍是文本承载（§13.1），依赖面收窄优先。
+- **`Cargo.lock` 净增 153 行 / 删 57 行**：来源是 `postgres`/`tokio-postgres` 出、
+  `tokio-opengauss`/`opengauss*`/`gaussdb` 入与 tokio feature 面变化，逐条对应上表；
+  未做无关漂浮升级。
+
+---
+
+## V25. 发版产物：三目标 CI 首跑（tag `v0.1.1`）全绿，Linux 侧另有本机 glibc 2.28 一手证据
+
+**结论**：AGENTS §9 的 Platform Build 从"文档里声称有"变成实物
+（`.github/workflows/release.yml`，tag `vX.Y.Z` 触发发布、`workflow_dispatch` 只构建
+不发布），并已在 GitHub 上真跑过一次：三个目标（Linux x86_64 / Linux aarch64 /
+Windows x86_64）构建 + 冒烟 + 发布全绿，四个资产已发布。Linux 两目标除 CI 证据外
+另有本机一手证据（下表）。
+
+### 一手证据（本机 apple silicon，stable，zig 0.15.2）
+
+| 目标 | 命令 | 构建 | 产物 GLIBC 上限（rockylinux:8 内 `readelf -V`） | 冒烟（glibc 2.28 实例内跑解包后的字节） |
+|---|---|---|---|---|
+| x86_64 | `cargo zigbuild --release --locked --features cli --target x86_64-unknown-linux-gnu.2.28` | `Finished in 3m 51s` | `GLIBC_2.18 / 2.23 / 2.25 / 2.28`（最大 2.28） | `spinduck version` → `spinduck 0.1.0`；`call prc_smoke 14 null` → `OUT p_o = 42`，`exit=0` |
+| aarch64 | 同上，`--target aarch64-unknown-linux-gnu.2.28`（cargo-zigbuild **0.23.4**） | `Finished in 4m 27s` | 最大 `GLIBC_2.28` | 同上，两条断言均通过（arm64 容器原生执行，非模拟） |
+
+参照侧环境自证：`rockylinux:8` 容器内 `ldd (GNU libc) 2.28`——即 AGENTS §10 的最低支持面
+本身，不是"差不多的发行版"。
+
+冒烟用的是打包后的字节：`tar -czf` → 解到 `/tmp/sd-smoke` → 从解出来的目录里执行，
+顺带验证 Package/Smoke 两步 shell 逻辑本身（workflow 里这两步与本次逐字同构）。
+压缩包实测 11,750,719 字节（aarch64）。
+
+### 被排除与踩到的坑（原文留证）
+
+1. **cargo-zigbuild 0.22.1 在 aarch64 链接期失败**（x86_64 同版本成功）：
+   ```text
+   error: linking with `.../zigcc-aarch64-unknown-linux-gnu.2.28-7810.sh' failed: exit status: 1
+   = note: error: unsupported linker arg: --fix-cortex-a53-843419
+   ```
+   根因是 rustc 对 aarch64-unknown-linux-gnu 传 LLD 专用参数，zig 的 cc 包装不转发。
+   0.23.4 通过 → workflow 顶部把 `ZIGBUILD_VERSION: "0.23.4"` 与 `ZIG_VERSION: "0.15.2"`
+   钉成 env，并写明"这是下限不是偏好"。
+2. **"在 glibc≤2.28 的容器里原生构建"这条备选路当前不可用**：`rockylinux:8` aarch64
+   内 `dnf install gcc-toolset-12-*` 失败于镜像源，非包名问题（包名问题已修，第二次
+   跑到源仍全镜像 404）：
+   ```text
+   Error: Failed to download metadata for repo 'appstream': ... Cannot download,
+   all mirrors were already tried without success
+   （多镜像 404 for .../rocky/8.10/AppStream/aarch64/os/repodata/*-primary.xml.gz）
+   ```
+   另注：rockylinux:8 基础镜像内**没有** `python3`，容器内跑门禁脚本需要显式装。
+3. **release 构建期有一条 lint 级链接器提示**（两个 Linux 目标都有，非本轮引入）：
+   `warning: linker stderr: ignoring deprecated linker optimization setting '1'`
+   （`#[warn(linker_messages)]`，来自 zig 的 lld）。常驻门禁的 `clippy -D warnings`
+   不覆盖 release 交叉构建，故不会红；若日后把 `-D warnings` 扩到发版 job，需要显式处理。
+
+### 门禁脚本（两条断言面 + 各自自检）
+
+- `scripts/ci/check_max_glibc.py`：`--self-test` 通过；对真产物报
+  `需要 GLIBC_2.28（策略上限 GLIBC_2.28）` 且退出 0；负例（PATH 前置伪造 `readelf`
+  输出 `GLIBC_2.39`）报 `要求 GLIBC_2.39，超出 GLIBC_2.28` 且退出非零——正负两面都取过证。
+- `scripts/ci/check_release_tag.py`：`--self-test` 通过（含"非 `vX.Y.Z` 形态 tag 必须被拒"
+  四条负例）；`--tag v0.1.0` → stdout 裸版本 `0.1.0`；`--tag v9.9.9` → 退出 1 并指向
+  "先改 Cargo.toml 再打 tag"。`--print spinduck/Cargo.toml` 供干跑取版本号。
+
+### 首次发版与版本号
+
+上表的本机证据取于 crate 版本 `0.1.0`（`spinduck version` 输出即 `spinduck 0.1.0`）；
+首个 tag 走 `v0.1.1`，同一提交把 `spinduck/Cargo.toml` 的 `version` 由 0.1.0 bump 到
+0.1.1，锁文件随之只多这一行版本号变化。版本号只影响 `meta` job 的 tag 守卫与资产命名，
+不影响构建路径，故 Linux 两目标的构建/glibc/冒烟结论对 0.1.1 同样成立。tag 命名必须
+`vX.Y.Z`：不带 v 的 `0.1.1` 由 `check_release_tag.py` 直接拒（其 `--self-test` 里的负例之一）。
+
+### CI 首跑（run 42336602157，tag `v0.1.1`，五个 job 全 success）
+
+| job | 关键断言原文（取自各 job 日志） |
+|---|---|
+| 版本守卫与脚本自检 | 两条 `self-test ok`；`产物版本号 = 0.1.1` |
+| Build linux-x86_64 | `spinduck/target/x86_64-unknown-linux-gnu/release/spinduck: 需要 GLIBC_2.28（策略上限 GLIBC_2.28）`；解包后的字节 `OUT p_o = 42` + `spinduck 0.1.1` |
+| Build linux-aarch64 | 同上两条，路径为 `target/aarch64-unknown-linux-gnu/release/spinduck` |
+| Build windows-x86_64 | `dumpbin /dependents` 静态导入清单（见下）；解包后的字节 `OUT p_o = 42` + `spinduck 0.1.1` |
+| 发布 GitHub Release | `资产数 3（期望 3）` + `SHA256SUMS.txt` 三条哈希 |
+
+已发布资产（<https://github.com/c2j/SpinDuck/releases/tag/v0.1.1>，非 draft、非
+prerelease）：
+
+| 资产 | 字节数 | SHA-256 |
+|---|---|---|
+| `SHA256SUMS.txt` | 309 | — |
+| `spinduck-0.1.1-linux-aarch64.tar.gz` | 11,730,589 | `3e11d13da768b671ac68d26ff9332c4db2946b89bd7d338307d09f94738146ff` |
+| `spinduck-0.1.1-linux-x86_64.tar.gz` | 13,047,389 | `6b8b51f97d012c45d1f70ac1afa91362c5b1f3bdd8c7848825e930e2edf752d2` |
+| `spinduck-0.1.1-windows-x86_64.zip` | 11,507,084 | `fcf8ac03ff7cbb7f8af9193de54f1558ce1fe639fb9b5c5f599eecd3108ac001` |
+
+Windows 那条"目标机需 VC++ 2015-2022 x64 运行库"的前提，这次由产物侧取证而不只是
+README 里推断：`dumpbin /dependents` 打印出 `MSVCP140.dll`、`VCRUNTIME140.dll`、
+`VCRUNTIME140_1.dll`（三者即 redist 实体）与一组 `api-ms-win-crt-*.dll`（UCRT 走系统
+转发桩，Win10+ 自带），另有 `KERNEL32.dll / WS2_32.dll / ntdll.dll /
+bcryptprimitives.dll`。边界仍是「未做的事」里记的那条：该面只覆盖静态导入。
+
+### 已知缺陷：三个构建 job 的 `rust-cache` 都没命中 `target` 缓存
+
+run 42336602157 的三个构建 job，`Swatinem/rust-cache@v2` 步骤各自打印同一组：
+
+```text
+Error: The process '/home/runner/.cargo/bin/cargo' failed with exit code 101
+    command: 'cargo metadata --all-features --format-version 1 --no-deps'
+    stderr: 'error: could not find `Cargo.toml` in `/home/runner/work/SpinDuck/SpinDuck`
+             or any parent directory'
+Workspaces: /home/runner/work/SpinDuck/SpinDuck      ← 仓库根，本仓库根没有 Cargo.toml
+Cache Paths: ... /home/runner/work/SpinDuck/SpinDuck/target
+No cache found.
+```
+
+根因是 `uses:` 步骤**不跟随** `defaults.run.working-directory: spinduck`（该 defaults 只
+作用于 `run:` 步骤），rust-cache 因此在仓库根找 manifest。两条后果：⑴ 步骤非致命——该
+action 把 `cargo metadata` 失败降级成日志，job 依旧 success，所以红绿面上看不出问题；
+⑵ 它登记的缓存路径 `<根>/target` 永远不会被写入（真正的产物目录是 `<根>/spinduck/target`），
+只有 `~/.cargo/registry`、`~/.cargo/bin` 那部分缓存生效。
+
+对本次结论的影响：上表与本机证据里的 `Finished in 3m 51s / 4m 27s` 是**冷构建**时长，
+不能当"缓存命中后的稳态时长"引用。
+
+已按同一修法补齐 `release.yml` 两处与 `ci.yml` 四处（`with: workspaces: spinduck`）。
+**这条修复本身还没有 run 级证据**：上面引的日志出自修复前的 head SHA，缓存是否真的命中
+要等下一次 run（`gh run view --log` 里 rust-cache 步骤应出现 `Workspaces: …/spinduck`、
+Cache Paths 指向 `…/spinduck/target`，且同架构重跑时 `Cache restored`）。在那之前，
+"发版构建 ~4 分钟"只能按冷构建口径引用。
+
+### 未做的事（明确不声称）
+
+- **Windows x86_64 本机证据仍为零**：本机无 MSVC 工具链，该目标的构建/打包/冒烟证据全部
+  来自 CI 首跑（见上），没有第二条独立路径交叉印证。该目标不加 `+crt-static`，运行库
+  前提由发版 job 每次打印的 `dumpbin /dependents` 静态导入清单取证（`ilammy/msvc-dev-cmd`
+  提供环境）——注意该面**只覆盖静态导入**，delay-load 与运行时 `LoadLibrary` 的依赖看不到，
+  且 windows-latest 自带运行库，冒烟通过不能反推裸机可直接跑。
+- **macOS 双架构、Win7（nightly `-Zbuild-std` + `crt-static`）没有发版 job**：本轮范围按
+  用户点名的 3 目标；AGENTS §10 表相应两行已标注"尚无发版 job"。
+- **只跑过 tag push（发布）路径**：`workflow_dispatch` 的"只构建不发布"分支未实跑过，
+  它靠 `if: github.event_name == 'push'` 挡发布，这条判断目前只有 YAML 级依据。
+- **tag push 不触发常驻 `ci.yml`**：`v0.1.1` 的 head SHA 上，fmt / clippy / test / audit /
+  golden 五个常驻门禁只有本机证据（`cargo test --features native` = 293 passed / 0 failed），
+  没有 GitHub 侧的绿。要让它们在同一个 SHA 上留痕，得走 PR。
