@@ -76,6 +76,11 @@ jobs:
             --ignore RUSTSEC-2026-0368 \
             --ignore RUSTSEC-2026-0369 \
             --ignore RUSTSEC-2026-0429
+      # 审计盲区（非豁免，是覆盖不到）：gauss feature 的 `gaussdb` 是 git 依赖
+      # （rust-opengauss @ b95ed0b9），不在 crates.io advisory 面内，cargo audit
+      # 不产出它的公告。机械化入口只有本地 `cargo test --features gauss-sha256`
+      # （默认 sha256 实例，见 golden/gaussdb-docker）；rev 升级必须人工复核认证与
+      # 线协议改动面（决策记录 ⑫ / validation V24）。
 
   golden:
     # 黄金对比：复用 golden/gaussdb-docker compose（与本地完全同口径：
