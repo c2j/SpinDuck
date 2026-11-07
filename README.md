@@ -28,9 +28,19 @@ cargo build --features gauss                # 追加 GaussDB 连接器
 
 ### 1. 语料编译体检
 
+clone 后即可复现（语料在仓库内）：
+
+```bash
+./target/debug/spinduck compile ../golden/case_corpus_purchase/sql
+# OK   …/PKG_SPLIT_TRADE_STEP3_SH.sql  routines=2
+# summary: files=7 ok=7 failed=0 routines=6
+```
+
+全量基线体检跑的是考题语料，那棵树在 `lib/fastaas` 子模块里（私有仓库，需
+`git submodule update --init lib/fastaas` 且有访问权限；不在本仓库的 clone 面内）：
+
 ```bash
 ./target/debug/spinduck compile ../lib/fastaas/exam/清算拆分优化考题/基线代码
-# OK   …/PKG_SPLIT_QQ.sql  routines=3
 # summary: files=136 ok=136 failed=0 routines=54
 ```
 
@@ -126,11 +136,11 @@ kind = "function"
 | PL 编译：赋值/IF/ELSIF/CASE/LOOP/WHILE/FOR(range)/GOTO/标签/嵌套块 | ✅ |
 | PL 表达式：算术/比较/布尔三值/`BETWEEN`/`IN`/一元负/括号/函数调用 | ✅ |
 | 声明段：变量（含初值）、静态游标、`%TYPE`/`%ROWTYPE` 类型名 | ✅（类型名仅解析，运行期按值） |
-| 游标：`OPEN`/`FETCH INTO`/`%FOUND`/`%NOTFOUND`/`%ROWCOUNT`/`%ISOPEN`/`CLOSE` | ✅ |
+| 游标：`OPEN`/`FETCH INTO`/`%FOUND`/`%NOTFOUND`/`%ROWCOUNT`/`%ISOPEN`/`CLOSE` | ✅（带参游标 `CURSOR c(args)` 声明段编译期不报错，拒绝只发生在 `OPEN c(args)` 调用点，见下） |
 | `FOR rec IN <query>` / `FOR rec IN <cursor>` | ✅（脱糖为隐式游标） |
 | 异常：`EXCEPTION WHEN <cond>` 匹配、未捕获上抛、`SQLSTATE` 匹配 | ✅ |
 | 例程：`CREATE PROCEDURE`/`FUNCTION`/`PACKAGE BODY`、IN/OUT/INOUT、过程间调用 | ✅ |
-| SQL 上下文函数分派 | ✅ 表达式级→内核宏；②内联/①UDF 见 `architecture.md` §8.3 |
+| SQL 上下文函数分派 | ✅ 表达式级→内核宏（路径③）；已注册例程调用→参数元组缓存化下沉（路径②，`sqlfn`）；路径① UDF 仍推迟（`architecture.md` §8.3） |
 | `EXECUTE IMMEDIATE`（静态文本与运行期拼接同一管线） | ✅ 与 OPEN FOR 共用解析/改写管线；`USING` 绑定 ⛔ 待做（`ENG-0058`，变量须先拼进文本） |
 | 事务标记 `COMMIT`/`ROLLBACK` | ✅ 统一事务边界：最外层调用包 `BEGIN…COMMIT`，过程内 `COMMIT`/`ROLLBACK` 即时生效并重开（`architecture.md` §3.5） |
 | GaussDB 物化/回写 | ✅（文本承载，回写为 append） |
@@ -143,11 +153,12 @@ kind = "function"
 | 黄金对比 | ✅ `golden/`：toy 用例 + 语料级逐字函数（stock_kind / min_tax）+ 核心过程（purchase） |
 | 用例原生断言层（无容器） | ✅ `[[case.assert]]`（`rows`/`call`/`out`/`error` 四维，进程内内核逐值比对）+ 语料形态覆盖门禁 `config/corpus_forms.toml`（`architecture.md` §12.1、validation V21） |
 | 入口链路核验 `spinduck verify` | ✅ `[[entry]]` 全名声明 → 例程断点 / 表·序列缺失 / 场景可执行逐条判定 + 运行态 `conf/` 快照（`architecture.md` §11.1、§12.1） |
-| `RETURN NEXT` / `PIPE ROW` / 集合类型（嵌套表/数组元素赋值）/ 带参游标 | ⛔ 待做（语料仅 3+1 例，编译期显式拒绝） |
+| `RETURN NEXT` / `PIPE ROW` / 集合类型（嵌套表/数组）/ 带参游标 | ⛔ 待做（语料仅 3+1 例；`RETURN NEXT`/`PIPE ROW`/集合元素**赋值**/`OPEN c(args)` 编译期显式拒绝，集合元素**读取**不属拒绝面，见「已知限制」） |
 | 例程目录持久化 | ✅ 内核内 `spinduck_routines` 表存源 DDL 文本，`reload_catalog` 按当前规则重放编译（`--db` 落盘后跨进程恢复） |
 
-语料实证：考题基线 **136/136 文件编译通过（54 例程）**；`exam` 全树 183/187
-（余 4 例为集合元素赋值与带参游标，显式拒绝）。详见 `docs/validation.md` V9。
+语料实证：考题基线 **136/136 文件编译通过（54 例程）**；`exam` 全树 182/187
+（余 5 例：3 集合赋值 `v_info_tab := …`（同一形态在三份收集件里各计一次）+ 1 带参游标
+`OPEN` + 1 声明了例程却未登记任何例程，均为显式拒绝）。详见 `docs/validation.md` V9、V23。
 
 ## 测试与门禁
 
@@ -180,9 +191,15 @@ SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 SPINDUCK_OG_PASSWORD="$GS_PASSW
 
 ## 已知限制
 
-- `RETURN NEXT`/`PIPE ROW`/集合类型/带参游标未实现（编译期显式拒绝，不静默错译）。
-- SQL 上下文的**过程级**函数（含控制流）只能 PL 上下文调用；SQL 内调用会得到
-  `KERNEL-0010` Catalog Error（宏路径只覆盖纯表达式函数）。
+- `RETURN NEXT`/`PIPE ROW`（编译器兜底支 `ENG-0022`）、集合元素赋值 `t(i) := v`
+  （`ENG-0022`）、带参游标 `OPEN c(args)`（`ENG-0048`）与 `FOR r IN c(args)`
+  （`ENG-0059`）编译期显式拒绝，不静默错译；但**集合元素读取** `v := t(i)` 会编成
+  标量函数调用，到运行期才报 `KERNEL-0010`——该形态语料真实存在（`PKG_IMPORT_EXCEL`
+  的 `v_info_tab(1)`），拒绝面尚未覆盖，登记为待补（V23）。
+- SQL 上下文的**过程级**函数（含控制流）调用：已在例程目录登记的走参数元组缓存化
+  下沉（`sqlfn`，路径②；确定性前提 + 10 万元组上界；上下文互引显式拒绝 `BIZ-0160`），
+  其余名字（宏路径③只覆盖纯表达式函数、UDF 路径①仍推迟）会得到 `KERNEL-0010`
+  Catalog Error，属明确失败、不静默降级。
 - `materialize` 逐行 INSERT：万级可用，百万级需批量通道。
 - GaussDB 侧若为 sha256 口令认证，纯 Rust `postgres` 驱动不支持（v1 需 md5 或
   自建 TLS 通道）；golden 复现包的容器经镜像环境变量启用 md5
