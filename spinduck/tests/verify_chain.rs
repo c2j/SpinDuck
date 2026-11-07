@@ -63,6 +63,42 @@ args = ["'20240105'", "0"]
 
 const SEED: &str = "INSERT INTO t_ok (a) VALUES (1);\nINSERT INTO t_ok (a) VALUES (2);\n";
 
+/// 场景指向别的例程、但断言集直接调用入口的过程——`verify` 不执行断言（断言层在
+/// `cargo test --features native --test cases_native`），所以仍记 Skip，但理由不能再写
+/// "可执行性未验证"。
+const ONLY_ASSERTS_CASE: &str = r#"
+[case]
+name = "only_asserts"
+kind = "function"
+routine = "fnc_unrelated"
+baseline = "expected.json"
+
+[[case.scenarios]]
+why = "本用例的场景不指向入口"
+args = ["'20240105'"]
+
+[[case.assert]]
+why = "入口 OUT 参逐值"
+kind = "out"
+target = "pkg_a.prc_clean"
+param = "p_n"
+args = ["'20240105'", "0"]
+want = "2"
+
+[[case.assert]]
+why = "入口错误契约"
+kind = "error"
+target = "PKG_A.PRC_CLEAN"
+args = ["'20240105'", "0"]
+want = "BIZ-0151|缺少实参"
+
+[[case.assert]]
+why = "干扰项：rows 断言的 target 是 SQL，不该计入本入口的覆盖数"
+kind = "rows"
+target = "SELECT count(*) FROM t_ok"
+want = "[2]"
+"#;
+
 fn write(dir: &Path, rel: &str, text: &str) {
     let p = dir.join(rel);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -158,6 +194,51 @@ fn should_pass_clean_entry_with_scenario_and_flag_chain_gaps() {
         "声明的入口在语料中不存在"
     );
     assert_eq!(typo.checks.len(), 1, "入口未命中时不展开链路");
+}
+
+/// 断言层已覆盖该入口时，Skip 的理由必须说清"本命令不执行断言"，而不是声称
+/// 可执行性没被验证——后者与 `[[case.assert]]` 的存在直接矛盾。
+#[test]
+fn should_credit_assert_layer_when_no_scenario_declares_the_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "spinduck.toml",
+        "[project]\nname = \"asserted\"\nkernel = \"1.5.5\"\n\n[[entry]]\nroutine = \"pkg_a.prc_clean\"\n",
+    );
+    write(root, "sql/ddl/tables.sql", DDL);
+    write(root, "sql/routines/pkg_a.sql", ROUTINES);
+    write(root, "cases/only_asserts.case.toml", ONLY_ASSERTS_CASE);
+    write(root, "cases/datasets/seed.sql", SEED);
+
+    let project = ProjectConfig::load(root).unwrap();
+    let reports = verify_project(&project).unwrap_or_else(|e| panic!("verify: {}", e.message));
+    let clean = report(&reports, "pkg_a.prc_clean");
+    assert_eq!(
+        status(clean, CheckKind::Scenario, "-"),
+        Status::Skip,
+        "无场景声明该入口：仍记 Skip（verify 不执行断言）"
+    );
+    let detail = clean
+        .checks
+        .iter()
+        .find(|c| c.kind == CheckKind::Scenario)
+        .unwrap()
+        .detail
+        .clone();
+    assert!(
+        detail.contains("2 条") && detail.contains("断言"),
+        "理由需给出覆盖该入口的断言条数并点名断言层：{detail}"
+    );
+    assert!(
+        detail.contains("only_asserts"),
+        "理由需指向承载断言的用例名：{detail}"
+    );
+    assert!(
+        !detail.contains("可执行性未验证"),
+        "断言层已覆盖时不得再声称未验证：{detail}"
+    );
 }
 
 #[test]
