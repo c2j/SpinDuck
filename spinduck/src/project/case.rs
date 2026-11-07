@@ -84,6 +84,16 @@ pub enum AssertKind {
     Error,
 }
 
+impl CaseAssert {
+    /// 该断言是否直接调用例程全名（归一小写比较）。
+    ///
+    /// `Rows` 的 `target` 是 SQL，不参与；短名不匹配限定名——宁可少认一条覆盖，
+    /// 也不把别的包的同名过程算进本入口。
+    pub(crate) fn targets_routine(&self, routine: &str) -> bool {
+        self.kind != AssertKind::Rows && self.target.eq_ignore_ascii_case(routine)
+    }
+}
+
 impl CaseConfig {
     pub fn load(path: &Path) -> Result<Self, EngineError> {
         let text = read_text(path)?;

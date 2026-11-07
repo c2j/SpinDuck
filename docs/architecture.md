@@ -888,7 +888,7 @@ kind = "procedure"                  # function | procedure（缺省 procedure）
 | `Entry` | 全名在例程目录命中且种类（function/procedure）一致 | 入口拼写不符或包体缺失 |
 | `Routine` | 从入口 BFS 沿 `CallRoutine` / SQL 上下文下沉调用点展开，每个被调例程都已登记 | 链路断点（源文件未纳入项目） |
 | `Relation` / `Sequence` | 链路 SQL 引用的表·视图·序列在内核目录存在 | 缺 DDL/桩，或部署顺序不符 |
-| `Scenario` | `*.case.toml` 中声明该入口的每个场景实际调用一次 | 用例缺失显式 `SKIP`（不计失败，但公示"可执行性未验证"） |
+| `Scenario` | `*.case.toml` 中声明该入口的每个场景实际调用一次 | 用例缺失显式 `SKIP`（不计失败）：无场景且无断言指向该入口 = 公示"可执行性未验证"；有 `[[case.assert]]` 指向该入口 = 公示"断言层已覆盖，本命令不执行断言" |
 
 SQL 侧对象名取自改写前的静态扫描（`FROM`/`JOIN`/`UPDATE`/`INSERT INTO` 后的标识符
 与 `<seq>.nextval`），字符串字面量与表函数不计——这是**近似口径**，其假阴面（动态

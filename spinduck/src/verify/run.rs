@@ -231,8 +231,9 @@ fn resolve_routine(r: &str, pkg: &str, registered: &BTreeMap<String, CaseKind>) 
 
 /// 场景核验：对声明了本入口的用例，逐场景实际调用（参数按 SQL 字面量口径）。
 ///
-/// 无匹配用例 → `Skip`（对象名 `-`）：入口链路的对象核验仍然有效，但可执行性
-/// 未被证明，报告必须显式区分，不得伪装成通过。
+/// 无匹配用例 → `Skip`（对象名 `-`）：入口链路的对象核验仍然有效，可执行性没有被本命令
+/// 证明，报告必须显式区分、不得伪装成通过；若同一项目的 `[[case.assert]]` 已指向该入口，
+/// 理由要改说"断言层已覆盖、本命令不执行断言"，不能再写成"未验证"。
 pub fn verify_scenarios(
     eng: &mut Engine,
     cases: &[crate::project::CaseConfig],
@@ -255,12 +256,9 @@ pub fn verify_scenarios(
             })
             .collect();
         if matched.is_empty() {
-            report.checks.push(Check {
-                kind: CheckKind::Scenario,
-                object: "-".to_string(),
-                status: Status::Skip,
-                detail: "无 *.case.toml 声明该入口，可执行性未验证".to_string(),
-            });
+            report
+                .checks
+                .push(scenario_skip_check(cases, &report.entry));
             continue;
         }
         for case in matched {
@@ -289,6 +287,36 @@ pub fn verify_scenarios(
                 });
             }
         }
+    }
+}
+
+/// Skip 理由的两种口径：没有任何用例碰过该入口 = 可执行性未验证；断言集指向该入口 =
+/// 覆盖已存在，只是 `verify` 不执行断言（由 `--features native --test cases_native` 跑）。
+fn scenario_skip_check(cases: &[crate::project::CaseConfig], entry: &str) -> Check {
+    let hit: Vec<&str> = cases
+        .iter()
+        .filter(|c| c.asserts.iter().any(|a| a.targets_routine(entry)))
+        .map(|c| c.name.as_str())
+        .collect();
+    let count: usize = cases
+        .iter()
+        .flat_map(|c| c.asserts.iter())
+        .filter(|a| a.targets_routine(entry))
+        .count();
+    let detail = if hit.is_empty() {
+        "无 *.case.toml 声明该入口，可执行性未验证".to_string()
+    } else {
+        format!(
+            "无场景声明该入口；{count} 条 [[case.assert]] 已由用例 {} 覆盖该例程，\
+             本命令不执行断言（断言层见 cases_native）",
+            hit.join("、")
+        )
+    };
+    Check {
+        kind: CheckKind::Scenario,
+        object: "-".to_string(),
+        status: Status::Skip,
+        detail,
     }
 }
 

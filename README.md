@@ -78,24 +78,41 @@ export SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
 出发沿调用链逐对象核验——语料是否齐全、链路对象是否真在核内、声明的场景能否执行：
 
 ```toml
-# spinduck.toml
+# spinduck.toml —— 示意声明形状：[[entry]] 允许多条，全名必须是 package.procedure 形态
+# （下面的例程名不属于在库用例项目，只为展示多入口与 kind 的写法）
 [[entry]]
-routine = "pkg_split_trade_step2.prc_pre_deal_shjycf"   # 必须 package.procedure 全名
+routine = "pkg_split_trade_step2.prc_pre_deal_shjycf"   # 缺省 kind = procedure
 
 [[entry]]
 routine = "pkg_qq_split.prc_general_deal_inst_sh_buy"
-kind = "function"                                       # 缺省 procedure
+kind = "function"
 ```
 
+下面是**在库项目的真实输出**（clone 后即可复现；考题项目不在库内，不能当例子）：
+
 ```bash
-./target/debug/spinduck verify ../golden/exam_split_trade
-# manifest: …/.spinduck/conf/spinduck.toml (updated)
-# == entry pkg_qq_split.prc_general_deal_inst_sh_buy
-#   PASS Entry pkg_qq_split.prc_general_deal_inst_sh_buy — 入口在例程目录命中且种类一致
+./target/debug/spinduck verify ../golden/case_corpus_purchase
+# manifest: ../golden/case_corpus_purchase/.spinduck/conf/spinduck.toml (updated|unchanged)
+# == entry pkg_split_trade_step3_sh.prc_trd_deal_purchase
+#   PASS Entry pkg_split_trade_step3_sh.prc_trd_deal_purchase — 入口在例程目录命中且种类一致
+#   PASS Routine pkg_split_trade_log.inst_log — 由 pkg_split_trade_step3_sh.prc_trd_deal_purchase 调用，已登记
+#   PASS Relation dat_trd_repurchase — 内核存在（main.dat_trd_repurchase）
 #   PASS Relation mid_yjqs_detail — 内核存在（main.mid_yjqs_detail）
+#   PASS Relation par_fund_partner — 内核存在（main.par_fund_partner）
+#   PASS Relation par_fund_seat — 内核存在（main.par_fund_seat）
+#   PASS Relation par_fund_seat_para — 内核存在（main.par_fund_seat_para）
+#   PASS Relation par_sys_purchase — 内核存在（main.par_sys_purchase）
+#   PASS Relation swh_all_kind — 内核存在（main.swh_all_kind）
+#   PASS Relation sys_dummy — 内核存在（main.sys_dummy）
+#   SKIP Scenario - — 无场景声明该入口；2 条 [[case.assert]] 已由用例 corpus_purchase 覆盖该例程，本命令不执行断言（断言层见 cases_native）
+# verify: entries=1 checks=11 failed=0 skipped=1
+```
+
+链路断点/缺表时长这样（示意片段，非某项目完整输出）：
+
+```
 #   FAIL Routine pkg_x.prc_gone — 链路断点：被 pkg_y.prc_z 调用，但语料中未登记
-#   SKIP Scenario - — 无 *.case.toml 声明该入口，可执行性未验证
-# verify: entries=8 checks=64 failed=1 skipped=2
+#   FAIL Relation t_missing — 链路 SQL 引用，内核目录无此对象（缺 DDL/桩，或部署顺序不符）
 ```
 
 出现 `FAIL` 退出码为 1。核验同时把可调用面与资产绝对路径写成运行态快照
