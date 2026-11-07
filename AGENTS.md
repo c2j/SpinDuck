@@ -307,6 +307,12 @@ CI 定义 `.github/workflows/ci.yml`。常驻门禁五个 job 全部必须通过
 Linux aarch64 / Windows x86_64）；§10 表里的 macOS 双架构与 Win7 行**尚无发版入口**，
 属未完成项而非"矩阵已覆盖"（实测证据见 validation V25，方案取舍见 architecture 决策记录 ⑬）。
 
+发版顺序是一条硬约束（不是流程偏好）：**版本号 bump 随 PR 落地，tag 打在 CI 已验证的
+main head 上**。原因是 tag push 不触发常驻 `ci.yml`——先打 tag 再补 PR，发布出去的 SHA
+上五个常驻门禁就只有本机证据（`v0.1.1` 正是这个形态，V25 保留该历史口径）。`v0.1.2` 起
+按 bump → PR → 五门禁绿 → merge → 在 merge commit 打 tag 走，并核对
+`git diff <PR head> origin/main` 为空，证明被打 tag 的树就是被验证过的树。
+
 > 子模块初始化（`git submodule update --init lib/ogsql-parser`）必须在仓库根
 > 执行；workflow 的 `defaults.working-directory` 是 `spinduck/`，故这些步骤逐条
 > 显式 `working-directory: .`（否则 pathspec 不匹配，CI 必红）。
