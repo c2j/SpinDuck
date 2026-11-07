@@ -7,7 +7,7 @@
   事务标记全部在 Rust 内实现，SQL 语句下发 DuckDB 执行。
 - **内核锚定**：DuckDB **1.5.5**（`duckdb` crate `=1.10505.0`，bundled 静态链接）。
 - **数据通路**：GaussDB 只读物化进 DuckDB → 引擎处理 → 结果回写 GaussDB
-  （PG 线协议，`postgres` crate）。
+  （PG 线协议，`gaussdb::sync`，见「已知限制」的认证条目）。
 
 设计文档：[`docs/architecture.md`](docs/architecture.md)（机制）；
 实证记录：[`docs/validation.md`](docs/validation.md)（V1–V10）；
@@ -176,6 +176,25 @@ SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 SPINDUCK_OG_PASSWORD="$GS_PASSW
 测试分层（`AGENTS.md` §4）：单元（`src/**`）、集成（`tests/`，假执行器）、
 内核探针（真实 DuckDB）、CLI 契约、黄金对比（openGauss 基线）。
 
+## 发版产物
+
+`.github/workflows/release.yml` 在 push `vX.Y.Z` tag 时构建并发布 GitHub Release：
+
+| 资产 | 目标 | 说明 |
+|---|---|---|
+| `spinduck-<ver>-linux-x86_64.tar.gz` | `x86_64-unknown-linux-gnu` | cargo-zigbuild 锚定 glibc 2.28 符号 |
+| `spinduck-<ver>-linux-aarch64.tar.gz` | `aarch64-unknown-linux-gnu` | 同上（国产化环境按此交付） |
+| `spinduck-<ver>-windows-x86_64.zip` | `x86_64-pc-windows-msvc` | 需目标机装 VC++ 2015-2022 x64 运行库 |
+| `SHA256SUMS.txt` | — | 覆盖上述全部资产 |
+
+发布前三道断言，任一不过即不发：tag 版本 == `spinduck/Cargo.toml` 的 `version`；
+产物实际要求的 `GLIBC_*` 符号最大值 ≤ 2.28（`scripts/ci/check_max_glibc.py` 反查
+ELF 版本化符号，不采信构建参数写了什么）；每个目标从**打包后的压缩包**里解出来跑
+`call prc_smoke 14 null` 并断言 `OUT p_o = 42`。`workflow_dispatch` 入口只构建上传
+artifact、不发布（实测与踩坑记录见 `docs/validation.md` V25）。
+
+macOS 双架构与 Windows 7 在 `AGENTS.md` §10 矩阵内，但**当前没有发版 job**。
+
 ## 关键约束
 
 1. **接缝纪律**：DuckDB API 只出现在 `sql/exec_native.rs`；编译器/解释器只依赖
@@ -201,7 +220,17 @@ SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 SPINDUCK_OG_PASSWORD="$GS_PASSW
   其余名字（宏路径③只覆盖纯表达式函数、UDF 路径①仍推迟）会得到 `KERNEL-0010`
   Catalog Error，属明确失败、不静默降级。
 - `materialize` 逐行 INSERT：万级可用，百万级需批量通道。
-- GaussDB 侧若为 sha256 口令认证，纯 Rust `postgres` 驱动不支持（v1 需 md5 或
-  自建 TLS 通道）；golden 复现包的容器经镜像环境变量启用 md5
-  （`GS_HOST_AUTH_METHOD=md5` + `password_encryption_type=1`，见 golden/README.md）。
+- GaussDB/openGauss 的 **sha256 口令认证已可用**（2026-11-07 换驱动）：数据通道由纯 Rust
+  `postgres` 改为 `rust-opengauss` 的同步门面 `gaussdb::sync::*`（实现 sha256 /
+  md5-sha256 / SM3），默认口令形态实例直连由 `tests/gauss_sha256.rs` 三条断言锁定
+  （`cargo test --features gauss-sha256`，compose 内新增 `gaussdb-sha256` 服务，见 V24）。
+  golden 参照实例**仍保持 md5 口径**不变——撤掉这个后门等于同时改参照实例与认证面，
+  拆成独立决策（V24「未做的事」）。代价：`gauss` feature 变为 git 依赖（`rev` 钉住），
+  `cargo audit` 对它没有公告面，见 `architecture.md` 决策记录 ⑫。
+- Windows x86_64 产物**不是自包含**：`x86_64-pc-windows-msvc` 走默认动态 CRT（静态
+  `+crt-static` 只属 `AGENTS.md` §10 的 Win7 行），目标机通常需要 VC++ 2015-2022 x64
+  运行库。每次发版由 release job 的 `dumpbin /dependents` 打印该 exe 的静态导入 DLL
+  清单作为产物侧证据（delay-load / 运行时 `LoadLibrary` 的依赖不在这张面上）；
+  在装了 Visual Studio 的 CI runner 上冒烟通过**不等于**裸机可直接跑（V25）。
+- macOS 与 Windows 7 尚无发版入口：§10 矩阵的这两类目标既无 job 也无构建证据。
 - 黄金基线当前由 openGauss 5.0.0 产出（GaussDB 实例不可达），差异见 V10。

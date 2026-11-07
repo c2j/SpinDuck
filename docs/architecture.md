@@ -556,7 +556,11 @@ UDF 回调发生在 DuckDB 执行查询的过程中：
 ### 10.6 版本升级与离线部署
 
 - **存储格式兼容是硬约束**：锚定内核版本（§5）后，升级 = 数据导出/导入迁移，不支持原地跨格式升级；升级路径写入运维手册
-- **平台矩阵**：Linux x86_64/aarch64（glibc ≥2.28，cargo-zigbuild 锚定符号版本）、macOS aarch64/x86_64、Windows x86_64 + Win7（nightly 专项）；duckdb-rs 各平台可用性在 M1 探针逐平台验证
+- **平台矩阵**：Linux x86_64/aarch64（glibc ≥2.28，cargo-zigbuild 锚定符号版本 + 产物侧
+  `scripts/ci/check_max_glibc.py` 反查）、macOS aarch64/x86_64、Windows x86_64 + Win7（nightly 专项）。
+  发版入口 = `.github/workflows/release.yml`（tag `vX.Y.Z` 触发，见 AGENTS §9 / 决策记录 ⑬），
+  **当前只覆盖前两项的 Linux 与 Windows x86_64 共 3 目标**；"duckdb-rs 各平台可用性在 M1 探针
+  逐平台验证"是计划而非事实，Linux 两目标已由 V25 实测补上，macOS/Win7 仍无证据
 - **离线/内网部署**：禁用扩展 autoinstall 网络，所需扩展静态链接进二进制（含 Win7 交叉编译目标）
 - 规则文件与 routine catalog 均带 schema 版本号，升级迁移脚本随版本发布
 
@@ -1022,3 +1026,36 @@ duckdb 类型；⑥ fastaas 子模块保留现状（私有项目）。
 > ⑪ **CI 口令与目录**：golden job 的 GaussDB 口令改为 runner 内随机生成（一次一密，
 > 不落仓库），三条子模块步骤显式 `working-directory: .`（`defaults` 为 `spinduck/`，
 > 在 crate 目录内 `git submodule update --init lib/ogsql-parser` 报 pathspec 不匹配）。
+> ⑫ **数据通道驱动换为 git 依赖 `gaussdb`（决策 2026-11-07，validation V24）**：纯 Rust
+> `postgres` 不认 openGauss/GaussDB 的 sha256 口令认证（握手即 `error parsing response
+> from server`），故 `io/gauss.rs` 改用 `rust-opengauss` 的**同步门面** `gaussdb::sync::*`，
+> `postgres` 依赖整体移除（两套 PG 线协议客户端并存会让 golden 与物化走不同认证面）。
+> 三条约束：⑴ `default-features = false` + 只开 `sync`（运行期不需要的类型扩展与 TLS
+> 连接器不进来，v1 仍走 `NoTls`）；⑵ `rev` 钉到 `b95ed0b9…`（与 hepta-dbcli 同基线），
+> 升级走独立评估 PR，同 §1 的 ogsql-parser/内核锚定纪律；⑶ **`cargo audit` 对 git 来源
+> 依赖没有公告面**——该 crate 不在 CI 审计覆盖内，属新增盲区，复评方式为 rust-opengauss
+> 上游打 tag / 发 crates.io 后切回版本依赖；在此之前每次升级 rev 必须人工过一遍
+> 认证与线协议改动面（V24 探针 `--features gauss-sha256` 是唯一机械化入口）。
+>
+> ⑬ **发版产物落地为 `release.yml`，Linux 走 zig 锚定而非低 glibc 容器（决策
+> 2026-11-07，validation V25）**：AGENTS §9 此前把 Platform Build 写成"CI 的一部分"，
+> 但仓库里并不存在该 job——本轮把它变成实物，范围按用户点名取 **3 个目标**
+> （Linux x86_64 / Linux aarch64 / Windows x86_64），macOS 双架构与 Win7 显式登记为
+> 未覆盖，不允许再被读成"§10 矩阵已一一对应"。取舍与依据：
+> ⑴ **glibc ≥2.28 不由构建工具承诺，由产物反查**——`cargo zigbuild --target
+> ....2.28` 只是请求锚定，真正判定权交给 `scripts/ci/check_max_glibc.py`（读
+> `readelf -V` 的版本化符号取最大值，超 2.28 即红）。两目标在 rockylinux:8（glibc
+> 恰 2.28）里实测上限 = `GLIBC_2.28` 且冒烟通过。
+> ⑵ **"在 glibc≤2.28 环境原生构建"这条备选路当前不可用**：Rocky 8.10 的 aarch64
+> AppStream repodata 在全网镜像 404，容器内 `dnf install` 直接失败；不是路线本身错，
+> 是上游镜像源状态，若日后恢复可重新评估（届时应换成能装下工具链的镜像再测）。
+> ⑶ **cargo-zigbuild 版本是硬下限 0.23.4**：0.22.1 在 aarch64 链接期失败——rustc 对
+> aarch64-unknown-linux-gnu 无条件传 `-Wl,--fix-cortex-a53-843419`，zig cc 报
+> `unsupported linker arg`。版本与 zig 0.15.2 一起钉在 workflow 顶部 env。
+> ⑷ **duckdb bundled 的 C++ 交叉编译可用**（`bundled` → cc 路径，非 cmake；
+> `buildtime_bindgen` 未开，故不需要 libclang），这是 §10 "某一平台不可用 = Ask first"
+> 的第一份实测证据，M1 当初并未逐平台跑过。
+> ⑸ **Windows 不加 `+crt-static`**：静态 CRT 只属 §10 的 Win7 行；代价是产物依赖
+> VC++ 2015-2022 x64 运行库，该前提入 README 已知限制而不是假装自包含。
+> ⑹ 发布动作只认 `push` tag，`workflow_dispatch` 只构建上传 artifact——干跑不得
+> 产生真实发布物；Release job 断言资产数量 == 目标数量，禁止部分产物静默缺失。

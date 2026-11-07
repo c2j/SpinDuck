@@ -256,6 +256,16 @@ cargo mutants -f src/ir -f src/sql -f src/runtime -f src/value.rs
 
 # 覆盖率（评审参考）
 cargo llvm-cov --html
+
+# 发版产物（本地复现 CI 的 Linux 目标；需 zig 与 cargo-zigbuild ≥ 0.23.4）
+cargo zigbuild --release --locked --features cli --target x86_64-unknown-linux-gnu.2.28
+cargo zigbuild --release --locked --features cli --target aarch64-unknown-linux-gnu.2.28
+# glibc 上限反查与 tag 守卫（发版门禁的两条断言面）
+python3 scripts/ci/check_max_glibc.py target/x86_64-unknown-linux-gnu/release/spinduck
+python3 scripts/ci/check_release_tag.py --tag v<X.Y.Z>
+# 两个脚本各自的自检（不需要构建产物）
+python3 scripts/ci/check_max_glibc.py --self-test
+python3 scripts/ci/check_release_tag.py --self-test
 ```
 
 循环内用 `<test_name>` 过滤；提交前跑全量 `--all-features` 门禁。
@@ -280,8 +290,22 @@ CI 定义 `.github/workflows/ci.yml`。常驻门禁五个 job 全部必须通过
   的多维断言走进程内内核（`cargo test --features native --test cases_native`）；
   调整的是**参照侧被测面划分**，不是断言——用例、期望基线、判定门禁一条不减）
 
-此外 **Platform Build**（发版触发，非常驻门禁）：按 §10 矩阵逐平台构建 + 冒烟
-（`call` 一个内置探针例程）。
+此外 **Platform Build**（发版触发，非常驻门禁）定义在 `.github/workflows/release.yml`：
+`push` 形如 `vX.Y.Z` 的 tag 触发，按 §10 矩阵构建 + 冒烟（`call` 一个探针例程并断言
+`OUT p_o = 42`），产物发布为 GitHub Release 并附 `SHA256SUMS.txt`。四条不可省的前提：
+
+- **版本守卫**：tag 版本必须等于 `spinduck/Cargo.toml` 的 `version`
+  （`scripts/ci/check_release_tag.py`，不一致即红——否则资产名与二进制内
+  `spinduck version` 自相矛盾）；
+- **glibc 由产物反查**：每个 Linux 目标构建后跑 `scripts/ci/check_max_glibc.py`，
+  读版本化符号判定 `≤ 2.28`；不采信工具承诺，也不接受"锚定参数写了就算数"；
+- **冒烟跑的是打包后的字节**：从 tar/zip 解出来再 `call`，顺带验证打包本身；
+- **不允许部分产物静默缺失**：Release job 核对资产数量必须等于目标数。
+
+`workflow_dispatch` 入口只构建并上传 artifact、**不发布 Release**，是在不产生真实
+发布物的前提下复验整条矩阵的唯一入口。**当前落地范围 = 3 个目标**（Linux x86_64 /
+Linux aarch64 / Windows x86_64）；§10 表里的 macOS 双架构与 Win7 行**尚无发版入口**，
+属未完成项而非"矩阵已覆盖"（实测证据见 validation V25，方案取舍见 architecture 决策记录 ⑬）。
 
 > 子模块初始化（`git submodule update --init lib/ogsql-parser`）必须在仓库根
 > 执行；workflow 的 `defaults.working-directory` 是 `spinduck/`，故这些步骤逐条
@@ -298,19 +322,23 @@ CI 定义 `.github/workflows/ci.yml`。常驻门禁五个 job 全部必须通过
 
 | 平台 | target | 最低系统 | 工具链 | 说明 |
 |---|---|---|---|---|
-| Linux x86_64 | `x86_64-unknown-linux-gnu` | **glibc ≥ 2.28**（RHEL8 / Ubuntu 20.04+） | stable + `cargo-zigbuild --target x86_64-unknown-linux-gnu.2.28`（或在不高于 glibc 2.28 的环境构建） | glibc 兼容性是发布硬约束：**禁止在高于 2.28 的构建机直接产物发布**（符号版本会随构建机的 glibc 抬高） |
-| Linux aarch64 | `aarch64-unknown-linux-gnu` | glibc ≥ 2.28 | `cargo-zigbuild --target aarch64-unknown-linux-gnu.2.28` | 交叉构建；国产化环境（鲲鹏等）按此目标产物交付 |
-| macOS | `aarch64-apple-darwin` / `x86_64-apple-darwin` | macOS 12+（跟随内核支持面） | stable；设置 `MACOSX_DEPLOYMENT_TARGET` | 双架构分别构建；universal2 按需 lipo 合并 |
-| Windows x86_64 | `x86_64-pc-windows-msvc` | Windows 10+ | stable | 日常发布目标 |
-| Windows 7 | `x86_64-win7-windows-msvc`（32 位：`i686-…`） | Windows 7 | nightly + `-Zbuild-std`（见下） | 仅发版，与日常门禁无关 |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | **glibc ≥ 2.28**（RHEL8 / Ubuntu 20.04+） | stable + `cargo-zigbuild --target x86_64-unknown-linux-gnu.2.28`（或在不高于 glibc 2.28 的环境构建） | glibc 兼容性是发布硬约束：**禁止在高于 2.28 的构建机直接产物发布**（符号版本会随构建机的 glibc 抬高）。发版已落地（V25 实测：rockylinux:8 内 `readelf -V` 上限 GLIBC_2.28、冒烟通过） |
+| Linux aarch64 | `aarch64-unknown-linux-gnu` | glibc ≥ 2.28 | **`cargo-zigbuild ≥ 0.23.4`** + zig 0.15.2，`--target aarch64-unknown-linux-gnu.2.28` | 交叉构建；国产化环境（鲲鹏等）按此目标产物交付。0.22.1 在链接期失败（rustc 传 `-Wl,--fix-cortex-a53-843419`，zig cc 不认）；"Rocky8 容器原生构建"这条路被 Rocky 8.10 aarch64 镜像源 repodata 全镜像 404 堵住（V25） |
+| macOS | `aarch64-apple-darwin` / `x86_64-apple-darwin` | macOS 12+（跟随内核支持面） | stable；设置 `MACOSX_DEPLOYMENT_TARGET` | 双架构分别构建；universal2 按需 lipo 合并。**尚无发版 job**（§9 范围外，待补） |
+| Windows x86_64 | `x86_64-pc-windows-msvc` | Windows 10+ | stable | 日常发布目标。不加 `+crt-static`（静态 CRT 只属 Win7 行），代价是目标机需 **VC++ 2015-2022 x64 运行库**；发版 job 用 `dumpbin /dependents` 打印静态导入清单作为产物侧证据（只覆盖静态导入），前提说明入 README 已知限制 |
+| Windows 7 | `x86_64-win7-windows-msvc`（32 位：`i686-…`） | Windows 7 | nightly + `-Zbuild-std`（见下） | 仅发版，与日常门禁无关。**尚无发版 job**（nightly + build-std + `crt-static` 组合未经探针，待补） |
 
 平台纪律：
 
 - duckdb-rs crate 对上述平台的可用性与静态链接行为（`bundled` feature）在
   M1 探针中逐平台验证一次，结果记录 validation.md；某一平台不可用 = Ask first
-  再决策（降级动态链接或裁剪平台）
-- CI 构建矩阵与上表一一对应；产物命名
-  `spinduck-<ver>-<os>-<arch>[.exe]`，随包附 SHA-256
+  再决策（降级动态链接或裁剪平台）。**现状口径**：M1 并未逐平台跑过；本轮发版
+  实测覆盖 Linux x86_64/aarch64（含 duckdb bundled 的 C++ 交叉编译，V25），
+  Windows x86_64 以 CI 首跑为证据，macOS/Win7 仍无证据
+- CI 构建矩阵与上表一一对应（**当前 3/6**：Linux×2 + Windows x86_64 已入
+  `release.yml`，macOS 双架构与 Win7 待补）；资产包命名
+  `spinduck-<ver>-<os>-<arch>.tar.gz|.zip`，包内二进制为 `spinduck`/`spinduck.exe`，
+  Release 层附覆盖全部资产的 `SHA256SUMS.txt`
 - 禁止使用平台专属 API（条件编译 `#[cfg(target_os)]` 需注释理由并配跨平台
   回退路径）；文件路径处理一律走 `std::path`，禁止字符串拼接分隔符
 - **Windows 7 专项**（Rust 1.78+ 移除 Win7 支持：stdlib 无条件调用

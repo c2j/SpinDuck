@@ -1,6 +1,6 @@
 [package]
 name = "spinduck"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "GaussDB stored-procedure engine on DuckDB kernel"
 license = "MIT OR Apache-2.0"
