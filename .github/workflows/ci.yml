@@ -44,6 +44,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # uses: 步骤不跟随 defaults.working-directory；缺这行会静默退化成只缓存 registry（V25）
+          workspaces: spinduck
       - run: cargo clippy --all-features --tests -- -D warnings
 
   test:
@@ -55,6 +58,9 @@ jobs:
         run: git submodule update --init lib/ogsql-parser
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # uses: 步骤不跟随 defaults.working-directory；缺这行会静默退化成只缓存 registry（V25）
+          workspaces: spinduck
       - run: cargo test --features native
 
   audit:
@@ -63,6 +69,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # uses: 步骤不跟随 defaults.working-directory；缺这行会静默退化成只缓存 registry（V25）
+          workspaces: spinduck
       - run: cargo install cargo-audit --locked
       # 内核锚定（AGENTS §1：duckdb = "=1.10505.0"）带来的构建期依赖：
       # zip 6.0.0 是 libduckdb-sys 的 build-dependency（bundled 解压缩包用），
@@ -116,6 +125,9 @@ jobs:
         run: git submodule update --init lib/ogsql-parser
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # uses: 步骤不跟随 defaults.working-directory；缺这行会静默退化成只缓存 registry（V25）
+          workspaces: spinduck
       - name: Generate one-off GaussDB password（仅本次 runner 生命周期）
         id: gspwd
         working-directory: .

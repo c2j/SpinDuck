@@ -311,6 +311,13 @@ Linux aarch64 / Windows x86_64）；§10 表里的 macOS 双架构与 Win7 行**
 > 执行；workflow 的 `defaults.working-directory` 是 `spinduck/`，故这些步骤逐条
 > 显式 `working-directory: .`（否则 pathspec 不匹配，CI 必红）。
 
+> 反向的同一个坑：`defaults.run.working-directory` **只作用于 `run:` 步骤**，
+> `uses:` 步骤（`Swatinem/rust-cache`、`upload-artifact` 的 `path`）一律从仓库根
+> 解析。crate 在 `spinduck/` 而根目录没有 `Cargo.toml`，rust-cache 因此在根目录
+> `cargo metadata` 失败并静默退化成"只缓存 registry、不缓存 target"——步骤仍
+> success、日志里有 `Error:` 但不报红（V25 记实测原文）。加缓存类 action 必须
+> 显式给工作区输入（`workspaces: spinduck`），不能指望 defaults 传导。
+
 > `cargo fmt --all -- --check` 失败是最常见 CI 错误。提交前先运行
 > `cargo fmt --all` 自动修复，再 `git add`。版本号在 `Cargo.toml` 维护。
 

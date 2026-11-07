@@ -1527,12 +1527,13 @@ V9 表已补记。
 
 ---
 
-## V25. 发版产物：Linux 两目标在 glibc 2.28 环境实测通过，Windows 目标待 CI 首跑
+## V25. 发版产物：三目标 CI 首跑（tag `v0.1.1`）全绿，Linux 侧另有本机 glibc 2.28 一手证据
 
 **结论**：AGENTS §9 的 Platform Build 从"文档里声称有"变成实物
 （`.github/workflows/release.yml`，tag `vX.Y.Z` 触发发布、`workflow_dispatch` 只构建
-不发布）。本轮落地 3 个目标中的 2 个有本机一手证据（Linux x86_64 / aarch64），
-Windows x86_64 只有配置、无本机证据。
+不发布），并已在 GitHub 上真跑过一次：三个目标（Linux x86_64 / Linux aarch64 /
+Windows x86_64）构建 + 冒烟 + 发布全绿，四个资产已发布。Linux 两目标除 CI 证据外
+另有本机一手证据（下表）。
 
 ### 一手证据（本机 apple silicon，stable，zig 0.15.2）
 
@@ -1589,14 +1590,72 @@ Windows x86_64 只有配置、无本机证据。
 不影响构建路径，故 Linux 两目标的构建/glibc/冒烟结论对 0.1.1 同样成立。tag 命名必须
 `vX.Y.Z`：不带 v 的 `0.1.1` 由 `check_release_tag.py` 直接拒（其 `--self-test` 里的负例之一）。
 
+### CI 首跑（run 42336602157，tag `v0.1.1`，五个 job 全 success）
+
+| job | 关键断言原文（取自各 job 日志） |
+|---|---|
+| 版本守卫与脚本自检 | 两条 `self-test ok`；`产物版本号 = 0.1.1` |
+| Build linux-x86_64 | `spinduck/target/x86_64-unknown-linux-gnu/release/spinduck: 需要 GLIBC_2.28（策略上限 GLIBC_2.28）`；解包后的字节 `OUT p_o = 42` + `spinduck 0.1.1` |
+| Build linux-aarch64 | 同上两条，路径为 `target/aarch64-unknown-linux-gnu/release/spinduck` |
+| Build windows-x86_64 | `dumpbin /dependents` 静态导入清单（见下）；解包后的字节 `OUT p_o = 42` + `spinduck 0.1.1` |
+| 发布 GitHub Release | `资产数 3（期望 3）` + `SHA256SUMS.txt` 三条哈希 |
+
+已发布资产（<https://github.com/c2j/SpinDuck/releases/tag/v0.1.1>，非 draft、非
+prerelease）：
+
+| 资产 | 字节数 | SHA-256 |
+|---|---|---|
+| `SHA256SUMS.txt` | 309 | — |
+| `spinduck-0.1.1-linux-aarch64.tar.gz` | 11,730,589 | `3e11d13da768b671ac68d26ff9332c4db2946b89bd7d338307d09f94738146ff` |
+| `spinduck-0.1.1-linux-x86_64.tar.gz` | 13,047,389 | `6b8b51f97d012c45d1f70ac1afa91362c5b1f3bdd8c7848825e930e2edf752d2` |
+| `spinduck-0.1.1-windows-x86_64.zip` | 11,507,084 | `fcf8ac03ff7cbb7f8af9193de54f1558ce1fe639fb9b5c5f599eecd3108ac001` |
+
+Windows 那条"目标机需 VC++ 2015-2022 x64 运行库"的前提，这次由产物侧取证而不只是
+README 里推断：`dumpbin /dependents` 打印出 `MSVCP140.dll`、`VCRUNTIME140.dll`、
+`VCRUNTIME140_1.dll`（三者即 redist 实体）与一组 `api-ms-win-crt-*.dll`（UCRT 走系统
+转发桩，Win10+ 自带），另有 `KERNEL32.dll / WS2_32.dll / ntdll.dll /
+bcryptprimitives.dll`。边界仍是「未做的事」里记的那条：该面只覆盖静态导入。
+
+### 已知缺陷：三个构建 job 的 `rust-cache` 都没命中 `target` 缓存
+
+run 42336602157 的三个构建 job，`Swatinem/rust-cache@v2` 步骤各自打印同一组：
+
+```text
+Error: The process '/home/runner/.cargo/bin/cargo' failed with exit code 101
+    command: 'cargo metadata --all-features --format-version 1 --no-deps'
+    stderr: 'error: could not find `Cargo.toml` in `/home/runner/work/SpinDuck/SpinDuck`
+             or any parent directory'
+Workspaces: /home/runner/work/SpinDuck/SpinDuck      ← 仓库根，本仓库根没有 Cargo.toml
+Cache Paths: ... /home/runner/work/SpinDuck/SpinDuck/target
+No cache found.
+```
+
+根因是 `uses:` 步骤**不跟随** `defaults.run.working-directory: spinduck`（该 defaults 只
+作用于 `run:` 步骤），rust-cache 因此在仓库根找 manifest。两条后果：⑴ 步骤非致命——该
+action 把 `cargo metadata` 失败降级成日志，job 依旧 success，所以红绿面上看不出问题；
+⑵ 它登记的缓存路径 `<根>/target` 永远不会被写入（真正的产物目录是 `<根>/spinduck/target`），
+只有 `~/.cargo/registry`、`~/.cargo/bin` 那部分缓存生效。
+
+对本次结论的影响：上表与本机证据里的 `Finished in 3m 51s / 4m 27s` 是**冷构建**时长，
+不能当"缓存命中后的稳态时长"引用。
+
+已按同一修法补齐 `release.yml` 两处与 `ci.yml` 四处（`with: workspaces: spinduck`）。
+**这条修复本身还没有 run 级证据**：上面引的日志出自修复前的 head SHA，缓存是否真的命中
+要等下一次 run（`gh run view --log` 里 rust-cache 步骤应出现 `Workspaces: …/spinduck`、
+Cache Paths 指向 `…/spinduck/target`，且同架构重跑时 `Cache restored`）。在那之前，
+"发版构建 ~4 分钟"只能按冷构建口径引用。
+
 ### 未做的事（明确不声称）
 
-- **Windows x86_64 未在本机取过任何证据**：无 MSVC 工具链，构建/打包/冒烟三步全部依赖
-  CI 首跑；该目标不加 `+crt-static`，README 里"需要 VC++ 2015-2022 x64 运行库"这条
-  前提改由发版 job 的 `dumpbin /dependents` 每次打印静态导入清单来取证（`ilammy/msvc-dev-cmd`
+- **Windows x86_64 本机证据仍为零**：本机无 MSVC 工具链，该目标的构建/打包/冒烟证据全部
+  来自 CI 首跑（见上），没有第二条独立路径交叉印证。该目标不加 `+crt-static`，运行库
+  前提由发版 job 每次打印的 `dumpbin /dependents` 静态导入清单取证（`ilammy/msvc-dev-cmd`
   提供环境）——注意该面**只覆盖静态导入**，delay-load 与运行时 `LoadLibrary` 的依赖看不到，
   且 windows-latest 自带运行库，冒烟通过不能反推裸机可直接跑。
 - **macOS 双架构、Win7（nightly `-Zbuild-std` + `crt-static`）没有发版 job**：本轮范围按
   用户点名的 3 目标；AGENTS §10 表相应两行已标注"尚无发版 job"。
-- **workflow 本身未在 GitHub 上跑过一次**：本地只验证到 YAML 可解析 + Linux 侧构建/
-  打包/冒烟/门禁脚本的等价命令。首次 `workflow_dispatch` 干跑才是矩阵级证据。
+- **只跑过 tag push（发布）路径**：`workflow_dispatch` 的"只构建不发布"分支未实跑过，
+  它靠 `if: github.event_name == 'push'` 挡发布，这条判断目前只有 YAML 级依据。
+- **tag push 不触发常驻 `ci.yml`**：`v0.1.1` 的 head SHA 上，fmt / clippy / test / audit /
+  golden 五个常驻门禁只有本机证据（`cargo test --features native` = 293 passed / 0 failed），
+  没有 GitHub 侧的绿。要让它们在同一个 SHA 上留痕，得走 PR。

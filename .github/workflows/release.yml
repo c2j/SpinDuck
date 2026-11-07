@@ -103,6 +103,9 @@ jobs:
       - name: Install cargo-zigbuild ${{ env.ZIGBUILD_VERSION }}
         run: cargo install cargo-zigbuild@${{ env.ZIGBUILD_VERSION }} --locked
       - uses: Swatinem/rust-cache@v2
+        with:
+          # uses: 步骤不跟随 defaults.working-directory；缺这行会静默退化成只缓存 registry（V25）
+          workspaces: spinduck
       - name: Build（glibc 符号锚定 2.28）
         run: >
           cargo zigbuild --release --locked --features cli
@@ -156,6 +159,9 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
+        with:
+          # uses: 步骤不跟随 defaults.working-directory；缺这行会静默退化成只缓存 registry（V25）
+          workspaces: spinduck
       # AGENTS §10 的 Windows x86_64 行是"Windows 10+，stable"，不加 crt-static
       # （静态 CRT 只属 Win7 行）。代价：目标机需 VC++ 2015-2022 x64 运行库，
       # 该前提写进 README 已知限制，不在 windows-latest 上假装验证过。

@@ -193,6 +193,9 @@ ELF 版本化符号，不采信构建参数写了什么）；每个目标从**�
 `call prc_smoke 14 null` 并断言 `OUT p_o = 42`。`workflow_dispatch` 入口只构建上传
 artifact、不发布（实测与踩坑记录见 `docs/validation.md` V25）。
 
+首个已发布版本：`v0.1.1`——三个目标的压缩包 + `SHA256SUMS.txt` 四个资产，各 job 的
+断言原文（含 Windows 侧 `dumpbin /dependents` 的静态导入清单）同样登记在 V25。
+
 macOS 双架构与 Windows 7 在 `AGENTS.md` §10 矩阵内，但**当前没有发版 job**。
 
 ## 关键约束
