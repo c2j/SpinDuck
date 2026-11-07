@@ -200,12 +200,14 @@ E2E（`cargo test --features gauss gauss_e2e`，`tests/gauss_e2e.rs`）两个用
 
 | 文件 | 原因 | 归类 |
 |---|---|---|
-| `0907sql/…`、`all_sq/…PKG_IMPORT_EXCEL.sql`、`final2/…` | 集合元素赋值 `t_res(i) := v`（PL 集合类型，非 UTF-8 只是伴随特征） | 集合/数组类型 M9+ |
+| `0907sql/…`、`all_sq/…PKG_IMPORT_EXCEL.sql`、`final2/…` | 集合变量**整体**赋值 `v_info_tab := split_string_into_table(…)`（PL 集合类型，非 UTF-8 只是伴随特征；探针里的元素赋值 `t(i) := v` 同落 `ENG-0022`，但不是语料命中形态） | 集合/数组类型 M9+ |
 | `all_sq/…PKG_SPLIT_TRADE_STEP3_SH.sql` | 带参游标 `OPEN c(args)`（`PlOpenKind` 参数化游标） | 带参游标 M9+ |
 
 **2026-11-07 复跑（`spinduck compile lib/fastaas/exam`，182/187、5 例）**：上表 4 例
-原样复现（3× `ENG-0022`、1× `ENG-0048`，均在 `all_sq/` 收集件，基线树
-`7_核心存储过程包/PKG_SPLIT_TRADE_STEP3_SH.sql` 不含带参游标、编译通过），另新增 1 例：
+原样复现（3× `ENG-0022` 分别落在 `0907sql/`、`all_sq/`、`final2/` 三份收集件，
+1× `ENG-0048` 落在 `all_sq/`；基线树
+`7_核心存储过程包/PKG_SPLIT_TRADE_STEP3_SH.sql` 里 `OPEN c_new_stock` 0 命中、收集件 3 命中，
+基线版编译通过），另新增 1 例：
 
 | 文件 | 报错 | 归类 |
 |---|---|---|
@@ -1409,17 +1411,36 @@ cd -
 # reason ENG-0022 x3 / ENG-0048 x1 / ENG-0064 x1      （V9 原登记 183/187）
 ```
 
-5 例失败逐条：3× `ENG-0022`（集合元素
-赋值）、1× `ENG-0048`（`all_sq` 收集件的带参游标 `OPEN`；基线树同名文件不含带参游标，
-编译通过）、1× `ENG-0064`（`SPLIT_LOG_INFO.sql`，登记数为零的静默丢弃守卫）。V9 表已补记。
+5 例失败逐条（`grep "^FAIL"` 原文，非转述）：
+
+- 3× `ENG-0022 statement not yet supported in M2 compiler: Sql(":= i_str")`，命中文件
+  `0907sql/aaspubs1_20260907_修改版.sql`、`all_sq/collected_sql/collected_sql/PKG_IMPORT_EXCEL.sql`、
+  `final2/aaspubs1_20260828-final.sql`——同一处**集合变量整体赋值** `v_info_tab := split_string_into_table(…)`
+  在三份收集件里各计一次。上一版把这三条写成"集合元素赋值"不准：元素赋值
+  `t_res(1) := 100` 是探针里的另一条（`Sql(":= 100")`），两者同落 `ir/stmt.rs` 的
+  ENG-0022 兜底支，但语料命中的是整体赋值。
+- 1× `ENG-0048 unsupported cursor reference: FunctionCall { name: [c_new_stock], … }`
+  （`all_sq/…/PKG_SPLIT_TRADE_STEP3_SH.sql`，带参游标 `OPEN`；基线树同名文件不含带参游标，编译通过）。
+- 1× `ENG-0064 声明了例程却未登记任何例程…`（`all_sq/…/SPLIT_LOG_INFO.sql`，登记数为零的
+  静默丢弃守卫）。
+
+V9 表已补记。
 
 ### 判定与待办
 
 - 集合类型**读取**不属拒绝面：待办是把 `t(i)` 识别为集合元素访问并在编译期显式拒绝
-  （改编译器，AGENTS §2 走 Red→Green），并补 6 条探针口径的单元/守护测试——当前这些
-  拒绝路径**没有任何测试断言**，只有手工 `compile` 证据，V9 门禁无法机械化。
-- 语料里该形态真实存在（`PKG_IMPORT_EXCEL.sql`：`v_info_tab := split_string_into_table(…)`
-  后接 `v_FUND_CODE1 := v_info_tab(1)`），只是该文件更早停在 `ENG-0022`，读侧未暴露。
+  （改编译器，AGENTS §2 走 Red→Green），并补探针口径的单元/守护测试。
+  上一版说"这些拒绝路径**没有任何测试断言**"说宽了，按码逐个核对（仓库根
+  `grep -rnE "ENG-00(22|48|59|64)" spinduck/tests/` = 5 命中）：
+  `ENG-0064` 已有两条守护（`tests/guard/guard_register_silent_drop.rs:48`、
+  `tests/guard/guard_ir_in_list_empty.rs:38`），`ENG-0022` 兜底支已由 `FORALL` 断言一条
+  （`tests/compiler_contracts.rs:287`）；**真正零断言**的是 `RETURN NEXT`、`PIPE ROW`、
+  集合赋值、`OPEN c(args)`（`ENG-0048`）、`FOR r IN c(args)`（`ENG-0059`）这五类具体构造，
+  它们只有本节的手工 `compile` 证据，V9 门禁无法机械化。
+- 语料里该形态真实存在（`all_sq/collected_sql/collected_sql/PKG_IMPORT_EXCEL.sql`：2429 行
+  `v_info_tab := split_string_into_table(p_i_extendStr,'$|$')` 后接 2430 行
+  `v_FUND_CODE1 := v_info_tab(1)`），只是该文件在 2429 行就停在 `ENG-0022`（实测
+  `Sql(":= i_str")`），读侧未暴露。
 
 ### 边界（不声称做到的）
 
