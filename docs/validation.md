@@ -1297,7 +1297,8 @@ PR#1 合并后自审扫出两处"输出/文档比事实宽或错"的地方，都
 ### 探针口径
 
 编译期不触碰内核，V9 同口径。探针不落库（临时目录），命令与期望输出直接写在这里，
-clone 后可逐条复现：
+clone 后可逐条复现——本节六条只依赖仓库内可见内容；§3 的语料体检另需 `lib/fastaas`
+子模块，见边界：
 
 ```bash
 cd spinduck
@@ -1398,8 +1399,17 @@ cd -
 
 ### 3. 语料体检复跑
 
-`compile 基线代码` → **136/136、54 例程**（与 V9 一致）；`compile lib/fastaas/exam`
-→ **182/187、72 例程**（V9 原登记 183/187）。5 例失败逐条：3× `ENG-0022`（集合元素
+仓库根逐字命令（本轮实跑，非引用 V9 旧数）：
+
+```bash
+./spinduck/target/debug/spinduck compile "lib/fastaas/exam/清算拆分优化考题/基线代码"
+# summary: files=136 ok=136 failed=0 routines=54      （与 V9 一致）
+./spinduck/target/debug/spinduck compile lib/fastaas/exam
+# summary: files=187 ok=182 failed=5 routines=72
+# reason ENG-0022 x3 / ENG-0048 x1 / ENG-0064 x1      （V9 原登记 183/187）
+```
+
+5 例失败逐条：3× `ENG-0022`（集合元素
 赋值）、1× `ENG-0048`（`all_sq` 收集件的带参游标 `OPEN`；基线树同名文件不含带参游标，
 编译通过）、1× `ENG-0064`（`SPLIT_LOG_INFO.sql`，登记数为零的静默丢弃守卫）。V9 表已补记。
 
@@ -1417,3 +1427,8 @@ cd -
 - `KERNEL-0010` 在"目录未登记名 + SQL 上下文"下的实跑只经由集合读取探针得到，
   未穷举其它未登记名场景（如下沉形态不支持时的 `BIZ-0160` 分支只引用既有测试，
   本轮没重跑）。
+- §3 的两个数**不是 clone 本仓库就能复现的**：`lib/fastaas` 是子模块（`.gitmodules`
+  指向 `git@github.com:NO3623/fastaas.git`，私有），考题语料不在本仓库跟踪面内
+  （V21.5 定案整目录不入库）。只 clone SpinDuck 的人能复现的是上面六条 `/tmp` 探针，
+  以及仓库内的 `./spinduck/target/debug/spinduck compile golden/case_corpus_purchase/sql`
+  → `files=7 ok=7 failed=0 routines=6`（本轮实跑）。

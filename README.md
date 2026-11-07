@@ -28,9 +28,19 @@ cargo build --features gauss                # 追加 GaussDB 连接器
 
 ### 1. 语料编译体检
 
+clone 后即可复现（语料在仓库内）：
+
+```bash
+./target/debug/spinduck compile ../golden/case_corpus_purchase/sql
+# OK   …/PKG_SPLIT_TRADE_STEP3_SH.sql  routines=2
+# summary: files=7 ok=7 failed=0 routines=6
+```
+
+全量基线体检跑的是考题语料，那棵树在 `lib/fastaas` 子模块里（私有仓库，需
+`git submodule update --init lib/fastaas` 且有访问权限；不在本仓库的 clone 面内）：
+
 ```bash
 ./target/debug/spinduck compile ../lib/fastaas/exam/清算拆分优化考题/基线代码
-# OK   …/PKG_SPLIT_QQ.sql  routines=3
 # summary: files=136 ok=136 failed=0 routines=54
 ```
 
