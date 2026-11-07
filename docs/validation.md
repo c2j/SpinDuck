@@ -160,10 +160,12 @@ E2E（`cargo test --features gauss gauss_e2e`，`tests/gauss_e2e.rs`）两个用
 | 过程（无返回） | 不进入内核函数命名空间 |
 | 宏体类型 | 不 CAST 到声明返回类型：`INTEGER` 实参 → `INTEGER` 结果（避免 DECIMAL(38,6) 精度/语义损失） |
 
-**未落地项与依据**：② 内联需编译期跨语句 SQL 重写（与动态 SQL 注入面同批，
-M8）；① UDF 需同 Database 第二连接，`SqlExecutor` 接缝未暴露该能力，属接缝
-签名变更（Ask first），故推迟。过程级函数在 SQL 上下文调用会得到
-`KERNEL-0010`（Catalog Error），属明确失败。
+**未落地项与依据**（2025-11 首轮口径；② 一项已被 V15/V21.3 与 V23 推翻，见下）：
+① UDF 需同 Database 第二连接，`SqlExecutor` 接缝未暴露该能力，属接缝签名变更
+（Ask first），故至今仍推迟。本轮同时登记的"过程级函数在 SQL 上下文调用会得到
+`KERNEL-0010`（Catalog Error）"**已不再是当前行为**——参数元组缓存化下沉（路径②）
+随后落地，SQL 上下文可以调用已登记的过程级函数；`KERNEL-0010` 只覆盖"名字不在
+例程目录且未宏化"的情形。复验证据与订正见 V23。
 
 ## V9. 语料批量编译体检（M7 门禁）
 
@@ -193,12 +195,21 @@ M8）；① UDF 需同 Database 第二连接，`SqlExecutor` 接缝未暴露该�
 `src/runtime/frame.rs`，守护测试 `should_evaluate_ne_as_inequality_not_inverted`
 与语料 IN/NOT IN 用例。
 
-**剩余 4 例（显式拒绝，非静默）**：
+**剩余 4 例（显式拒绝，非静默）**（2025-11 首轮口径；2026-11-07 复跑为
+**182/187、5 例**，新增归类见下方补记与 V23）：
 
 | 文件 | 原因 | 归类 |
 |---|---|---|
 | `0907sql/…`、`all_sq/…PKG_IMPORT_EXCEL.sql`、`final2/…` | 集合元素赋值 `t_res(i) := v`（PL 集合类型，非 UTF-8 只是伴随特征） | 集合/数组类型 M9+ |
 | `all_sq/…PKG_SPLIT_TRADE_STEP3_SH.sql` | 带参游标 `OPEN c(args)`（`PlOpenKind` 参数化游标） | 带参游标 M9+ |
+
+**2026-11-07 复跑（`spinduck compile lib/fastaas/exam`，182/187、5 例）**：上表 4 例
+原样复现（3× `ENG-0022`、1× `ENG-0048`，均在 `all_sq/` 收集件，基线树
+`7_核心存储过程包/PKG_SPLIT_TRADE_STEP3_SH.sql` 不含带参游标、编译通过），另新增 1 例：
+
+| 文件 | 报错 | 归类 |
+|---|---|---|
+| `all_sq/…/SPLIT_LOG_INFO.sql` | `ENG-0064` 声明了例程却未登记任何例程（解析器降级/静默丢弃守卫） | 非上述四类构造；守卫在 `src/engine.rs`（登记数为零即红），属显式失败 |
 
 **非 UTF-8 语料**：GBK 文件以有损 UTF-8 解码（SQL 关键字/标识符为 ASCII，仅注释
 与中文字面量受影响），报告行标注 `(non-utf8)`。实测该 47 个文件解码后全部通过
@@ -1259,7 +1270,13 @@ PR#1 合并后自审扫出两处"输出/文档比事实宽或错"的地方，都
 
 `cargo fmt --all` / `cargo clippy --all-features -- -D warnings` 干净；
 `cargo test --features native` = **293 passed / 0 failed / 0 ignored**（292 + 本轮新增 1 条）。
-黄金层 `--features gauss` 不受影响（`verify` 不在黄金层），CI 五 job 以 PR 首轮为准。
+合并后 main 实测（run `42317165064`，head `741d26c`，五 job 全绿）：`test` job 293 passed、
+`golden` job **299 passed / 0 failed / 0 ignored**。
+
+> **更正本来自审写错的一句**：原记"黄金层 `--features gauss` 不受影响"。这句在**计数**上是错的
+> ——新增的 `verify_chain` 测试同样计入 `--features gauss` 的套件总数，实测 298 → **299**。成立
+> 的部分只是"黄金**比对项**没有新增，`verify` 不被黄金层消费"。已按实测口径改写，避免下一轮
+> 把"不受影响"读成"总数没变"。
 
 ### 边界（不声称做到的）
 
@@ -1271,3 +1288,132 @@ PR#1 合并后自审扫出两处"输出/文档比事实宽或错"的地方，都
   `outs=2`"的例子、`case_corpus_purchase/reports/PROVENANCE.md` 的陈旧路径说明），经
   `git grep` + `git ls-files` 复核**在跟踪内容里都不存在**（前者无匹配、后者文件不在库内），
   故未采纳，也不写进改动清单。
+
+## V23. 「已知限制」两条口径订正（README / V8 / V9 / architecture §8.3）
+
+**结论先说**：本轮复核 README「已知限制」的两条声明，一条**部分成立且有一条静默
+缝隙**，一条**已被后续实现推翻**；顺带发现 V9 语料体检数漂移。只改文档，未动代码。
+
+### 探针口径
+
+编译期不触碰内核，V9 同口径。探针不落库（临时目录），命令与期望输出直接写在这里，
+clone 后可逐条复现：
+
+```bash
+cd spinduck
+cargo build --bin spinduck --features cli
+
+mkdir -p /tmp/sd_v23 && cd /tmp/sd_v23
+# ① 集合元素读取（本轮唯一"不静默"缺口）
+cat > read.sql <<'EOF'
+CREATE OR REPLACE PROCEDURE prc_read IS
+  DECLARE
+    TYPE t_tab IS TABLE OF NUMBER INDEX BY BINARY_INTEGER;
+    t_res t_tab;
+    v_n NUMBER;
+  BEGIN
+    v_n := 1;
+    v_n := t_res(1) + 1;
+  END;
+EOF
+# ② 集合元素赋值 ③ RETURN NEXT ④ PIPE ROW ⑤ 带参游标 OPEN ⑥ 仅声明带参游标
+cat > assign.sql <<'EOF'
+CREATE OR REPLACE PROCEDURE prc_coll IS
+  DECLARE
+    TYPE t_tab IS TABLE OF NUMBER INDEX BY BINARY_INTEGER;
+    t_res t_tab;
+  BEGIN
+    t_res(1) := 100;
+  END;
+EOF
+cat > return_next.sql <<'EOF'
+CREATE OR REPLACE FUNCTION fnc_set(p IN NUMBER) RETURN TABLE OF NUMBER IS
+  BEGIN
+    RETURN NEXT p;
+  END;
+EOF
+cat > pipe_row.sql <<'EOF'
+CREATE OR REPLACE FUNCTION fnc_pipe(p IN NUMBER) RETURN TABLE OF NUMBER IS
+  BEGIN
+    PIPE ROW(p);
+  END;
+EOF
+cat > open_args.sql <<'EOF'
+CREATE OR REPLACE PROCEDURE prc_open(p IN NUMBER) IS
+  DECLARE
+    CURSOR c1 FOR SELECT 1;
+  BEGIN
+    OPEN c1(p);
+    CLOSE c1;
+  END;
+EOF
+cat > decl_only.sql <<'EOF'
+CREATE OR REPLACE PROCEDURE prc_declonly IS
+  DECLARE
+    CURSOR c1 (a NUMBER) FOR SELECT 1;
+  BEGIN
+    NULL;
+  END;
+EOF
+
+cd -
+./target/debug/spinduck compile /tmp/sd_v23      # 期望见下表"实测"列
+./target/debug/spinduck explain --file /tmp/sd_v23/read.sql prc_read
+./target/debug/spinduck call --file /tmp/sd_v23/read.sql prc_read
+```
+
+实测输出（2026-11-07，DuckDB 1.5.5 / `=1.10505.0`）：`compile` 六文件
+`ok=2 failed=4`——`read.sql` 与 `decl_only.sql` 为 **OK**（即缺口），其余四条分别是
+`assign.sql`/`pipe_row.sql`/`return_next.sql` 的 `ENG-0022`（后两条
+`…: ReturnNext{…}` / `…: PipeRow{…}`，赋值条 `…: Sql(":= 100")`）与
+`open_args.sql` 的 `ENG-0048 unsupported cursor reference: FunctionCall{ name: c1, … }`；
+`explain read.sql prc_read` 出 4 条 IR，末条 `assign v_n := (t_res(1) + 1)`；
+`call` 得 `[KERNEL-0010] Catalog Error: Scalar Function with name t_res does not exist!`
+（下发文本 `SELECT t_res($p0)`），退出码 1。`FOR r IN c1(p)` 形态另得
+`ENG-0059 FOR rec IN cursor(args) is not supported in v1`。
+
+### 1. 四类构造的「编译期显式拒绝」覆盖面
+
+| 构造（探针） | 实测 | 判定 |
+|---|---|---|
+| `RETURN NEXT i;` | `ENG-0022 statement not yet supported in M2 compiler: ReturnNext{…}` | 与声明一致（兜底支 `ir/stmt.rs`，编译器只列 25 个 `PlStatement` 变体，`ReturnNext`/`PipeRow`/`ReturnQuery`/`ForAll` 落兜底） |
+| `PIPE ROW(i);` | 同上，`…: PipeRow{…}` | 一致 |
+| 集合元素**赋值** `t_res(1) := 100;` | 同上，`…: Sql(":= 100")` | 一致（解析器把整条赋值降级成 `Sql` 片段，编译器兜底拒绝，非静默） |
+| 带参游标 `OPEN c1(p)` | `ENG-0048 unsupported cursor reference: FunctionCall{…}` | 一致：拒绝发生在 `OPEN` **调用点**（`ir/stmt.rs` 把游标引用限定为 `PlVariable`/`ColumnRef`，`OPEN c(args)` 解析成 `FunctionCall` 落错误支） |
+| `FOR r IN c1(p)` | `ENG-0059 FOR rec IN cursor(args) is not supported in v1` | 一致 |
+| **集合元素读取** `v_n := t_res(1) + 1;` | `compile` **OK**（routines=1）；`explain` 出 `assign v_n := (t_res(1) + 1)`；`call` 运行期 `[KERNEL-0010] Catalog Error: Scalar Function with name t_res does not exist!` | **不一致：静默错译** —— `TYPE … IS TABLE OF` 声明被 `ir/entry.rs` 的"不影响帧布局"支跳过，`t(i)` 在表达式侧按标量函数调用编译 |
+| 带参游标**仅声明不使用** `CURSOR c1 (a NUMBER) FOR …` + `NULL;` | `compile` **OK** | 拒绝只发生在调用点；声明本身不报错（README 原句未区分，已在能力矩阵游标行补注） |
+
+### 2. SQL 上下文过程级函数调用
+
+- `should_not_register_macro_for_function_with_local_logic`（`src/engine.rs`）：
+  含局部变量的函数不进 `duckdb_functions()`（计数 0），但 `eng.call("fnc_local", …)`
+  仍返回 2 —— 宏路径③ 只覆盖纯表达式函数这一半成立。
+- `should_keep_procedure_out_of_sql_macro_namespace`（同文件）：过程不进内核函数命名空间。
+- `src/runtime/interp/kernel_tests.rs`（注释即"集合形态：`UPDATE ... SET v = length(fnc(k)) * 10`"）：
+  `fnc_tag` 含局部变量 + `SELECT INTO` + `RETURN`（过程级），在 `UPDATE SET` 与
+  `INSERT … VALUES` 两处 **SQL 上下文**被成功调用，断言行集
+  `[a,10] [a,100] [b,2]` 通过 —— **推翻**"过程级函数只能 PL 上下文调用、SQL 内调用
+  一律得 `KERNEL-0010`"。机制是路径②（`sql/sqlfn/`，V15/V21.3 已落地）。
+
+### 3. 语料体检复跑
+
+`compile 基线代码` → **136/136、54 例程**（与 V9 一致）；`compile lib/fastaas/exam`
+→ **182/187、72 例程**（V9 原登记 183/187）。5 例失败逐条：3× `ENG-0022`（集合元素
+赋值）、1× `ENG-0048`（`all_sq` 收集件的带参游标 `OPEN`；基线树同名文件不含带参游标，
+编译通过）、1× `ENG-0064`（`SPLIT_LOG_INFO.sql`，登记数为零的静默丢弃守卫）。V9 表已补记。
+
+### 判定与待办
+
+- 集合类型**读取**不属拒绝面：待办是把 `t(i)` 识别为集合元素访问并在编译期显式拒绝
+  （改编译器，AGENTS §2 走 Red→Green），并补 6 条探针口径的单元/守护测试——当前这些
+  拒绝路径**没有任何测试断言**，只有手工 `compile` 证据，V9 门禁无法机械化。
+- 语料里该形态真实存在（`PKG_IMPORT_EXCEL.sql`：`v_info_tab := split_string_into_table(…)`
+  后接 `v_FUND_CODE1 := v_info_tab(1)`），只是该文件更早停在 `ENG-0022`，读侧未暴露。
+
+### 边界（不声称做到的）
+
+- 本轮只改文档口径，未改代码、未改任何测试；测试数与门禁不变。
+- `KERNEL-0010` 在"目录未登记名 + SQL 上下文"下的实跑只经由集合读取探针得到，
+  未穷举其它未登记名场景（如下沉形态不支持时的 `BIZ-0160` 分支只引用既有测试，
+  本轮没重跑）。
