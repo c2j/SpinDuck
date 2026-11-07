@@ -1527,13 +1527,13 @@ V9 表已补记。
 
 ---
 
-## V25. 发版产物：三目标 CI 首跑（tag `v0.1.1`）全绿，Linux 侧另有本机 glibc 2.28 一手证据
+## V25. 发版产物：三目标 CI 两轮（tag `v0.1.1` 首跑 / `v0.1.2` 复跑）全绿，Linux 侧另有本机 glibc 2.28 一手证据
 
 **结论**：AGENTS §9 的 Platform Build 从"文档里声称有"变成实物
 （`.github/workflows/release.yml`，tag `vX.Y.Z` 触发发布、`workflow_dispatch` 只构建
-不发布），并已在 GitHub 上真跑过一次：三个目标（Linux x86_64 / Linux aarch64 /
-Windows x86_64）构建 + 冒烟 + 发布全绿，四个资产已发布。Linux 两目标除 CI 证据外
-另有本机一手证据（下表）。
+不发布），并已在 GitHub 上连跑两轮：三个目标（Linux x86_64 / Linux aarch64 /
+Windows x86_64）构建 + 冒烟 + 发布全绿，`v0.1.1` 与 `v0.1.2` 各四个资产已发布。
+Linux 两目标除 CI 证据外另有本机一手证据（下表）。
 
 ### 一手证据（本机 apple silicon，stable，zig 0.15.2）
 
@@ -1639,23 +1639,71 @@ action 把 `cargo metadata` 失败降级成日志，job 依旧 success，所以�
 对本次结论的影响：上表与本机证据里的 `Finished in 3m 51s / 4m 27s` 是**冷构建**时长，
 不能当"缓存命中后的稳态时长"引用。
 
-已按同一修法补齐 `release.yml` 两处与 `ci.yml` 四处（`with: workspaces: spinduck`）。
-**这条修复本身还没有 run 级证据**：上面引的日志出自修复前的 head SHA，缓存是否真的命中
-要等下一次 run（`gh run view --log` 里 rust-cache 步骤应出现 `Workspaces: …/spinduck`、
-Cache Paths 指向 `…/spinduck/target`，且同架构重跑时 `Cache restored`）。在那之前，
-"发版构建 ~4 分钟"只能按冷构建口径引用。
+已按同一修法补齐 `release.yml` 两处与 `ci.yml` 四处（`with: workspaces: spinduck`），并在
+v0.1.2 这一轮取到修复后的 run 级证据（下节）：**manifest 定位缺陷已消失，缓存命中与否
+仍未取证**。
+
+### v0.1.2 复跑（PR #5 → merge commit → tag，两条 run 全绿）
+
+流程按"PR 先绿 → 合并 → bump 随 PR 落地 → tag 打在 CI 已验证的 SHA"走：
+
+| 环节 | 对象 | 结果 |
+|---|---|---|
+| 常驻五门禁（PR） | run 42338938955 @ head SHA `c336222` | format / clippy / test / audit / golden 全 success |
+| 合并 | merge commit `a42c2d7`（PR #5） | `git diff --stat c336222 origin/main` 为空——main head 与已验证的 PR head **同内容** |
+| 常驻五门禁（push main） | run 42339792560 @ `a42c2d7` | 五 job 全 success（v0.1.1 缺的那份"tag 的 head SHA 上常驻门禁留痕"，这一轮补上了） |
+| 发版 | run 42339823731 @ tag `v0.1.2` → Release 已发布 | 五 job 全 success |
+
+发版矩阵复跑断言原文：
+
+- 版本守卫：两条 `self-test ok`；`产物版本号 = 0.1.2`
+- linux-x86_64：`spinduck/target/x86_64-unknown-linux-gnu/release/spinduck: 需要 GLIBC_2.28
+  （策略上限 GLIBC_2.28）`；解包后 `OUT p_o = 42` + `spinduck 0.1.2`
+- linux-aarch64：同两条，路径 `target/aarch64-unknown-linux-gnu/release/spinduck`
+- windows-x86_64：`dumpbin /dependents` 静态导入清单与 v0.1.1 **逐条同集合**，共 18 项：
+  `MSVCP140.dll`、`VCRUNTIME140.dll`、`VCRUNTIME140_1.dll`（redist 实体）、10 个
+  `api-ms-win-crt-*.dll`（UCRT 转发桩）、`api-ms-win-core-synch-l1-2-0.dll`、
+  `KERNEL32 / WS2_32 / ntdll / bcryptprimitives`；解包后 `OUT p_o = 42` + `spinduck 0.1.2`
+- Release job：`资产数 3（期望 3）`
+
+| 资产 | 字节数 | SHA-256 |
+|---|---|---|
+| `SHA256SUMS.txt` | 309 | — |
+| `spinduck-0.1.2-linux-aarch64.tar.gz` | 11,730,723 | `9be11223d1a26986fe3ad8491bd34b832f41d95fb1f9cc39a868069a6e8a03e8` |
+| `spinduck-0.1.2-linux-x86_64.tar.gz` | 13,047,431 | `3586d976f26726f6503c0a355f06f14bf540136bbc54e0aeef9adfeb51b651d9` |
+| `spinduck-0.1.2-windows-x86_64.zip` | 11,507,085 | `8a8aa329dc49fbd16b9951f1d56b9e5e7010d5e4e2aa3f304113e952ca67df91` |
+
+rust-cache 修复的取证方式与结论（对 `gh run view --log` 的计数，不是看红绿）：
+
+- 修复前（v0.1.1 三个构建 job）：各有一条 `could not find Cargo.toml` + `exit code 101`，
+  Cache Paths 为 `<根>/target`。
+- 修复后：windows 发版 job、push-main 的 clippy 与 test job 三个抽样里
+  `could not find` 命中数均为 **0**，且 `spinduck/target`（Windows 为
+  `spinduck\target`）各出现 3 次——分别在 Cache Paths 列表、Workspaces 列表与 Post 步骤的
+  `Cleaning …` 里，即真正产物目录已进入缓存面。
+- **仍未取证的一条**：这几个 job 的 Restoring 全是 `No cache found`。原因是缓存 key 随
+  工作区路径/锁文件集合变化而失效（首跑必冷），命中需要"同 workflow、同分支口径、
+  key 不变"的第二次 run；在此之前，构建时长只能按冷构建口径引用——本轮发版 job 里
+  实测到的区间是 `rust-cache` 恢复到 glibc 反查之间 aarch64 ≈ 9m56s、x86_64 ≈ 9m34s
+  （与本机 `Finished in 4m 27s / 3m 51s` 的差值即 runner 上的依赖编译与安装步骤，
+  两个口径都还没享受到 target 缓存）。
 
 ### 未做的事（明确不声称）
 
 - **Windows x86_64 本机证据仍为零**：本机无 MSVC 工具链，该目标的构建/打包/冒烟证据全部
-  来自 CI 首跑（见上），没有第二条独立路径交叉印证。该目标不加 `+crt-static`，运行库
-  前提由发版 job 每次打印的 `dumpbin /dependents` 静态导入清单取证（`ilammy/msvc-dev-cmd`
-  提供环境）——注意该面**只覆盖静态导入**，delay-load 与运行时 `LoadLibrary` 的依赖看不到，
-  且 windows-latest 自带运行库，冒烟通过不能反推裸机可直接跑。
+  来自 CI 发版 run（`v0.1.1`、`v0.1.2` 两轮），两轮是同一条路径的重复，不构成独立交叉印证。
+  该目标不加 `+crt-static`，运行库前提由发版 job 每次打印的 `dumpbin /dependents` 静态导入
+  清单取证（`ilammy/msvc-dev-cmd` 提供环境）——注意该面**只覆盖静态导入**，delay-load 与
+  运行时 `LoadLibrary` 的依赖看不到，且 windows-latest 自带运行库，冒烟通过不能反推裸机
+  可直接跑。
 - **macOS 双架构、Win7（nightly `-Zbuild-std` + `crt-static`）没有发版 job**：本轮范围按
   用户点名的 3 目标；AGENTS §10 表相应两行已标注"尚无发版 job"。
 - **只跑过 tag push（发布）路径**：`workflow_dispatch` 的"只构建不发布"分支未实跑过，
   它靠 `if: github.event_name == 'push'` 挡发布，这条判断目前只有 YAML 级依据。
-- **tag push 不触发常驻 `ci.yml`**：`v0.1.1` 的 head SHA 上，fmt / clippy / test / audit /
-  golden 五个常驻门禁只有本机证据（`cargo test --features native` = 293 passed / 0 failed），
-  没有 GitHub 侧的绿。要让它们在同一个 SHA 上留痕，得走 PR。
+- **`target` 缓存命中仍未取证**：修复只证明了"缓存面里出现了正确的产物目录"，`Restoring`
+  两轮都是 `No cache found`（见上节）。
+- **发版 SHA 上的常驻门禁证据：`v0.1.2` 起才补齐**：tag push 本身不触发 `ci.yml`，
+  `v0.1.1` 的 head SHA 上五门禁只有本机证据。`v0.1.2` 改走 PR，两条 run 都留了痕——
+  PR run 42338938955（head `c336222`）与 push-main run 42339792560（merge `a42c2d7`，
+  与已验证 head 同内容）各五 job 全绿，tag 指在该 merge commit 上。后续发版沿用
+  "bump 随 PR 落地、tag 打在 CI 已验证的 main head"这条顺序（AGENTS §9）。
