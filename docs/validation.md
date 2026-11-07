@@ -764,8 +764,12 @@ doctest 阶段红（测试二进制 17 组 292 passed / 0 failed 全绿，只有
   的对象"。补齐方式是取得视图 DDL 或写显式桩，不在引擎侧伪造。
 - 9 处 SKIP 是"无 `*.case.toml` 声明该入口"（可执行性未验证，按 §12.1 不计失败）；
   唯一声明场景的 `exam_bjgsyh#1` PASS（`outs=1`）。
+  **V22 起该理由分两档**：有 `[[case.assert]]` 指向该入口时不再写"未验证"。这里的计数是
+  当时实测状态，不追溯改写；考题项目不入库，故该命令不可在 clone 里复现。
 - 在库项目的同一命令：`verify ../golden/case_corpus_purchase` →
   `entries=1 checks=11 failed=0`，并把运行态快照落到 `.spinduck/conf/spinduck.toml`。
+  V22 在同一项目复跑为 `entries=1 checks=11 failed=0 skipped=1`，那 1 条 SKIP 的理由已改为
+  "2 条 `[[case.assert]]` 已由用例 `corpus_purchase` 覆盖该例程，本命令不执行断言"。
 - "不入库"的范围已核实到文件级：`golden/exam_split_trade/` 共 163 个文件，其中只有
   `docs/4-数据库与连接信息.md` 含远端库凭据；`sql/` 147 个逐字件（36 例程 + 107 表/视图
   DDL + 4 外部依赖桩，与 `config/corpus_forms.toml` 的 `files = 147` 同口径）、`cases/`（4）、
@@ -1220,3 +1224,50 @@ postmaster 在过程 CALL 中以 0 自行退出的内部成因（V21.9–V21.11 
 `ubuntu26/20261101.186`，故 docker/compose 版本不是混淆变量）：此前 3/3 轮红在过程
 `CALL`，本轮绿——这组对照把"崩溃主语就是那条过程"钉得更死了：被测面上唯一被拿掉的
 变量，也是唯一改变结果的变量。
+
+
+## V22. `verify` 的 SKIP 理由分两档；README 的 verify 例子换成 clone 可复现命令
+
+PR#1 合并后自审扫出两处"输出/文档比事实宽或错"的地方，都在 `verify` 这一面：
+
+1. **README §5 的例子指向不入库的路径。** 那条 `spinduck verify ../golden/exam_split_trade`
+   在 clone 里必失败——该目录被 `.git/info/exclude` 挡在库外，clone 后不存在；`verify` 对缺失
+   项目目录的实测行为是 `[ENV-0030] 未在 … 及其上级目录找到项目声明（spinduck.toml 或
+   conf/spinduck.toml；verify 以项目声明为起点）`（本机用错相对路径时撞到同一条）。README 的
+   命令例子必须能在拿到的仓库里跑通。
+2. **SKIP 的理由与断言层的存在直接矛盾。** 对 `golden/case_corpus_purchase` 实测：
+   `SKIP Scenario - — 无 *.case.toml 声明该入口，可执行性未验证`。而同一份
+   `purchase.case.toml` 里 `kind = "function"` 的 `[case]` 只声明函数场景，指向该入口过程的
+   恰是同文件的两条 `[[case.assert]]`（`out p_o_succeed` / `error BIZ-0151`），它们由
+   `cargo test --features native --test cases_native` 真跑并逐值断言——V21.12 第 2 点刚立的
+   分工。留着"未验证"这句话，等于让报告否认自己刚登记的执行面。
+
+### TDD 循环
+
+| 步 | 内容 | 实测 |
+|---|---|---|
+| Red | `tests/verify_chain.rs::should_credit_assert_layer_when_no_scenario_declares_the_entry`：一个入口 + 一份场景不指向它、断言指向它的用例；断言 Skip 理由含条数、含用例名、不含"可执行性未验证" | 首跑红于 `verify_chain.rs:224`，detail 实为 `无 *.case.toml 声明该入口，可执行性未验证`（断言失败，非编译失败） |
+| Green | `src/project/case.rs`：`CaseAssert::targets_routine()`；`src/verify/run.rs`：`scenario_skip_check()` 出两档理由 | `cargo test --features native --test verify_chain` → 9 passed / 0 failed / 0 ignored |
+| 口径钉住 | 同一 fixture 再加 1 条 `kind = "rows"` 干扰断言（`target` 是 SQL） | 理由仍写"2 条"，证明计数只认以例程为 target 的 `out`/`call`/`error`，`rows` 不计入——SQL 断言不能证明例程可执行 |
+| 在库复跑 | `./target/debug/spinduck verify ../golden/case_corpus_purchase` | `entries=1 checks=11 failed=0 skipped=1`，SKIP 行改为 `2 条 [[case.assert]] 已由用例 corpus_purchase 覆盖该例程，本命令不执行断言（断言层见 cases_native）` |
+
+**判定没动，只动了理由**：状态仍是 `Skip`、`object` 仍是 `-`、`failed` 计数与退出码口径不变
+（只有 `FAIL` 计非零）。把 `verify` 变成执行断言的是另一件事（要拖进数据集物化与部署面），
+本轮不做。
+
+### 门禁
+
+`cargo fmt --all` / `cargo clippy --all-features -- -D warnings` 干净；
+`cargo test --features native` = **293 passed / 0 failed / 0 ignored**（292 + 本轮新增 1 条）。
+黄金层 `--features gauss` 不受影响（`verify` 不在黄金层），CI 五 job 以 PR 首轮为准。
+
+### 边界（不声称做到的）
+
+- 匹配是归一小写全名比较。`[[case.assert]]` 若以短名指向限定名入口则**不计入**，宁可少认一条
+  覆盖，也不把别的包的同名过程算进来；代价是这种写法下理由仍显示"未验证"。在库 4 个用例的
+  入口级断言实测均为限定名，计数与用例文本一致。
+- 一文件多 `[[case.assert]]` 的用例数与断言数分别计数：理由里的用例名去重，条数不去重。
+- 本轮自审的二手结论必须自己复核：另一路评审另报两处待改（`golden/README.md` 里"3 参过程 +
+  `outs=2`"的例子、`case_corpus_purchase/reports/PROVENANCE.md` 的陈旧路径说明），经
+  `git grep` + `git ls-files` 复核**在跟踪内容里都不存在**（前者无匹配、后者文件不在库内），
+  故未采纳，也不写进改动清单。
