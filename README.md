@@ -143,7 +143,7 @@ kind = "function"
 | SQL 上下文函数分派 | ✅ 表达式级→内核宏（路径③）；已注册例程调用→参数元组缓存化下沉（路径②，`sqlfn`）；路径① UDF 仍推迟（`architecture.md` §8.3） |
 | `EXECUTE IMMEDIATE`（静态文本与运行期拼接同一管线） | ✅ 与 OPEN FOR 共用解析/改写管线；`USING` 绑定 ⛔ 待做（`ENG-0058`，变量须先拼进文本） |
 | 事务标记 `COMMIT`/`ROLLBACK` | ✅ 统一事务边界：最外层调用包 `BEGIN…COMMIT`，过程内 `COMMIT`/`ROLLBACK` 即时生效并重开（`architecture.md` §3.5） |
-| GaussDB 物化/回写 | ✅（文本承载，回写为 append） |
+| GaussDB 物化/回写 | ✅（文本承载；回写走线协议 COPY 单事务追加、物化 500 行/语句批量 INSERT，实测 100k/98k 分别 26s/1.2s，见 validation V24.4） |
 | `rownum = 1` 首行谓词 | ✅ `[patterns] rownum_first_row`（AST 级，语料 42 处：顶层 SELECT 与 `INSERT … SELECT` 子查询；UPDATE/DELETE 无对应语法位，原样下发由内核报错） |
 | 记录变量限定字段下发 SQL（`INSERT … VALUES (r.field)`） | ✅ `BindSrc::Field`（`$v_<rec>__<field>` 绑定） |
 | `%ROWTYPE` 整行记录 + 显式 `FETCH c INTO rec` | ✅ |
@@ -151,6 +151,7 @@ kind = "function"
 | **SQL 上下文例程调用**（`UPDATE SET f(col)` / 游标 WHERE / INSERT VALUES 中的 PL 函数） | ✅ 参数元组缓存化下沉（`sqlfn`，确定性前提 + 10 万元组上界） |
 | `%NOTFOUND` 空游标 / `SQLERRM` / `UPDATE` 去别名 / `SELECT INTO` 行数语义（0 行 `NO_DATA_FOUND`、>1 行 `TOO_MANY_ROWS`，静态与动态同口径） | ✅ |
 | 黄金对比 | ✅ `golden/`：toy 用例 + 语料级逐字函数（stock_kind / min_tax）+ 核心过程（purchase） |
+| 合并 COMMIT 开关（`Engine::batch_commit`） | ✅ 默认 OFF（§3.5 逐行即时提交不变）；ON 时过程内 INSERT 攒批合并 + COMMIT 吞并 + 出口统一提交（100k 稳态 938s→316s；失败行数据级跳过的偏差点见 writebuf.rs，validation V24.3） |
 | 用例原生断言层（无容器） | ✅ `[[case.assert]]`（`rows`/`call`/`out`/`error` 四维，进程内内核逐值比对）+ 语料形态覆盖门禁 `config/corpus_forms.toml`（`architecture.md` §12.1、validation V21） |
 | 入口链路核验 `spinduck verify` | ✅ `[[entry]]` 全名声明 → 例程断点 / 表·序列缺失 / 场景可执行逐条判定 + 运行态 `conf/` 快照（`architecture.md` §11.1、§12.1） |
 | `RETURN NEXT` / `PIPE ROW` / 集合类型（嵌套表/数组）/ 带参游标 | ⛔ 待做（语料仅 3+1 例；`RETURN NEXT`/`PIPE ROW`/集合元素**赋值**/`OPEN c(args)` 编译期显式拒绝，集合元素**读取**不属拒绝面，见「已知限制」） |
@@ -224,7 +225,8 @@ macOS 双架构与 Windows 7 在 `AGENTS.md` §10 矩阵内，但**当前没有�
   下沉（`sqlfn`，路径②；确定性前提 + 10 万元组上界；上下文互引显式拒绝 `BIZ-0160`），
   其余名字（宏路径③只覆盖纯表达式函数、UDF 路径①仍推迟）会得到 `KERNEL-0010`
   Catalog Error，属明确失败、不静默降级。
-- `materialize` 逐行 INSERT：万级可用，百万级需批量通道。
+- `materialize` 逐行 INSERT / `sync` 逐行往返：**已落地批量通道**（V26）——物化 500 行/语句
+  多值 INSERT、回写走驱动 `copy_in`（COPY FROM STDIN）单事务追加；100k/98k 实测 26s / 1.2s。
 - GaussDB/openGauss 的 **sha256 口令认证已可用**（2026-11-07 换驱动）：数据通道由纯 Rust
   `postgres` 改为 `rust-opengauss` 的同步门面 `gaussdb::sync::*`（实现 sha256 /
   md5-sha256 / SM3），默认口令形态实例直连由 `tests/gauss_sha256.rs` 三条断言锁定
@@ -238,4 +240,5 @@ macOS 双架构与 Windows 7 在 `AGENTS.md` §10 矩阵内，但**当前没有�
   清单作为产物侧证据（delay-load / 运行时 `LoadLibrary` 的依赖不在这张面上）；
   在装了 Visual Studio 的 CI runner 上冒烟通过**不等于**裸机可直接跑（V25）。
 - macOS 与 Windows 7 尚无发版入口：§10 矩阵的这两类目标既无 job 也无构建证据。
+(docs(validation): V24 三段引擎优化与数据搬运通道的实证记录；architecture/README 对应口径)
 - 黄金基线当前由 openGauss 5.0.0 产出（GaussDB 实例不可达），差异见 V10。

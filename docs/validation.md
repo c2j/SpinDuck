@@ -1707,3 +1707,148 @@ rust-cache 修复的取证方式与结论（对 `gh run view --log` 的计数，
   PR run 42338938955（head `c336222`）与 push-main run 42339792560（merge `a42c2d7`，
   与已验证 head 同内容）各五 job 全绿，tag 指在该 merge commit 上。后续发版沿用
   "bump 随 PR 落地、tag 打在 CI 已验证的 main head"这条顺序（AGENTS §9）。
+
+## V26. 三段引擎优化与数据搬运批量通道的实证（记忆化 / prepared / 合并 COMMIT 开关 / COPY）
+
+> **与 V24 的关系（rebase 后口径）**：本节初稿基于 `postgres` 驱动的旧树，V24
+> （sha256 认证面、驱动换 `gaussdb::sync`）落在同一窗口。V26.4 的回写通道已按
+> 新驱动重做——`gaussdb::sync` 自带 `copy_in`/`CopyInWriter`（openGauss 官方
+> 驱动 fork，协议层含 CopyInResponse），手写线协议会话随之退役；sha256 口令
+> 实例不再需要任何降级（V24 结论原样成立）。V26.4 的重做实测见本节内更新值。
+
+**结论先说**：100k 行语料过程 `prc_trd_deal_purchase`（openGauss 参照 vs SpinDuck，
+`golden/case_corpus_purchase` 全套夹具）三段逐项迭代、逐项基准对比：引擎执行
+698.9s→264.3s（首跑）/ 938.2s→316.2s（稳态含 DELETE），物化 244.7s→26.0s，回写
+204.0s→1.18s；全链路 1,147.6s→291.5s（−75%）。每段默认语义不变或显式 opt-in
+开关（`Engine::batch_commit` 默认 OFF）。产物（`dat_trd_repurchase` 逐值）在
+三段全部运行中与基线一致。本节只做实证记录与口径钉死；机制描述见
+architecture §3.5 补注与 `writebuf.rs` 头注释。
+
+### 基准环境（一次声明，全节适用）
+
+- 参照：openGauss **7.0.0-RC3**（`opengauss/opengauss:latest`，amd64，127.0.0.1:5435）。
+  采用依据见 V24.5（5.0.0 amd64 的过程调用自杀在本机复现，V21.9–V21.12 补充证据）。
+  部署夹具与 golden 同源（tables/views/stubs/routines/seed 逐字），3 行种子冒烟
+  `CALL pkg_split_trade_step3_sh.prc_trd_deal_purchase('20250715', NULL)` 产物
+  `[2, 300, 30000, 6]` 与黄金断言逐值一致后才做基准。
+- 被测：SpinDuck release 构建，`golden/case_corpus_purchase` 部署口径
+  （`verify::deploy_schema/deploy_routines` + 项目规则），数据集与参照同一份
+  SQL 文件装入（37 列 ×100k，含 2% A999 异常行=partner 未维护走行级跳过路径）。
+- 计时口径：参照为 gsql 客户端墙钟（含 ~0.3s 启动）；SpinDuck 为进程内
+  `Engine::call` 墙钟（部署/编译/装数在计时圈外）。语句计数来自
+  `MeterExecutor`（按 SQL 文本聚合下发的装饰器，随 bench 存证）。
+- 两侧写路径对称：过程内逐行 INSERT+COMMIT（fsync 同价）。
+
+### V26.1 迭代①：纯标量语句执行期记忆化（MemoizingExecutor）
+
+- 依据：Meter 计量显示**解释器只占 wall 2.7%**，97% 在内核下发；每行 16 条语句
+  中 5 条是纯标量表达式宏（`substr`/`to_char(to_date()+n)`/date_diff），参数组合
+  仅 4 种。白名单（substring/strftime/strptime/to_days/date_diff）按
+  （SQL 文本, 绑定值）缓存，`Engine::call` 入口清空。
+- 实测（10k 稳态）：68.12s→46.60s（**−31.6%**）；语句 157,006→78,617（−50%）。
+- 测试 6 个：合并命中、按绑定值区分、表查询/非确定性函数/execute 不缓存、
+  clear 后重执行（`exec::tests::should_memoize_*` 等）。
+
+### V26.2 迭代②：内核 prepared 语句缓存 + 一个内核缺陷被实测钉死
+
+- `prepare`→`prepare_cached`（容量 512，内核默认 16）：微查询均摊 212→91µs、
+  BEGIN 70→46µs；但 wall 持平——大项（COMMIT 1.05ms / 单行 INSERT 0.99ms /
+  点查 0.8ms）是执行硬成本（WAL fsync / MVCC / 管线固定），parse 只占小头。
+- **实测钉死的内核缺陷（1.5.5）**：缓存的 `CREATE OR REPLACE TEMP TABLE` plan
+  二次执行留下 **0 列残表**（`Binder Error: table sd_fn0 has 0 columns but 2
+  values were supplied`），sqlfn 物化路径（`materialize_fn_sites`）必踩——
+  V24 前该路径在开关 OFF 下由既有测试 `should_execute_pl_function_calls_inside_
+  sql_statements` 抓出。修复：DDL 绕过语句缓存 + DDL 后 `flush_prepared_
+  statement_cache()`（替换表的所有缓存 plan 一并作废）。守护测试
+  `should_recreate_temp_table_across_prepared_cache` 永久保留。
+- 接缝纪律：DuckDB API 触碰只在 `sql/exec_native.rs`（AGENTS §1）。
+
+### V26.3 迭代③：合并 COMMIT 开关（`Engine::batch_commit`，默认 OFF）
+
+- 依据：COMMIT 1.05ms + 单行 INSERT 0.99ms 占内核时间 44%，只能靠事务边界
+  合批消化——属对 §3.5「过程内 COMMIT 即时生效」的显式偏离，故为 opt-in 开关。
+- 语义（四条，`writebuf.rs` 头注释为准）：① 过程内 COMMIT 吞并，INSERT 攒批
+  合并 500 行/语句，出口统一刷盘由 `engine.call` 最终 COMMIT 持久化；② 触及
+  缓冲表的语句先刷盘（读自己写）；③ 合并失败回退逐行重放，失败行**数据级
+  跳过**——与 OFF 的差异是该行不进 PL 异常处理器（inst_log 缺失），组内首行
+  失败视为表级错误上抛；④ 嵌套例程边界即刷盘点（各自独立缓冲；SQL 上下文
+  函数调用不批——语料函数体无 INSERT）。
+- 实测（10k 稳态）：46.6s→23.6s（**−49%**）；100k 首跑 439.3→264.3s、稳态
+  911.7→316.2s；语句 786,017→494,015。产物逐值一致（三组运行）。
+- 测试 4 个（interp 层 FakeExecutor 计数）：合并+吞并（ON）、逐行 COMMIT
+  （OFF 默认守护）、触及缓冲表先刷盘、合并失败回退跳过。
+- 实现中由测试/基准抓出的自身缺陷（各一条，均修复）：
+  ① md5 外层摘要误用 16 字节 raw digest——正确输入是 inner 的 **32 字符
+  hex ASCII 串**（服务端 28P01）；
+  ② 行级业务异常（NO_DATA_FOUND，语料空表 commission 查询每行合法抛出）的
+  trap 重入路径误清缓冲 → 全部行丢失（实测 count=0）——discard 收敛到
+  「handler 不可重入的最终异常」；
+  ③ 字面量行（`VALUES ('x')`，无占位符）需原样采用；
+  ④ VALUES 表达式是复合形态（`round(($a-$b)/$c, 2)`）——字面量化必须
+  占位符**就地文本替换**，按值提取会拆散表达式导致列/值错位（22→26 值实测）。
+
+### V26.4 数据搬运：postgres crate 的 copy_in 对 openGauss 静默无效 → 简单协议 COPY IN
+
+- **存证**：`postgres` crate 0.19 的 `copy_in`（扩展协议 Parse/Bind/Execute）
+  对 openGauss 5.0.0/7.0.0-RC3 均**不报错且 0 行落库**（CSV 与文本两种格式
+  变体实测）；同表 gsql `\copy` 成功（2 行）——服务端 COPY 能力正常，
+  缺口在扩展协议交互。
+- **可行域实测**：手写简单协议会话（TcpStream：Startup → md5 认证 →
+  `Q`("COPY … FROM STDIN") → `G` → `d`×N → `c` → `C`/`Z`）在两代内核全绿：
+  10 万行 104.6ms（5.0.0）/ 142.8ms（7.0.0-RC3）。落地为 `io/gauss.rs` 的
+  `WireCopy`（回写整次单事务原子追加，服务端/本地行数交叉校验）。
+- **线协议四条契约**（探针钉死，代码注释与 `tests/wire_probe.rs` 存证，改动
+  必须重跑）：
+  ① md5 PasswordMessage 的长度字段**必须含结尾 `\0`**——短一字节即
+  `invalid password packet size` 后字节流错位；
+  ② 收到 `G` 必须立即转入数据流——继续读会与服务端互等死锁（服务端
+  `CONTEXT: COPY …, line 1` + 客户端读超时即此症状）；
+  ③ COPY 数据流期间禁发任何其他消息——`Q` 即
+  `08P01 unexpected message type 0x51 during COPY from stdin`；
+  ④ `CopyInResponse` 的 body[0] 是全局格式码（0=text/1=binary），成功标志是
+  消息 tag `G` 本身。
+- 实测：回写 98k 204.0s→**1.18s**（480→82,738 行/s）；物化 100k 244.7s→**26.0s**
+  （409→3,853 行/s，500 行/语句批量 INSERT——字面量形态与逐行逐字一致）。
+- 行数核对：回写前后服务端 `196,000 → 294,000`（+98,000 精确）。
+
+### V26.5 参照实例 V21.9 的本机复现；7.0.0-RC3 替代口径的验证依据
+
+- **V21.9–V21.11 在开发机复现**：5.0.0 amd64（`187da08af341`，与 CI 同 artifact）
+  干净实例裸 `CALL` → postmaster 自杀：`RestartCount` 0→1→2、`ExitCode=0`、
+  服务端日志零错误（V21.10/21.11 的判定协议逐条执行，本机 100% 复现）。
+  首次 CALL 幸存一次但 0 行插入（未做工作）——与 CI"3/3 轮"口径一致：
+  参照实例不可作为过程执行基线，证据链闭合。
+- **7.0.0-RC3 替代口径**：Lite 镜像入口在 `/entrypoint.sh`（非 5.0.0 的
+  `/var/lib/opengauss/entrypoint.sh`），`GS_HOST_AUTH_METHOD=md5` 原生支持、
+  `OTHER_PG_CONF` 不支持（无需——实测 `password_encryption_type=0` md5 为
+  默认）；`datcompatibility=A` 由 initdb 默认给出（实测查询确认）。镜像缺陷：
+  缺 `libopenblas.so.0`/`libgfortran.so.5`（openEuler RPM + 宿主 so 注入后
+  正常，探针脚本存证）。部署口径与 golden 逐字一致；冒烟产物与黄金断言
+  逐值一致后才采用。**黄金 pin 的 5.0.0 参照地位不变**——7.0-RC3 仅作为
+  性能比对替代参照，绝对耗时不可与黄金基线历史混比。
+- 端口适配：宿主 5433 被既有 dota-gaussdb（同 5.0.0 镜像，同缺陷）占用——
+  按golden/README 处置方式改绑端口，未触碰他人实例。
+
+### V26.6 门禁与测试清单
+
+- fmt / clippy（gauss，`-D warnings`）✓；`cargo audit` 无新增告警
+  （既有 zip 维持 CI 豁免口径）。
+- `cargo test --features native` 全量 **307/0**：新增 memo 6、prepared 守护 2、
+  batch_commit 4（合并+吞并 / OFF 默认守护 / 读自己写刷盘 / 失败回退跳过）。
+- golden 回归（5.0.0 容器，默认 OFF 路径）：cases_native 4/4、
+  golden_corpus_purchase 1/1、gauss_e2e 2/2（**新 COPY/批量通道在 5.0.0 实测**）
+  ——7/0。
+- 基准与探针工具存证：`spinduck_bench`（mat/sync 模式 + MeterExecutor）、
+  `tests/wire_probe.rs`、`tests/io_probe.rs`（含 openGauss copy_in 失败探针）。
+
+### 边界（不声称做到的）
+
+- 合并 COMMIT 开关 ON 的两处偏差（失败行不进 inst_log、嵌套边界即刷盘）是
+  **文档化偏离**而非等效实现；默认 OFF 的行为由 OFF 守护测试锁定。
+- 7.0-RC3 参照的绝对耗时不可与黄金基线历史混比（不同内核版本）；本节所有
+  "对比"都是同机同数据同时点的 A/B。
+- 参照侧计时含 gsql 客户端（~0.3s 启动），SpinDuck 为进程内 call——两口径
+  差异相对 200s/264s 的量级可忽略，未做归一。
+- 动态 SQL（`EXECUTE IMMEDIATE`）在开关 ON 下走保守整缓冲刷盘，未单独基准。
+- `lib/fastaas` 考题语料不在本仓库跟踪面内（V21.5 口径），本节数据全部来自
+  `golden/case_corpus_purchase` 在库夹具。

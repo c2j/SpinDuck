@@ -281,6 +281,13 @@ PopFrame）。语义要点：
   默认**延迟事务模式**——过程体内的 COMMIT/ROLLBACK 记录为事务边界标记，
   在顶层 `CALL` 返回后统一执行；`strict_transactions = false` 选项下允许
   真实提交（文档明示与 GaussDB 的差异）。该差异必须写入兼容性清单。
+- **合并 COMMIT 开关**（`Engine::batch_commit`，默认 OFF；V24）：在"过程内
+  COMMIT 即时生效"的实现口径上，ON 时过程内 COMMIT 被吞并、INSERT 攒批
+  合并（500 行/语句多值），缓冲在例程出口统一刷盘、随顶层调用 COMMIT 一起
+  持久化。两处显式偏差：① 持久化粒度从行级变为调用级（连接中断不再留
+  半截数据，亦不再逐行落盘）；② 合并语句失败回退逐行重放，失败行按数据
+  语义跳过、不进入 PL 异常处理器（inst_log 缺失）。机制与协议级细节见
+  `runtime/interp/writebuf.rs` 头注释，实证见 validation V24.3。
 
 ### 3.6 目录与持久化
 
