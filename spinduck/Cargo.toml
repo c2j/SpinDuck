@@ -53,6 +53,10 @@ name = "guard_tx_semantics"
 path = "tests/guard/guard_tx_semantics.rs"
 
 [[test]]
+name = "guard_exec_native_prepared_cache"
+path = "tests/guard/guard_exec_native_prepared_cache.rs"
+
+[[test]]
 name = "guard_execute_dynamic"
 path = "tests/guard/guard_execute_dynamic.rs"
 
