@@ -54,7 +54,9 @@ pub struct ExecOutcome {
 
 /// 纯标量函数白名单（仅这些名字的 FROM-less SELECT 记忆化）。
 /// 判据从严：不在名单内的未知内建（可能非确定性，如 CURRENT_TIMESTAMP）
-/// 一律照常下发。来源：改写规则映射的确定性方言函数（rewrite-rules.toml）。
+/// 一律照常下发。名单是**保守固定集**，与 rewrite-rules.toml 的 [functions]
+/// 映射无自动联动——新增可缓存函数须在此登记并补探针
+/// （config 侧有反向锚点注释指向此处，V24 评审应修 10）。
 const PURE_SCALAR_FNS: [&str; 5] = ["substring", "strftime", "strptime", "to_days", "date_diff"];
 
 /// 记忆化条目：结果 schema + 全行集（RowStream 可重建的最小集）。
@@ -156,8 +158,40 @@ impl SqlExecutor for MemoizingExecutor {
 
     fn execute(&self, sql: &str, binds: &BindMap) -> Result<ExecOutcome, EngineError> {
         self.inner_calls.set(self.inner_calls.get() + 1);
+        // DDL/MACRO 会使白名单函数的缓存值陈旧（如 EXECUTE IMMEDIATE
+        // 'CREATE OR REPLACE MACRO …' 改变内核宏语义）：清缓存后透传。
+        if is_ddl(sql) {
+            self.cache.clear();
+        }
         self.inner.execute(sql, binds)
     }
+}
+
+/// DDL 判定（exec.rs 层共享：语句缓存失效与 prepared 缓存绕过同一口径）：
+/// CREATE/DROP/ALTER，前导注释（行 `--` 与块 `/* */`，可叠加）剥离后再判。
+pub(crate) fn is_ddl(sql: &str) -> bool {
+    let mut t = sql.trim_start();
+    loop {
+        if let Some(rest) = t.strip_prefix("--") {
+            t = match rest.find('\n') {
+                Some(i) => &rest[i + 1..],
+                None => "",
+            };
+            t = t.trim_start();
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("/*") {
+            t = match rest.find("*/") {
+                Some(i) => &rest[i + 2..],
+                None => "",
+            };
+            t = t.trim_start();
+            continue;
+        }
+        break;
+    }
+    let head: String = t.chars().take(6).collect::<String>().to_ascii_uppercase();
+    head == "CREATE" || head.starts_with("DROP") || head.starts_with("ALTER")
 }
 
 /// SQL 执行接缝：解释器/编译器唯一可见的内核能力面。

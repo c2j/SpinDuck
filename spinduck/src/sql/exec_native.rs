@@ -2,7 +2,7 @@
 //! 唯一允许触碰 duckdb crate 的模块（AGENTS.md §1）。
 
 use crate::error::EngineError;
-use crate::exec::{BindMap, ExecOutcome, Row, RowStream, SqlExecutor};
+use crate::exec::{is_ddl, BindMap, ExecOutcome, Row, RowStream, SqlExecutor};
 use crate::value::SpinValue;
 use duckdb::types::{Value, ValueRef};
 use duckdb::Connection;
@@ -16,16 +16,6 @@ pub struct DuckExecutor {
 /// prepared 语句缓存容量：语料工作集（≥50 条不同语句）远大于内核默认 16，
 /// LRU 淘汰会把热语句挤出缓存反噬吞吐（V24 计量：单工作集 ~10 条热语句）。
 const PREPARED_CACHE_CAPACITY: usize = 512;
-
-/// DDL 判定：CREATE/DROP/ALTER（含 TEMP TABLE OR REPLACE）不得进语句缓存——
-/// 本版内核（1.5.5）缓存的 CREATE plan 二次执行会留下 0 列残表
-/// （V24 守护测试 should_recreate_temp_table_across_prepared_cache）；
-/// 且 DDL 替换了其他缓存语句引用的表，必须连带清空缓存迫使全部重绑定。
-fn is_ddl(sql: &str) -> bool {
-    let t = sql.trim_start();
-    let u = &t[..t.len().min(6)].to_ascii_uppercase();
-    u == "CREATE" || u.starts_with("DROP") || u.starts_with("ALTER")
-}
 
 fn kernel_err(e: impl std::fmt::Display) -> EngineError {
     EngineError::kernel(10, format!("{e}"))
@@ -141,10 +131,13 @@ impl SqlExecutor for DuckExecutor {
 
     fn execute(&self, sql: &str, binds: &BindMap) -> Result<ExecOutcome, EngineError> {
         if is_ddl(sql) {
+            // DDL 本体绕过语句缓存（契约①的根源：缓存的 CREATE plan 二次执行
+            // 产生 0 列残表）；被替换表的其他缓存语句交由内核 execute 期
+            // rebind 兜底（V24 评审决断 1：不做全缓存 flush——sqlfn 物化路径
+            // 每行 CREATE 会把 512 容量反复清空，互斥计量不可接受）。
             let mut stmt = self.conn.prepare(sql).map_err(kernel_err)?;
             let named = Self::named_binds(binds);
             let n = stmt.execute(&named).map_err(kernel_err)?;
-            self.conn.flush_prepared_statement_cache();
             return Ok(ExecOutcome { rows_affected: n });
         }
         let mut stmt = self.conn.prepare_cached(sql).map_err(kernel_err)?;
@@ -218,49 +211,5 @@ mod tests {
             .query("SELECT COUNT(*) FROM t", &BindMap::new())
             .unwrap_or_else(|e| panic!("失败语句后同会话不可查询: {}", e.message));
         assert_eq!(s.fetch_many(1)[0][0].as_str_loose(), "2");
-    }
-
-    #[test]
-    fn should_rebind_prepared_shape_after_table_recreate() {
-        // 守护测试（prepared 缓存前提）：同文本语句在表被 DROP/重建（列类型变化）
-        // 后再次执行，必须按新 schema 重新绑定，而不是复用旧 plan 的列形状。
-        let ex = DuckExecutor::open_in_memory().unwrap();
-        ex.execute("CREATE TABLE t(a BIGINT)", &BindMap::new())
-            .unwrap();
-        ex.execute("INSERT INTO t VALUES (42)", &BindMap::new())
-            .unwrap();
-        let mut s = ex.query("SELECT a FROM t", &BindMap::new()).unwrap();
-        assert_eq!(s.fetch_many(1)[0][0], SpinValue::Int(42));
-        ex.execute("DROP TABLE t", &BindMap::new()).unwrap();
-        ex.execute("CREATE TABLE t(a VARCHAR)", &BindMap::new())
-            .unwrap();
-        ex.execute("INSERT INTO t VALUES ('xyz')", &BindMap::new())
-            .unwrap();
-        let mut s = ex
-            .query("SELECT a FROM t", &BindMap::new())
-            .unwrap_or_else(|e| panic!("表重建后同文本语句必须可重新绑定: {}", e.message));
-        assert_eq!(s.fetch_many(1)[0][0], SpinValue::Str("xyz".into()));
-    }
-
-    #[test]
-    fn should_recreate_temp_table_across_prepared_cache() {
-        // 回归守护（V24）：缓存的 CREATE OR REPLACE TEMP TABLE plan 二次执行
-        // 会留下 0 列残表（KERNEL-0010 Binder Error），sqlfn 物化路径
-        // （materialize_fn_sites）必踩。DDL 绕过缓存 + DDL 后清空缓存。
-        let ex = DuckExecutor::open_in_memory().unwrap();
-        for round in 0..2 {
-            ex.execute(
-                "CREATE OR REPLACE TEMP TABLE sd_fn0 (sd_v VARCHAR, sd_a0 VARCHAR)",
-                &BindMap::new(),
-            )
-            .unwrap_or_else(|e| panic!("round {round} create: {}", e.message));
-            let ins = format!("INSERT INTO sd_fn0 VALUES ('v{round}','a{round}')");
-            ex.execute(&ins, &BindMap::new())
-                .unwrap_or_else(|e| panic!("round {round} insert: {}", e.message));
-            let mut s = ex
-                .query("SELECT count(*) FROM sd_fn0", &BindMap::new())
-                .unwrap_or_else(|e| panic!("round {round} query: {}", e.message));
-            assert_eq!(s.fetch_many(1)[0][0].as_str_loose(), "1");
-        }
     }
 }

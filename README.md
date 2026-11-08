@@ -143,7 +143,7 @@ kind = "function"
 | SQL 上下文函数分派 | ✅ 表达式级→内核宏（路径③）；已注册例程调用→参数元组缓存化下沉（路径②，`sqlfn`）；路径① UDF 仍推迟（`architecture.md` §8.3） |
 | `EXECUTE IMMEDIATE`（静态文本与运行期拼接同一管线） | ✅ 与 OPEN FOR 共用解析/改写管线；`USING` 绑定 ⛔ 待做（`ENG-0058`，变量须先拼进文本） |
 | 事务标记 `COMMIT`/`ROLLBACK` | ✅ 统一事务边界：最外层调用包 `BEGIN…COMMIT`，过程内 `COMMIT`/`ROLLBACK` 即时生效并重开（`architecture.md` §3.5） |
-| GaussDB 物化/回写 | ✅（文本承载；回写走线协议 COPY 单事务追加、物化 500 行/语句批量 INSERT，实测 100k/98k 分别 26s/1.2s，见 validation V24.4） |
+| GaussDB 物化/回写 | ✅（文本承载；回写走驱动 `copy_in`（COPY FROM STDIN）单事务追加、物化 500 行/语句批量 INSERT，实测 100k/98k 分别 26s/1.2s，见 validation V26.4） |
 | `rownum = 1` 首行谓词 | ✅ `[patterns] rownum_first_row`（AST 级，语料 42 处：顶层 SELECT 与 `INSERT … SELECT` 子查询；UPDATE/DELETE 无对应语法位，原样下发由内核报错） |
 | 记录变量限定字段下发 SQL（`INSERT … VALUES (r.field)`） | ✅ `BindSrc::Field`（`$v_<rec>__<field>` 绑定） |
 | `%ROWTYPE` 整行记录 + 显式 `FETCH c INTO rec` | ✅ |

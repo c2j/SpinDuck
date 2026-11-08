@@ -12,13 +12,14 @@
 use crate::error::EngineError;
 use crate::exec::{BindMap, SqlExecutor};
 use crate::runtime::interp::dynamic::sql_literal;
+use crate::runtime::interp::Env;
 use std::cell::RefCell;
 use std::rc::Rc;
 
 /// 缓冲行数上限：超过即刷盘（内存上界）。
 const WRITE_BUF_CAP: usize = 10_000;
 
-pub(super) type WBufOpt = Option<Rc<RefCell<WriteBuffer>>>;
+pub(in crate::runtime) type WBufOpt = Option<Rc<RefCell<WriteBuffer>>>;
 
 struct BufGroup {
     /// "insert into <表> (列清单)" 前缀（分组键，逐字一致才合并）
@@ -28,18 +29,25 @@ struct BufGroup {
 }
 
 /// 顶层调用的延迟写缓冲（嵌套例程各自持有独立缓冲，例程边界即刷盘点）。
-pub(super) struct WriteBuffer {
+pub(in crate::runtime) struct WriteBuffer {
     groups: Vec<BufGroup>,
     buffered: usize,
 }
 
 impl WriteBuffer {
-    /// 已缓冲表名（读自己写的刷盘判定）。
+    /// 已缓冲表名（读自己写的刷盘判定）：保留 `schema.table` 全名与
+    /// 去引号形态各一份——touches 侧分词会把 `sch.t` 切成两段，
+    /// 全名与尾段都要能命中（V24 评审应修 9：限定名漏判 → 读到旧数据）。
     fn tables(&self) -> Vec<String> {
         let mut out = Vec::new();
         for g in &self.groups {
-            if let Some(t) = g.prefix.split_whitespace().nth(2) {
-                out.push(t.trim_end_matches('(').to_string());
+            let Some(t) = g.prefix.split_whitespace().nth(2) else {
+                continue;
+            };
+            let t = t.trim_end_matches('(').trim_matches('"').to_string();
+            out.push(t.clone());
+            if let Some((_, last)) = t.rsplit_once('.') {
+                out.push(last.to_string());
             }
         }
         out
@@ -48,32 +56,34 @@ impl WriteBuffer {
     /// 攒一条 INSERT；缓冲满则先刷盘。
     fn push(
         &mut self,
-        sql: &str,
+        prefix: String,
+        values_part: &str,
         binds: &BindMap,
         ex: &dyn SqlExecutor,
     ) -> Result<(), EngineError> {
         if self.buffered >= WRITE_BUF_CAP {
             self.flush(ex)?;
         }
-        let lower = sql.to_ascii_lowercase();
-        let Some(vpos) = lower.find(" values") else {
-            return Err(EngineError::invariant(
-                33,
-                "batch_commit: INSERT 语句缺少 VALUES 段".to_string(),
-            ));
-        };
-        let prefix = sql[..vpos].trim_end().to_string();
-        let values_part = &sql[vpos + " values".len()..];
         let row = literalize_values(values_part, binds)?;
+        // 同前缀连续攒入（游标循环形态），保持语句顺序
+        let is_last_same = self
+            .groups
+            .last()
+            .map(|g| g.prefix == prefix)
+            .unwrap_or(false);
+        if !is_last_same {
+            self.groups.push(BufGroup {
+                prefix,
+                rows: Vec::new(),
+            });
+        }
         let group = match self.groups.last_mut() {
-            // 同前缀连续攒入（游标循环形态），保持语句顺序
-            Some(g) if g.prefix == prefix => g,
-            _ => {
-                self.groups.push(BufGroup {
-                    prefix,
-                    rows: Vec::new(),
-                });
-                self.groups.last_mut().expect("just pushed")
+            Some(g) => g,
+            None => {
+                return Err(EngineError::invariant(
+                    33,
+                    "batch_commit: 缓冲组缺失".to_string(),
+                ))
             }
         };
         group.rows.push(row);
@@ -81,15 +91,20 @@ impl WriteBuffer {
         Ok(())
     }
 
-    /// 刷盘：同前缀合并为一条多值 INSERT；失败回退逐行重放。
+    /// 刷盘：逐组消费（每组处理完立即出账），同前缀合并为一条多值 INSERT；
+    /// 失败回退逐行重放。任何时刻失败，已下发组不重复（V24 评审阻塞项 3）。
     fn flush(&mut self, ex: &dyn SqlExecutor) -> Result<(), EngineError> {
-        for g in &self.groups {
+        while !self.groups.is_empty() {
+            let g = self.groups.remove(0);
             if g.rows.is_empty() {
+                self.buffered -= 0;
                 continue;
             }
             let merged = format!("{} VALUES {}", g.prefix, g.rows.join(", "));
             if let Err(first_err) = ex.execute(&merged, &BindMap::new()) {
-                // 回退逐行：失败行按数据语义跳过；组内首行失败视为表级错误上抛
+                // 回退逐行：失败行按数据语义跳过；组内首行失败视为表级错误上抛。
+                // 上抛前先出账本组（已重放的行不重复），剩余组随外层错误丢弃。
+                self.buffered -= g.rows.len();
                 let mut first_row = true;
                 for row in &g.rows {
                     let stmt = format!("{} VALUES {}", g.prefix, row);
@@ -104,10 +119,10 @@ impl WriteBuffer {
                         }
                     }
                 }
+            } else {
+                self.buffered -= g.rows.len();
             }
         }
-        self.groups.clear();
-        self.buffered = 0;
         Ok(())
     }
 
@@ -127,8 +142,33 @@ fn literalize_values(values_part: &str, binds: &BindMap) -> Result<String, Engin
     let mut i = 0;
     let mut replaced = 0;
     while i < bytes.len() {
+        // 字符串字面量整体复制（'' 为转义引号）：内部 `$` 不是占位符
+        if bytes[i] == b'\'' {
+            out.push('\'');
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        out.push_str("''");
+                        i += 2;
+                        continue;
+                    }
+                    out.push('\'');
+                    i += 1;
+                    break;
+                }
+                let Some(ch) = values_part[i..].chars().next() else {
+                    break;
+                };
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+            continue;
+        }
         if bytes[i] != b'$' {
-            let ch = values_part[i..].chars().next().expect("non-empty");
+            let Some(ch) = values_part[i..].chars().next() else {
+                break;
+            };
             out.push(ch);
             i += ch.len_utf8();
             continue;
@@ -167,65 +207,83 @@ fn is_insert(sql: &str) -> bool {
 
 /// SQL 文本的标识符 token 集（小写），用于「是否触及缓冲表」判定。
 fn touches_buffered_table(sql: &str, tables: &[String]) -> bool {
-    sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .any(|t| tables.iter().any(|bt| t.eq_ignore_ascii_case(bt)))
+    // 标识符字符集含 '.' 与 '"'：限定名 `sch.t` 成单 token 参与匹配
+    sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"'))
+        .map(|t| t.trim_matches('"').to_ascii_lowercase())
+        .any(|t| tables.iter().any(|bt| bt.eq_ignore_ascii_case(&t)))
 }
 
 /// 开关 ON 时：INSERT 攒缓冲（返回 true = 已缓冲，调用方跳过即时下发）；
 /// 其余语句先按表命中刷盘（读自己写），返回 false 走原路径。
-pub(super) fn take_insert(
-    ex: &dyn SqlExecutor,
-    wbuf: &mut WBufOpt,
+pub(in crate::runtime) fn take_insert(
+    env: &mut Env<'_>,
     sql: &str,
-    binds: &BindMap,
+    binds_src: &[(String, crate::ir::BindSrc)],
 ) -> Result<bool, EngineError> {
-    let Some(rc) = wbuf else {
+    let Some(rc) = env.wbuf.clone() else {
         return Ok(false);
     };
     if !is_insert(sql) {
         let tables = rc.borrow().tables();
         if !tables.is_empty() && touches_buffered_table(sql, &tables) {
-            rc.borrow_mut().flush(ex)?;
+            rc.borrow_mut().flush(env.ex)?;
         }
         return Ok(false);
     }
-    rc.borrow_mut().push(sql, binds, ex)?;
+    // 可缓冲判定前置：只有「INSERT INTO 表 (列) VALUES (标量列表)」形态才攒批；
+    // INSERT … SELECT 等不可字面量化的形态回落即时下发（V24 评审阻塞项 2——
+    // 该形态是形态覆盖门禁已断言的合法输入，不能当作错误）。
+    let lower = sql.to_ascii_lowercase();
+    let Some(vpos) = lower.find(" values") else {
+        // 不可缓冲形态（如 INSERT … SELECT）：回落即时下发（评审阻塞项 2——
+        // 该形态是形态覆盖门禁已断言的合法输入，不能当作错误）。
+        let tables = rc.borrow().tables();
+        if !tables.is_empty() && touches_buffered_table(sql, &tables) {
+            rc.borrow_mut().flush(env.ex)?;
+        }
+        return Ok(false);
+    };
+    let prefix = sql[..vpos].trim_end().to_string();
+    let values_part = &sql[vpos + " values".len()..];
+    // 仅此处（攒批路径）解析绑定源；OFF 路径不付解析成本（评审：双重解析）
+    let resolved = crate::runtime::interp::resolve_binds(binds_src, env.frame)?;
+    rc.borrow_mut()
+        .push(prefix, values_part, &resolved, env.ex)?;
     Ok(true)
 }
 
 /// 开关 ON 时：语句触及缓冲表则先刷盘（读自己写）。
-pub(super) fn flush_if_touches(
-    ex: &dyn SqlExecutor,
-    wbuf: &mut WBufOpt,
+pub(in crate::runtime) fn flush_if_touches(
+    env: &mut Env<'_>,
     sql: &str,
 ) -> Result<(), EngineError> {
-    let Some(rc) = wbuf else {
+    let Some(rc) = env.wbuf.clone() else {
         return Ok(());
     };
     let tables = rc.borrow().tables();
     if !tables.is_empty() && touches_buffered_table(sql, &tables) {
-        rc.borrow_mut().flush(ex)?;
+        rc.borrow_mut().flush(env.ex)?;
     }
     Ok(())
 }
 
 /// 开关 ON 时：无条件刷盘（例程出口 / 动态 SQL 前的保守点）。
-pub(super) fn flush_all(ex: &dyn SqlExecutor, wbuf: &mut WBufOpt) -> Result<(), EngineError> {
-    if let Some(rc) = wbuf {
-        rc.borrow_mut().flush(ex)?;
+pub(in crate::runtime) fn flush_all(env: &mut Env<'_>) -> Result<(), EngineError> {
+    if let Some(rc) = env.wbuf.clone() {
+        rc.borrow_mut().flush(env.ex)?;
     }
     Ok(())
 }
 
 /// 放弃缓冲（ROLLBACK 路径：缓冲从未下发，直接丢弃）。
-pub(super) fn discard(wbuf: &mut WBufOpt) {
-    if let Some(rc) = wbuf {
+pub(in crate::runtime) fn discard(env: &mut Env<'_>) {
+    if let Some(rc) = env.wbuf.clone() {
         rc.borrow_mut().flush_discard();
     }
 }
 
 /// 顶层调用入口构造缓冲（`Engine::batch_commit` = true 时为 Some）。
-pub(super) fn shared_buffer() -> WBufOpt {
+pub(in crate::runtime) fn shared_buffer() -> WBufOpt {
     Some(Rc::new(RefCell::new(WriteBuffer {
         groups: Vec::new(),
         buffered: 0,

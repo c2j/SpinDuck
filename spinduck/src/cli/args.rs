@@ -39,6 +39,8 @@ pub enum Command {
         files: Vec<PathBuf>,
         routine: String,
         args: Vec<String>,
+        /// 合并 COMMIT 开关（V26，默认关；见 writebuf.rs 语义边界）。
+        batch_commit: bool,
     },
 }
 
@@ -92,7 +94,8 @@ fn parse_verify(rest: &[String]) -> Result<Command, EngineError> {
 }
 
 fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
-    let mut db = None;
+    let mut db: Option<PathBuf> = None;
+    let mut batch_commit = false;
     let mut rules = None;
     let mut files = Vec::new();
     let mut routine = None;
@@ -115,6 +118,9 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
                     it.next().ok_or_else(|| usage_err("--file <path>"))?,
                 ));
             }
+            "--batch-commit" => {
+                batch_commit = true;
+            }
             t if t.starts_with("--") => {
                 return Err(usage_err(format!("unknown flag {t}")));
             }
@@ -134,6 +140,7 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
         files,
         routine,
         args,
+        batch_commit,
     })
 }
 
@@ -265,7 +272,7 @@ pub fn usage() -> &'static str {
 \
      \x20                                本地 DuckDB 回写追加到 GaussDB（需 feature gauss）
 \
-     \x20 call [--db <f>] [--rules <f>] [--file <sql>]... <routine> [args...]\n\
+     \x20 call [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] <routine> [args...]\n\
      \x20                                注册 SQL 文件内例程并调用（args: 整数/小数/'串'/null）\n"
 }
 
@@ -316,6 +323,7 @@ mod tests {
                 files: vec![PathBuf::from("pkg.sql")],
                 routine: "prc_x".to_string(),
                 args: v(&["1", "2"]),
+                batch_commit: false,
             }
         );
     }

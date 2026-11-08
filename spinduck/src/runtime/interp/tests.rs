@@ -551,3 +551,28 @@ fn should_replay_batch_and_skip_failing_row_when_batch_commit_on() {
     assert_eq!(out.unwrap(), RunOutcome::Completed);
     assert_eq!(ex.ok_execs.get(), 2, "合并失败后逐行重放：两个好行落库");
 }
+
+#[test]
+fn should_fall_back_to_immediate_exec_for_insert_select_when_batch_commit_on() {
+    // 评审阻塞项 2：INSERT … SELECT 是形态覆盖门禁已断言的合法形态，
+    // 开关 ON 时不可缓冲 → 回落即时下发（不得 ENG-0033 上抛）
+    use ogsql_parser::parser::Parser;
+    use ogsql_parser::token::tokenizer::Tokenizer;
+    let sql = "INSERT INTO t2 (a) SELECT a FROM t1";
+    let parsed = Parser::new(Tokenizer::new(sql).tokenize().unwrap())
+        .parse()
+        .remove(0);
+    let ins_sel = PlStatement::SqlStatement {
+        span: None,
+        sql_text: sql.to_string(),
+        statement: Box::new(parsed),
+    };
+    let ex = FakeExecutor::default();
+    let (_, out) = run_pl_batch(vec![insert_stmt("t1", "'x'"), ins_sel], &ex, true);
+    assert_eq!(out.unwrap(), RunOutcome::Completed);
+    let calls = ex.calls();
+    assert!(
+        calls.iter().any(|(s, _)| s.starts_with("INSERT INTO t2")),
+        "回落路径必须真实下发 INSERT…SELECT"
+    );
+}

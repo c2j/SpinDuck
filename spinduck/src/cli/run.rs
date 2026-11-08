@@ -81,12 +81,14 @@ fn cmd_call(cmd: Command) -> CallParts {
             files,
             routine,
             args,
+            batch_commit,
         } => CallParts {
             db,
             rules,
             files,
             routine,
             args,
+            batch_commit,
         },
         _ => unreachable!("cmd_call only for Call"),
     }
@@ -132,6 +134,7 @@ struct CallParts {
     files: Vec<PathBuf>,
     routine: String,
     args: Vec<String>,
+    batch_commit: bool,
 }
 
 /// 语料目录的规则口径：内置种子为基座 + 各路径向上发现的 `spinduck.toml`
@@ -240,6 +243,7 @@ fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, EngineError> {
         None => crate::sql::DuckExecutor::open_in_memory()?,
     };
     let mut eng = Engine::new(Box::new(ex), rules);
+    eng.batch_commit = parts.batch_commit;
     for f in &parts.files {
         let (text, _) = crate::cli::read_source(f)?;
         eng.register(&text)?;

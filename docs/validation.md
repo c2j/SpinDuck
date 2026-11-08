@@ -1454,6 +1454,14 @@ V9 表已补记。
   以及仓库内的 `./spinduck/target/debug/spinduck compile golden/case_corpus_purchase/sql`
   → `files=7 ok=7 failed=0 routines=6`（本轮实跑）。
 
+
+> **后续事实（2026-11-08，V26.5 回写）**：V21.9–V21.12 的「参照实例不可作为
+> 过程执行基线」结论**只在 5.0.0 amd64 成立**。开发机复现确认（干净实例裸
+> CALL → postmaster exit 0，RestartCount 0→1→2，服务端零错误日志）后，
+> 性能基准改用 openGauss 7.0.0-RC3 作替代参照：同夹具 3 行种子冒烟产物与
+> 黄金断言逐值一致后才采用；裸 CALL 同语句在 7.0-RC3 上正常完成并落行。
+> 口径详见 V26.5。
+
 ## V24. 数据通道认证面：sha256 实测可连，驱动由 `postgres` 换为 `gaussdb::sync`
 
 **结论**：README「已知限制」里"GaussDB 侧若为 sha256 口令认证，纯 Rust `postgres`
@@ -1768,15 +1776,22 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
 - 依据：COMMIT 1.05ms + 单行 INSERT 0.99ms 占内核时间 44%，只能靠事务边界
   合批消化——属对 §3.5「过程内 COMMIT 即时生效」的显式偏离，故为 opt-in 开关。
 - 语义（四条，`writebuf.rs` 头注释为准）：① 过程内 COMMIT 吞并，INSERT 攒批
-  合并 500 行/语句，出口统一刷盘由 `engine.call` 最终 COMMIT 持久化；② 触及
+  合并（同前缀连续攒入为一组，每组刷盘为一条多值 INSERT；缓冲行数上限
+  10,000），出口统一刷盘由 `engine.call` 最终 COMMIT 持久化；② 触及
   缓冲表的语句先刷盘（读自己写）；③ 合并失败回退逐行重放，失败行**数据级
   跳过**——与 OFF 的差异是该行不进 PL 异常处理器（inst_log 缺失），组内首行
   失败视为表级错误上抛；④ 嵌套例程边界即刷盘点（各自独立缓冲；SQL 上下文
   函数调用不批——语料函数体无 INSERT）。
 - 实测（10k 稳态）：46.6s→23.6s（**−49%**）；100k 首跑 439.3→264.3s、稳态
   911.7→316.2s；语句 786,017→494,015。产物逐值一致（三组运行）。
-- 测试 4 个（interp 层 FakeExecutor 计数）：合并+吞并（ON）、逐行 COMMIT
-  （OFF 默认守护）、触及缓冲表先刷盘、合并失败回退跳过。
+- 评审修复（V24 PR 审查实测抓出，各带回归覆盖）：① `INSERT … SELECT`
+  不可缓冲形态回落即时下发（原 ENG-0033 上抛，语料合法形态）；② flush
+  失败时逐组出账（原多组部分成功后重复下发）；③ `INSERT INTO sch.t`
+  限定名的读自己写命中（原 token 切分漏判）；④ 字符串字面量内的 `$`
+  不再误判为占位符；⑤ push 改收已验证前缀（原不可达错误分支）。
+- 测试 5 个（interp 层 FakeExecutor 计数）：合并+吞并（ON）、逐行 COMMIT
+  （OFF 默认守护）、触及缓冲表先刷盘、合并失败回退跳过、INSERT…SELECT
+  回落即时下发。
 - 实现中由测试/基准抓出的自身缺陷（各一条，均修复）：
   ① md5 外层摘要误用 16 字节 raw digest——正确输入是 inner 的 **32 字符
   hex ASCII 串**（服务端 28P01）；
@@ -1787,29 +1802,27 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
   ④ VALUES 表达式是复合形态（`round(($a-$b)/$c, 2)`）——字面量化必须
   占位符**就地文本替换**，按值提取会拆散表达式导致列/值错位（22→26 值实测）。
 
-### V26.4 数据搬运：postgres crate 的 copy_in 对 openGauss 静默无效 → 简单协议 COPY IN
+### V26.4 数据搬运批量通道：postgres crate 的 copy_in 静默无效 → `gaussdb::sync` 驱动通道
 
-- **存证**：`postgres` crate 0.19 的 `copy_in`（扩展协议 Parse/Bind/Execute）
-  对 openGauss 5.0.0/7.0.0-RC3 均**不报错且 0 行落库**（CSV 与文本两种格式
-  变体实测）；同表 gsql `\copy` 成功（2 行）——服务端 COPY 能力正常，
-  缺口在扩展协议交互。
-- **可行域实测**：手写简单协议会话（TcpStream：Startup → md5 认证 →
-  `Q`("COPY … FROM STDIN") → `G` → `d`×N → `c` → `C`/`Z`）在两代内核全绿：
-  10 万行 104.6ms（5.0.0）/ 142.8ms（7.0.0-RC3）。落地为 `io/gauss.rs` 的
-  `WireCopy`（回写整次单事务原子追加，服务端/本地行数交叉校验）。
-- **线协议四条契约**（探针钉死，代码注释与 `tests/wire_probe.rs` 存证，改动
-  必须重跑）：
-  ① md5 PasswordMessage 的长度字段**必须含结尾 `\0`**——短一字节即
-  `invalid password packet size` 后字节流错位；
-  ② 收到 `G` 必须立即转入数据流——继续读会与服务端互等死锁（服务端
-  `CONTEXT: COPY …, line 1` + 客户端读超时即此症状）；
-  ③ COPY 数据流期间禁发任何其他消息——`Q` 即
-  `08P01 unexpected message type 0x51 during COPY from stdin`；
-  ④ `CopyInResponse` 的 body[0] 是全局格式码（0=text/1=binary），成功标志是
-  消息 tag `G` 本身。
-- 实测：回写 98k 204.0s→**1.18s**（480→82,738 行/s）；物化 100k 244.7s→**26.0s**
-  （409→3,853 行/s，500 行/语句批量 INSERT——字面量形态与逐行逐字一致）。
-- 行数核对：回写前后服务端 `196,000 → 294,000`（+98,000 精确）。
+- **旧驱动缺陷存证**：`postgres` crate 0.19 的 `copy_in`（扩展协议
+  Parse/Bind/Execute）对 openGauss 5.0.0/7.0.0-RC3 均**不报错且 0 行落库**
+  （CSV 与文本两种格式变体实测）；同表 gsql `\copy` 成功——服务端 COPY
+  能力正常，缺口在扩展协议交互。历史对照：手写简单协议会话（TcpStream
+  Startup → md5 → `Q`/`G`/`d`/`c`）曾在此驱动上打通（10 万行 104–143ms），
+  探针存证于 V24 初稿（未入库，结论保留在此）。
+- **落地（V26 重做口径）**：驱动换 `gaussdb::sync`（V24）后，其 `copy_in` /
+  `CopyInWriter`（`opengauss-protocol` 独立协议实现，**非** tokio-postgres
+  fork）对 openGauss 实测可用——`sync_append` 切换为驱动 `copy_in`
+  （COPY FROM STDIN，CSV 分块写入，`finish()` 行数与本地计数交叉校验，
+  单事务原子追加）；`materialize` 为 500 行/语句批量多值 INSERT。双内核
+  e2e（`gauss_e2e`）与 100k/98k 全量实测通过。
+- **实测（V26 重做后）**：回写 98k 204.0s→**0.89s**（480→110,236 行/s）；
+  物化 100k 244.7s→**25.6s**（409→3,903 行/s）。行数核对：回写前后服务端
+  行数精确 +98,000。
+- **退役说明**：初稿的手写线协议会话（含 md5-only 限制与四条协议契约
+  ——md5 长度含 `\0` / `G` 即转数据流 / COPY 期禁发 `Q` / `G` body[0]
+  为格式码）随驱动通道退役，不再构成回写路径的认证面限制（sha256 实例
+  由驱动原生支持，V24 结论原样成立）。
 
 ### V26.5 参照实例 V21.9 的本机复现；7.0.0-RC3 替代口径的验证依据
 
