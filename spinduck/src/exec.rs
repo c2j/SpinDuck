@@ -4,7 +4,7 @@
 use crate::error::EngineError;
 use crate::value::SpinValue;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// 按名绑定表：编译期变量替换产生 `$v_<名>` 占位符，运行期按名绑定。
 pub type BindMap = BTreeMap<String, SpinValue>;
@@ -50,6 +50,114 @@ impl RowStream {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecOutcome {
     pub rows_affected: usize,
+}
+
+/// 纯标量函数白名单（仅这些名字的 FROM-less SELECT 记忆化）。
+/// 判据从严：不在名单内的未知内建（可能非确定性，如 CURRENT_TIMESTAMP）
+/// 一律照常下发。来源：改写规则映射的确定性方言函数（rewrite-rules.toml）。
+const PURE_SCALAR_FNS: [&str; 5] = ["substring", "strftime", "strptime", "to_days", "date_diff"];
+
+/// 记忆化条目：结果 schema + 全行集（RowStream 可重建的最小集）。
+type MemoRows = (Vec<String>, Vec<Row>);
+
+#[derive(Debug, Default)]
+pub struct MemoCache {
+    entries: std::cell::RefCell<HashMap<String, MemoRows>>,
+}
+
+impl MemoCache {
+    pub fn clear(&self) {
+        self.entries.borrow_mut().clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.borrow().is_empty()
+    }
+}
+
+/// 纯标量 SELECT（`SELECT fn(args)`，无 FROM）的执行期记忆化执行器。
+///
+/// 语料游标循环把同一表达式语句按行重复下发，而参数组合通常只有少数几种
+/// （V24 计量：10k 行 78,400 次宏下发仅对应 4 种参数组合）。按
+/// （SQL 文本, 绑定值）缓存命中即免去内核 parse/plan/execute 全程。
+/// 表查询（含 FROM）与非白名单函数一律照常下发——不判断数据新鲜度，
+/// 因为白名单内的表达式是绑定的纯函数，调用期内结果不依赖任何表状态。
+pub struct MemoizingExecutor {
+    inner: Box<dyn SqlExecutor>,
+    cache: std::rc::Rc<MemoCache>,
+    inner_calls: std::cell::Cell<u64>,
+}
+
+fn memo_key(sql: &str, binds: &BindMap) -> Option<String> {
+    let t = sql.trim_start();
+    let rest = t.strip_prefix("SELECT")?;
+    let upper = t.to_ascii_uppercase();
+    if upper.contains(" FROM ") || upper.contains(';') {
+        return None;
+    }
+    let name = rest
+        .trim()
+        .split(|c: char| c == '(' || c.is_whitespace())
+        .next()?
+        .to_ascii_lowercase();
+    if !PURE_SCALAR_FNS.contains(&name.as_str()) {
+        return None;
+    }
+    Some(format!("{sql}\u{1}{binds:?}"))
+}
+
+impl MemoizingExecutor {
+    pub fn new(inner: Box<dyn SqlExecutor>) -> Self {
+        Self::with_cache(inner, std::rc::Rc::new(MemoCache::default()))
+    }
+
+    pub fn with_cache(inner: Box<dyn SqlExecutor>, cache: std::rc::Rc<MemoCache>) -> Self {
+        Self {
+            inner,
+            cache,
+            inner_calls: std::cell::Cell::new(0),
+        }
+    }
+
+    pub fn shared_cache(&self) -> std::rc::Rc<MemoCache> {
+        self.cache.clone()
+    }
+
+    pub fn clear_memo(&self) {
+        self.cache.clear();
+    }
+
+    pub fn inner_calls(&self) -> u64 {
+        self.inner_calls.get()
+    }
+}
+
+impl SqlExecutor for MemoizingExecutor {
+    fn query(&self, sql: &str, binds: &BindMap) -> Result<RowStream, EngineError> {
+        let Some(key) = memo_key(sql, binds) else {
+            self.inner_calls.set(self.inner_calls.get() + 1);
+            return self.inner.query(sql, binds);
+        };
+        if let Some((schema, rows)) = self.cache.entries.borrow().get(&key) {
+            return Ok(RowStream::new(schema.clone(), rows.clone()));
+        }
+        self.inner_calls.set(self.inner_calls.get() + 1);
+        let out = self.inner.query(sql, binds)?;
+        self.cache
+            .entries
+            .borrow_mut()
+            .insert(key, (out.schema.clone(), out.rows.clone()));
+        Ok(out)
+    }
+
+    fn execute(&self, sql: &str, binds: &BindMap) -> Result<ExecOutcome, EngineError> {
+        self.inner_calls.set(self.inner_calls.get() + 1);
+        self.inner.execute(sql, binds)
+    }
 }
 
 /// SQL 执行接缝：解释器/编译器唯一可见的内核能力面。
@@ -189,5 +297,110 @@ mod tests {
         let ex = FakeExecutor::default();
         let mut s = ex.query("SELECT 1", &BindMap::new()).unwrap();
         assert_eq!(s.fetch_many(2).len(), 0);
+    }
+
+    struct CountingExec {
+        queries: std::cell::Cell<u32>,
+        value: SpinValue,
+    }
+    impl CountingExec {
+        fn new(value: SpinValue) -> Self {
+            Self {
+                queries: std::cell::Cell::new(0),
+                value,
+            }
+        }
+    }
+    impl SqlExecutor for CountingExec {
+        fn query(&self, _sql: &str, _binds: &BindMap) -> Result<RowStream, EngineError> {
+            self.queries.set(self.queries.get() + 1);
+            Ok(RowStream::new(
+                vec!["v".into()],
+                vec![vec![self.value.clone()]],
+            ))
+        }
+        fn execute(&self, _sql: &str, _binds: &BindMap) -> Result<ExecOutcome, EngineError> {
+            self.queries.set(self.queries.get() + 1);
+            Ok(ExecOutcome { rows_affected: 1 })
+        }
+    }
+
+    fn binds(date: &str) -> BindMap {
+        let mut b = BindMap::new();
+        b.insert("$p0".to_string(), SpinValue::Str(date.to_string()));
+        b
+    }
+
+    #[test]
+    fn should_memoize_repeated_pure_scalar_select() {
+        let ex = MemoizingExecutor::new(Box::new(CountingExec::new(SpinValue::Int(90))));
+        let sql =
+            "SELECT strftime(strptime($p0, '%Y%m%d') + to_days(CAST($p1 AS INTEGER)), '%Y%m%d')";
+        let mut b = binds("20250715");
+        b.insert("$p1".to_string(), SpinValue::Int(90));
+        let v1 = ex
+            .query(sql, &b)
+            .unwrap()
+            .fetch_many(1)
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next())
+            .unwrap();
+        let v2 = ex
+            .query(sql, &b)
+            .unwrap()
+            .fetch_many(1)
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next())
+            .unwrap();
+        assert_eq!(v1, SpinValue::Int(90));
+        assert_eq!(v2, SpinValue::Int(90));
+        assert_eq!(ex.inner_calls(), 1);
+    }
+
+    #[test]
+    fn should_memoize_per_bind_values() {
+        let ex = MemoizingExecutor::new(Box::new(CountingExec::new(SpinValue::Int(1))));
+        let sql = "SELECT SUBSTRING($p0, 1, 2)";
+        let _ = ex.query(sql, &binds("20250715")).unwrap();
+        let _ = ex.query(sql, &binds("20250716")).unwrap();
+        assert_eq!(ex.inner_calls(), 2);
+    }
+
+    #[test]
+    fn should_not_memoize_table_selects() {
+        let ex = MemoizingExecutor::new(Box::new(CountingExec::new(SpinValue::Int(1))));
+        let sql = "SELECT t.fund_code FROM par_fund_partner AS t WHERE t.partner_code = $p0";
+        let _ = ex.query(sql, &binds("A0001")).unwrap();
+        let _ = ex.query(sql, &binds("A0001")).unwrap();
+        assert_eq!(ex.inner_calls(), 2);
+    }
+
+    #[test]
+    fn should_not_memoize_nondeterministic_functions() {
+        let ex = MemoizingExecutor::new(Box::new(CountingExec::new(SpinValue::Null)));
+        let sql = "SELECT CURRENT_TIMESTAMP()";
+        let _ = ex.query(sql, &binds("x")).unwrap();
+        let _ = ex.query(sql, &binds("x")).unwrap();
+        assert_eq!(ex.inner_calls(), 2);
+    }
+
+    #[test]
+    fn should_not_memoize_execute_statements() {
+        let ex = MemoizingExecutor::new(Box::new(CountingExec::new(SpinValue::Null)));
+        let _ = ex.execute("UPDATE t SET a = $p0", &binds("1")).unwrap();
+        let _ = ex.execute("UPDATE t SET a = $p0", &binds("1")).unwrap();
+        assert_eq!(ex.inner_calls(), 2);
+    }
+
+    #[test]
+    fn should_reexecute_after_memo_clear() {
+        let ex = MemoizingExecutor::new(Box::new(CountingExec::new(SpinValue::Int(7))));
+        let sql = "SELECT SUBSTRING($p0, 1, 2)";
+        let _ = ex.query(sql, &binds("20250715")).unwrap();
+        ex.clear_memo();
+        let _ = ex.query(sql, &binds("20250715")).unwrap();
+        assert_eq!(ex.inner_calls(), 2);
     }
 }

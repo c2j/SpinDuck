@@ -1,6 +1,6 @@
 // 解释器测试模块（自 interp.rs 拆分，行为不变，AGENTS §3）。
 use super::*;
-use crate::exec::FakeExecutor;
+use crate::exec::{BindMap, FakeExecutor, SqlExecutor};
 use crate::ir::compile_stmts;
 use crate::ir::VarName;
 use crate::value::SpinValue;
@@ -146,6 +146,67 @@ fn should_stop_infinite_loop_at_step_budget() {
     assert_eq!(err.code.to_string(), "ENG-0032");
 }
 
+fn run_pl_with_budget(
+    stmts: Vec<PlStatement>,
+    budget: u64,
+) -> (Frame, Result<RunOutcome, EngineError>) {
+    let prog = compile_stmts(&stmts).expect("compile");
+    let mut f = Frame::new();
+    let mut sink = crate::exec::TraceNoopSink;
+    let cat = crate::catalog::RoutineCatalog::new();
+    let out = run_with_catalog(
+        &prog,
+        &mut f,
+        &FakeExecutor::default(),
+        &mut sink,
+        &cat,
+        0,
+        crate::runtime::RunLimits {
+            budget,
+            batch_commit: false,
+        },
+    );
+    (f, out)
+}
+
+#[test]
+fn should_stop_loop_at_custom_step_budget() {
+    let stmt = PlStatement::Loop(ogsql_parser::ast::Spanned::new(
+        ogsql_parser::ast::plpgsql::PlLoopStmt {
+            label: None,
+            body: vec![],
+            end_label: None,
+        },
+        None,
+    ));
+    let (_, out) = run_pl_with_budget(vec![assign(var("v_i"), lit_int(0)), stmt], 100);
+    let err = out.unwrap_err();
+    assert_eq!(err.code.to_string(), "ENG-0032");
+    assert!(err.message.contains("(100)"), "实际消息: {}", err.message);
+}
+
+#[test]
+fn should_complete_loop_within_custom_step_budget() {
+    let body = vec![
+        assign(var("v_i"), bin(var("v_i"), "+", lit_int(1))),
+        PlStatement::Exit {
+            label: None,
+            condition: Some(bin(var("v_i"), ">=", lit_int(50))),
+        },
+    ];
+    let stmt = PlStatement::Loop(ogsql_parser::ast::Spanned::new(
+        ogsql_parser::ast::plpgsql::PlLoopStmt {
+            label: None,
+            body,
+            end_label: None,
+        },
+        None,
+    ));
+    let (f, out) = run_pl_with_budget(vec![assign(var("v_i"), lit_int(0)), stmt], 1000);
+    assert_eq!(out.unwrap(), RunOutcome::Completed);
+    assert_eq!(f.get(&VarName("v_i".into())), Some(&SpinValue::Int(50)));
+}
+
 #[test]
 fn should_raise_business_error_with_message() {
     use ogsql_parser::ast::plpgsql::PlRaiseStmt;
@@ -281,4 +342,212 @@ fn should_reject_sql_statements_at_m2_scope() {
     let err = compile_stmts(&[PlStatement::Sql("SELECT 1".into())]).unwrap_err();
     assert_eq!(err.domain, crate::error::FaultDomain::Engine);
     assert!(err.message.contains("not yet supported"));
+}
+
+fn run_pl_batch(
+    stmts: Vec<PlStatement>,
+    ex: &FakeExecutor,
+    batch: bool,
+) -> (Frame, Result<RunOutcome, EngineError>) {
+    let prog = compile_stmts(&stmts).expect("compile");
+    let mut f = Frame::new();
+    let mut sink = crate::exec::TraceNoopSink;
+    let cat = crate::catalog::RoutineCatalog::new();
+    let out = run_with_catalog(
+        &prog,
+        &mut f,
+        ex,
+        &mut sink,
+        &cat,
+        0,
+        crate::runtime::RunLimits {
+            budget: DEFAULT_STEP_BUDGET,
+            batch_commit: batch,
+        },
+    );
+    (f, out)
+}
+
+fn insert_stmt(table: &str, val: &str) -> PlStatement {
+    use ogsql_parser::parser::Parser;
+    use ogsql_parser::token::tokenizer::Tokenizer;
+    let sql = format!("INSERT INTO {table} (a) VALUES ({val})");
+    let parsed = Parser::new(Tokenizer::new(sql.as_str()).tokenize().unwrap())
+        .parse()
+        .remove(0);
+    PlStatement::SqlStatement {
+        span: None,
+        sql_text: sql,
+        statement: Box::new(parsed),
+    }
+}
+
+fn commit_stmt() -> PlStatement {
+    PlStatement::Commit { and_chain: false }
+}
+
+fn count_loop_body() -> Vec<PlStatement> {
+    vec![
+        assign(var("v_i"), bin(var("v_i"), "+", lit_int(1))),
+        insert_stmt("t", "v_i"),
+        commit_stmt(),
+        PlStatement::Exit {
+            label: None,
+            condition: Some(bin(var("v_i"), ">=", lit_int(3))),
+        },
+    ]
+}
+
+#[test]
+fn should_coalesce_inserts_and_commits_when_batch_commit_on() {
+    let ex = FakeExecutor::default();
+    let (_, out) = run_pl_batch(
+        vec![
+            assign(var("v_i"), lit_int(0)),
+            PlStatement::Loop(ogsql_parser::ast::Spanned::new(
+                ogsql_parser::ast::plpgsql::PlLoopStmt {
+                    label: None,
+                    body: count_loop_body(),
+                    end_label: None,
+                },
+                None,
+            )),
+        ],
+        &ex,
+        true,
+    );
+    assert_eq!(out.unwrap(), RunOutcome::Completed);
+    let commits = ex.calls().iter().filter(|(s, _)| s == "COMMIT").count();
+    let merged = ex
+        .calls()
+        .iter()
+        .find(|(s, _)| s.starts_with("INSERT"))
+        .map(|(sql, _)| sql.clone());
+    assert_eq!(commits, 0, "开关 ON 时过程内 COMMIT 必须被吞并");
+    let insert_count = ex
+        .calls()
+        .iter()
+        .filter(|(s, _)| s.starts_with("INSERT"))
+        .count();
+    assert_eq!(insert_count, 1, "同表 INSERT 应合并为一条多值语句");
+    let tuples = merged
+        .as_deref()
+        .map(|s| s.matches('(').count())
+        .unwrap_or(0);
+    // 3 个行元组 + 1 个列清单括号
+    assert_eq!(tuples, 4, "多值语句应含 3 行元组 + 列清单: {tuples}");
+}
+
+#[test]
+fn should_commit_immediately_when_batch_commit_off() {
+    let ex = FakeExecutor::default();
+    let (_, out) = run_pl_batch(
+        vec![
+            assign(var("v_i"), lit_int(0)),
+            PlStatement::Loop(ogsql_parser::ast::Spanned::new(
+                ogsql_parser::ast::plpgsql::PlLoopStmt {
+                    label: None,
+                    body: count_loop_body(),
+                    end_label: None,
+                },
+                None,
+            )),
+        ],
+        &ex,
+        false,
+    );
+    assert_eq!(out.unwrap(), RunOutcome::Completed);
+    let commits = ex.calls().iter().filter(|(s, _)| s == "COMMIT").count();
+    let inserts = ex
+        .calls()
+        .iter()
+        .filter(|(s, _)| s.starts_with("INSERT"))
+        .count();
+    assert_eq!(commits, 3, "开关 OFF（默认）逐行 COMMIT 语义不变");
+    assert_eq!(inserts, 3, "开关 OFF 逐行下发");
+}
+
+#[test]
+fn should_flush_buffer_before_touching_table_when_batch_commit_on() {
+    // 读自己写：INSERT t 后 DELETE t（触及缓冲表）→ 必须先刷盘再下发 DELETE
+    use ogsql_parser::parser::Parser;
+    use ogsql_parser::token::tokenizer::Tokenizer;
+    let del_sql = "DELETE FROM t WHERE a = 'x'";
+    let parsed = Parser::new(Tokenizer::new(del_sql).tokenize().unwrap())
+        .parse()
+        .remove(0);
+    let del = PlStatement::SqlStatement {
+        span: None,
+        sql_text: del_sql.to_string(),
+        statement: Box::new(parsed),
+    };
+    let ex = FakeExecutor::default();
+    let stmts = vec![insert_stmt("t", "'x'"), del];
+    let (_, out) = run_pl_batch(stmts, &ex, true);
+    assert_eq!(out.unwrap(), RunOutcome::Completed);
+    let calls = ex.calls();
+    assert!(calls[0].0.starts_with("INSERT"), "缓冲 INSERT 先刷盘");
+    assert!(calls[1].0.starts_with("DELETE"), "DELETE 后于刷盘下发");
+    assert_eq!(calls.len(), 2);
+}
+
+struct FailOnPattern {
+    pattern: &'static str,
+    ok_execs: std::cell::Cell<u32>,
+}
+impl SqlExecutor for FailOnPattern {
+    fn query(
+        &self,
+        _sql: &str,
+        _binds: &BindMap,
+    ) -> Result<crate::exec::RowStream, crate::error::EngineError> {
+        Ok(crate::exec::RowStream::new(vec![], vec![]))
+    }
+    fn execute(
+        &self,
+        sql: &str,
+        _binds: &BindMap,
+    ) -> Result<crate::exec::ExecOutcome, EngineError> {
+        if sql.contains(self.pattern) {
+            return Err(crate::error::EngineError::kernel(
+                10,
+                "constraint violation".to_string(),
+            ));
+        }
+        self.ok_execs.set(self.ok_execs.get() + 1);
+        Ok(crate::exec::ExecOutcome { rows_affected: 1 })
+    }
+}
+
+#[test]
+fn should_replay_batch_and_skip_failing_row_when_batch_commit_on() {
+    // 批内含坏行：合并语句失败 → 回退逐行 → 坏行跳过、好行落库、不误伤调用结果
+    let ex = std::rc::Rc::new(FailOnPattern {
+        pattern: "'bad'",
+        ok_execs: std::cell::Cell::new(0),
+    });
+    let stmts = vec![
+        insert_stmt("t", "'good1'"),
+        insert_stmt("t", "'bad'"),
+        insert_stmt("t", "'good2'"),
+    ];
+    let rc: std::rc::Rc<dyn SqlExecutor> = ex.clone();
+    let prog = compile_stmts(&stmts).expect("compile");
+    let mut f = Frame::new();
+    let mut sink = crate::exec::TraceNoopSink;
+    let cat = crate::catalog::RoutineCatalog::new();
+    let out = run_with_catalog(
+        &prog,
+        &mut f,
+        &*rc,
+        &mut sink,
+        &cat,
+        0,
+        crate::runtime::RunLimits {
+            budget: DEFAULT_STEP_BUDGET,
+            batch_commit: true,
+        },
+    );
+    assert_eq!(out.unwrap(), RunOutcome::Completed);
+    assert_eq!(ex.ok_execs.get(), 2, "合并失败后逐行重放：两个好行落库");
 }

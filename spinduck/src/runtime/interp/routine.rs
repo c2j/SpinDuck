@@ -6,7 +6,7 @@ use crate::exec::SqlExecutor;
 use crate::ir::{AssignTarget, IrExpr, VarName};
 use crate::runtime::eval::EvalEnv;
 use crate::runtime::frame::Frame;
-use crate::runtime::interp::{run_with_catalog, Env, RunOutcome};
+use crate::runtime::interp::{run_with_catalog, Env, RunLimits, RunOutcome, DEFAULT_STEP_BUDGET};
 use crate::value::SpinValue;
 
 /// CALL 例程：形参按名入被调帧，OUT/INOUT 按 `out_targets` 位置写回调用方。
@@ -50,6 +50,10 @@ pub(super) fn call(
         &mut noop,
         env.cat,
         env.depth + 1,
+        RunLimits {
+            budget: DEFAULT_STEP_BUDGET,
+            batch_commit: env.batch,
+        },
     )?;
     // OUT/INOUT 写回：按参数序对应 out_targets（None = 丢弃）
     for (i, p) in routine.params.iter().enumerate() {
@@ -89,7 +93,15 @@ pub(super) fn call_routine_value(
         callee.set(&VarName(p.name.to_ascii_lowercase()), v);
     }
     let mut noop = crate::exec::TraceNoopSink;
-    let out = run_with_catalog(&routine.prog, &mut callee, ex, &mut noop, cat, depth + 1)?;
+    let out = run_with_catalog(
+        &routine.prog,
+        &mut callee,
+        ex,
+        &mut noop,
+        cat,
+        depth + 1,
+        RunLimits::default(),
+    )?;
     Ok(match out {
         RunOutcome::Returned(Some(v)) => v,
         _ => SpinValue::Null,
