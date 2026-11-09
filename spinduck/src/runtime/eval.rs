@@ -115,6 +115,7 @@ fn eval_funccall(name: &str, args: &[IrExpr], env: &EvalEnv<'_>) -> Result<SpinV
         &mut crate::exec::TraceNoopSink,
         env.cat,
         env.depth + 1,
+        crate::runtime::interp::RunLimits::default(),
     )?;
     match out {
         RunOutcome::Returned(Some(v)) => Ok(v),

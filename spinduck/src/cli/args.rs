@@ -39,6 +39,11 @@ pub enum Command {
         files: Vec<PathBuf>,
         routine: String,
         args: Vec<String>,
+        /// 合并 COMMIT 开关（V26，默认关；见 writebuf.rs 语义边界）。
+        batch_commit: bool,
+        /// 步数预算覆盖（复核应修 C：默认预算跑不动 100k 级游标循环，
+        /// 大业务经此入口放大；None = 用引擎默认值）。
+        step_budget: Option<u64>,
     },
 }
 
@@ -92,7 +97,9 @@ fn parse_verify(rest: &[String]) -> Result<Command, EngineError> {
 }
 
 fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
-    let mut db = None;
+    let mut db: Option<PathBuf> = None;
+    let mut batch_commit = false;
+    let mut step_budget: Option<u64> = None;
     let mut rules = None;
     let mut files = Vec::new();
     let mut routine = None;
@@ -115,6 +122,20 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
                     it.next().ok_or_else(|| usage_err("--file <path>"))?,
                 ));
             }
+            "--batch-commit" => {
+                batch_commit = true;
+            }
+            "--step-budget" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| usage_err("--step-budget <n>"))?
+                    .parse::<u64>()
+                    .map_err(|_| usage_err("--step-budget <n>（正整数）"))?;
+                if v == 0 {
+                    return Err(usage_err("--step-budget <n>（正整数）"));
+                }
+                step_budget = Some(v);
+            }
             t if t.starts_with("--") => {
                 return Err(usage_err(format!("unknown flag {t}")));
             }
@@ -134,6 +155,8 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
         files,
         routine,
         args,
+        batch_commit,
+        step_budget,
     })
 }
 
@@ -265,7 +288,7 @@ pub fn usage() -> &'static str {
 \
      \x20                                本地 DuckDB 回写追加到 GaussDB（需 feature gauss）
 \
-     \x20 call [--db <f>] [--rules <f>] [--file <sql>]... <routine> [args...]\n\
+     \x20 call [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>] <routine> [args...]\n\
      \x20                                注册 SQL 文件内例程并调用（args: 整数/小数/'串'/null）\n"
 }
 
@@ -316,8 +339,30 @@ mod tests {
                 files: vec![PathBuf::from("pkg.sql")],
                 routine: "prc_x".to_string(),
                 args: v(&["1", "2"]),
+                batch_commit: false,
+                step_budget: None,
             }
         );
+    }
+
+    #[test]
+    fn should_parse_call_with_step_budget() {
+        // 复核应修 C：100k 级游标循环默认预算（1M 步）跑不动，CLI 需放大入口
+        let c = parse(&v(&["call", "--step-budget", "20000000", "prc_x"])).unwrap();
+        assert_eq!(
+            c,
+            Command::Call {
+                db: None,
+                rules: None,
+                files: vec![],
+                routine: "prc_x".to_string(),
+                args: vec![],
+                batch_commit: false,
+                step_budget: Some(20_000_000),
+            }
+        );
+        let bad = parse(&v(&["call", "--step-budget", "0", "prc_x"])).unwrap_err();
+        assert!(bad.message.contains("--step-budget"));
     }
 
     #[test]

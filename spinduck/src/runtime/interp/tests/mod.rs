@@ -1,6 +1,8 @@
 // 解释器测试模块（自 interp.rs 拆分，行为不变，AGENTS §3）。
+// writebuf/batch_commit 块独立成子模块（§3 规模拆分，第四轮复核应修 ④）。
+mod writebuf;
 use super::*;
-use crate::exec::FakeExecutor;
+use crate::exec::{BindMap, FakeExecutor, SqlExecutor};
 use crate::ir::compile_stmts;
 use crate::ir::VarName;
 use crate::value::SpinValue;
@@ -146,6 +148,67 @@ fn should_stop_infinite_loop_at_step_budget() {
     assert_eq!(err.code.to_string(), "ENG-0032");
 }
 
+fn run_pl_with_budget(
+    stmts: Vec<PlStatement>,
+    budget: u64,
+) -> (Frame, Result<RunOutcome, EngineError>) {
+    let prog = compile_stmts(&stmts).expect("compile");
+    let mut f = Frame::new();
+    let mut sink = crate::exec::TraceNoopSink;
+    let cat = crate::catalog::RoutineCatalog::new();
+    let out = run_with_catalog(
+        &prog,
+        &mut f,
+        &FakeExecutor::default(),
+        &mut sink,
+        &cat,
+        0,
+        crate::runtime::RunLimits {
+            budget,
+            batch_commit: false,
+        },
+    );
+    (f, out)
+}
+
+#[test]
+fn should_stop_loop_at_custom_step_budget() {
+    let stmt = PlStatement::Loop(ogsql_parser::ast::Spanned::new(
+        ogsql_parser::ast::plpgsql::PlLoopStmt {
+            label: None,
+            body: vec![],
+            end_label: None,
+        },
+        None,
+    ));
+    let (_, out) = run_pl_with_budget(vec![assign(var("v_i"), lit_int(0)), stmt], 100);
+    let err = out.unwrap_err();
+    assert_eq!(err.code.to_string(), "ENG-0032");
+    assert!(err.message.contains("(100)"), "实际消息: {}", err.message);
+}
+
+#[test]
+fn should_complete_loop_within_custom_step_budget() {
+    let body = vec![
+        assign(var("v_i"), bin(var("v_i"), "+", lit_int(1))),
+        PlStatement::Exit {
+            label: None,
+            condition: Some(bin(var("v_i"), ">=", lit_int(50))),
+        },
+    ];
+    let stmt = PlStatement::Loop(ogsql_parser::ast::Spanned::new(
+        ogsql_parser::ast::plpgsql::PlLoopStmt {
+            label: None,
+            body,
+            end_label: None,
+        },
+        None,
+    ));
+    let (f, out) = run_pl_with_budget(vec![assign(var("v_i"), lit_int(0)), stmt], 1000);
+    assert_eq!(out.unwrap(), RunOutcome::Completed);
+    assert_eq!(f.get(&VarName("v_i".into())), Some(&SpinValue::Int(50)));
+}
+
 #[test]
 fn should_raise_business_error_with_message() {
     use ogsql_parser::ast::plpgsql::PlRaiseStmt;
@@ -281,4 +344,58 @@ fn should_reject_sql_statements_at_m2_scope() {
     let err = compile_stmts(&[PlStatement::Sql("SELECT 1".into())]).unwrap_err();
     assert_eq!(err.domain, crate::error::FaultDomain::Engine);
     assert!(err.message.contains("not yet supported"));
+}
+
+fn run_pl_batch(
+    stmts: Vec<PlStatement>,
+    ex: &FakeExecutor,
+    batch: bool,
+) -> (Frame, Result<RunOutcome, EngineError>) {
+    let prog = compile_stmts(&stmts).expect("compile");
+    let mut f = Frame::new();
+    let mut sink = crate::exec::TraceNoopSink;
+    let cat = crate::catalog::RoutineCatalog::new();
+    let out = run_with_catalog(
+        &prog,
+        &mut f,
+        ex,
+        &mut sink,
+        &cat,
+        0,
+        crate::runtime::RunLimits {
+            budget: DEFAULT_STEP_BUDGET,
+            batch_commit: batch,
+        },
+    );
+    (f, out)
+}
+
+fn insert_stmt(table: &str, val: &str) -> PlStatement {
+    use ogsql_parser::parser::Parser;
+    use ogsql_parser::token::tokenizer::Tokenizer;
+    let sql = format!("INSERT INTO {table} (a) VALUES ({val})");
+    let parsed = Parser::new(Tokenizer::new(sql.as_str()).tokenize().unwrap())
+        .parse()
+        .remove(0);
+    PlStatement::SqlStatement {
+        span: None,
+        sql_text: sql,
+        statement: Box::new(parsed),
+    }
+}
+
+fn commit_stmt() -> PlStatement {
+    PlStatement::Commit { and_chain: false }
+}
+
+fn count_loop_body() -> Vec<PlStatement> {
+    vec![
+        assign(var("v_i"), bin(var("v_i"), "+", lit_int(1))),
+        insert_stmt("t", "v_i"),
+        commit_stmt(),
+        PlStatement::Exit {
+            label: None,
+            condition: Some(bin(var("v_i"), ">=", lit_int(3))),
+        },
+    ]
 }

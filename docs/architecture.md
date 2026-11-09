@@ -281,6 +281,16 @@ PopFrame）。语义要点：
   默认**延迟事务模式**——过程体内的 COMMIT/ROLLBACK 记录为事务边界标记，
   在顶层 `CALL` 返回后统一执行；`strict_transactions = false` 选项下允许
   真实提交（文档明示与 GaussDB 的差异）。该差异必须写入兼容性清单。
+- **合并 COMMIT 开关**（`Engine::batch_commit`，默认 OFF；V26）：在"过程内
+  COMMIT 即时生效"的实现口径上，ON 时过程内 COMMIT 被吞并、INSERT 攒批
+  合并（同前缀连续攒入为一组，每组刷盘为一条多值 INSERT；缓冲行数上限
+  10,000），缓冲在例程出口统一刷盘、随顶层调用 COMMIT 一起
+  持久化。带 sqlfn 下沉（`fn_sites` 非空）或不可字面量化形态（INSERT … SELECT）
+  的语句不攒批、回落即时下发（`take_insert` 显式准入条件）。两处显式偏差：
+  ① 持久化粒度从行级变为调用级（连接中断不再留半截数据，亦不再逐行落盘）；
+  ② 合并语句失败回退逐行重放，失败行按数据
+  语义跳过、不进入 PL 异常处理器（inst_log 缺失）。机制细节见
+  `runtime/interp/writebuf.rs` 头注释，实证见 validation V26.3/V26.7。
 
 ### 3.6 目录与持久化
 
@@ -641,7 +651,13 @@ $SPINDUCK_HOME/                       # 根路径，配置项 home；默认 ./�
  "msg":"...", "err":"PL-04001"}            // 错误码来自异常映射表（规则数据）
 
 // audit 专属：{"user":"…","args_digest":"sha256:…","sql_count":12,"duration_ms":1843}
-// trace 专属：{"event":"SQL_EXEC|CURSOR_OPEN|FETCH|UDF_CALL|IR_STMT","detail":{…},"elapsed_us":97}
+// trace 专属：{"event":"SQL_EXEC|CURSOR_OPEN|FETCH|UDF_CALL|IR_STMT|BATCH_SKIP","detail":{…},"elapsed_us":97}
+//   BATCH_SKIP detail 形态（V26，第四轮复审确认并入契约）：
+//   {"event":"BATCH_SKIP","detail":{"rows":1,"first_error":"KERNEL-0010 constraint violation"},"elapsed_us":0}
+//   ——合并 COMMIT 开关 ON 的回放期被跳过行数与首个错误（含错误码）
+//   注意：exec_native 把所有 DuckDB 错误统一映射为 KERNEL-0010，因此该码
+//   不承担「引擎缺陷 vs 业务跳行」的判别维度——判别信号是 BatchSkip 事件
+//   本身 + first_error 的 message 文本，勿按错误码写告警规则（第五轮复审口径）
 // engine 专属：{"component":"interp|exec|catalog|rules","kv":{…}}
 ```
 

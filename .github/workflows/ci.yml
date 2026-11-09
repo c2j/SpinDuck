@@ -61,7 +61,9 @@ jobs:
         with:
           # uses: 步骤不跟随 defaults.working-directory；缺这行会静默退化成只缓存 registry（V25）
           workspaces: spinduck
-      - run: cargo test --features native
+      # cli 蕴含 native（覆盖面只增不减），并使 tests/cli.rs 的二进制契约层
+      # 真实运行（V26.10：--batch-commit/--step-budget 接线此前无测试面）
+      - run: cargo test --features cli
 
   audit:
     runs-on: ubuntu-latest

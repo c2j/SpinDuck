@@ -2,7 +2,7 @@
 //! 唯一允许触碰 duckdb crate 的模块（AGENTS.md §1）。
 
 use crate::error::EngineError;
-use crate::exec::{BindMap, ExecOutcome, Row, RowStream, SqlExecutor};
+use crate::exec::{is_ddl, BindMap, ExecOutcome, Row, RowStream, SqlExecutor};
 use crate::value::SpinValue;
 use duckdb::types::{Value, ValueRef};
 use duckdb::Connection;
@@ -13,6 +13,10 @@ pub struct DuckExecutor {
     conn: Connection,
 }
 
+/// prepared 语句缓存容量：语料工作集（≥50 条不同语句）远大于内核默认 16，
+/// LRU 淘汰会把热语句挤出缓存反噬吞吐（V24 计量：单工作集 ~10 条热语句）。
+const PREPARED_CACHE_CAPACITY: usize = 512;
+
 fn kernel_err(e: impl std::fmt::Display) -> EngineError {
     EngineError::kernel(10, format!("{e}"))
 }
@@ -20,15 +24,15 @@ fn kernel_err(e: impl std::fmt::Display) -> EngineError {
 impl DuckExecutor {
     /// 内存库（开发/测试默认）。
     pub fn open_in_memory() -> Result<Self, EngineError> {
-        Ok(Self {
-            conn: Connection::open_in_memory().map_err(kernel_err)?,
-        })
+        let conn = Connection::open_in_memory().map_err(kernel_err)?;
+        conn.set_prepared_statement_cache_capacity(PREPARED_CACHE_CAPACITY);
+        Ok(Self { conn })
     }
     /// 文件库（持久化运行态，§11.1 data/）。
     pub fn open(path: &str) -> Result<Self, EngineError> {
-        Ok(Self {
-            conn: Connection::open(path).map_err(kernel_err)?,
-        })
+        let conn = Connection::open(path).map_err(kernel_err)?;
+        conn.set_prepared_statement_cache_capacity(PREPARED_CACHE_CAPACITY);
+        Ok(Self { conn })
     }
     pub fn connection(&self) -> &Connection {
         &self.conn
@@ -96,7 +100,7 @@ impl DuckExecutor {
 
 impl SqlExecutor for DuckExecutor {
     fn query(&self, sql: &str, binds: &BindMap) -> Result<RowStream, EngineError> {
-        let mut stmt = self.conn.prepare(sql).map_err(kernel_err)?;
+        let mut stmt = self.conn.prepare_cached(sql).map_err(kernel_err)?;
         let named = Self::named_binds(binds);
         // duckdb 1.10505：列元数据在执行后才有效，故先 query 再取 schema
         let mut rows = stmt.query(&named).map_err(kernel_err)?;
@@ -126,7 +130,17 @@ impl SqlExecutor for DuckExecutor {
     }
 
     fn execute(&self, sql: &str, binds: &BindMap) -> Result<ExecOutcome, EngineError> {
-        let mut stmt = self.conn.prepare(sql).map_err(kernel_err)?;
+        if is_ddl(sql) {
+            // DDL 本体绕过语句缓存（契约①的根源：缓存的 CREATE plan 二次执行
+            // 产生 0 列残表）；被替换表的其他缓存语句交由内核 execute 期
+            // rebind 兜底（V24 评审决断 1：不做全缓存 flush——sqlfn 物化路径
+            // 每行 CREATE 会把 512 容量反复清空，互斥计量不可接受）。
+            let mut stmt = self.conn.prepare(sql).map_err(kernel_err)?;
+            let named = Self::named_binds(binds);
+            let n = stmt.execute(&named).map_err(kernel_err)?;
+            return Ok(ExecOutcome { rows_affected: n });
+        }
+        let mut stmt = self.conn.prepare_cached(sql).map_err(kernel_err)?;
         let named = Self::named_binds(binds);
         let n = stmt.execute(&named).map_err(kernel_err)?;
         Ok(ExecOutcome { rows_affected: n })

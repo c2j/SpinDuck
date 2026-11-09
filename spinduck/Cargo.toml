@@ -1,6 +1,6 @@
 [package]
 name = "spinduck"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "GaussDB stored-procedure engine on DuckDB kernel"
 license = "MIT OR Apache-2.0"
@@ -53,6 +53,10 @@ name = "guard_tx_semantics"
 path = "tests/guard/guard_tx_semantics.rs"
 
 [[test]]
+name = "guard_exec_native_prepared_cache"
+path = "tests/guard/guard_exec_native_prepared_cache.rs"
+
+[[test]]
 name = "guard_execute_dynamic"
 path = "tests/guard/guard_execute_dynamic.rs"
 
@@ -68,3 +72,8 @@ path = "tests/guard/guard_sql_pipeline_parity.rs"
 name = "guard_register_silent_drop"
 path = "tests/guard/guard_register_silent_drop.rs"
 
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+required-features = ["cli"]

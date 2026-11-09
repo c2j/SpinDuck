@@ -1454,6 +1454,14 @@ V9 表已补记。
   以及仓库内的 `./spinduck/target/debug/spinduck compile golden/case_corpus_purchase/sql`
   → `files=7 ok=7 failed=0 routines=6`（本轮实跑）。
 
+
+> **后续事实（2026-11-08，V26.5 回写）**：V21.9–V21.12 的「参照实例不可作为
+> 过程执行基线」结论**只在 5.0.0 amd64 成立**。开发机复现确认（干净实例裸
+> CALL → postmaster exit 0，RestartCount 0→1→2，服务端零错误日志）后，
+> 性能基准改用 openGauss 7.0.0-RC3 作替代参照：同夹具 3 行种子冒烟产物与
+> 黄金断言逐值一致后才采用；裸 CALL 同语句在 7.0-RC3 上正常完成并落行。
+> 口径详见 V26.5。
+
 ## V24. 数据通道认证面：sha256 实测可连，驱动由 `postgres` 换为 `gaussdb::sync`
 
 **结论**：README「已知限制」里"GaussDB 侧若为 sha256 口令认证，纯 Rust `postgres`
@@ -1707,3 +1715,313 @@ rust-cache 修复的取证方式与结论（对 `gh run view --log` 的计数，
   PR run 42338938955（head `c336222`）与 push-main run 42339792560（merge `a42c2d7`，
   与已验证 head 同内容）各五 job 全绿，tag 指在该 merge commit 上。后续发版沿用
   "bump 随 PR 落地、tag 打在 CI 已验证的 main head"这条顺序（AGENTS §9）。
+
+## V26. 三段引擎优化与数据搬运批量通道的实证（记忆化 / prepared / 合并 COMMIT 开关 / COPY）
+
+> **与 V24 的关系（rebase 后口径）**：本节初稿基于 `postgres` 驱动的旧树，V24
+> （sha256 认证面、驱动换 `gaussdb::sync`）落在同一窗口。V26.4 的回写通道已按
+> 新驱动重做——`gaussdb::sync` 自带 `copy_in`/`CopyInWriter`（openGauss 官方
+> 驱动 fork，协议层含 CopyInResponse），手写线协议会话随之退役；sha256 口令
+> 实例不再需要任何降级（V24 结论原样成立）。V26.4 的重做实测见本节内更新值。
+
+**结论先说**：100k 行语料过程 `prc_trd_deal_purchase`（openGauss 参照 vs SpinDuck，
+`golden/case_corpus_purchase` 全套夹具）三段逐项迭代、逐项基准对比：引擎执行
+698.9s→264.3s（首跑）/ 938.2s→316.2s（稳态含 DELETE），物化 244.7s→26.0s，回写
+204.0s→1.18s；全链路 1,147.6s→291.5s（−75%）。每段默认语义不变或显式 opt-in
+开关（`Engine::batch_commit` 默认 OFF）。产物（`dat_trd_repurchase` 逐值）在
+三段全部运行中与基线一致。本节只做实证记录与口径钉死；机制描述见
+architecture §3.5 补注与 `writebuf.rs` 头注释。
+
+### 基准环境（一次声明，全节适用）
+
+- 参照：openGauss **7.0.0-RC3**（`opengauss/opengauss:latest`，amd64，127.0.0.1:5435）。
+  采用依据见 V26.5（5.0.0 amd64 的过程调用自杀在本机复现，V21.9–V21.12 补充证据）。
+  部署夹具与 golden 同源（tables/views/stubs/routines/seed 逐字），3 行种子冒烟
+  `CALL pkg_split_trade_step3_sh.prc_trd_deal_purchase('20250715', NULL)` 产物
+  `[2, 300, 30000, 6]` 与黄金断言逐值一致后才做基准。
+- 被测：SpinDuck release 构建，`golden/case_corpus_purchase` 部署口径
+  （`verify::deploy_schema/deploy_routines` + 项目规则），数据集与参照同一份
+  SQL 文件装入（37 列 ×100k，含 2% A999 异常行=partner 未维护走行级跳过路径）。
+- 计时口径：参照为 gsql 客户端墙钟（含 ~0.3s 启动）；SpinDuck 为进程内
+  `Engine::call` 墙钟（部署/编译/装数在计时圈外）。语句计数来自
+  `MeterExecutor`（按 SQL 文本聚合下发的装饰器，随 bench 存证）。
+- 两侧写路径对称：过程内逐行 INSERT+COMMIT（fsync 同价）。
+
+### V26.1 迭代①：纯标量语句执行期记忆化（MemoizingExecutor）
+
+- 依据：Meter 计量显示**解释器只占 wall 2.7%**，97% 在内核下发；每行 16 条语句
+  中 5 条是纯标量表达式宏（`substr`/`to_char(to_date()+n)`/date_diff），参数组合
+  仅 4 种。白名单（substring/strftime/strptime/to_days/date_diff）按
+  （SQL 文本, 绑定值）缓存，`Engine::call` 入口清空。
+- 实测（10k 稳态）：68.12s→46.60s（**−31.6%**）；语句 157,006→78,617（−50%）。
+  **口径注记（V26.7 修后）**：该数字采集于「memo 对任意 DDL 失效」的版本——
+  失效口径收窄到 MACRO 后（V26.7），带 sqlfn 下沉的游标循环不再每行清缓存，
+  该类过程的实际收益应高于本数字；重跑见 V26.7 口径标注。
+- 测试 6 个：合并命中、按绑定值区分、表查询/非确定性函数/execute 不缓存、
+  clear 后重执行（`exec::tests::should_memoize_*` 等）。
+
+### V26.2 迭代②：内核 prepared 语句缓存 + 一个内核缺陷被实测钉死
+
+- `prepare`→`prepare_cached`（容量 512，内核默认 16）：微查询均摊 212→91µs、
+  BEGIN 70→46µs；但 wall 持平——大项（COMMIT 1.05ms / 单行 INSERT 0.99ms /
+  点查 0.8ms）是执行硬成本（WAL fsync / MVCC / 管线固定），parse 只占小头。
+- **实测钉死的内核缺陷（1.5.5）**：缓存的 `CREATE OR REPLACE TEMP TABLE` plan
+  二次执行留下 **0 列残表**（`Binder Error: table sd_fn0 has 0 columns but 2
+  values were supplied`），sqlfn 物化路径（`materialize_fn_sites`）必踩——
+  V24 前该路径在开关 OFF 下由既有测试 `should_execute_pl_function_calls_inside_
+  sql_statements` 抓出。修复（复核决断 1 后的现行口径）：**DDL 本体绕过语句
+  缓存** + execute 期 rebind 兜底——不做全缓存 flush（sqlfn 物化路径每行一次
+  CREATE TEMP TABLE，全 flush 等于把 512 容量抵消掉）。守护测试
+  `guard_should_recreate_temp_table_across_prepared_cache` /
+  `guard_should_rebind_prepared_shape_after_table_recreate` 集中登记于
+  `tests/guard/guard_exec_native_prepared_cache.rs`，在**无 flush 前提**下钉住。
+- 接缝纪律：DuckDB API 触碰只在 `sql/exec_native.rs`（AGENTS §1）。
+
+### V26.3 迭代③：合并 COMMIT 开关（`Engine::batch_commit`，默认 OFF）
+
+- 依据：COMMIT 1.05ms + 单行 INSERT 0.99ms 占内核时间 44%，只能靠事务边界
+  合批消化——属对 §3.5「过程内 COMMIT 即时生效」的显式偏离，故为 opt-in 开关。
+- 语义（四条，`writebuf.rs` 头注释为准）：① 过程内 COMMIT 吞并，INSERT 攒批
+  合并（同前缀连续攒入为一组，每组刷盘为一条多值 INSERT；缓冲行数上限
+  10,000），出口统一刷盘由 `engine.call` 最终 COMMIT 持久化；② 触及
+  缓冲表的语句先刷盘（读自己写）；③ 合并失败回退逐行重放，失败行**数据级
+  跳过**——与 OFF 的差异是该行不进 PL 异常处理器（inst_log 缺失），组内首行
+  失败视为表级错误上抛；④ 嵌套例程边界即刷盘点（各自独立缓冲；SQL 上下文
+  函数调用不批——语料函数体无 INSERT）。
+- 实测（10k 稳态）：46.6s→23.6s（**−49%**）；100k 首跑 439.3→264.3s、稳态
+  911.7→316.2s；语句 786,017→494,015。产物逐值一致（三组运行）。
+- 评审修复（V24 PR 审查实测抓出，各带回归覆盖）：① `INSERT … SELECT`
+  不可缓冲形态回落即时下发（原 ENG-0033 上抛，语料合法形态）；② flush
+  失败时逐组出账（原多组部分成功后重复下发）；③ `INSERT INTO sch.t`
+  限定名的读自己写命中（原 token 切分漏判）；④ 字符串字面量内的 `$`
+  不再误判为占位符；⑤ push 改收已验证前缀（原不可达错误分支）。
+- 测试 10 个（V26.10 修后实数；interp 层 FakeExecutor 计数），按面分组：
+  语义四条（合并+吞并 ON、逐行 COMMIT OFF 默认守护、触及缓冲表先刷盘、
+  无空格表名形态触表刷盘）、回落两条（INSERT…SELECT、带 fn_sites 的
+  INSERT）、回放一条（合并失败回退跳行）、事件面两条（刷盘点 SqlExec、
+  回放跳行 BatchSkip）、上限一条（WRITE_BUF_CAP 满则先刷盘）。
+- 实现中由测试/基准抓出的自身缺陷（各一条，均修复）：
+  ① md5 外层摘要误用 16 字节 raw digest——正确输入是 inner 的 **32 字符
+  hex ASCII 串**（服务端 28P01）；
+  ② 行级业务异常（NO_DATA_FOUND，语料空表 commission 查询每行合法抛出）的
+  trap 重入路径误清缓冲 → 全部行丢失（实测 count=0）——discard 收敛到
+  「handler 不可重入的最终异常」；
+  ③ 字面量行（`VALUES ('x')`，无占位符）需原样采用；
+  ④ VALUES 表达式是复合形态（`round(($a-$b)/$c, 2)`）——字面量化必须
+  占位符**就地文本替换**，按值提取会拆散表达式导致列/值错位（22→26 值实测）。
+
+### V26.4 数据搬运批量通道：postgres crate 的 copy_in 静默无效 → `gaussdb::sync` 驱动通道
+
+- **旧驱动缺陷存证**：`postgres` crate 0.19 的 `copy_in`（扩展协议
+  Parse/Bind/Execute）对 openGauss 5.0.0/7.0.0-RC3 均**不报错且 0 行落库**
+  （CSV 与文本两种格式变体实测）；同表 gsql `\copy` 成功——服务端 COPY
+  能力正常，缺口在扩展协议交互。历史对照：手写简单协议会话（TcpStream
+  Startup → md5 → `Q`/`G`/`d`/`c`）曾在此驱动上打通（10 万行 104–143ms），
+  探针存证于 V24 初稿（未入库，结论保留在此）。
+- **落地（V26 重做口径）**：驱动换 `gaussdb::sync`（V24）后，其 `copy_in` /
+  `CopyInWriter`（`opengauss-protocol` 独立协议实现，**非** tokio-postgres
+  fork）对 openGauss 实测可用——`sync_append` 切换为驱动 `copy_in`
+  （COPY FROM STDIN，CSV 分块写入，`finish()` 行数与本地计数交叉校验，
+  单事务原子追加）；`materialize` 为 500 行/语句批量多值 INSERT。双内核
+  e2e（`gauss_e2e`）与 100k/98k 全量实测通过。
+- **实测（V26 重做后）**：回写 98k 204.0s→**0.89s**（480→110,236 行/s）；
+  物化 100k 244.7s→**25.6s**（409→3,903 行/s）。行数核对：回写前后服务端
+  行数精确 +98,000。
+- **退役说明**：初稿的手写线协议会话（含 md5-only 限制与四条协议契约
+  ——md5 长度含 `\0` / `G` 即转数据流 / COPY 期禁发 `Q` / `G` body[0]
+  为格式码）随驱动通道退役，不再构成回写路径的认证面限制（sha256 实例
+  由驱动原生支持，V24 结论原样成立）。
+
+### V26.5 参照实例 V21.9 的本机复现；7.0.0-RC3 替代口径的验证依据
+
+- **V21.9–V21.11 在开发机复现**：5.0.0 amd64（`187da08af341`，与 CI 同 artifact）
+  干净实例裸 `CALL` → postmaster 自杀：`RestartCount` 0→1→2、`ExitCode=0`、
+  服务端日志零错误（V21.10/21.11 的判定协议逐条执行，本机 100% 复现）。
+  首次 CALL 幸存一次但 0 行插入（未做工作）——与 CI"3/3 轮"口径一致：
+  参照实例不可作为过程执行基线，证据链闭合。
+- **7.0.0-RC3 替代口径**：Lite 镜像入口在 `/entrypoint.sh`（非 5.0.0 的
+  `/var/lib/opengauss/entrypoint.sh`），`GS_HOST_AUTH_METHOD=md5` 原生支持、
+  `OTHER_PG_CONF` 不支持（无需——实测 `password_encryption_type=0` md5 为
+  默认）；`datcompatibility=A` 由 initdb 默认给出（实测查询确认）。镜像缺陷：
+  缺 `libopenblas.so.0`/`libgfortran.so.5`（openEuler RPM + 宿主 so 注入后
+  正常，探针脚本存证）。部署口径与 golden 逐字一致；冒烟产物与黄金断言
+  逐值一致后才采用。**黄金 pin 的 5.0.0 参照地位不变**——7.0-RC3 仅作为
+  性能比对替代参照，绝对耗时不可与黄金基线历史混比。
+- 端口适配：宿主 5433 被既有 dota-gaussdb（同 5.0.0 镜像，同缺陷）占用——
+  按golden/README 处置方式改绑端口，未触碰他人实例。
+
+### V26.6 门禁与测试清单
+
+- fmt / clippy（gauss，`-D warnings`）✓；`cargo audit` 无新增告警
+  （既有 zip 维持 CI 豁免口径）。
+- `cargo test --features cli` 全量 **322/0**（V26.10 修后口径，cli 蕴含
+  native；V24 批次时 native 口径为 307/0）：新增 memo 8（含 FUNCTION/短形态
+  MACRO 判定 1）、prepared 守护 2、batch_commit 10（见 V26.3 分组）、
+  回放跳行事件 1、CLI 解析 1、cases_native 6
+  （OFF 4 + **ON 2**，见 V26.8 应修 1）、CLI 契约 3（bin 面，V26.10）。
+- golden 回归（5.0.0 容器，默认 OFF 路径）：cases_native 4/4、
+  golden_corpus_purchase 1/1、gauss_e2e 2/2（**新 COPY/批量通道在 5.0.0 实测**）
+  ——7/0。ON 模式的内核级 A/B（cases_native ON 2 条）走 native 门禁（进程内
+  内核、无容器依赖），断言集与 OFF 完全一致。
+- 基准与探针工具存证口径（与 V26.4 一致，复核修）：`spinduck_bench`、
+  `tests/wire_probe.rs`、`tests/io_probe.rs` 三者**均未入库**——本节全部
+  基准数字为开发机一次性测量，结论保留在此，不可从仓库复现。
+
+### 边界（不声称做到的）
+
+- 合并 COMMIT 开关 ON 的两处偏差（失败行不进 inst_log、嵌套边界即刷盘）是
+  **文档化偏离**而非等效实现；默认 OFF 的行为由 OFF 守护测试锁定。
+- ON 模式刷盘点补发的 `SqlExec` 事件（V26.7）`elapsed_us` 记 0——与
+  `sqlstmts::exec` 现行口径一致，合并语句未单独计时。
+- 攒批多行共享一张按元组缓存的下沉表（sd_fnN）是独立设计题，本节不覆盖
+  （带下沉的 INSERT 一律回落即时下发，见 V26.7 准入条件）。
+- 7.0-RC3 参照的绝对耗时不可与黄金基线历史混比（不同内核版本）；本节所有
+  "对比"都是同机同数据同时点的 A/B。
+- 参照侧计时含 gsql 客户端（~0.3s 启动），SpinDuck 为进程内 call——两口径
+  差异相对 200s/264s 的量级可忽略，未做归一。
+- 动态 SQL（`EXECUTE IMMEDIATE`）在开关 ON 下走保守整缓冲刷盘，未单独基准。
+- `lib/fastaas` 考题语料不在本仓库跟踪面内（V21.5 口径），本节数据全部来自
+  `golden/case_corpus_purchase` 在库夹具。
+
+### V26.7 第二轮复核修复：fn_sites 攒批漏物化、memo 失效收窄、刷盘事件、CLI 预算入口
+
+第二轮复核（head `a267748`，2026-11-09）抓出的数据级阻塞项与后续修：
+
+- **阻塞项（数据级）**：ON 模式带 sqlfn 下沉（`fn_sites` 非空）的 INSERT 被
+  `take_insert` 攒批——`materialize_fn_sites` 是 `sqlstmts::exec` 的执行期
+  副作用，攒批跳过它 → `sd_fnN` 未建（KERNEL-0010 硬失败）或滞留旧元组
+  （静默写错值）。语料形态 `PKG_SPLIT_TRADE_STEP3_SH.prc_trd_hz_byfund` 的
+  `INSERT … VALUES (… fnc_get_rate_info2 …)` 即是此形态；V26 基准恰好未覆盖
+  带下沉的 INSERT 故未暴露。修复：`take_insert` 增加显式准入条件——fn_sites
+  非空一律按表命中刷盘后回落即时下发；回填为「缓冲 = 只能替换 `ex.execute`，
+  原路径其余副作用一律回落」的原则。回归：
+  `should_fall_back_to_immediate_exec_for_insert_with_fn_sites_when_batch_commit_on`
+  （修前实测红：sd_fn0 未物化）。
+- **memo 失效收窄（复核应修 A）**：DDL 即清 memo 与 sqlfn 每行一次
+  CREATE TEMP TABLE 相乘，带下沉的游标循环每行清空缓存。收窄到只认
+  `CREATE OR REPLACE MACRO|FUNCTION` / `DROP MACRO`（`is_macro_ddl`；
+  TEMP TABLE 不改变白名单纯表达式语义）。回归：`should_keep_memo_across_
+  temp_table_ddl`（修前红）+ `should_clear_memo_after_macro_ddl`。
+  V26.1 的 −31.6% 为收窄前采集，已加口径注记；重跑需 7.0-RC3 参照实例，
+  未在本轮执行。
+- **刷盘点补发 SqlExec 事件（复核应修 B）**：被合并的 INSERT 原在 JSONL
+  面完全消失。`flush` 现对每条实际下发的语句（合并语句 + 回放行）发
+  `TraceEvent::SqlExec`（`elapsed_us` 记 0，与 `sqlstmts::exec` 同口径）。
+  回归：`should_emit_sql_exec_event_for_merged_insert_at_flush_point`。
+- **CLI 步数预算入口（复核应修 C）**：`Engine::step_budget` 原有字段无入口
+  ——按步数模型推断，`call --batch-commit` 跑 100k 级游标循环会撞 ENG-0032
+  （基准工具未入库，当时的实际步数/预算未留档，此为推断口径而非实测）。
+  补 `spinduck call --step-budget <n>`（正整数，0 拒绝），与 `--batch-commit`
+  同处接线。**注意：该入口只放大顶层 `RunLimits.budget`，嵌套例程仍沿各自
+  默认预算**。回归：`should_parse_call_with_step_budget`（解析层；CLI 接线的
+  契约测试面 `tests/cli.rs` 仓库尚不存在，属既有缺口、非本 PR 引入）。
+- **小项**：`is_insert` 字节切片改 `chars().take(12)`（与 `is_ddl` 同口径）；
+  不可达的 `last_mut()` None 分支改按索引取尾组；`writebuf.rs` 头注释补
+  `borrow_mut` 跨 `ex.execute` 的重入约束一行。空组分支在第三轮整支删除
+  （V26.8：本节初稿写「随逐组出账重写消除」不成立——它只是改成了
+  `-= 0` 的不可达形态）。
+- **文档一致性（复核文档 6 条）**：V26.6 探针口径与 V26.4 统一为「未入库」；
+  V26.2 改述为决断 1 后的现行修复（DDL 绕缓存 + rebind 兜底，无全 flush）
+  并指向 `tests/guard/` 现行守护；「采用依据见 V24.5」改 V26.5；
+  architecture §3.5 删除代码中不存在的「组随例程内业务异常边界切分」、
+  「协议级细节」措辞随 WireCopy 退役改为「机制细节」；README 能力矩阵数字
+  回传 V26.4 更新值、删除线/杂行清理。
+
+### V26.8 第三轮复核修复：ON 模式内核级 A/B、回放跳行留痕、表名解析、is_macro_ddl 口径
+
+第三轮复核（head `66cebd3`，2026-11-09）无阻塞项；三条应修 + 两条建议落地：
+
+- **应修 1（ON 模式内核级 A/B）**：`cases_native.rs` 的 `run_project` 增加
+  `batch_commit` 形参，`case_split_agg`（INSERT 带 `fnc_fee` 下沉，钉住准入
+  回落路径）与 `case_corpus_purchase`（大 INSERT 循环，真攒批）各加 ON 变体
+  ——**同一部署、同一断言集**在 ON 下逐值复跑，合并 INSERT 产物由真实
+  DuckDB 解析，「开关不改变数据」从文档承诺变成门禁。两条一次通过。
+- **应修 2（回放跳行留痕）**：`flush` 回放期被跳过的坏行补发
+  `TraceEvent::BatchSkip { rows, first_error }`（枚举新变体）。第四轮复审
+  ② 的决策为**接受并入契约**：事件枚举与 JSONL 形态已登记
+  architecture §11.2（`first_error` 自第四轮起携带错误码）。口径更正
+  （第四轮③）：当前全仓无 JSONL writer、CLI 无 `--trace`——事件面是
+  「可订阅」，**JSONL 落盘属 §11.2 未完成项**，本节不断言其已可见；
+  `first_error` 携带错误码使引擎缺陷与业务跳行在事件层可区分。
+  回归：`should_emit_batch_skip_event_when_replay_drops_rows`（修前编译红：
+  变体不存在；第四轮②断言收紧为必须含 `KERNEL-` 错误码）。
+- **应修 3（表名解析）**：`tables()` 对 `INSERT INTO t(a, …)`（表名与列清单
+  无空格，golden `case_split_agg` 的 routine.sql 即此写法）曾取到 `"t(a,"`
+  → 读自己写永不命中。按 `'('` 截掉列清单。回归：
+  `should_flush_buffer_before_touching_table_when_insert_has_no_space_before_cols`
+  （修前红：DELETE 先于刷盘下发）。
+- **建议 4（is_macro_ddl 口径）**：`chars().take(24)` 字符窗口使
+  FUNCTION 分支永不匹配（26 字符被截），`CREATE MACRO` 短形态 /
+  `DROP FUNCTION` / TEMP 修饰同漏。改前 5 个空白分隔 token 判定，覆盖
+  `CREATE [OR REPLACE] [TEMP] MACRO|FUNCTION`、`CREATE MACRO` 与
+  `DROP MACRO|FUNCTION`。回归：
+  `should_clear_memo_after_function_and_short_form_macro_ddl`（修前红：
+  FUNCTION 不清缓存）。
+- **建议 5（回落分支断言保护 + 代码收敛）**：`INSERT … SELECT` 与 fn_sites
+  两条回落测试改为**顺序断言**（预置同表缓冲行 → 缓冲合并 INSERT 必须先于
+  回落语句下发；删掉 flush 分支会红）；`take_insert` 三处内联的
+  「取 tables → touches → flush」收敛为 `flush_if_touches` 单一调用。
+- **文档口径**：V26.6 测试计数回传（307→318，分类明细见上）；V26.3
+  batch_commit 测试数 5→7；V26.7 的「必撞 ENG-0032」改推断口径并注明
+  `--step-budget` 只作用顶层预算；「空组分支已消除」的不实表述更正（本节
+  整支删除，V26.7 已附注）。
+- **规模注记（§3）**：`exec.rs` 含测试 543 行（第四轮修后 `wc -l` 实测；该
+  数字随 memo 口径微调会小幅漂移，判定以当场 wc 为准，两轴 500/700 内）。
+  **书面豁免**：本 PR 对 exec.rs 的后续改动（is_macro_ddl）即 memo 口径
+  本身，拆 memo 子模块属独立重构、另开 PR，不在本 PR 范围内。`interp/tests.rs` 的
+  682 行注记在写下后被第四轮修复推过 700 上限（793 行）——已在第四轮**拆分
+  为 `tests/mod.rs`（共享 helper，401 行）+ `tests/writebuf.rs`（batch/writebuf 块，452 行）**，
+  两个文件均在限内；本条历史数字保留作口径教训。
+- ~~**非本 PR 缺口（存档）**：AGENTS §4.1 的 CLI 契约层~~ **已在 V26.10 落地**：`tests/cli.rs`
+  （bin 契约 3 条，`required-features = ["cli"]`），CI Test 口径改
+  `--features cli`（蕴含 native）——`cli/run.rs` 两个开关的接线自此有测试面。
+
+### V26.9 第四轮复核：契约决策落地、tests 拆分、缓冲上限入测
+
+第四轮复审（head `65f3bad`）确认第三轮五条应修全部真落地、无数据正确性
+阻塞项；本轮把被挂起的契约决策定案并收口小尾巴：
+
+- **契约决策（第四轮②①）**：`TraceEvent::BatchSkip` **接受并入契约**——
+  事件枚举与 JSONL 形态登记 architecture §11.2（`BATCH_SKIP` detail 携带
+  `rows` 与 `first_error`）；`first_error` 从只含 message 改为
+  `"CODE message"` 形态（错误码在产生点携带，§5），回归断言收紧为必须含
+  `KERNEL-` 前缀（修前红）；「引擎缺陷与业务异常行自此可在 JSONL 面区分」
+  的超出口径更正为「事件接缝可订阅，JSONL 落盘属 §11.2 未完成项」。
+- **应修 ④（tests 拆分）**：`interp/tests.rs` 793 行破 700 上限 → 拆为
+  `tests/mod.rs`（共享 helper 与 interp 层测试）+ `tests/writebuf.rs`
+  （batch/writebuf 全部测试与 fixture），仅移动、断言不变，全量复绿。
+- **应修 ⑤（缓冲上限入测）**：`WRITE_BUF_CAP`「满则先刷盘」此前无任何测试。
+  `WriteBuffer` 增加 `cap` 字段 + 测试专用 `shared_buffer_with_cap`（生产
+  入口恒为 10,000）；回归 `should_flush_partial_batch_when_write_buf_cap_
+  reached`（cap=2 注入：第 3 行攒入前刷出两行合并 INSERT，出口再刷 1 行，
+  两条下发各为独立语句；编译红起步）。
+- **小项**：`is_macro_ddl` 的 TEMP 修饰放宽为前缀匹配（`TEMPORARY` 同义，
+  潜在面收口）并加回归用例；`VecSink` 消歧 match 的 `_ => {}` 兜底改为
+  显式分支；V26.3 测试清单补齐 2 个漏列名字；V26.8 规模注记更正
+  （682→793→拆分后实际行数）。
+- **计数（V26.9 修后）**：`cargo test --features native` 全量 **319/0**
+  （V26.8 的 318 + cap 回归 1）。
+
+### V26.10 第五轮复核：CLI 契约层落地、CI Test 口径升 cli、文档精度收口
+
+第五轮复审（head `c1adc5a`）确认第四轮四条全部真落地、无阻塞项；本轮处理
+三处文档精度与那个需要显式定案的缺口：
+
+- **CLI 契约层落地（复审「合并前唯一需要显式定的事」，取本 PR 内补）**：
+  新建 `tests/cli.rs`（`required-features = ["cli"]`，AGENTS §4.1 口径），
+  驱动**打包后的二进制**走完整 parse → run → Engine::call 路径：开关同开
+  成功调用（`--batch-commit` + `--step-budget 1000000`，语料同款
+  LOOP/COMMIT/EXIT 例程）、`--step-budget 0` 拒绝（usage 退出码 2）、
+  默认 OFF 路径同例程——`cli/run.rs` 对 `eng.batch_commit` /
+  `eng.step_budget` 的接线自此有测试面。3/3 一次通过。
+- **CI Test 口径升 `--features cli`**：cli 蕴含 native（既有覆盖一条不减）
+  并使 cli 契约层在常驻 Test job 真实运行；AGENTS §8/§9 与 workflow 注释
+  同步。**计数（V26.10 修后）**：`cargo test --features cli` 全量
+  **322/0**（V26.9 的 319 + cli 契约 3）。
+- **文档精度三处**：V26.8 规模注记改为不随行号漂移的表述（543 行 +
+  「is_macro_ddl 即 memo 口径本身、拆 memo 另开 PR」的书面豁免）；V26.3
+  batch_commit 测试 7→**10**（按语义/回落/回放/事件面/上限分组）；V26.9
+  拆分注记补实际行数 401/452。
+- **口径注记**：`KERNEL-0010` 是 exec_native 对所有 DuckDB 错误的统一映射，
+  **不承担 BatchSkip 的判别维度**——判别信号是事件本身 + message 文本
+  （architecture §11.2 已注）。

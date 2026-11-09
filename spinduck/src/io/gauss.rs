@@ -9,6 +9,7 @@ use crate::error::EngineError;
 use crate::exec::BindMap;
 use crate::value::SpinValue;
 use gaussdb::sync::{Client, NoTls};
+use std::io::Write;
 
 /// 回写批大小（单次从 DuckDB 取的行数）。
 const SYNC_BATCH: usize = 1000;
@@ -108,6 +109,9 @@ impl GaussConn {
 
     /// 物化（§13.1）：GaussDB 表（可带 WHERE）→ 本地 DuckDB 表（INSERT 文本承载）。
     /// 要求 DuckDB 侧表已由 load 通道建好（类型一致，§13.1 类型保真）。
+    ///
+    /// V26：逐行改 500 行/语句的批量多值 INSERT（字面量形态与逐行逐字一致，
+    /// 类型转换仍由 DuckDB 列类型完成；100k 实测见 validation V26.4）。
     pub fn materialize(
         &mut self,
         duck: &dyn crate::exec::SqlExecutor,
@@ -121,24 +125,35 @@ impl GaussConn {
         let (schema, rows) = self.fetch_rows(&sql)?;
         let cols = schema.join(", ");
         let mut n = 0;
-        for r in &rows {
-            let vals: Vec<String> = r
-                .iter()
-                .map(|c| match c {
-                    Some(s) => format!("'{}'", s.replace('\'', "''")),
-                    None => "NULL".into(),
-                })
-                .collect();
-            duck.execute(
-                &format!("INSERT INTO {table} ({cols}) VALUES ({})", vals.join(", ")),
-                &BindMap::new(),
-            )?;
-            n += 1;
+        const MAT_BATCH: usize = 500;
+        for chunk in rows.chunks(MAT_BATCH) {
+            let mut stmt = format!("INSERT INTO {table} ({cols}) VALUES ");
+            for (i, r) in chunk.iter().enumerate() {
+                if i > 0 {
+                    stmt.push(',');
+                }
+                stmt.push('(');
+                let vals: Vec<String> = r
+                    .iter()
+                    .map(|c| match c {
+                        Some(s) => format!("'{}'", s.replace('\'', "''")),
+                        None => "NULL".into(),
+                    })
+                    .collect();
+                stmt.push_str(&vals.join(", "));
+                stmt.push(')');
+            }
+            duck.execute(&stmt, &BindMap::new())?;
+            n += chunk.len();
         }
         Ok(n)
     }
 
     /// 回写（§13.2）：DuckDB 表 → GaussDB 追加。返回回写行数。
+    ///
+    /// V26：逐行 execute 改为驱动 `copy_in`（COPY FROM STDIN，单事务原子追加；
+    /// 98k 实测 1.2s，见 validation V26.4）。行数以 `finish()` 返回值为准，
+    /// 与本地计数交叉校验。
     pub fn sync_append(
         &mut self,
         duck: &dyn crate::exec::SqlExecutor,
@@ -147,33 +162,54 @@ impl GaussConn {
     ) -> Result<usize, EngineError> {
         let collist = cols.join(", ");
         let mut s = duck.query(&format!("SELECT {collist} FROM {table}"), &BindMap::new())?;
-        let mut n = 0;
+        let mut n = 0usize;
         // 分批拉取直到耗尽（一次 fetch 有上限，>1 万行时必须循环）
+        let mut writer = self
+            .client
+            .copy_in(&format!("COPY {table} ({collist}) FROM STDIN (FORMAT csv)"))
+            .map_err(db_err)?;
         loop {
             let rows = s.fetch_many(SYNC_BATCH);
             if rows.is_empty() {
                 break;
             }
             for r in &rows {
-                let vals: Vec<String> = r
+                let line = r
                     .iter()
                     .map(|v| match v {
-                        SpinValue::Null => "NULL".into(),
-                        other => format!("'{}'", other.as_str_loose().replace('\'', "''")),
+                        SpinValue::Null => csv_field(None),
+                        other => {
+                            let t = other.as_str_loose();
+                            csv_field(Some(&t))
+                        }
                     })
-                    .collect();
-                self.client
-                    .execute(
-                        &format!(
-                            "INSERT INTO {table} ({collist}) VALUES ({})",
-                            vals.join(", ")
-                        ),
-                        &[],
-                    )
-                    .map_err(db_err)?;
+                    .collect::<Vec<_>>()
+                    .join(",");
+                writer
+                    .write_all(line.as_bytes())
+                    .and_then(|_| writer.write_all(b"\n"))
+                    .map_err(|e| EngineError::env(20, format!("gaussdb copy: {e}")))?;
                 n += 1;
             }
         }
+        let copied = writer.finish().map_err(db_err)? as usize;
+        if copied != n {
+            return Err(EngineError::env(
+                20,
+                format!("gaussdb: COPY 行数不一致：服务端 {copied}，本地 {n} ({table})"),
+            ));
+        }
         Ok(n)
+    }
+}
+
+/// CSV 字段编码（FORMAT csv）：NULL → 空字段；空串 → `""`（与 NULL 区分）；
+/// 含 `,` `"` `\n` `\r` 的值加引号并在引号内翻倍。
+fn csv_field(v: Option<&str>) -> String {
+    match v {
+        None => String::new(),
+        Some("") => "\"\"".to_string(),
+        Some(s) if s.contains([',', '"', '\n', '\r']) => format!("\"{}\"", s.replace('"', "\"\"")),
+        Some(s) => s.to_string(),
     }
 }
