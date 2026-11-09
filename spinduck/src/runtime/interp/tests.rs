@@ -657,8 +657,7 @@ fn should_emit_sql_exec_event_for_merged_insert_at_flush_point() {
     // ON 路径刷盘只调 ex.execute——JSONL 面上这些写入完全消失，排障盲区。
     // 刷盘点必须补发与 OFF 同构的事件。
     let ex = FakeExecutor::default();
-    let sink = VecSink::new();
-    let prog = compile_stmts(&vec![insert_stmt("t", "'x'"), commit_stmt()]).unwrap();
+    let prog = compile_stmts(&[insert_stmt("t", "'x'"), commit_stmt()]).unwrap();
     let mut f = Frame::new();
     let mut sink = VecSink::new();
     let cat = crate::catalog::RoutineCatalog::new();
