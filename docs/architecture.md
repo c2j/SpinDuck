@@ -651,7 +651,10 @@ $SPINDUCK_HOME/                       # 根路径，配置项 home；默认 ./�
  "msg":"...", "err":"PL-04001"}            // 错误码来自异常映射表（规则数据）
 
 // audit 专属：{"user":"…","args_digest":"sha256:…","sql_count":12,"duration_ms":1843}
-// trace 专属：{"event":"SQL_EXEC|CURSOR_OPEN|FETCH|UDF_CALL|IR_STMT","detail":{…},"elapsed_us":97}
+// trace 专属：{"event":"SQL_EXEC|CURSOR_OPEN|FETCH|UDF_CALL|IR_STMT|BATCH_SKIP","detail":{…},"elapsed_us":97}
+//   BATCH_SKIP detail 形态（V26，第四轮复审确认并入契约）：
+//   {"event":"BATCH_SKIP","detail":{"rows":1,"first_error":"KERNEL-0010 constraint violation"},"elapsed_us":0}
+//   ——合并 COMMIT 开关 ON 的回放期被跳过行数与首个错误（含错误码）
 // engine 专属：{"component":"interp|exec|catalog|rules","kv":{…}}
 ```
 

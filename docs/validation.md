@@ -1796,8 +1796,8 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
   限定名的读自己写命中（原 token 切分漏判）；④ 字符串字面量内的 `$`
   不再误判为占位符；⑤ push 改收已验证前缀（原不可达错误分支）。
 - 测试 7 个（interp 层 FakeExecutor 计数）：合并+吞并（ON）、逐行 COMMIT
-  （OFF 默认守护）、触及缓冲表先刷盘、合并失败回退跳过、INSERT…SELECT
-  回落即时下发。
+  （OFF 默认守护）、触及缓冲表先刷盘、无空格表名形态触表刷盘、合并失败
+  回退跳过、INSERT…SELECT 回落即时下发、带 fn_sites 的 INSERT 回落即时下发。
 - 实现中由测试/基准抓出的自身缺陷（各一条，均修复）：
   ① md5 外层摘要误用 16 字节 raw digest——正确输入是 inner 的 **32 字符
   hex ASCII 串**（服务端 28P01）；
@@ -1934,10 +1934,14 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
   ——**同一部署、同一断言集**在 ON 下逐值复跑，合并 INSERT 产物由真实
   DuckDB 解析，「开关不改变数据」从文档承诺变成门禁。两条一次通过。
 - **应修 2（回放跳行留痕）**：`flush` 回放期被跳过的坏行补发
-  `TraceEvent::BatchSkip { rows, first_error }`（枚举新变体，字段面变更
-  随本 PR 评审确认）；引擎缺陷与业务异常行自此可在 JSONL 面区分。
+  `TraceEvent::BatchSkip { rows, first_error }`（枚举新变体）。第四轮复审
+  ② 的决策为**接受并入契约**：事件枚举与 JSONL 形态已登记
+  architecture §11.2（`first_error` 自第四轮起携带错误码）。口径更正
+  （第四轮③）：当前全仓无 JSONL writer、CLI 无 `--trace`——事件面是
+  「可订阅」，**JSONL 落盘属 §11.2 未完成项**，本节不断言其已可见；
+  `first_error` 携带错误码使引擎缺陷与业务跳行在事件层可区分。
   回归：`should_emit_batch_skip_event_when_replay_drops_rows`（修前编译红：
-  变体不存在）。
+  变体不存在；第四轮②断言收紧为必须含 `KERNEL-` 错误码）。
 - **应修 3（表名解析）**：`tables()` 对 `INSERT INTO t(a, …)`（表名与列清单
   无空格，golden `case_split_agg` 的 routine.sql 即此写法）曾取到 `"t(a,"`
   → 读自己写永不命中。按 `'('` 截掉列清单。回归：
@@ -1958,8 +1962,37 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
   batch_commit 测试数 5→7；V26.7 的「必撞 ENG-0032」改推断口径并注明
   `--step-budget` 只作用顶层预算；「空组分支已消除」的不实表述更正（本节
   整支删除，V26.7 已附注）。
-- **规模注记（§3）**：`exec.rs` 本轮含测试 500 行顶格——下一个改动它的 PR
-  须先拆 memo 子模块或书面豁免；`interp/tests.rs` 682 行（<700 含测试上限）。
+- **规模注记（§3）**：`exec.rs` 含测试 536 行（<700 上限内，但超 500 基础线）
+  ——下一个改动它的 PR 须先拆 memo 子模块或书面豁免。`interp/tests.rs` 的
+  682 行注记在写下后被第四轮修复推过 700 上限（793 行）——已在第四轮**拆分
+  为 `tests/mod.rs`（共享 helper）+ `tests/writebuf.rs`（batch/writebuf 块）**，
+  两个文件均在限内；本条历史数字保留作口径教训。
 - **非本 PR 缺口（存档）**：AGENTS §4.1 的 CLI 契约层 `tests/cli.rs` 在仓库
   不存在，`cli/run.rs` 两个开关的实际接线（`eng.batch_commit` /
   `eng.step_budget` 赋值）无测试面——本轮 `--step-budget` 仅到解析层。
+
+### V26.9 第四轮复核：契约决策落地、tests 拆分、缓冲上限入测
+
+第四轮复审（head `65f3bad`）确认第三轮五条应修全部真落地、无数据正确性
+阻塞项；本轮把被挂起的契约决策定案并收口小尾巴：
+
+- **契约决策（第四轮②①）**：`TraceEvent::BatchSkip` **接受并入契约**——
+  事件枚举与 JSONL 形态登记 architecture §11.2（`BATCH_SKIP` detail 携带
+  `rows` 与 `first_error`）；`first_error` 从只含 message 改为
+  `"CODE message"` 形态（错误码在产生点携带，§5），回归断言收紧为必须含
+  `KERNEL-` 前缀（修前红）；「引擎缺陷与业务异常行自此可在 JSONL 面区分」
+  的超出口径更正为「事件接缝可订阅，JSONL 落盘属 §11.2 未完成项」。
+- **应修 ④（tests 拆分）**：`interp/tests.rs` 793 行破 700 上限 → 拆为
+  `tests/mod.rs`（共享 helper 与 interp 层测试）+ `tests/writebuf.rs`
+  （batch/writebuf 全部测试与 fixture），仅移动、断言不变，全量复绿。
+- **应修 ⑤（缓冲上限入测）**：`WRITE_BUF_CAP`「满则先刷盘」此前无任何测试。
+  `WriteBuffer` 增加 `cap` 字段 + 测试专用 `shared_buffer_with_cap`（生产
+  入口恒为 10,000）；回归 `should_flush_partial_batch_when_write_buf_cap_
+  reached`（cap=2 注入：第 3 行攒入前刷出两行合并 INSERT，出口再刷 1 行，
+  两条下发各为独立语句；编译红起步）。
+- **小项**：`is_macro_ddl` 的 TEMP 修饰放宽为前缀匹配（`TEMPORARY` 同义，
+  潜在面收口）并加回归用例；`VecSink` 消歧 match 的 `_ => {}` 兜底改为
+  显式分支；V26.3 测试清单补齐 2 个漏列名字；V26.8 规模注记更正
+  （682→793→拆分后实际行数）。
+- **计数（V26.9 修后）**：`cargo test --features native` 全量 **319/0**
+  （V26.8 的 318 + cap 回归 1）。

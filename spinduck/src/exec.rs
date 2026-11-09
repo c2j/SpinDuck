@@ -179,19 +179,25 @@ pub(crate) fn is_ddl(sql: &str) -> bool {
 
 /// 改变白名单纯表达式内核语义的 DDL 判定（memo 缓存失效口径，复核应修 A +
 /// 建议 4）：按前 5 个空白分隔 token 判定，覆盖
-/// `CREATE [OR REPLACE] [TEMP] MACRO|FUNCTION`、`CREATE MACRO` 短形态与
-/// `DROP MACRO|FUNCTION`。TEMP TABLE 等其余 DDL 不改变纯表达式语义，
-/// 不清 memo（否则 sqlfn 物化路径每行清空）。
+/// `CREATE [OR REPLACE] [TEMP|TEMPORARY] MACRO|FUNCTION`、`CREATE MACRO`
+/// 短形态与 `DROP MACRO|FUNCTION`。TEMP TABLE 等其余 DDL 不改变纯表达式
+/// 语义，不清 memo（否则 sqlfn 物化路径每行清空）。
 pub(crate) fn is_macro_ddl(sql: &str) -> bool {
     let t = strip_leading_comments(sql);
     let toks: Vec<&str> = t.split_whitespace().take(5).collect();
     let is = |i: usize, s: &str| toks.get(i).is_some_and(|w| w.eq_ignore_ascii_case(s));
+    // TEMPORARY 与 TEMP 同义（第四轮小项：前缀匹配，全仓/语料现无 TEMPORARY
+    // 实例，属潜在面收口）
+    let temp = |i: usize| {
+        toks.get(i)
+            .is_some_and(|w| w.to_ascii_uppercase().starts_with("TEMP"))
+    };
     let kind = |i: usize| is(i, "MACRO") || is(i, "FUNCTION");
     if is(0, "CREATE") {
         if is(1, "OR") {
-            is(2, "REPLACE") && (if is(3, "TEMP") { kind(4) } else { kind(3) })
+            is(2, "REPLACE") && (if temp(3) { kind(4) } else { kind(3) })
         } else {
-            (is(1, "TEMP") && kind(2)) || kind(1)
+            (temp(1) && kind(2)) || kind(1)
         }
     } else {
         is(0, "DROP") && kind(1)
@@ -522,6 +528,7 @@ mod tests {
             "CREATE OR REPLACE FUNCTION f(x) AS x + 1",
             "CREATE MACRO m(x) AS x + 1",
             "CREATE OR REPLACE TEMP MACRO m(x) AS x + 1",
+            "CREATE OR REPLACE TEMPORARY MACRO m(x) AS x + 1",
             "DROP FUNCTION f",
             "DROP MACRO m",
         ] {

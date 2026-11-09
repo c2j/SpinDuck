@@ -37,6 +37,8 @@ struct BufGroup {
 pub(in crate::runtime) struct WriteBuffer {
     groups: Vec<BufGroup>,
     buffered: usize,
+    /// 攒批行数上限（满则先刷盘，第四轮复核应修 ⑤：测试可注入小上限）
+    cap: usize,
 }
 
 impl WriteBuffer {
@@ -75,7 +77,7 @@ impl WriteBuffer {
         ex: &dyn SqlExecutor,
         sink: &mut dyn TraceSink,
     ) -> Result<(), EngineError> {
-        if self.buffered >= WRITE_BUF_CAP {
+        if self.buffered >= self.cap {
             self.flush(ex, sink)?;
         }
         let row = literalize_values(values_part, binds)?;
@@ -134,7 +136,8 @@ impl WriteBuffer {
                             // 跳行留痕（复核应修 2）：不上抛但必须可观测
                             skipped += 1;
                             if skip_reason.is_empty() {
-                                skip_reason = row_err.message.clone();
+                                // 带错误码（第四轮②）：引擎缺陷与业务跳行不靠文本猜
+                                skip_reason = format!("{} {}", row_err.code, row_err.message);
                             }
                             first_row = false;
                         }
@@ -320,5 +323,17 @@ pub(in crate::runtime) fn shared_buffer() -> WBufOpt {
     Some(Rc::new(RefCell::new(WriteBuffer {
         groups: Vec::new(),
         buffered: 0,
+        cap: WRITE_BUF_CAP,
+    })))
+}
+
+/// 测试专用：注入小上限以锁定「满则先刷盘」语义（复核应修 ⑤；
+/// 生产入口 `shared_buffer` 恒为 WRITE_BUF_CAP）。
+#[cfg(test)]
+pub(in crate::runtime) fn shared_buffer_with_cap(cap: usize) -> WBufOpt {
+    Some(Rc::new(RefCell::new(WriteBuffer {
+        groups: Vec::new(),
+        buffered: 0,
+        cap,
     })))
 }
