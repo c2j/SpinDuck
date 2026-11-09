@@ -576,3 +576,108 @@ fn should_fall_back_to_immediate_exec_for_insert_select_when_batch_commit_on() {
         "回落路径必须真实下发 INSERT…SELECT"
     );
 }
+
+#[test]
+fn should_fall_back_to_immediate_exec_for_insert_with_fn_sites_when_batch_commit_on() {
+    // 复核阻塞项：带 sqlfn 下沉（fn_sites 非空）的 INSERT 不可攒批——
+    // 攒批路径跳过 sqlstmts::exec，materialize_fn_sites 不执行，
+    // sd_fnN 缓存表要么缺失（KERNEL-0010）要么滞留旧元组（静默写错值）。
+    // 准入条件：fn_sites 为空才可攒，非空必须回落即时下发。
+    let site = crate::sql::FnSite {
+        table: "sd_fn0".into(),
+        name: "fnc_x".into(),
+        args: vec!["v_i".into()],
+        distinct_sql: "SELECT DISTINCT 1 AS sd_v, 1 AS sd_a0".into(),
+        binds: vec![],
+    };
+    let prog = IrProg {
+        code: vec![IrStmt::SqlExec {
+            sql: "INSERT INTO t (a) VALUES (1)".into(),
+            binds: vec![],
+            fn_sites: vec![site],
+        }],
+    };
+    let ex = FakeExecutor::default();
+    let mut f = Frame::new();
+    let mut sink = crate::exec::TraceNoopSink;
+    let cat = crate::catalog::RoutineCatalog::new();
+    let out = run_with_catalog(
+        &prog,
+        &mut f,
+        &ex,
+        &mut sink,
+        &cat,
+        0,
+        crate::runtime::RunLimits {
+            budget: DEFAULT_STEP_BUDGET,
+            batch_commit: true,
+        },
+    );
+    assert_eq!(out.unwrap(), RunOutcome::Completed);
+    let calls = ex.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|(s, _)| s.contains("CREATE OR REPLACE TEMP TABLE sd_fn0")),
+        "fn_sites 必须先物化（temp table 建立）"
+    );
+    assert!(
+        calls.iter().any(|(s, _)| s.starts_with("INSERT INTO t")),
+        "带下沉的 INSERT 必须原样即时下发，不得进入缓冲"
+    );
+}
+
+/// 事件收集 sink（writebuf 刷盘事件断言用）。
+struct VecSink {
+    events: std::cell::RefCell<Vec<String>>,
+}
+
+impl VecSink {
+    fn new() -> Self {
+        Self {
+            events: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+    fn snapshot(&self) -> Vec<String> {
+        self.events.borrow().clone()
+    }
+}
+
+impl crate::exec::TraceSink for VecSink {
+    fn on_event(&mut self, event: crate::exec::TraceEvent) {
+        if let crate::exec::TraceEvent::SqlExec { sql, .. } = event {
+            self.events.borrow_mut().push(sql);
+        }
+    }
+}
+
+#[test]
+fn should_emit_sql_exec_event_for_merged_insert_at_flush_point() {
+    // 复核应修 B：被合并的 INSERT 在 OFF 路径每条语句发一次 SqlExec 事件，
+    // ON 路径刷盘只调 ex.execute——JSONL 面上这些写入完全消失，排障盲区。
+    // 刷盘点必须补发与 OFF 同构的事件。
+    let ex = FakeExecutor::default();
+    let sink = VecSink::new();
+    let prog = compile_stmts(&vec![insert_stmt("t", "'x'"), commit_stmt()]).unwrap();
+    let mut f = Frame::new();
+    let mut sink = VecSink::new();
+    let cat = crate::catalog::RoutineCatalog::new();
+    let out = run_with_catalog(
+        &prog,
+        &mut f,
+        &ex,
+        &mut sink,
+        &cat,
+        0,
+        crate::runtime::RunLimits {
+            budget: DEFAULT_STEP_BUDGET,
+            batch_commit: true,
+        },
+    );
+    assert_eq!(out.unwrap(), RunOutcome::Completed);
+    let events = sink.snapshot();
+    assert!(
+        events.iter().any(|s| s.starts_with("INSERT INTO t")),
+        "刷盘点必须补发合并 INSERT 的 SqlExec 事件，实际: {events:?}"
+    );
+}

@@ -82,6 +82,7 @@ fn cmd_call(cmd: Command) -> CallParts {
             routine,
             args,
             batch_commit,
+            step_budget,
         } => CallParts {
             db,
             rules,
@@ -89,6 +90,7 @@ fn cmd_call(cmd: Command) -> CallParts {
             routine,
             args,
             batch_commit,
+            step_budget,
         },
         _ => unreachable!("cmd_call only for Call"),
     }
@@ -135,6 +137,7 @@ struct CallParts {
     routine: String,
     args: Vec<String>,
     batch_commit: bool,
+    step_budget: Option<u64>,
 }
 
 /// 语料目录的规则口径：内置种子为基座 + 各路径向上发现的 `spinduck.toml`
@@ -244,6 +247,10 @@ fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, EngineError> {
     };
     let mut eng = Engine::new(Box::new(ex), rules);
     eng.batch_commit = parts.batch_commit;
+    // 复核应修 C：大业务（100k 级游标循环）默认预算不够，CLI 放大入口
+    if let Some(b) = parts.step_budget {
+        eng.step_budget = b;
+    }
     for f in &parts.files {
         let (text, _) = crate::cli::read_source(f)?;
         eng.register(&text)?;

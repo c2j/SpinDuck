@@ -253,7 +253,7 @@ fn run_inner(
                 binds,
                 fn_sites,
             } => {
-                let buffered = writebuf::take_insert(env, sql, binds)?;
+                let buffered = writebuf::take_insert(env, sql, binds, fn_sites)?;
                 if !buffered {
                     sqlstmts::exec(env, sql, binds, fn_sites)?;
                 }

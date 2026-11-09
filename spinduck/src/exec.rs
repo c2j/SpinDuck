@@ -158,9 +158,11 @@ impl SqlExecutor for MemoizingExecutor {
 
     fn execute(&self, sql: &str, binds: &BindMap) -> Result<ExecOutcome, EngineError> {
         self.inner_calls.set(self.inner_calls.get() + 1);
-        // DDL/MACRO 会使白名单函数的缓存值陈旧（如 EXECUTE IMMEDIATE
-        // 'CREATE OR REPLACE MACRO …' 改变内核宏语义）：清缓存后透传。
-        if is_ddl(sql) {
+        // MACRO/FUNCTION DDL 会改变白名单纯表达式在内核侧的语义：
+        // 清缓存后透传。只收窄到 MACRO 形态——sqlfn 物化路径每行一次
+        // CREATE OR REPLACE TEMP TABLE，若对任意 DDL 失效，带下沉的
+        // 游标循环每行清空缓存，记忆化在这类过程上不成立（复核应修 A）。
+        if is_macro_ddl(sql) {
             self.cache.clear();
         }
         self.inner.execute(sql, binds)
@@ -168,8 +170,27 @@ impl SqlExecutor for MemoizingExecutor {
 }
 
 /// DDL 判定（exec.rs 层共享：语句缓存失效与 prepared 缓存绕过同一口径）：
-/// CREATE/DROP/ALTER，前导注释（行 `--` 与块 `/* */`，可叠加）剥离后再判。
+/// CREATE/DROP/ALTER，前导注释剥离后再判。
 pub(crate) fn is_ddl(sql: &str) -> bool {
+    let t = strip_leading_comments(sql);
+    let head: String = t.chars().take(6).collect::<String>().to_ascii_uppercase();
+    head == "CREATE" || head.starts_with("DROP") || head.starts_with("ALTER")
+}
+
+/// 改变白名单纯表达式内核语义的 DDL 判定（memo 缓存失效口径，复核应修 A）：
+/// 仅 `CREATE OR REPLACE MACRO|FUNCTION` / `DROP MACRO`。TEMP TABLE 等
+/// 其余 DDL 不改变纯表达式语义，不清 memo（否则 sqlfn 物化路径每行清空）。
+pub(crate) fn is_macro_ddl(sql: &str) -> bool {
+    let t = strip_leading_comments(sql);
+    let head: String = t.chars().take(24).collect::<String>().to_ascii_uppercase();
+    let compact = head.replace(char::is_whitespace, "");
+    compact.starts_with("CREATEORREPLACEMACRO")
+        || compact.starts_with("CREATEORREPLACEFUNCTION")
+        || compact.starts_with("DROPMACRO")
+}
+
+/// 剥离可叠加的前导注释（行 `--` 与块 `/* */`）。
+pub(crate) fn strip_leading_comments(sql: &str) -> &str {
     let mut t = sql.trim_start();
     loop {
         if let Some(rest) = t.strip_prefix("--") {
@@ -190,8 +211,7 @@ pub(crate) fn is_ddl(sql: &str) -> bool {
         }
         break;
     }
-    let head: String = t.chars().take(6).collect::<String>().to_ascii_uppercase();
-    head == "CREATE" || head.starts_with("DROP") || head.starts_with("ALTER")
+    t
 }
 
 /// SQL 执行接缝：解释器/编译器唯一可见的内核能力面。
@@ -436,5 +456,45 @@ mod tests {
         ex.clear_memo();
         let _ = ex.query(sql, &binds("20250715")).unwrap();
         assert_eq!(ex.inner_calls(), 2);
+    }
+
+    #[test]
+    fn should_keep_memo_across_temp_table_ddl() {
+        // 复核应修 A：sqlfn 物化路径每行一次 CREATE OR REPLACE TEMP TABLE，
+        // memo 若对 TEMP TABLE 失效，带下沉的循环每行清空缓存，V26 迭代①
+        // 的百分比在这类过程上不成立。TEMP TABLE 不改变白名单纯表达式
+        // 在内核侧的语义，memo 必须跨它存活。
+        let ex = MemoizingExecutor::new(Box::new(CountingExec::new(SpinValue::Int(7))));
+        let sql = "SELECT SUBSTRING($p0, 1, 2)";
+        let _ = ex.query(sql, &binds("20250715")).unwrap();
+        let _ = ex
+            .execute(
+                "CREATE OR REPLACE TEMP TABLE t (a INTEGER)",
+                &BindMap::new(),
+            )
+            .unwrap();
+        let _ = ex.query(sql, &binds("20250715")).unwrap();
+        assert_eq!(
+            ex.inner_calls(),
+            2,
+            "TEMP TABLE DDL 不清 memo 缓存（execute 1 次 + 命中缓存的 query 0 次）"
+        );
+    }
+
+    #[test]
+    fn should_clear_memo_after_macro_ddl() {
+        // MACRO/FUNCTION DDL 会改变白名单纯表达式在内核侧的语义：必须失效。
+        let ex = MemoizingExecutor::new(Box::new(CountingExec::new(SpinValue::Int(7))));
+        let sql = "SELECT SUBSTRING($p0, 1, 2)";
+        let _ = ex.query(sql, &binds("20250715")).unwrap();
+        let _ = ex
+            .execute("CREATE OR REPLACE MACRO m(x) AS x + 1", &BindMap::new())
+            .unwrap();
+        let _ = ex.query(sql, &binds("20250715")).unwrap();
+        assert_eq!(
+            ex.inner_calls(),
+            3,
+            "MACRO DDL 必须清 memo 缓存（execute 1 次 + 失效后的 query 再执行 1 次）"
+        );
     }
 }

@@ -8,9 +8,14 @@
 //!    与 OFF 模式的差异是该行不再进入 PL 异常处理器（inst_log 缺失），
 //!    且组内首行失败视为表级错误上抛；
 //! ④ 嵌套例程边界即刷盘点（嵌套例程持有自己的缓冲）。
+//!
+//! 重入约束（复核小项）：`flush` / `push` 持有 `Rc<RefCell<WriteBuffer>>` 的
+//! `borrow_mut` 期间调用 `ex.execute(&dyn SqlExecutor)`——当前无再入路径
+//! （嵌套例程各持独立缓冲，物化由 `sqlstmts` 而非 executor 触发）；若将来
+//! executor 反向进入本模块，double-borrow 将 panic，任何改动须先复核本条。
 
 use crate::error::EngineError;
-use crate::exec::{BindMap, SqlExecutor};
+use crate::exec::{BindMap, SqlExecutor, TraceEvent, TraceSink};
 use crate::runtime::interp::dynamic::sql_literal;
 use crate::runtime::interp::Env;
 use std::cell::RefCell;
@@ -60,9 +65,10 @@ impl WriteBuffer {
         values_part: &str,
         binds: &BindMap,
         ex: &dyn SqlExecutor,
+        sink: &mut dyn TraceSink,
     ) -> Result<(), EngineError> {
         if self.buffered >= WRITE_BUF_CAP {
-            self.flush(ex)?;
+            self.flush(ex, sink)?;
         }
         let row = literalize_values(values_part, binds)?;
         // 同前缀连续攒入（游标循环形态），保持语句顺序
@@ -77,30 +83,33 @@ impl WriteBuffer {
                 rows: Vec::new(),
             });
         }
-        let group = match self.groups.last_mut() {
-            Some(g) => g,
-            None => {
-                return Err(EngineError::invariant(
-                    33,
-                    "batch_commit: 缓冲组缺失".to_string(),
-                ))
-            }
-        };
-        group.rows.push(row);
+        // 刚保证非空，按索引取尾组（省去不可达的 None 分支，复核小项）
+        let last = self.groups.len() - 1;
+        self.groups[last].rows.push(row);
         self.buffered += 1;
         Ok(())
     }
 
     /// 刷盘：逐组消费（每组处理完立即出账），同前缀合并为一条多值 INSERT；
     /// 失败回退逐行重放。任何时刻失败，已下发组不重复（V24 评审阻塞项 3）。
-    fn flush(&mut self, ex: &dyn SqlExecutor) -> Result<(), EngineError> {
+    /// 每条实际下发的语句（含回放行）补发 `SqlExec` 事件（复核应修 B：
+    /// OFF 路径每条语句一事件，ON 路径不能在 JSONL 面上消失）。
+    fn flush(&mut self, ex: &dyn SqlExecutor, sink: &mut dyn TraceSink) -> Result<(), EngineError> {
+        let emit = |sink: &mut dyn TraceSink, sql: &str| {
+            sink.on_event(TraceEvent::SqlExec {
+                sql: sql.to_string(),
+                binds: BindMap::new(),
+                elapsed_us: 0,
+            });
+        };
         while !self.groups.is_empty() {
             let g = self.groups.remove(0);
             if g.rows.is_empty() {
-                self.buffered -= 0;
+                self.buffered -= g.rows.len();
                 continue;
             }
             let merged = format!("{} VALUES {}", g.prefix, g.rows.join(", "));
+            emit(sink, &merged);
             if let Err(first_err) = ex.execute(&merged, &BindMap::new()) {
                 // 回退逐行：失败行按数据语义跳过；组内首行失败视为表级错误上抛。
                 // 上抛前先出账本组（已重放的行不重复），剩余组随外层错误丢弃。
@@ -108,6 +117,7 @@ impl WriteBuffer {
                 let mut first_row = true;
                 for row in &g.rows {
                     let stmt = format!("{} VALUES {}", g.prefix, row);
+                    emit(sink, &stmt);
                     match ex.execute(&stmt, &BindMap::new()) {
                         Ok(_) => first_row = false,
                         Err(row_err) => {
@@ -201,8 +211,9 @@ fn literalize_values(values_part: &str, binds: &BindMap) -> Result<String, Engin
 
 /// INSERT 判定（改写产物为小写形态，大小写不敏感兜底）。
 fn is_insert(sql: &str) -> bool {
-    let t = sql.trim_start();
-    t.len() >= 12 && t[..12].eq_ignore_ascii_case("insert into ")
+    // 按 char 取前缀（复核小项：字节切片遇非 ASCII 前导即 panic，同 is_ddl）
+    let head: String = sql.trim_start().chars().take(12).collect::<String>();
+    head.eq_ignore_ascii_case("insert into ")
 }
 
 /// SQL 文本的标识符 token 集（小写），用于「是否触及缓冲表」判定。
@@ -215,18 +226,29 @@ fn touches_buffered_table(sql: &str, tables: &[String]) -> bool {
 
 /// 开关 ON 时：INSERT 攒缓冲（返回 true = 已缓冲，调用方跳过即时下发）；
 /// 其余语句先按表命中刷盘（读自己写），返回 false 走原路径。
+///
+/// 显式准入条件（复核新增，与「INSERT … SELECT 回落」同一原则——缓冲只能
+/// 替换 `ex.execute`，原路径的其余前置副作用一律不允许被略过）：
+/// fn_sites 为空（非空则 `materialize_fn_sites` 必须在 sqlstmts::exec
+/// 里执行，攒批会跳过它 → sd_fnN 不物化 / 滞留旧元组）。
 pub(in crate::runtime) fn take_insert(
     env: &mut Env<'_>,
     sql: &str,
     binds_src: &[(String, crate::ir::BindSrc)],
+    fn_sites: &[crate::sql::FnSite],
 ) -> Result<bool, EngineError> {
     let Some(rc) = env.wbuf.clone() else {
         return Ok(false);
     };
+    // fn_sites 非空：下沉物化是 sqlstmts::exec 的执行期副作用，不可缓冲
+    if !fn_sites.is_empty() {
+        flush_if_touches(env, sql)?;
+        return Ok(false);
+    }
     if !is_insert(sql) {
         let tables = rc.borrow().tables();
         if !tables.is_empty() && touches_buffered_table(sql, &tables) {
-            rc.borrow_mut().flush(env.ex)?;
+            rc.borrow_mut().flush(env.ex, env.sink)?;
         }
         return Ok(false);
     }
@@ -239,7 +261,7 @@ pub(in crate::runtime) fn take_insert(
         // 该形态是形态覆盖门禁已断言的合法输入，不能当作错误）。
         let tables = rc.borrow().tables();
         if !tables.is_empty() && touches_buffered_table(sql, &tables) {
-            rc.borrow_mut().flush(env.ex)?;
+            rc.borrow_mut().flush(env.ex, env.sink)?;
         }
         return Ok(false);
     };
@@ -248,7 +270,7 @@ pub(in crate::runtime) fn take_insert(
     // 仅此处（攒批路径）解析绑定源；OFF 路径不付解析成本（评审：双重解析）
     let resolved = crate::runtime::interp::resolve_binds(binds_src, env.frame)?;
     rc.borrow_mut()
-        .push(prefix, values_part, &resolved, env.ex)?;
+        .push(prefix, values_part, &resolved, env.ex, env.sink)?;
     Ok(true)
 }
 
@@ -262,7 +284,7 @@ pub(in crate::runtime) fn flush_if_touches(
     };
     let tables = rc.borrow().tables();
     if !tables.is_empty() && touches_buffered_table(sql, &tables) {
-        rc.borrow_mut().flush(env.ex)?;
+        rc.borrow_mut().flush(env.ex, env.sink)?;
     }
     Ok(())
 }
@@ -270,7 +292,7 @@ pub(in crate::runtime) fn flush_if_touches(
 /// 开关 ON 时：无条件刷盘（例程出口 / 动态 SQL 前的保守点）。
 pub(in crate::runtime) fn flush_all(env: &mut Env<'_>) -> Result<(), EngineError> {
     if let Some(rc) = env.wbuf.clone() {
-        rc.borrow_mut().flush(env.ex)?;
+        rc.borrow_mut().flush(env.ex, env.sink)?;
     }
     Ok(())
 }

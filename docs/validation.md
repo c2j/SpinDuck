@@ -1735,7 +1735,7 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
 ### 基准环境（一次声明，全节适用）
 
 - 参照：openGauss **7.0.0-RC3**（`opengauss/opengauss:latest`，amd64，127.0.0.1:5435）。
-  采用依据见 V24.5（5.0.0 amd64 的过程调用自杀在本机复现，V21.9–V21.12 补充证据）。
+  采用依据见 V26.5（5.0.0 amd64 的过程调用自杀在本机复现，V21.9–V21.12 补充证据）。
   部署夹具与 golden 同源（tables/views/stubs/routines/seed 逐字），3 行种子冒烟
   `CALL pkg_split_trade_step3_sh.prc_trd_deal_purchase('20250715', NULL)` 产物
   `[2, 300, 30000, 6]` 与黄金断言逐值一致后才做基准。
@@ -1754,6 +1754,9 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
   仅 4 种。白名单（substring/strftime/strptime/to_days/date_diff）按
   （SQL 文本, 绑定值）缓存，`Engine::call` 入口清空。
 - 实测（10k 稳态）：68.12s→46.60s（**−31.6%**）；语句 157,006→78,617（−50%）。
+  **口径注记（V26.7 修后）**：该数字采集于「memo 对任意 DDL 失效」的版本——
+  失效口径收窄到 MACRO 后（V26.7），带 sqlfn 下沉的游标循环不再每行清缓存，
+  该类过程的实际收益应高于本数字；重跑见 V26.7 口径标注。
 - 测试 6 个：合并命中、按绑定值区分、表查询/非确定性函数/execute 不缓存、
   clear 后重执行（`exec::tests::should_memoize_*` 等）。
 
@@ -1766,9 +1769,12 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
   二次执行留下 **0 列残表**（`Binder Error: table sd_fn0 has 0 columns but 2
   values were supplied`），sqlfn 物化路径（`materialize_fn_sites`）必踩——
   V24 前该路径在开关 OFF 下由既有测试 `should_execute_pl_function_calls_inside_
-  sql_statements` 抓出。修复：DDL 绕过语句缓存 + DDL 后 `flush_prepared_
-  statement_cache()`（替换表的所有缓存 plan 一并作废）。守护测试
-  `should_recreate_temp_table_across_prepared_cache` 永久保留。
+  sql_statements` 抓出。修复（复核决断 1 后的现行口径）：**DDL 本体绕过语句
+  缓存** + execute 期 rebind 兜底——不做全缓存 flush（sqlfn 物化路径每行一次
+  CREATE TEMP TABLE，全 flush 等于把 512 容量抵消掉）。守护测试
+  `guard_should_recreate_temp_table_across_prepared_cache` /
+  `guard_should_rebind_prepared_shape_after_table_recreate` 集中登记于
+  `tests/guard/guard_exec_native_prepared_cache.rs`，在**无 flush 前提**下钉住。
 - 接缝纪律：DuckDB API 触碰只在 `sql/exec_native.rs`（AGENTS §1）。
 
 ### V26.3 迭代③：合并 COMMIT 开关（`Engine::batch_commit`，默认 OFF）
@@ -1851,13 +1857,18 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
 - golden 回归（5.0.0 容器，默认 OFF 路径）：cases_native 4/4、
   golden_corpus_purchase 1/1、gauss_e2e 2/2（**新 COPY/批量通道在 5.0.0 实测**）
   ——7/0。
-- 基准与探针工具存证：`spinduck_bench`（mat/sync 模式 + MeterExecutor）、
-  `tests/wire_probe.rs`、`tests/io_probe.rs`（含 openGauss copy_in 失败探针）。
+- 基准与探针工具存证口径（与 V26.4 一致，复核修）：`spinduck_bench`、
+  `tests/wire_probe.rs`、`tests/io_probe.rs` 三者**均未入库**——本节全部
+  基准数字为开发机一次性测量，结论保留在此，不可从仓库复现。
 
 ### 边界（不声称做到的）
 
 - 合并 COMMIT 开关 ON 的两处偏差（失败行不进 inst_log、嵌套边界即刷盘）是
   **文档化偏离**而非等效实现；默认 OFF 的行为由 OFF 守护测试锁定。
+- ON 模式刷盘点补发的 `SqlExec` 事件（V26.7）`elapsed_us` 记 0——与
+  `sqlstmts::exec` 现行口径一致，合并语句未单独计时。
+- 攒批多行共享一张按元组缓存的下沉表（sd_fnN）是独立设计题，本节不覆盖
+  （带下沉的 INSERT 一律回落即时下发，见 V26.7 准入条件）。
 - 7.0-RC3 参照的绝对耗时不可与黄金基线历史混比（不同内核版本）；本节所有
   "对比"都是同机同数据同时点的 A/B。
 - 参照侧计时含 gsql 客户端（~0.3s 启动），SpinDuck 为进程内 call——两口径
@@ -1865,3 +1876,43 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
 - 动态 SQL（`EXECUTE IMMEDIATE`）在开关 ON 下走保守整缓冲刷盘，未单独基准。
 - `lib/fastaas` 考题语料不在本仓库跟踪面内（V21.5 口径），本节数据全部来自
   `golden/case_corpus_purchase` 在库夹具。
+
+### V26.7 第二轮复核修复：fn_sites 攒批漏物化、memo 失效收窄、刷盘事件、CLI 预算入口
+
+第二轮复核（head `a267748`，2026-11-09）抓出的数据级阻塞项与后续修：
+
+- **阻塞项（数据级）**：ON 模式带 sqlfn 下沉（`fn_sites` 非空）的 INSERT 被
+  `take_insert` 攒批——`materialize_fn_sites` 是 `sqlstmts::exec` 的执行期
+  副作用，攒批跳过它 → `sd_fnN` 未建（KERNEL-0010 硬失败）或滞留旧元组
+  （静默写错值）。语料形态 `PKG_SPLIT_TRADE_STEP3_SH.prc_trd_hz_byfund` 的
+  `INSERT … VALUES (… fnc_get_rate_info2 …)` 即是此形态；V26 基准恰好未覆盖
+  带下沉的 INSERT 故未暴露。修复：`take_insert` 增加显式准入条件——fn_sites
+  非空一律按表命中刷盘后回落即时下发；回填为「缓冲 = 只能替换 `ex.execute`，
+  原路径其余副作用一律回落」的原则。回归：
+  `should_fall_back_to_immediate_exec_for_insert_with_fn_sites_when_batch_commit_on`
+  （修前实测红：sd_fn0 未物化）。
+- **memo 失效收窄（复核应修 A）**：DDL 即清 memo 与 sqlfn 每行一次
+  CREATE TEMP TABLE 相乘，带下沉的游标循环每行清空缓存。收窄到只认
+  `CREATE OR REPLACE MACRO|FUNCTION` / `DROP MACRO`（`is_macro_ddl`；
+  TEMP TABLE 不改变白名单纯表达式语义）。回归：`should_keep_memo_across_
+  temp_table_ddl`（修前红）+ `should_clear_memo_after_macro_ddl`。
+  V26.1 的 −31.6% 为收窄前采集，已加口径注记；重跑需 7.0-RC3 参照实例，
+  未在本轮执行。
+- **刷盘点补发 SqlExec 事件（复核应修 B）**：被合并的 INSERT 原在 JSONL
+  面完全消失。`flush` 现对每条实际下发的语句（合并语句 + 回放行）发
+  `TraceEvent::SqlExec`（`elapsed_us` 记 0，与 `sqlstmts::exec` 同口径）。
+  回归：`should_emit_sql_exec_event_for_merged_insert_at_flush_point`。
+- **CLI 步数预算入口（复核应修 C）**：`Engine::step_budget` 原有字段无入口
+  ——`call --batch-commit` 跑 100k 级游标循环必撞 ENG-0032。补
+  `spinduck call --step-budget <n>`（正整数，0 拒绝），与 `--batch-commit`
+  同处接线。回归：`should_parse_call_with_step_budget`。
+- **小项**：`is_insert` 字节切片改 `chars().take(12)`（与 `is_ddl` 同口径）；
+  空组分支的 `buffered -= 0` 随逐组出账重写消除；不可达的 `last_mut()` None
+  分支改按索引取尾组；`writebuf.rs` 头注释补 `borrow_mut` 跨 `ex.execute`
+  的重入约束一行。
+- **文档一致性（复核文档 6 条）**：V26.6 探针口径与 V26.4 统一为「未入库」；
+  V26.2 改述为决断 1 后的现行修复（DDL 绕缓存 + rebind 兜底，无全 flush）
+  并指向 `tests/guard/` 现行守护；「采用依据见 V24.5」改 V26.5；
+  architecture §3.5 删除代码中不存在的「组随例程内业务异常边界切分」、
+  「协议级细节」措辞随 WireCopy 退役改为「机制细节」；README 能力矩阵数字
+  回传 V26.4 更新值、删除线/杂行清理。
