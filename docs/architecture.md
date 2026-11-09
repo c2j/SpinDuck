@@ -655,6 +655,9 @@ $SPINDUCK_HOME/                       # 根路径，配置项 home；默认 ./�
 //   BATCH_SKIP detail 形态（V26，第四轮复审确认并入契约）：
 //   {"event":"BATCH_SKIP","detail":{"rows":1,"first_error":"KERNEL-0010 constraint violation"},"elapsed_us":0}
 //   ——合并 COMMIT 开关 ON 的回放期被跳过行数与首个错误（含错误码）
+//   注意：exec_native 把所有 DuckDB 错误统一映射为 KERNEL-0010，因此该码
+//   不承担「引擎缺陷 vs 业务跳行」的判别维度——判别信号是 BatchSkip 事件
+//   本身 + first_error 的 message 文本，勿按错误码写告警规则（第五轮复审口径）
 // engine 专属：{"component":"interp|exec|catalog|rules","kv":{…}}
 ```
 

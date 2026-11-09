@@ -247,7 +247,7 @@ cargo test --all-features
 cargo fmt --all
 cargo fmt --all -- --check
 cargo clippy --all-features -- -D warnings
-cargo test --features native        # 无容器环境；gauss 见 golden job
+cargo test --features cli          # 无容器环境；cli 蕴含 native 并含 CLI 契约层；gauss 见 golden job
 cargo audit
 
 # 变异测试（仅 M3.5/M6.5/M10 门禁节点）
@@ -278,7 +278,8 @@ CI 定义 `.github/workflows/ci.yml`。常驻门禁五个 job 全部必须通过
 
 - **Format**: `cargo fmt --all -- --check`
 - **Clippy**: `cargo clippy --all-features -- -D warnings`
-- **Test**: `cargo test --features native`（默认/内核通道；gauss 黄金层
+- **Test**: `cargo test --features cli`（cli 蕴含 native，覆盖面只增不减，
+  并使 tests/cli.rs 的二进制契约层真实运行——V26.10；gauss 黄金层
   需 A 模式容器，缺容器必红——见 golden job）
 - **Security Audit**: `cargo audit`（构建期 `zip` 豁免清单见 workflow 注释与
   `docs/architecture.md`「审计豁免」，内核升级 PR 必须复评）

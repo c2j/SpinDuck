@@ -72,3 +72,8 @@ path = "tests/guard/guard_sql_pipeline_parity.rs"
 name = "guard_register_silent_drop"
 path = "tests/guard/guard_register_silent_drop.rs"
 
+
+[[test]]
+name = "cli"
+path = "tests/cli.rs"
+required-features = ["cli"]

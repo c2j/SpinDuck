@@ -1795,9 +1795,11 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
   失败时逐组出账（原多组部分成功后重复下发）；③ `INSERT INTO sch.t`
   限定名的读自己写命中（原 token 切分漏判）；④ 字符串字面量内的 `$`
   不再误判为占位符；⑤ push 改收已验证前缀（原不可达错误分支）。
-- 测试 7 个（interp 层 FakeExecutor 计数）：合并+吞并（ON）、逐行 COMMIT
-  （OFF 默认守护）、触及缓冲表先刷盘、无空格表名形态触表刷盘、合并失败
-  回退跳过、INSERT…SELECT 回落即时下发、带 fn_sites 的 INSERT 回落即时下发。
+- 测试 10 个（V26.10 修后实数；interp 层 FakeExecutor 计数），按面分组：
+  语义四条（合并+吞并 ON、逐行 COMMIT OFF 默认守护、触及缓冲表先刷盘、
+  无空格表名形态触表刷盘）、回落两条（INSERT…SELECT、带 fn_sites 的
+  INSERT）、回放一条（合并失败回退跳行）、事件面两条（刷盘点 SqlExec、
+  回放跳行 BatchSkip）、上限一条（WRITE_BUF_CAP 满则先刷盘）。
 - 实现中由测试/基准抓出的自身缺陷（各一条，均修复）：
   ① md5 外层摘要误用 16 字节 raw digest——正确输入是 inner 的 **32 字符
   hex ASCII 串**（服务端 28P01）；
@@ -1852,10 +1854,11 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
 
 - fmt / clippy（gauss，`-D warnings`）✓；`cargo audit` 无新增告警
   （既有 zip 维持 CI 豁免口径）。
-- `cargo test --features native` 全量 **318/0**（V26.8 修后复核计数；V24 批次时为
-  307/0）：新增 memo 8（含 FUNCTION/短形态 MACRO 判定 1）、prepared 守护 2、
-  batch_commit 7（interp 层）、回放跳行事件 1、CLI 解析 1、cases_native 6
-  （OFF 4 + **ON 2**，见 V26.8 应修 1）。
+- `cargo test --features cli` 全量 **322/0**（V26.10 修后口径，cli 蕴含
+  native；V24 批次时 native 口径为 307/0）：新增 memo 8（含 FUNCTION/短形态
+  MACRO 判定 1）、prepared 守护 2、batch_commit 10（见 V26.3 分组）、
+  回放跳行事件 1、CLI 解析 1、cases_native 6
+  （OFF 4 + **ON 2**，见 V26.8 应修 1）、CLI 契约 3（bin 面，V26.10）。
 - golden 回归（5.0.0 容器，默认 OFF 路径）：cases_native 4/4、
   golden_corpus_purchase 1/1、gauss_e2e 2/2（**新 COPY/批量通道在 5.0.0 实测**）
   ——7/0。ON 模式的内核级 A/B（cases_native ON 2 条）走 native 门禁（进程内
@@ -1962,14 +1965,16 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
   batch_commit 测试数 5→7；V26.7 的「必撞 ENG-0032」改推断口径并注明
   `--step-budget` 只作用顶层预算；「空组分支已消除」的不实表述更正（本节
   整支删除，V26.7 已附注）。
-- **规模注记（§3）**：`exec.rs` 含测试 536 行（<700 上限内，但超 500 基础线）
-  ——下一个改动它的 PR 须先拆 memo 子模块或书面豁免。`interp/tests.rs` 的
+- **规模注记（§3）**：`exec.rs` 含测试 543 行（第四轮修后 `wc -l` 实测；该
+  数字随 memo 口径微调会小幅漂移，判定以当场 wc 为准，两轴 500/700 内）。
+  **书面豁免**：本 PR 对 exec.rs 的后续改动（is_macro_ddl）即 memo 口径
+  本身，拆 memo 子模块属独立重构、另开 PR，不在本 PR 范围内。`interp/tests.rs` 的
   682 行注记在写下后被第四轮修复推过 700 上限（793 行）——已在第四轮**拆分
-  为 `tests/mod.rs`（共享 helper）+ `tests/writebuf.rs`（batch/writebuf 块）**，
+  为 `tests/mod.rs`（共享 helper，401 行）+ `tests/writebuf.rs`（batch/writebuf 块，452 行）**，
   两个文件均在限内；本条历史数字保留作口径教训。
-- **非本 PR 缺口（存档）**：AGENTS §4.1 的 CLI 契约层 `tests/cli.rs` 在仓库
-  不存在，`cli/run.rs` 两个开关的实际接线（`eng.batch_commit` /
-  `eng.step_budget` 赋值）无测试面——本轮 `--step-budget` 仅到解析层。
+- ~~**非本 PR 缺口（存档）**：AGENTS §4.1 的 CLI 契约层~~ **已在 V26.10 落地**：`tests/cli.rs`
+  （bin 契约 3 条，`required-features = ["cli"]`），CI Test 口径改
+  `--features cli`（蕴含 native）——`cli/run.rs` 两个开关的接线自此有测试面。
 
 ### V26.9 第四轮复核：契约决策落地、tests 拆分、缓冲上限入测
 
@@ -1996,3 +2001,27 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
   （682→793→拆分后实际行数）。
 - **计数（V26.9 修后）**：`cargo test --features native` 全量 **319/0**
   （V26.8 的 318 + cap 回归 1）。
+
+### V26.10 第五轮复核：CLI 契约层落地、CI Test 口径升 cli、文档精度收口
+
+第五轮复审（head `c1adc5a`）确认第四轮四条全部真落地、无阻塞项；本轮处理
+三处文档精度与那个需要显式定案的缺口：
+
+- **CLI 契约层落地（复审「合并前唯一需要显式定的事」，取本 PR 内补）**：
+  新建 `tests/cli.rs`（`required-features = ["cli"]`，AGENTS §4.1 口径），
+  驱动**打包后的二进制**走完整 parse → run → Engine::call 路径：开关同开
+  成功调用（`--batch-commit` + `--step-budget 1000000`，语料同款
+  LOOP/COMMIT/EXIT 例程）、`--step-budget 0` 拒绝（usage 退出码 2）、
+  默认 OFF 路径同例程——`cli/run.rs` 对 `eng.batch_commit` /
+  `eng.step_budget` 的接线自此有测试面。3/3 一次通过。
+- **CI Test 口径升 `--features cli`**：cli 蕴含 native（既有覆盖一条不减）
+  并使 cli 契约层在常驻 Test job 真实运行；AGENTS §8/§9 与 workflow 注释
+  同步。**计数（V26.10 修后）**：`cargo test --features cli` 全量
+  **322/0**（V26.9 的 319 + cli 契约 3）。
+- **文档精度三处**：V26.8 规模注记改为不随行号漂移的表述（543 行 +
+  「is_macro_ddl 即 memo 口径本身、拆 memo 另开 PR」的书面豁免）；V26.3
+  batch_commit 测试 7→**10**（按语义/回落/回放/事件面/上限分组）；V26.9
+  拆分注记补实际行数 401/452。
+- **口径注记**：`KERNEL-0010` 是 exec_native 对所有 DuckDB 错误的统一映射，
+  **不承担 BatchSkip 的判别维度**——判别信号是事件本身 + message 文本
+  （architecture §11.2 已注）。
