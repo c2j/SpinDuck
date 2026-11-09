@@ -1795,7 +1795,7 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
   失败时逐组出账（原多组部分成功后重复下发）；③ `INSERT INTO sch.t`
   限定名的读自己写命中（原 token 切分漏判）；④ 字符串字面量内的 `$`
   不再误判为占位符；⑤ push 改收已验证前缀（原不可达错误分支）。
-- 测试 5 个（interp 层 FakeExecutor 计数）：合并+吞并（ON）、逐行 COMMIT
+- 测试 7 个（interp 层 FakeExecutor 计数）：合并+吞并（ON）、逐行 COMMIT
   （OFF 默认守护）、触及缓冲表先刷盘、合并失败回退跳过、INSERT…SELECT
   回落即时下发。
 - 实现中由测试/基准抓出的自身缺陷（各一条，均修复）：
@@ -1852,11 +1852,14 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
 
 - fmt / clippy（gauss，`-D warnings`）✓；`cargo audit` 无新增告警
   （既有 zip 维持 CI 豁免口径）。
-- `cargo test --features native` 全量 **307/0**：新增 memo 6、prepared 守护 2、
-  batch_commit 4（合并+吞并 / OFF 默认守护 / 读自己写刷盘 / 失败回退跳过）。
+- `cargo test --features native` 全量 **318/0**（V26.8 修后复核计数；V24 批次时为
+  307/0）：新增 memo 8（含 FUNCTION/短形态 MACRO 判定 1）、prepared 守护 2、
+  batch_commit 7（interp 层）、回放跳行事件 1、CLI 解析 1、cases_native 6
+  （OFF 4 + **ON 2**，见 V26.8 应修 1）。
 - golden 回归（5.0.0 容器，默认 OFF 路径）：cases_native 4/4、
   golden_corpus_purchase 1/1、gauss_e2e 2/2（**新 COPY/批量通道在 5.0.0 实测**）
-  ——7/0。
+  ——7/0。ON 模式的内核级 A/B（cases_native ON 2 条）走 native 门禁（进程内
+  内核、无容器依赖），断言集与 OFF 完全一致。
 - 基准与探针工具存证口径（与 V26.4 一致，复核修）：`spinduck_bench`、
   `tests/wire_probe.rs`、`tests/io_probe.rs` 三者**均未入库**——本节全部
   基准数字为开发机一次性测量，结论保留在此，不可从仓库复现。
@@ -1903,16 +1906,60 @@ architecture §3.5 补注与 `writebuf.rs` 头注释。
   `TraceEvent::SqlExec`（`elapsed_us` 记 0，与 `sqlstmts::exec` 同口径）。
   回归：`should_emit_sql_exec_event_for_merged_insert_at_flush_point`。
 - **CLI 步数预算入口（复核应修 C）**：`Engine::step_budget` 原有字段无入口
-  ——`call --batch-commit` 跑 100k 级游标循环必撞 ENG-0032。补
-  `spinduck call --step-budget <n>`（正整数，0 拒绝），与 `--batch-commit`
-  同处接线。回归：`should_parse_call_with_step_budget`。
+  ——按步数模型推断，`call --batch-commit` 跑 100k 级游标循环会撞 ENG-0032
+  （基准工具未入库，当时的实际步数/预算未留档，此为推断口径而非实测）。
+  补 `spinduck call --step-budget <n>`（正整数，0 拒绝），与 `--batch-commit`
+  同处接线。**注意：该入口只放大顶层 `RunLimits.budget`，嵌套例程仍沿各自
+  默认预算**。回归：`should_parse_call_with_step_budget`（解析层；CLI 接线的
+  契约测试面 `tests/cli.rs` 仓库尚不存在，属既有缺口、非本 PR 引入）。
 - **小项**：`is_insert` 字节切片改 `chars().take(12)`（与 `is_ddl` 同口径）；
-  空组分支的 `buffered -= 0` 随逐组出账重写消除；不可达的 `last_mut()` None
-  分支改按索引取尾组；`writebuf.rs` 头注释补 `borrow_mut` 跨 `ex.execute`
-  的重入约束一行。
+  不可达的 `last_mut()` None 分支改按索引取尾组；`writebuf.rs` 头注释补
+  `borrow_mut` 跨 `ex.execute` 的重入约束一行。空组分支在第三轮整支删除
+  （V26.8：本节初稿写「随逐组出账重写消除」不成立——它只是改成了
+  `-= 0` 的不可达形态）。
 - **文档一致性（复核文档 6 条）**：V26.6 探针口径与 V26.4 统一为「未入库」；
   V26.2 改述为决断 1 后的现行修复（DDL 绕缓存 + rebind 兜底，无全 flush）
   并指向 `tests/guard/` 现行守护；「采用依据见 V24.5」改 V26.5；
   architecture §3.5 删除代码中不存在的「组随例程内业务异常边界切分」、
   「协议级细节」措辞随 WireCopy 退役改为「机制细节」；README 能力矩阵数字
   回传 V26.4 更新值、删除线/杂行清理。
+
+### V26.8 第三轮复核修复：ON 模式内核级 A/B、回放跳行留痕、表名解析、is_macro_ddl 口径
+
+第三轮复核（head `66cebd3`，2026-11-09）无阻塞项；三条应修 + 两条建议落地：
+
+- **应修 1（ON 模式内核级 A/B）**：`cases_native.rs` 的 `run_project` 增加
+  `batch_commit` 形参，`case_split_agg`（INSERT 带 `fnc_fee` 下沉，钉住准入
+  回落路径）与 `case_corpus_purchase`（大 INSERT 循环，真攒批）各加 ON 变体
+  ——**同一部署、同一断言集**在 ON 下逐值复跑，合并 INSERT 产物由真实
+  DuckDB 解析，「开关不改变数据」从文档承诺变成门禁。两条一次通过。
+- **应修 2（回放跳行留痕）**：`flush` 回放期被跳过的坏行补发
+  `TraceEvent::BatchSkip { rows, first_error }`（枚举新变体，字段面变更
+  随本 PR 评审确认）；引擎缺陷与业务异常行自此可在 JSONL 面区分。
+  回归：`should_emit_batch_skip_event_when_replay_drops_rows`（修前编译红：
+  变体不存在）。
+- **应修 3（表名解析）**：`tables()` 对 `INSERT INTO t(a, …)`（表名与列清单
+  无空格，golden `case_split_agg` 的 routine.sql 即此写法）曾取到 `"t(a,"`
+  → 读自己写永不命中。按 `'('` 截掉列清单。回归：
+  `should_flush_buffer_before_touching_table_when_insert_has_no_space_before_cols`
+  （修前红：DELETE 先于刷盘下发）。
+- **建议 4（is_macro_ddl 口径）**：`chars().take(24)` 字符窗口使
+  FUNCTION 分支永不匹配（26 字符被截），`CREATE MACRO` 短形态 /
+  `DROP FUNCTION` / TEMP 修饰同漏。改前 5 个空白分隔 token 判定，覆盖
+  `CREATE [OR REPLACE] [TEMP] MACRO|FUNCTION`、`CREATE MACRO` 与
+  `DROP MACRO|FUNCTION`。回归：
+  `should_clear_memo_after_function_and_short_form_macro_ddl`（修前红：
+  FUNCTION 不清缓存）。
+- **建议 5（回落分支断言保护 + 代码收敛）**：`INSERT … SELECT` 与 fn_sites
+  两条回落测试改为**顺序断言**（预置同表缓冲行 → 缓冲合并 INSERT 必须先于
+  回落语句下发；删掉 flush 分支会红）；`take_insert` 三处内联的
+  「取 tables → touches → flush」收敛为 `flush_if_touches` 单一调用。
+- **文档口径**：V26.6 测试计数回传（307→318，分类明细见上）；V26.3
+  batch_commit 测试数 5→7；V26.7 的「必撞 ENG-0032」改推断口径并注明
+  `--step-budget` 只作用顶层预算；「空组分支已消除」的不实表述更正（本节
+  整支删除，V26.7 已附注）。
+- **规模注记（§3）**：`exec.rs` 本轮含测试 500 行顶格——下一个改动它的 PR
+  须先拆 memo 子模块或书面豁免；`interp/tests.rs` 682 行（<700 含测试上限）。
+- **非本 PR 缺口（存档）**：AGENTS §4.1 的 CLI 契约层 `tests/cli.rs` 在仓库
+  不存在，`cli/run.rs` 两个开关的实际接线（`eng.batch_commit` /
+  `eng.step_budget` 赋值）无测试面——本轮 `--step-budget` 仅到解析层。

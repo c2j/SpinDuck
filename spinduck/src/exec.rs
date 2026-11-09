@@ -177,16 +177,25 @@ pub(crate) fn is_ddl(sql: &str) -> bool {
     head == "CREATE" || head.starts_with("DROP") || head.starts_with("ALTER")
 }
 
-/// 改变白名单纯表达式内核语义的 DDL 判定（memo 缓存失效口径，复核应修 A）：
-/// 仅 `CREATE OR REPLACE MACRO|FUNCTION` / `DROP MACRO`。TEMP TABLE 等
-/// 其余 DDL 不改变纯表达式语义，不清 memo（否则 sqlfn 物化路径每行清空）。
+/// 改变白名单纯表达式内核语义的 DDL 判定（memo 缓存失效口径，复核应修 A +
+/// 建议 4）：按前 5 个空白分隔 token 判定，覆盖
+/// `CREATE [OR REPLACE] [TEMP] MACRO|FUNCTION`、`CREATE MACRO` 短形态与
+/// `DROP MACRO|FUNCTION`。TEMP TABLE 等其余 DDL 不改变纯表达式语义，
+/// 不清 memo（否则 sqlfn 物化路径每行清空）。
 pub(crate) fn is_macro_ddl(sql: &str) -> bool {
     let t = strip_leading_comments(sql);
-    let head: String = t.chars().take(24).collect::<String>().to_ascii_uppercase();
-    let compact = head.replace(char::is_whitespace, "");
-    compact.starts_with("CREATEORREPLACEMACRO")
-        || compact.starts_with("CREATEORREPLACEFUNCTION")
-        || compact.starts_with("DROPMACRO")
+    let toks: Vec<&str> = t.split_whitespace().take(5).collect();
+    let is = |i: usize, s: &str| toks.get(i).is_some_and(|w| w.eq_ignore_ascii_case(s));
+    let kind = |i: usize| is(i, "MACRO") || is(i, "FUNCTION");
+    if is(0, "CREATE") {
+        if is(1, "OR") {
+            is(2, "REPLACE") && (if is(3, "TEMP") { kind(4) } else { kind(3) })
+        } else {
+            (is(1, "TEMP") && kind(2)) || kind(1)
+        }
+    } else {
+        is(0, "DROP") && kind(1)
+    }
 }
 
 /// 剥离可叠加的前导注释（行 `--` 与块 `/* */`）。
@@ -246,6 +255,12 @@ pub enum TraceEvent {
     },
     IrStmt {
         variant: &'static str,
+    },
+    /// 批量写入回放期被跳过的行（复核应修 2：丢行必须在事件面可见，
+    /// 并能与引擎缺陷区分——rows 为跳过行数，first_error 为首个失败原因）。
+    BatchSkip {
+        rows: usize,
+        first_error: String,
     },
 }
 
@@ -496,5 +511,26 @@ mod tests {
             3,
             "MACRO DDL 必须清 memo 缓存（execute 1 次 + 失效后的 query 再执行 1 次）"
         );
+    }
+
+    #[test]
+    fn should_clear_memo_after_function_and_short_form_macro_ddl() {
+        // 复核建议 4：take(24) 字符窗口让 FUNCTION 分支永不匹配（26 字符被截），
+        // CREATE MACRO 短形态 / DROP FUNCTION / TEMP 修饰同样漏。token 判定后
+        // 这四类都必须命中。
+        for ddl in [
+            "CREATE OR REPLACE FUNCTION f(x) AS x + 1",
+            "CREATE MACRO m(x) AS x + 1",
+            "CREATE OR REPLACE TEMP MACRO m(x) AS x + 1",
+            "DROP FUNCTION f",
+            "DROP MACRO m",
+        ] {
+            let ex = MemoizingExecutor::new(Box::new(CountingExec::new(SpinValue::Int(7))));
+            let sql = "SELECT SUBSTRING($p0, 1, 2)";
+            let _ = ex.query(sql, &binds("20250715")).unwrap();
+            let _ = ex.execute(ddl, &BindMap::new()).unwrap();
+            let _ = ex.query(sql, &binds("20250715")).unwrap();
+            assert_eq!(ex.inner_calls(), 3, "{ddl} 必须清 memo 缓存");
+        }
     }
 }

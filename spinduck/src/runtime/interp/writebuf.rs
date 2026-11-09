@@ -49,7 +49,15 @@ impl WriteBuffer {
             let Some(t) = g.prefix.split_whitespace().nth(2) else {
                 continue;
             };
-            let t = t.trim_end_matches('(').trim_matches('"').to_string();
+            // `INSERT INTO t(a, …)`（表名与列清单无空格，golden case_split_agg
+            // 即此写法）：按 '(' 截掉列清单（复核应修 3，原取到 "t(a," 永不命中）
+            let t = t
+                .split('(')
+                .next()
+                .unwrap_or(t)
+                .trim_end_matches('(')
+                .trim_matches('"')
+                .to_string();
             out.push(t.clone());
             if let Some((_, last)) = t.rsplit_once('.') {
                 out.push(last.to_string());
@@ -104,10 +112,7 @@ impl WriteBuffer {
         };
         while !self.groups.is_empty() {
             let g = self.groups.remove(0);
-            if g.rows.is_empty() {
-                self.buffered -= g.rows.len();
-                continue;
-            }
+            // push 保证每组入账即带行，空组不可达（复核文档 7：不再保留分支）
             let merged = format!("{} VALUES {}", g.prefix, g.rows.join(", "));
             emit(sink, &merged);
             if let Err(first_err) = ex.execute(&merged, &BindMap::new()) {
@@ -115,19 +120,31 @@ impl WriteBuffer {
                 // 上抛前先出账本组（已重放的行不重复），剩余组随外层错误丢弃。
                 self.buffered -= g.rows.len();
                 let mut first_row = true;
+                let mut skipped = 0usize;
+                let mut skip_reason = String::new();
                 for row in &g.rows {
                     let stmt = format!("{} VALUES {}", g.prefix, row);
                     emit(sink, &stmt);
                     match ex.execute(&stmt, &BindMap::new()) {
                         Ok(_) => first_row = false,
                         Err(row_err) => {
-                            let _ = row_err;
                             if first_row {
                                 return Err(first_err);
+                            }
+                            // 跳行留痕（复核应修 2）：不上抛但必须可观测
+                            skipped += 1;
+                            if skip_reason.is_empty() {
+                                skip_reason = row_err.message.clone();
                             }
                             first_row = false;
                         }
                     }
+                }
+                if skipped > 0 {
+                    sink.on_event(TraceEvent::BatchSkip {
+                        rows: skipped,
+                        first_error: skip_reason,
+                    });
                 }
             } else {
                 self.buffered -= g.rows.len();
@@ -246,10 +263,7 @@ pub(in crate::runtime) fn take_insert(
         return Ok(false);
     }
     if !is_insert(sql) {
-        let tables = rc.borrow().tables();
-        if !tables.is_empty() && touches_buffered_table(sql, &tables) {
-            rc.borrow_mut().flush(env.ex, env.sink)?;
-        }
+        flush_if_touches(env, sql)?;
         return Ok(false);
     }
     // 可缓冲判定前置：只有「INSERT INTO 表 (列) VALUES (标量列表)」形态才攒批；
@@ -259,10 +273,7 @@ pub(in crate::runtime) fn take_insert(
     let Some(vpos) = lower.find(" values") else {
         // 不可缓冲形态（如 INSERT … SELECT）：回落即时下发（评审阻塞项 2——
         // 该形态是形态覆盖门禁已断言的合法输入，不能当作错误）。
-        let tables = rc.borrow().tables();
-        if !tables.is_empty() && touches_buffered_table(sql, &tables) {
-            rc.borrow_mut().flush(env.ex, env.sink)?;
-        }
+        flush_if_touches(env, sql)?;
         return Ok(false);
     };
     let prefix = sql[..vpos].trim_end().to_string();

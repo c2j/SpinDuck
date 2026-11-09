@@ -491,6 +491,44 @@ fn should_flush_buffer_before_touching_table_when_batch_commit_on() {
     assert_eq!(calls.len(), 2);
 }
 
+#[test]
+fn should_flush_buffer_before_touching_table_when_insert_has_no_space_before_cols() {
+    // 复核应修 3：`INSERT INTO t(a) VALUES …`（表名与列清单之间无空格）的
+    // tables() 曾取到 "t(a," → 永不命中 → 读自己写漏刷（golden case_split_agg
+    // 的 routine.sql 即此写法）。表名 token 必须按 '(' 截断。
+    use ogsql_parser::parser::Parser;
+    use ogsql_parser::token::tokenizer::Tokenizer;
+    let ins_sql = "INSERT INTO t(a) VALUES ('x')";
+    let ins = PlStatement::SqlStatement {
+        span: None,
+        sql_text: ins_sql.to_string(),
+        statement: Box::new(
+            Parser::new(Tokenizer::new(ins_sql).tokenize().unwrap())
+                .parse()
+                .remove(0),
+        ),
+    };
+    let del_sql = "DELETE FROM t WHERE a = 'x'";
+    let del = PlStatement::SqlStatement {
+        span: None,
+        sql_text: del_sql.to_string(),
+        statement: Box::new(
+            Parser::new(Tokenizer::new(del_sql).tokenize().unwrap())
+                .parse()
+                .remove(0),
+        ),
+    };
+    let ex = FakeExecutor::default();
+    let (_, out) = run_pl_batch(vec![ins, del], &ex, true);
+    assert_eq!(out.unwrap(), RunOutcome::Completed);
+    let calls = ex.calls();
+    assert!(
+        calls[0].0.starts_with("INSERT"),
+        "无空格形态也必须命中缓冲表并先刷盘，实际下发顺序: {calls:?}"
+    );
+    assert!(calls[1].0.starts_with("DELETE"), "DELETE 后于刷盘下发");
+}
+
 struct FailOnPattern {
     pattern: &'static str,
     ok_execs: std::cell::Cell<u32>,
@@ -571,8 +609,19 @@ fn should_fall_back_to_immediate_exec_for_insert_select_when_batch_commit_on() {
     let (_, out) = run_pl_batch(vec![insert_stmt("t1", "'x'"), ins_sel], &ex, true);
     assert_eq!(out.unwrap(), RunOutcome::Completed);
     let calls = ex.calls();
+    // 复核建议 5：回落分支的「先刷盘」也要有断言保护——预置的 t1 缓冲行
+    // 必须先于 INSERT…SELECT 下发（删掉该分支的 flush 会在此变红）
+    assert_eq!(
+        calls.len(),
+        2,
+        "恰好两条下发：t1 缓冲合并 INSERT 先刷盘 + INSERT…SELECT 即时下发，实际: {calls:?}"
+    );
     assert!(
-        calls.iter().any(|(s, _)| s.starts_with("INSERT INTO t2")),
+        calls[0].0.starts_with("INSERT INTO t1"),
+        "缓冲的 t1 行先刷盘，实际: {calls:?}"
+    );
+    assert!(
+        calls[1].0.starts_with("INSERT INTO t2"),
         "回落路径必须真实下发 INSERT…SELECT"
     );
 }
@@ -590,17 +639,27 @@ fn should_fall_back_to_immediate_exec_for_insert_with_fn_sites_when_batch_commit
         distinct_sql: "SELECT DISTINCT 1 AS sd_v, 1 AS sd_a0".into(),
         binds: vec![],
     };
-    let prog = IrProg {
-        code: vec![IrStmt::SqlExec {
-            sql: "INSERT INTO t (a) VALUES (1)".into(),
-            binds: vec![],
-            fn_sites: vec![site],
-        }],
+    let fn_insert = IrStmt::SqlExec {
+        sql: "INSERT INTO t (a) VALUES (1)".into(),
+        binds: vec![],
+        fn_sites: vec![site],
     };
     let ex = FakeExecutor::default();
     let mut f = Frame::new();
     let mut sink = crate::exec::TraceNoopSink;
     let cat = crate::catalog::RoutineCatalog::new();
+    // 复核建议 5：预置同表缓冲行使回落分支的 flush_if_touches 真实执行，
+    // 并断言顺序（先刷盘 → 再物化 → 再下发 INSERT）
+    let prog = IrProg {
+        code: vec![
+            IrStmt::SqlExec {
+                sql: "INSERT INTO t (a) VALUES ('x')".into(),
+                binds: vec![],
+                fn_sites: vec![],
+            },
+            fn_insert,
+        ],
+    };
     let out = run_with_catalog(
         &prog,
         &mut f,
@@ -615,19 +674,26 @@ fn should_fall_back_to_immediate_exec_for_insert_with_fn_sites_when_batch_commit
     );
     assert_eq!(out.unwrap(), RunOutcome::Completed);
     let calls = ex.calls();
+    let ins_pos = calls
+        .iter()
+        .position(|(s, _)| s.starts_with("INSERT INTO t"))
+        .expect("带下沉的 INSERT 必须原样即时下发，不得进入缓冲");
+    let mat_pos = calls
+        .iter()
+        .position(|(s, _)| s.contains("CREATE OR REPLACE TEMP TABLE sd_fn0"))
+        .expect("fn_sites 必须先物化（temp table 建立）");
     assert!(
-        calls
-            .iter()
-            .any(|(s, _)| s.contains("CREATE OR REPLACE TEMP TABLE sd_fn0")),
-        "fn_sites 必须先物化（temp table 建立）"
+        ins_pos < mat_pos,
+        "缓冲的 t 行必须先刷盘（calls[0]），再物化 sd_fn0；实际: {calls:?}"
     );
     assert!(
-        calls.iter().any(|(s, _)| s.starts_with("INSERT INTO t")),
-        "带下沉的 INSERT 必须原样即时下发，不得进入缓冲"
+        calls[0].0.starts_with("INSERT INTO t"),
+        "首条下发必须是刷盘的合并 INSERT，实际: {calls:?}"
     );
 }
 
-/// 事件收集 sink（writebuf 刷盘事件断言用）。
+/// 事件收集 sink（writebuf 刷盘事件断言用）：SqlExec 记 SQL 文本、
+/// BatchSkip 记「跳过行数|首错文本」。
 struct VecSink {
     events: std::cell::RefCell<Vec<String>>,
 }
@@ -645,8 +711,13 @@ impl VecSink {
 
 impl crate::exec::TraceSink for VecSink {
     fn on_event(&mut self, event: crate::exec::TraceEvent) {
-        if let crate::exec::TraceEvent::SqlExec { sql, .. } = event {
-            self.events.borrow_mut().push(sql);
+        match event {
+            crate::exec::TraceEvent::SqlExec { sql, .. } => self.events.borrow_mut().push(sql),
+            crate::exec::TraceEvent::BatchSkip { rows, first_error } => self
+                .events
+                .borrow_mut()
+                .push(format!("SKIP {rows}|{first_error}")),
+            _ => {}
         }
     }
 }
@@ -678,5 +749,45 @@ fn should_emit_sql_exec_event_for_merged_insert_at_flush_point() {
     assert!(
         events.iter().any(|s| s.starts_with("INSERT INTO t")),
         "刷盘点必须补发合并 INSERT 的 SqlExec 事件，实际: {events:?}"
+    );
+}
+
+#[test]
+fn should_emit_batch_skip_event_when_replay_drops_rows() {
+    // 复核应修 2：回放期被跳过的坏行原样吞掉——JSONL 面上看不出 ON 模式
+    // 少了一批数据。补发 BatchSkip{rows, first_error} 事件使丢行可见，
+    // 并能把「业务异常行跳过」与引擎缺陷区分开。
+    let ex = FailOnPattern {
+        pattern: "'bad'",
+        ok_execs: std::cell::Cell::new(0),
+    };
+    let stmts = vec![
+        insert_stmt("t", "'good1'"),
+        insert_stmt("t", "'bad'"),
+        insert_stmt("t", "'good2'"),
+    ];
+    let prog = compile_stmts(&stmts).expect("compile");
+    let mut f = Frame::new();
+    let mut sink = VecSink::new();
+    let cat = crate::catalog::RoutineCatalog::new();
+    let out = run_with_catalog(
+        &prog,
+        &mut f,
+        &ex,
+        &mut sink,
+        &cat,
+        0,
+        crate::runtime::RunLimits {
+            budget: DEFAULT_STEP_BUDGET,
+            batch_commit: true,
+        },
+    );
+    assert_eq!(out.unwrap(), RunOutcome::Completed);
+    let events = sink.snapshot();
+    assert!(
+        events
+            .iter()
+            .any(|s| s.starts_with("SKIP 1|") && s.contains("constraint violation")),
+        "回放跳行必须发 BatchSkip 事件（行数 + 首错文本），实际: {events:?}"
     );
 }
