@@ -10,6 +10,13 @@ use crate::exec::BindMap;
 use crate::project::{CaseConfig, ProjectConfig};
 use crate::rules::RuleRegistry;
 use crate::verify::run::{kernel_objects, verify_entry, verify_scenarios, ChainFacts, EntryReport};
+use std::path::{Path, PathBuf};
+
+/// `deploy_schema` 自建的表：A 模式单行表等价物，项目里没有对应的 DDL 文件。
+///
+/// 唯一口径：新增自建对象只改这里，[`deploy_schema`] 的下发文本按它生成。
+/// `plan` 的静态闭包也读同一份清单——按"无声明即缺件"处理会对每个使用者报假缺件。
+pub const ENGINE_PROVIDED_TABLES: &[&str] = &["sys_dummy"];
 
 /// 部署并核验整个项目（`verify` 子命令的唯一入口，需 `native`）。
 ///
@@ -65,27 +72,50 @@ pub fn deploy_project(eng: &mut Engine, project: &ProjectConfig) -> Result<(), E
 pub fn deploy_schema(eng: &mut Engine, project: &ProjectConfig) -> Result<(), EngineError> {
     let funcs = eng.rules.functions.clone();
     for f in project.ddl_files()? {
-        let text = std::fs::read_to_string(&f)
-            .map_err(|e| EngineError::env(30, format!("读取 {}: {e}", f.display())))?;
-        for unit in sql_units(&strip_defaults(&text)) {
-            let unit = drop_cache_option(&clamp_sequence_bounds(&unit));
-            let rewritten =
-                crate::sql::rewrite_tokens_with_rules(&unit, &Default::default(), &funcs)?;
-            let sql = crate::sql::apply_ast_transforms(&rewritten.text)?;
-            eng.ex.execute(&sql, &BindMap::new()).map_err(|e| {
-                EngineError::kernel(70, format!("建表 {}: {}", f.display(), e.message))
-            })?;
-        }
+        deploy_ddl_file(eng, &f, &funcs)?;
     }
     for f in project.view_files()? {
-        let text = std::fs::read_to_string(&f)
-            .map_err(|e| EngineError::env(30, format!("读取 {}: {e}", f.display())))?;
-        deploy_view(eng, &text, &funcs)?;
+        deploy_view_file(eng, &f, &funcs)?;
     }
-    eng.ex.execute(
-        "CREATE TABLE IF NOT EXISTS sys_dummy AS SELECT 1",
-        &BindMap::new(),
-    )?;
+    ensure_engine_provided_tables(eng)
+}
+
+/// 单个表/序列 DDL 文件下发（`deploy_schema` 与计划面 `deploy` 共用同一条口径）。
+pub(crate) fn deploy_ddl_file(
+    eng: &mut Engine,
+    file: &Path,
+    funcs: &std::collections::BTreeMap<String, String>,
+) -> Result<(), EngineError> {
+    let text = crate::source::read_text(file)?;
+    for unit in sql_units(&strip_defaults(&text)) {
+        let unit = drop_cache_option(&clamp_sequence_bounds(&unit));
+        let rewritten = crate::sql::rewrite_tokens_with_rules(&unit, &Default::default(), funcs)?;
+        let sql = crate::sql::apply_ast_transforms(&rewritten.text)?;
+        eng.ex.execute(&sql, &BindMap::new()).map_err(|e| {
+            EngineError::kernel(70, format!("建表 {}: {}", file.display(), e.message))
+        })?;
+    }
+    Ok(())
+}
+
+/// 单个视图文件下发（视图体优先，失败退占位）。
+pub(crate) fn deploy_view_file(
+    eng: &mut Engine,
+    file: &Path,
+    funcs: &std::collections::BTreeMap<String, String>,
+) -> Result<(), EngineError> {
+    let text = crate::source::read_text(file)?;
+    deploy_view(eng, &text, funcs)
+}
+
+/// 引擎自建对象：无源文件，`plan` 的闭包与这里读同一份 [`ENGINE_PROVIDED_TABLES`]。
+pub(crate) fn ensure_engine_provided_tables(eng: &mut Engine) -> Result<(), EngineError> {
+    for table in ENGINE_PROVIDED_TABLES {
+        eng.ex.execute(
+            &format!("CREATE TABLE IF NOT EXISTS {table} AS SELECT 1"),
+            &BindMap::new(),
+        )?;
+    }
     Ok(())
 }
 
@@ -93,9 +123,16 @@ pub fn deploy_schema(eng: &mut Engine, project: &ProjectConfig) -> Result<(), En
 pub fn deploy_routines(eng: &mut Engine, project: &ProjectConfig) -> Result<(), EngineError> {
     let mut sources = project.stub_files()?;
     sources.extend(project.routine_files()?);
-    for f in sources {
-        let text = std::fs::read_to_string(&f)
-            .map_err(|e| EngineError::env(30, format!("读取 {}: {e}", f.display())))?;
+    register_routine_files(eng, &sources)
+}
+
+/// 逐文件注册例程源码（`deploy_routines` 与计划面 `deploy` 共用的唯一实现）。
+pub(crate) fn register_routine_files(
+    eng: &mut Engine,
+    files: &[PathBuf],
+) -> Result<(), EngineError> {
+    for f in files {
+        let text = crate::source::read_text(f)?;
         eng.register(&text)
             .map_err(|e| EngineError::env(30, format!("注册 {}: {}", f.display(), e.message)))?;
     }
@@ -105,8 +142,7 @@ pub fn deploy_routines(eng: &mut Engine, project: &ProjectConfig) -> Result<(), 
 /// 数据集种子：`cases/datasets/*.sql` 按语句下发。
 pub fn deploy_seeds(eng: &mut Engine, project: &ProjectConfig) -> Result<(), EngineError> {
     for f in project.dataset_files()? {
-        let text = std::fs::read_to_string(&f)
-            .map_err(|e| EngineError::env(30, format!("读取 {}: {e}", f.display())))?;
+        let text = crate::source::read_text(&f)?;
         for unit in sql_units(&text) {
             eng.ex.execute(&unit, &BindMap::new()).map_err(|e| {
                 EngineError::kernel(72, format!("种子 {}: {}", f.display(), e.message))
@@ -132,8 +168,7 @@ fn deploy_view(
         return Ok(());
     }
     for unit in sql_units(text) {
-        let up = unit.to_ascii_uppercase();
-        if !up.contains("CREATE VIEW") && !up.contains("CREATE OR REPLACE VIEW") {
+        if !creates_view(&unit) {
             continue;
         }
         let Ok(unit) = crate::sql::rewrite_tokens_with_rules(&unit, &Default::default(), funcs)
@@ -154,6 +189,26 @@ fn deploy_view(
         )
         .map(|_| ())
         .map_err(|e| EngineError::kernel(71, format!("占位视图 {name}: {}", e.message)))
+}
+
+/// 这条语句是不是 `CREATE [OR REPLACE] … VIEW`——判定走 [`crate::verify::tokens`]，
+/// 与链路抽取同一把词法刀，注释与字符串字面量都不参与。
+///
+/// 按原文 `contains` 会漏掉语料的 `CREATE OR REPLACE /*FORCE*/ VIEW`（考题 9 个
+/// `1_V_*.sql`）：判定不成立 ⇒ 循环体一条都不下发，库里只剩 `SELECT 1` 占位视图，
+/// 视图体的列根本不存在（V29.4 ① 那条教训的部署面对偶）。
+fn creates_view(unit: &str) -> bool {
+    let toks = crate::verify::tokens(&unit.to_ascii_lowercase());
+    let words: Vec<&str> = toks
+        .iter()
+        .filter_map(|t| match t {
+            crate::verify::Tok::Word(w) => Some(w.as_str()),
+            crate::verify::Tok::Punct(_) => None,
+        })
+        .collect();
+    let direct = ["create", "view"];
+    let replaceable = ["create", "or", "replace", "view"];
+    words.windows(2).any(|w| w == &direct[..]) || words.windows(4).any(|w| w == &replaceable[..])
 }
 
 /// 去 `DEFAULT (…)` 子句（与黄金 harness 同口径：DuckDB 对带括号默认值 + 逗号解析不稳）。

@@ -360,10 +360,14 @@ PACKAGE：spec+body 配对校验（ogsql 已有包一致性分析可复用），
 
 ## 6.1 字符集与时区声明（V1 兼容边界）
 
-- **编码统一 UTF-8**：引擎输入（SQL 文本、SQL 文件）与输出（结果、日志、
-  golden）一律 UTF-8；GB18030/GBK 等外部编码的文件由工具层（cli `load` 的
-  `--encoding` 参数或预处理）转换，引擎不做运行时编码探测。DuckDB 字符串
-  原生 UTF-8，无转换成本。
+- **编码统一 UTF-8（读入面判定，决策 2026-11-10 / D9②，实证 validation V32）**：引擎内部、
+  结果、日志、golden 输出一律 UTF-8 不变。SQL **源文件**的读入走 `crate::source::decode`
+  的两把严格判定：UTF-8 合法即用，否则按 GBK 解码（`encoding_rs`），两种都不合法即
+  `ENV-0030` 判红——不猜第三种编码，也不退回有损解码。原条文"引擎不做运行时编码探测、
+  由工具层 `--encoding` 预处理"在 A 阶段作废：交付件 14,611 个 `.sql` 里 3,149 个是 GBK
+  （design §4），"先把语料转成 UTF-8"不在承诺范围（语料字节不动，AGENTS §6），故判定只能
+  发生在读入时；顺序固定 UTF-8 优先（两把判定同时成立的 5,130 个文件按 UTF-8 解释，
+  按 GBK 读必成乱码）。细节与残留风险面见 §13.8。
 - **会话时区**：引擎启动/会话级 `timezone` 配置（默认 UTC），映射到 DuckDB
   `SET TimeZone`；`now()`/`CURRENT_DATE` 及 TIMESTAMP WITH TIME ZONE 行为
   依赖此配置。与 GaussDB 会话时区语义的差异（GaussDB 支持会话级动态切换）
@@ -996,8 +1000,205 @@ materialize(物化快照+时间戳)
   （`data/parquet_cache/<db>/<table>/<分区>`）
 
 
+### 13.5 运行计划（`run-plan`，design §6.1 的落地 schema）
+
+`plan` 子命令把"一次闭包求值所需的全部对象与文件"落成计划文件，落在
+`<home>/plan/<target>.toml`（§11.1 运行态分区）；计划是**数据**不是执行结果，
+由 `deploy`（A2-3）消费。产出方 `spinduck/src/plan/`。
+
+```toml
+[plan]
+schema_version = 1
+target    = "pkg_split_trade_step2.prc_pre_deal_shjycf"   # 归一小写的例程全名
+generator = "spinduck 0.1.2 (plan schema 1)"             # 红时先怀疑两边口径
+project_dir = "../.."                                    # 相对计划文件所在目录，不含绝对路径
+schema    = "bigfund"                                    # --schema 透传；缺省整行不写
+
+[sources]
+ddl_routines = ["sql/routines/PKG_SPLIT_TRADE_STEP2.sql", "sql/stubs/PACK_LOG.sql"]
+ddl_tables   = ["sql/ddl/tables/par_fund_info.sql"]       # 表/视图/序列 DDL（deploy 用）
+materialize  = []                                         # 只读物化清单（§6.4 默认空）
+writeback    = []                                         # 回写白名单（默认空）
+
+[[missing]]                                               # 缺件红清单（非空即 rc=1）
+object = "relation:par_oper_close_date"
+from   = "pkg_a.fnc_x"                                    # 引用它的例程（R3 定位）
+```
+
+| 项 | 口径 |
+|---|---|
+| 对象标识 | `relation:` / `sequence:` / `routine:` 三前缀。视图与表同为 `relation`（链路抽取本就归一类），故没有 design 草图里的 `table:` |
+| 闭包来源 | SpinDuck 自有的静态链路抽取（`src/verify/chain/`）+ 例程目录解析，**逐字复用 `verify` 的纯函数**，不再写第二套真相；codeweb 图接入后替换的只是这一处输入 |
+| 名字归一 | `db.schema.name` 截尾两段 + 小写；被调例程先按调用方所属包补全再试裸名，DDL 名先全名后尾段（同 `verify::run::resolve_routine` / `present`，两处实现分开的唯一原因是容器类型不同） |
+| 引擎自建对象 | `deploy_schema` 自己建的表（`ENGINE_PROVIDED_TABLES`，现为 `sys_dummy`）没有源文件：既不进 `ddl_tables` 也不报缺件 |
+| 文件清单 | 一个文件常声明多个闭包成员，故按**文件**去重排序；路径一律相对项目根、`/` 分隔 |
+| 可复现 | 渲染前排序去重、段序与字段序固定、不写日期、不写绝对路径 → 同输入逐字节相同；落盘只在内容变化时写，摘要行末词随之为 `updated` 或 `unchanged` |
+| 退出码 | `[[missing]]` 空 = 0；非空 = 1（照抄缺件行 `MISS <object> <- <from>`）；目标例程未登记 = 1（`BIZ-0150`）且不落盘；参数用法错 = 2 |
+| 静态边界 | 词法扫描不建 AST：注释与字符串字面量不参与，改写后形态（`nextval('seq')`、空格拆开的限定名）按原文单独取一次。计划描述静态引用，"此刻内核里有没有这张表"归 `deploy`/`verify` |
+| 逗号连表的关系名 | `FROM a t, b s` 是语料主形态，而 `FROM` 只出现一次：`sql_object_refs` 取到第一个关系名后走 `comma_join_refs` 把逗号连表里其余名字一并取回（别名只有在紧跟逗号时才当别名，`FROM a, b` 的 `b` 是表不是别名）。括号子查询（`FROM (SELECT 1) x, t_b b`）由 `subquery_tail_refs` 越过整对括号后继续取连表；带括号的调用形态（`unnest(…)`、`read_csv(…)`）与非对象名一律不收——宁少不误。这条刀口同时决定 `verify` 的链路判定与 `plan` 的部署清单（两者共用同一函数），改它等于同时改两个面 |
+| 视图体的基表 | 视图文件进清单后，再展开一层它的**视图体**引用（`closure::expand_view_bodies`，用 `chain::sql_object_refs`，与例程体同一条抽取管线，不开第二套词法）。理由：下发顺序是"表 → 视图"，视图体读的表没进清单时内核建视图必失败，`deploy_view` 就静默退化成 `SELECT 1` 占位视图——对象在、列不在。只补**有 DDL 文件**的引用；查不到声明的名字（`dual`、外部同义词）不据此报缺件，否则一个语料外的别名就把整份计划判红 |
+
+### 13.6 `deploy`：计划的消费面（design §6.2，A2-3）
+
+三段落点，职责互不重叠：
+
+| 段 | 落点 | 职责 |
+|---|---|---|
+| 壳 | `spinduck/src/cli/deploy.rs` | 读计划 → 缺件即拒 → 定位项目 → 开库 → 打印一行汇总。零引擎逻辑（§1） |
+| 消费 | `spinduck/src/plan/deploy.rs` | `resolve`（计划 → 逐条核对存在的文件，视图/表分流）与 `apply`（逐文件下发）分成两段：全部文件核对完才碰内核 |
+| 下发 | `spinduck/src/verify/deploy.rs` 的 `deploy_ddl_file` / `deploy_view_file` / `ensure_engine_provided_tables` / `register_routine_files`（`pub(crate)`） | 与 `verify` 共用同一套逐文件实现，顺序同为 表/序列 → 视图 → `sys_dummy` → 例程；视图是否走视图体由 `creates_view()` 判定，走的是链路同一把词法刀（注释与字符串不参与） |
+
+口径：
+
+- 输入是**计划里的文件清单**（`sources.ddl_routines` / `sources.ddl_tables`），不做目录发现——
+  design §6.2 三点差异的第一条。清单外的资产一律不下发，`deploy` 因此可复现。
+- 库**落盘**：开库发生在 CLI 接缝处（`DuckExecutor::open(--db)`），`verify` 侧仍是
+  `open_in_memory`，接缝签名未动。开库排在文件核对之后——`open` 会创建文件，先开后查等于
+  留下半成品库。
+- 缺件面：`[[missing]]` 非空 → rc=1，照抄 `MISS <object> <- <from>`，不开库、不建对象；
+  计划列出的文件不存在 → `ENV-0030`。两条都不要求项目声明 `[[entry]]`（计划的入口是目标例程）。
+- **不跑种子**：`cases/datasets/*` 与 `materialize` / `writeback` 两条清单都不消费——数据面归
+  §13.1 的物化，装配面只管对象与例程。
+- `plan.schema` 只随计划透传、不参与下发：对象一律落在内核默认目录 `main`，与 `verify` 的既有
+  判定口径一致。design §6.1 的草图只给了 `schema` 字段、没有约定 `deploy` 用它建 schema，
+  本文把它**明确记为未落地**（validation V30.7），不假装支持。
+- **非幂等**：对同一个已装配过的库文件再跑一次会撞 `CREATE TABLE` 已存在（内核报错原样带出，
+  不静默跳过）。`deploy` 的语义是"从零装配一个库"，重来请换文件或先删。
+- **例程不落盘**（与上一条同量级的口径限制）：`register_routine_files` 走的是进程内例程目录
+  （`src/catalog.rs` 的 `register`），写进库文件的只有表/序列/视图与数据。因此"部署好的库"
+  只承诺**对象面**可跨进程复用；换一个进程 `call --db <库>` 而不带 `--file`，得到的是
+  `[BIZ-0150] routine … not registered`（一手证据见 validation V30.3）。免逐个传源码要靠
+  `call --plan`（design D5/R3，A2-4），不是靠 `deploy` 把存过存进库。
+
+退出码：`0` 装配完成 / `1` 计划带缺件 / `2` 用法错（缺 `--db`、多余位置参数）；
+未编译 `native` 时 `ENV-0012`。全部输出走 stdout，stderr 保持空（§1 CLI 契约）。
+
+### 13.7 `call` 的缺件门与计划面入口（design D5，A2-4）
+
+`call` 现在有两条入口，**都在 `eng.call` 之前**过同一把缺件刀：
+
+| 入口 | 目标与例程源从哪来 | 缺件门 |
+|---|---|---|
+| `call [--db <f>] [--file <sql>]... <routine> [args...]` | 位置参数给名，`--file` 给源码 | **内核目录**：链路上任何 `relation:`/`sequence:` 在内核 catalog 里没有 ⇒ 列清单、rc=1、不执行 |
+| `call --plan <计划.toml> [--db <f>] [--file <sql>]... [args...]` | 计划给目标与闭包内例程源，`--file` 退化为"计划外追加" | **两道**：计划自带 `[[missing]]` 非空 ⇒ 先拒且**不开库**；计划干净再走上一条的内核门 |
+
+落点三段：
+
+| 段 | 落点 | 职责 |
+|---|---|---|
+| 壳 | `spinduck/src/cli/run.rs` 的 `call_target_and_sources` / `refuse_on_kernel_gaps` | 解析目标与源清单、按计划拒、按内核拒；零闭包逻辑（§1） |
+| 判定 | `spinduck/src/plan/closure.rs` 的 `walk_chain`（BFS 本体）+ `kernel_gaps`（内核参照面） | **一份闭包实现，两个参照面**：`build`（`plan`）以项目 DDL 声明为参照，`kernel_gaps`（`call`）以 `verify::kernel_objects` 为参照。不允许再出现第二套 BFS——否则计划说干净、门说缺件的漂移只是换了个方向。被调面的采集同样只有一套：`chain::routine_refs`（结论）+ `chain::expr_func_names`（候选，由目录判），两个参照面共用 |
+| 解析 | `spinduck/src/cli/args.rs` 的 `CallTarget::{Routine, Plan}` | 目标形态是枚举不是可选字段：`--plan` 下位置参数**全部**归实参（不猜例程名），两者皆无即用法错且诊断同时点名两条路 |
+
+口径：
+
+- **红必须早于产出**：门判缺件时 stdout 只有 `MISS <object> <- <from>` 行 + 一行摘要，
+  不含 `OUT`/`RETURN`/`CALL … OK`（`tests/cli/call.rs` 逐字锁死）。形态 C 那种
+  `RETURN 0` + rc=0 的静默面就此消失（design §3.3）。
+- **计划门的拒排在开库之前**：DuckDB 的 `open` 即建文件，晚一步核对就留下半成品库——
+  `deploy` 与 `call --plan` 必须先拒在同一件事上（断言面：`!db.exists()`）。
+- 目标未登记时 `kernel_gaps` 给 `None`：那是 `BIZ-0150` 的故障域，门不抢判（§5 归域在产生点）。
+- `routine:` 缺件与表/序列缺件同列一份清单，按标识排序去重；`engine_provided`（`sys_dummy`）短路。
+- 名称口径与调用本身同源：目标走 `catalog.lookup`（与 `Engine::call` 同一个键），摘要行
+  `target=` 用小写归一名，与 `plan`/`deploy` 一致——门不能比它守护的那次调用更宽或更严。
+- **表达式级被调函数进闭包（design A2-5，V33）**：`routine_refs` 只给"确定是例程"的名字
+  （语句级 `CALL` + 带包限定的表达式调用 + SQL 下沉点），PL 表达式里的裸名调用
+  （`v := fnc_x()`）走第三个采集面 `expr_func_names`——它交的是**候选**，不是结论：
+  闭包逐个拿例程目录精确查名，命中才把被调函数排进 BFS，于是**它自己的表**同时进
+  计划与门。判否（查不到）一律丢弃，不报 `routine:` 缺件，理由与运行期同源：
+  `runtime::eval::eval_funccall` 也只做一次 `catalog.lookup(name)`，未命中就按内建/库函数
+  下沉给内核求值——把每个 `trunc(...)`、`nvl(...)`（规则改名后是 `coalesce`）都判成
+  假缺件，等于门比它守护的那次调用更严。考题语料实测：10 条 entry 的 `missing` 仍全为 0，
+  而 `routines`/`tables` 两条清单同步变大（entry5 由 7/20 到 24/41）；把"未命中也报缺件"
+  这一变体在同一条闭包上跑出来，9 条 entry 共 23 行 `MISS routine:`，去重只有 4 个名字
+  （`coalesce`、`now`、`round`、`substring`），全是内建或规则改名后的内建（V33.4）。
+- **仍然看不见的两类**（登记于 design §8「缺件门的盲区」行）：① 被调函数**源码不在本次
+  注册面里**（`call` 少给了一个 `--file`）——目录里没有这个名字，门与运行期一样无从判断，
+  后果仍是 `KERNEL-0010` 响亮报错；② 同包成员函数按裸名调用（登记名是 `pkg.fnc_x`）——
+  这是**分派**面的缺口（`eval_funccall` 不做包名补全），不在闭包里补，否则计划要为一次
+  根本不会命中的调用铺表。语料实测此类为 0（V33.4），要收口须改解释器分派，属另立编号。
+
+退出码与通道沿用 §1 CLI 契约：`0` 正常返回 / `1` 缺件红或引擎错误 / `2` 用法错（`call` 无目标）。
+
+### 13.8 源码读入的编码判定（design §3.5，D9②）
+
+一处实现、四个消费面、一个刻意留在原地的体检面：
+
+| 段 | 落点 | 职责 |
+|---|---|---|
+| 判定 | `spinduck/src/source.rs` 的 `read_text` / `decode` | **唯一**的读入实现：`std::fs::read` → UTF-8 严格 → `encoding_rs::GBK.decode`（`had_errors` 即拒）→ `ENV-0030`。`decode` 不碰磁盘，三种字节形态都能单测 |
+| 执行/计划/部署/核验/比对面 | `cli::read_source_strict`（`call`、`explain`、`plan`、`call --plan`、`query` 的 SQL 文件、`compare` 的两份快照）与 `verify/deploy.rs` 的四文件下发点（表 DDL、视图、例程注册、数据集种子） | 全部走同一把刀。`verify/deploy.rs` 原先各写一份 `read_to_string`，故 GBK 语料在 `plan` 侧可读、`verify` 侧报编码错——同一份资产两个结论，正是 §13.7 反对的漂移形态 |
+| 体检面 | `cli::read_source`（`compile`） | **不参与解码**：有损 UTF-8 + `(non-utf8)` 标记，rc=0。语料体检要"一趟扫完并按错误码分类"，停在第一个编码问题就让体检本身没法用（design §3.5 末段的原始取舍，D9② 未改） |
+| 依赖 | `spinduck/Cargo.toml` 的 `encoding_rs = "=0.8.44"` | 由 `ogsql-parser` 的传递依赖提为直接依赖：`Cargo.lock` 只多一行（该 crate 进 `spinduck` 的依赖表），零新增 crate、零新增 `cargo audit` 面 |
+
+口径：
+
+- **不猜**：判定只有两把——合法 UTF-8 或合法 GBK，其余一律 `ENV-0030`。D9① 消灭的静默形态
+  是"`from_utf8_lossy` 把中文字面量换成 U+FFFD 却 rc=0"，有损兜底一旦回来，MATCH/NO_MATCH
+  分叉就回来（判据实验见 design §3.5，`tests/cli/call.rs` 锁在 D9② 两侧都是 `RETURN MATCH`）。
+- **UTF-8 优先是判定不是风格**：交付件里 11,462 个 UTF-8 文件中 5,130 个的字节同时是合法 GBK，
+  按 GBK 读它们必然乱码。所以顺序先 UTF-8，且这份优先级有实测计数支撑（V32.4）。
+- **转码发生在读入时，语料文件逐字不动**（AGENTS §6）。引擎不写回源文件，也不提供
+  `--encoding` 覆盖：一旦允许人工指定，同一份语料就能被解成两种文本，正是本轮要消灭的形态。
+- 错误码分工：读不到文件 = `ENV-0010`（`read <path>: <io>`），读到但两把判定都不成立 =
+  `ENV-0030`（`读取 <path>: stream is neither valid UTF-8 nor valid GBK`）。`verify` 侧原先把
+  两者都归 `ENV-0030`，收口后与执行面同码同文本。
+- **残留风险（一手计数，判定仍是推算）**：交付件里 3,149 个非 UTF-8 文件全部 GBK 严格可解
+  （两把都不成立的 = 0），其中 **418 个同时是合法 Big5 且两种解出的文本不同**。这 418 个到底
+  是 GBK 还是 Big5，字面统计判不动（GBK 解出 94.8% 落在 CJK 统一表意文字区，Big5 解出 92.3%），
+  采信 GBK 的依据是交付来源（简体中文 GaussDB 环境，design §4 画像）而非检测器。若日后接入
+  繁体语料，这条会从"理论"变成"静默错值"，届时必须显式指定编码而不是继续加启发式。
+
+### 13.9 `query` / `compare`：结果快照的落盘与裁决（design §6.2，A5 本地半边）
+
+四段落点，职责互不重叠：
+
+| 段 | 落点 | 职责 |
+|---|---|---|
+| 壳 | `spinduck/src/cli/query.rs`、`spinduck/src/cli/compare.rs` | 读入 → 调 core → 渲染 → 退出码。零判定逻辑（§1）；`DIFF` 行的**文本形状**归这里，差异**是什么**归 core |
+| 载体 | `spinduck/src/snapshot/mod.rs` | `Snapshot{schema, rows}` 与它的 JSON 约定、`capture`（切句 + 取回全部行）、`to_json_string`（逐字节可复现、一行一行、结尾恒带换行） |
+| 裁决 | `spinduck/src/snapshot/compare.rs` | `compare`（位置序）与 `compare_by_key`（键序）→ `Vec<Diff>`（类型化：`Value`/`Arity`/`OnlyInA`/`OnlyInB`）。一趟跑完所有行，**不早停** |
+| 归一 | `spinduck/src/norm.rs` | **唯一**一份口径实现：`None→"NULL"`、`trim`、去 `+` 前缀、`.5` 补 `0.`、尾零与尾点削掉。黄金层与 `compare` 共用，两侧各自 `pub use` 指回来 |
+
+口径：
+
+- **落盘的是文本，裁决时归一**：单元格存内核给回的原样字符串，`compare` 才按值判定。
+  于是同一份快照既能和新快照比、也能和人手写的基线比，而**口径改了不必重跑查询**——
+  反过来（落盘即归一）会让每次调整比对规则都要重出一遍结果，千万级面前不可接受。
+  宽容面：手写基线里 `600000` 与 `"600000"` 落到同一个值（`Number`/`Bool` 按字面文本收下）。
+- **NULL 与空文本在载体里区分、在判定里同值**：`null` 落盘、`""` 落盘，`norm` 后都是
+  `"NULL"`。少了前者就没法事后追问"这格到底是空串还是缺值"。
+- **判值不判文本；列名不是判据，列数是**：参照侧与本地给回不同别名（`cnt` vs `n`）不是
+  差异，`DIFF value` 的 `col=` 一律取**左快照**的列名（没有列名时退到 `col{n}`，报告里
+  不许出现空列名）。
+- **行序默认是判据，`--key` 下不是**：实例侧不保证行序。键列按大小写不敏感定位，
+  **键列找不到即 `ENV-0031`，绝不退化成位置序**——把"没比成"说成"比过了"是本命令最危险的
+  静默形态。重复键：排序稳定，同键的几行按文件序两两配对。
+- **多语句必须拒**（一手发现，validation V34.2）：DuckDB 的 `prepare` 对 `SELECT 1; SELECT 2`
+  **不报错**，它把两句都执行、只把最后一句的结果集给回来。若"交给内核报红"，两行的 `.sql`
+  会得到一份只覆盖第二句的快照，而第一句若含写入已经落进库。故切句在 core：只在 `'…'`/`"…"`
+  （`''`、`""` 为转义）、`--` 行注释、`/* */` 块注释**之外**的分号处切，切出来多于一条即
+  `ENV-0031` 且一条都不发给内核。
+- **判红不得留下产物**（与 §13.6 同一条纪律）：读 SQL 文件排在开库之前（`open` 即建文件），
+  写 `--out` 排在查询成功之后（半份快照会被下一步 `compare` 判成"两边都空 ⇒ 一致"）。
+- **内存天花板是明写的限制**：`capture` 把结果集整体驻留——`RowStream` 的契约就是快照。
+  所以 `query` 面向**结果裁决**（聚合输出、小表全量），千万级取数属 design A3 的
+  COPY OUT 流式改造；本轮不为它改 `SqlExecutor` 接缝签名（Ask first，§1）。
+- 错误码分工：读不到文件 = `ENV-0010`，快照 JSON 不合约定 / 语句形状不对 =
+  **`ENV-0031`**（与 `case.toml` 缺 `[case]` 段同族，"输入形状不对"这一类），
+  内核报错原样带出（`KERNEL-*`，§5 归域在产生点）。口令类参数一个都没有：`query`
+  只接本地 DuckDB 文件，实例侧采集属 A0b/A1/A3。
+- 归一收口的性质：这是**纯去重**，两份副本的语句序列与 core 实现完全相同，只差形参名与一行
+  注释（diff 原文见 V34.3）。等价性的两手证据在 V34.3/V34.6（corpus 层、进程内 cases 层、
+  真容器黄金层各自全绿，期望值一个没收），且 `-.0 → -0` 这一既有怪癖被新单测原样锁定，
+  而不是"顺手修正"。
+
+退出码与通道沿用 §1 CLI 契约：`query` `0` 快照已落盘 / `1` 语句或形状错 / `2` 用法错；
+`compare` `0` 无差异 / `1` 有差异或键列找不到 / `2` 用法错。全部输出走 stdout，stderr 恒空。
+
+
 > 决策记录 2025-11-05（PR#1 评审）：① COMMIT/ROLLBACK 实现统一事务边界（最外层显式事务，Tx 语句即时提交/回滚并重开，未处理异常统一 ROLLBACK，DuckDB ACID 承载原子性），不降级；② ENG-0062 撤销整体拒绝，动态文本统一经 ogsql 解析管线（解析失败 BIZ-061；解析器不支持的形态向 ogsql-parser 上游提 issue）；③ 内置规则 `config/rewrite-rules.toml` 编译期嵌入，`RuleRegistry::default()` 直接加载，CLI/项目规则叠加其上；④ 容器口令经 `.env` 注入（`${GS_PASSWORD:?}`），端口仅回环；
-⑤ `DuckExecutor::connection()` 暴露内核连接句柄——**Ask-first 决策记录（2025-11-05）**：
+> ⑤ `DuckExecutor::connection()` 暴露内核连接句柄——**Ask-first 决策记录（2025-11-05）**：
 e2e 测试（`tests/gauss_e2e.rs` 直取内核句柄校验 GaussDB 侧落库）需要内核事务/批量能力，
 `SqlExecutor` 接缝尚未提供对应方法（扩接缝 = 破坏所有消费者，需单独评审）；接受为**过渡态**，移除条件 =
 回写通道参数化改造（评审 PR#1 行内评论）落地时收敛，届时 `gauss.rs` 不再触及

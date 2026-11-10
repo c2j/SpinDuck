@@ -146,47 +146,11 @@ impl Kernel {
 }
 
 /// 逐值归一：与黄金 harness 同口径（忽略 scale、尾零、`+`，空串与 NULL 同值）。
-pub fn norm(s: Option<String>) -> String {
-    let Some(t) = s else {
-        return "NULL".to_string();
-    };
-    let t = t.trim().trim_start_matches('+');
-    if t.is_empty() {
-        return "NULL".to_string();
-    }
-    let t = if let Some(rest) = t.strip_prefix('.') {
-        format!("0.{rest}")
-    } else if let Some(rest) = t.strip_prefix("-.") {
-        format!("-0.{rest}")
-    } else {
-        t.to_string()
-    };
-    if t.contains('.') {
-        let t2 = t.trim_end_matches('0').trim_end_matches('.');
-        if t2.is_empty() || t2 == "-" {
-            "0".to_string()
-        } else {
-            t2.to_string()
-        }
-    } else {
-        t
-    }
-}
-
-fn norm_value(v: &SpinValue) -> String {
-    match v {
-        SpinValue::Null => "NULL".to_string(),
-        other => norm(Some(other.as_str_loose())),
-    }
-}
-
-/// 例程返回值 → 归一文本（NULL 显式化，便于逐值断言）。
-pub fn norm_scalar(v: Option<SpinValue>) -> String {
-    match v {
-        None | Some(SpinValue::Null) => "NULL".to_string(),
-        Some(other) => norm(Some(other.as_str_loose())),
-    }
-}
+///
+/// 实现已收口到 `spinduck_core::norm`（A5）。这里曾是第二份逐字相同的副本，与本文件
+/// 原 [`norm_value`] / [`norm_scalar`] 两个包装一起搬进 core，`compare` 才能和夹具判
+/// 同一个口径；本层只引用，判定一条没改。
+pub use spinduck_core::norm::{norm, norm_scalar, norm_value};
 
 /// 进程内引擎：夹具表建好后注册例程用（语料过程体路径）。
 pub fn engine() -> spinduck_core::engine::Engine {

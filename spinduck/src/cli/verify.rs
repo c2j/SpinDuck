@@ -44,7 +44,9 @@ fn sync_manifest(project: &ProjectConfig, out: &mut dyn Write) -> Result<(), Eng
 }
 
 /// 项目定位：目录本身有声明文件（研发态或运行态快照）直接用，否则向上查找。
-fn locate(start: &Path) -> Result<ProjectConfig, EngineError> {
+///
+/// `plan` 复用同一口径（`src/cli/plan.rs`）：两个入口都从项目声明出发，不接受散落参数。
+pub(crate) fn locate(start: &Path) -> Result<ProjectConfig, EngineError> {
     if start.join("spinduck.toml").is_file() || start.join("conf/spinduck.toml").is_file() {
         return ProjectConfig::load(start);
     }

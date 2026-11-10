@@ -69,6 +69,18 @@ fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError> {
         Command::Sync { .. } => sync_cmd(cmd_sync(cmd), out),
         Command::Call { .. } => call_cmd(cmd_call(cmd), out),
         Command::Verify { path } => crate::cli::verify::verify_cmd(path.as_deref(), out),
+        Command::Plan {
+            dir,
+            routine,
+            schema,
+        } => crate::cli::plan::plan_cmd(dir.as_deref(), &routine, schema, out),
+        Command::Deploy { plan, db } => crate::cli::deploy::deploy_cmd(&plan, &db, out),
+        Command::Query {
+            db,
+            sql_file,
+            out: out_path,
+        } => crate::cli::query::query_cmd(&db, &sql_file, &out_path, out),
+        Command::Compare { a, b, key } => crate::cli::compare::compare_cmd(&a, &b, &key, out),
     }
 }
 
@@ -79,13 +91,13 @@ fn cmd_call(cmd: Command) -> CallParts {
             db,
             rules,
             files,
-            routine,
+            target,
             args,
         } => CallParts {
             db,
             rules,
             files,
-            routine,
+            target,
             args,
         },
         _ => unreachable!("cmd_call only for Call"),
@@ -130,7 +142,7 @@ struct CallParts {
     db: Option<PathBuf>,
     rules: Option<PathBuf>,
     files: Vec<PathBuf>,
-    routine: String,
+    target: crate::cli::args::CallTarget,
     args: Vec<String>,
 }
 
@@ -185,7 +197,7 @@ fn compile_cmd(paths: &[PathBuf], out: &mut dyn Write) -> Result<i32, EngineErro
 }
 
 fn explain_cmd(file: &Path, routine: &str, out: &mut dyn Write) -> Result<i32, EngineError> {
-    let (text, _) = crate::cli::read_source(file)?;
+    let text = crate::cli::read_source_strict(file)?;
     for line in crate::cli::explain::explain_routine(&text, routine)? {
         writeln!(out, "{line}").map_err(io_err)?;
     }
@@ -235,19 +247,27 @@ fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, EngineError> {
             .map_err(|e| EngineError::env(12, format!("read rules: {e}")))?;
         rules.overlay(&raw)?;
     }
+    let Some((target, sources)) = call_target_and_sources(&parts, out)? else {
+        return Ok(EXIT_FAIL);
+    };
     let ex = match &parts.db {
         Some(p) => crate::sql::DuckExecutor::open(&p.to_string_lossy())?,
         None => crate::sql::DuckExecutor::open_in_memory()?,
     };
+    // 内核此刻的对象目录要在开库后、把执行器交给引擎之前取：缺件门的参照面就是它。
+    let objects = crate::verify::kernel_objects(&ex)?;
     let mut eng = Engine::new(Box::new(ex), rules);
-    for f in &parts.files {
-        let (text, _) = crate::cli::read_source(f)?;
+    for f in &sources {
+        let text = crate::cli::read_source_strict(f)?;
         eng.register(&text)?;
     }
+    if refuse_on_kernel_gaps(&eng, &target, &objects, out)? {
+        return Ok(EXIT_FAIL);
+    }
     let args: Vec<crate::value::SpinValue> = parts.args.iter().map(|a| parse_literal(a)).collect();
-    let res = eng.call(&parts.routine, &args)?;
+    let res = eng.call(&target, &args)?;
     if res.outs.is_empty() && res.return_value.is_none() {
-        writeln!(out, "CALL {} OK", parts.routine).map_err(io_err)?;
+        writeln!(out, "CALL {target} OK").map_err(io_err)?;
         return Ok(EXIT_OK);
     }
     for (k, v) in &res.outs {
@@ -257,6 +277,75 @@ fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, EngineError> {
         writeln!(out, "RETURN {}", v.display()).map_err(io_err)?;
     }
     Ok(EXIT_OK)
+}
+
+/// 执行面的缺件门（design D5）：目标闭包里内核没有的对象 ⇒ 列清单并拒绝。
+///
+/// BFS 与 `plan` 同一份实现（`src/plan/closure.rs::walk_chain`），只有参照面从"项目 DDL
+/// 声明"换成"内核目录"。返回 `true` = 已打印缺件行，调用方直接退出 1。目标未登记时
+/// `kernel_gaps` 给 `None`：那是 `BIZ-0150` 的故障域，本门不抢判。
+#[cfg(feature = "native")]
+fn refuse_on_kernel_gaps(
+    eng: &crate::engine::Engine,
+    target: &str,
+    objects: &std::collections::BTreeSet<crate::verify::ObjectRef>,
+    out: &mut dyn Write,
+) -> Result<bool, EngineError> {
+    let Some((resolved, gaps)) = crate::plan::kernel_gaps(eng, target, objects) else {
+        return Ok(false);
+    };
+    if gaps.is_empty() {
+        return Ok(false);
+    }
+    for m in &gaps {
+        writeln!(out, "MISS {} <- {}", m.object, m.from).map_err(io_err)?;
+    }
+    writeln!(
+        out,
+        "call: target={resolved} missing={} 未执行（design D5 缺件即红）",
+        gaps.len()
+    )
+    .map_err(io_err)?;
+    Ok(true)
+}
+
+/// `call` 的目标例程与例程源清单（design D5/R3）。
+///
+/// 返回 `None` = 计划带缺件、已打印拒绝行，调用方直接退出 1。缺件检查排在开库之前：
+/// DuckDB 的 `open` 即建文件，晚一步核对就留下半成品库（口径与 `deploy` 逐字相同——
+/// 同一份计划，两个入口必须先拒在同一件事上）。`--file` 在两种形态下都有效：计划给的是
+/// 闭包内的源，计划外临时补一个桩包仍要允许。
+#[cfg(feature = "native")]
+fn call_target_and_sources(
+    parts: &CallParts,
+    out: &mut dyn Write,
+) -> Result<Option<(String, Vec<std::path::PathBuf>)>, EngineError> {
+    use crate::cli::args::CallTarget;
+    match &parts.target {
+        CallTarget::Routine(r) => Ok(Some((r.clone(), parts.files.clone()))),
+        CallTarget::Plan(p) => {
+            let text = crate::cli::read_source_strict(p)?;
+            let plan = crate::plan::RunPlan::from_toml_str(&text)?;
+            if !plan.missing.is_empty() {
+                for m in &plan.missing {
+                    writeln!(out, "MISS {} <- {}", m.object, m.from).map_err(io_err)?;
+                }
+                writeln!(
+                    out,
+                    "call: target={} missing={} 拒绝执行（补齐缺件后重跑 plan）",
+                    plan.target,
+                    plan.missing.len()
+                )
+                .map_err(io_err)?;
+                return Ok(None);
+            }
+            let project = crate::cli::verify::locate(&plan.project_root(p))?;
+            let deployment = crate::plan::deploy::resolve(&project, &plan)?;
+            let mut files = deployment.routines;
+            files.extend(parts.files.iter().cloned());
+            Ok(Some((plan.target.clone(), files)))
+        }
+    }
 }
 
 /// GaussDB 连接参数来自环境变量（避免命令行泄露口令，§10.4）。
@@ -324,8 +413,8 @@ fn call_cmd(parts: CallParts, _out: &mut dyn Write) -> Result<i32, EngineError> 
     Err(EngineError::env(
         12,
         format!(
-            "call {} (args: {}, files: {:?}, db: {:?}, rules: {:?}) requires feature `native`",
-            parts.routine,
+            "call {:?} (args: {}, files: {:?}, db: {:?}, rules: {:?}) requires feature `native`",
+            parts.target,
             parts.args.join(","),
             parts.files,
             parts.db,

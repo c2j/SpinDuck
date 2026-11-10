@@ -3,7 +3,11 @@
 //! 子命令与退出码契约见 AGENTS.md §8 与 docs/architecture.md §11。
 
 pub mod args;
+mod compare;
+mod deploy;
 pub mod explain;
+mod plan;
+mod query;
 pub mod run;
 mod verify;
 
@@ -49,6 +53,16 @@ pub fn read_source(path: &std::path::Path) -> Result<(String, bool), EngineError
         Ok(text) => Ok((text, false)),
         Err(e) => Ok((String::from_utf8_lossy(e.as_bytes()).into_owned(), true)),
     }
+}
+
+/// 严格读取源码文本：UTF-8 → GBK 两把判定，都不成立即红（design §3.5 / D9①②）。
+///
+/// 与 [`read_source`] 的分工：`compile` 是语料体检面，保留有损解码 + `(non-utf8)` 标记；
+/// `call`/`explain`/`plan`/`deploy`/`query`/`compare` 是执行与比对面，同一份源码只可能因
+/// 编码不同**报错**或被**正确还原**，不可能返回不同的值。实现收口在 [`crate::source`]，
+/// 诊断仍是 `ENV-0030` 形状。
+pub fn read_source_strict(path: &std::path::Path) -> Result<String, EngineError> {
+    crate::source::read_text(path)
 }
 
 /// 汇总。
