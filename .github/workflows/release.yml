@@ -107,8 +107,10 @@ jobs:
           # uses: 步骤不跟随 defaults.working-directory；缺这行会静默退化成只缓存 registry（V25）
           workspaces: spinduck
       - name: Build（glibc 符号锚定 2.28）
+        # 发版产物带 gauss：materialize/sync 子命令可用（gaussdb 为纯 Rust git 依赖，
+        # 不开 TLS，无 openssl，不破坏 zigbuild 交叉编译与 glibc 2.28 锚定）
         run: >
-          cargo zigbuild --release --locked --features cli
+          cargo zigbuild --release --locked --features cli,gauss
           --target ${{ matrix.target }}.2.28
       - name: 反查产物 GLIBC 上限（AGENTS §10 硬约束）
         working-directory: .
@@ -166,7 +168,8 @@ jobs:
       # （静态 CRT 只属 Win7 行）。代价：目标机需 VC++ 2015-2022 x64 运行库，
       # 该前提写进 README 已知限制，不在 windows-latest 上假装验证过。
       - name: Build
-        run: cargo build --release --locked --features cli --target x86_64-pc-windows-msvc
+        # 与 Linux 一致：发版产物带 gauss（materialize/sync 可用）
+        run: cargo build --release --locked --features cli,gauss --target x86_64-pc-windows-msvc
       # README 已知限制里"Windows 产物依赖 VC++ 运行库"目前是文档假设，不该假装验证过：
       # 这一步把假设变成每次发版的产物侧证据（打印直接导入的 DLL 清单）。
       # 说明：这只能看到**静态导入**，delay-load 与运行时 LoadLibrary 的依赖不在面上。
