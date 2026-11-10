@@ -3832,18 +3832,51 @@ ls work.duckdb → No such file or directory        ← 红之后不留半成品
 两面并存最直接的产物侧证据：release 二进制上 `call --plan` + 两个执行面开关同条命令生效，
 且缺件门仍然早于开库（rc=1 且没有库文件）。
 
+**CI 一手日志（run `42779751418`，head `aa8588f`，五个 job 全 `success`）**
+
+推送后 `gh pr view 8 --json mergeStateStatus,statusCheckRollup` 的形态先变：从
+CONFLICTING + `statusCheckRollup: []`（CI 根本不启动）变成 UNSTABLE + 五个 job
+`IN_PROGRESS`，最终 `mergeStateStatus = CLEAN`、`mergeable = MERGEABLE`。
+逐 job 核对（`gh run view 42779751418 --json conclusion,jobs`）：
+`audit / format / golden / test / clippy` 五个 conclusion 全 `success`，run conclusion `success`。
+
+不采信绿勾，直接查断言输出（`gh run view 42779751418 --log`，按 job 切分后聚合）：
+
+| job | 一手输出 | 与本机对照 |
+|---|---|---|
+| `test` | `test result: ok. 78 passed; 0 failed`（`Running tests/cli.rs`）；该 job 全部 result 行求和 **475 passed**、`0 failed` 行数 23 | 本机 `--features cli` 同为 **475 / 0**，契约层同为 **78** |
+| `golden` | 步骤命令行 `cargo test --features gauss -- --nocapture`；套件 `gauss_e2e` 2、`golden_corpus_gauss` 2、`golden_corpus_purchase` 1、`golden_gauss` 1 逐条 `... ok`；该 job 求和 **403 passed** | 本机 `--features gauss` 同为 **403 / 0**（黄金层同样 6 条） |
+| `clippy` / `audit` / `format` | 无 result 行（各自的判据是零告警 / 豁免外零公告 / 零 diff） | 本机同口径全绿 |
+
+整份日志 `grep -cE "test result: FAILED|panicked"` = **0**。两个 job 的总数与本机逐项相等，
+说明 CI 与本地不是"两套口径刚好都绿"，而是同一条命令面（`--features cli` / `--features gauss`）。
+
+合并提交本身那一次（run `42779313763`，head `d6e58bc`）也跑完且 `conclusion = success`，
+五个 job 同样全绿——但那一轮只核到 job conclusion，没再抓断言输出；被核到断言面的是
+上表这次 `aa8588f`，两者只差一个纯文档提交（`git diff d6e58bc aa8588f --stat` = 只有
+`docs/validation.md`）。按 V25 立的规矩，能当"CI 已验证"用的是**有断言输出的那一次**。
+
 **仍是推算的 / 未覆盖**
 
-- CI 五 job 在合并后 head SHA 上的一手日志还没有——本轮只做到"分支能与 main 干净合并 + 本机同口径门禁全绿"。
-  PR #8 的 CI 要等这次 push 之后才启动（V25 记过同一形态：本地绿 ≠ CI 绿）。
+- 把上面这段 CI 证据写进文档的提交本身会让 CI 再跑一次；那一轮是纯文档改动
+  （`git diff` 只碰 `docs/validation.md`），不在本节的判定面内，也不在本节登记范围内。
 - `--batch-commit` 与 `--step-budget` 在**千万级游标循环**上的实际放大效果仍无一手数字：
   本轮新增的组合契约只证明"计划面吃下开关、结果逐字不变"，性能与预算阈值属 A3/A4（需实例）。
 - **AGENTS §3 规模**：合并后 `src/cli/args.rs` 859 行、`src/cli/run.rs` 588 行，均越过
-  单文件 500 行（args.rs 连"含 `#[cfg(test)]` ≤700"也超）。一手对照：主干 `bc887de` 上
-  分别是 468 / 499 行（在限内），本分支 `934d5ad` 上是 812 / 577 行——**越限是本分支
-  A2/A5 连续加子命令累积的，合并只把它加深**。本轮不顺手拆：拆分是纯结构改动，要按 §3
-  "按职责拆子模块"单独一轮走，且 `args.rs` 已含 `query`/`compare`/`plan`/`deploy`/`call`
-  五套解析器，切分线清晰（每个解析器一文件 + 共享夹具），适合作为下一轮的独立 PR。
+  单文件 500 行（`args.rs` 连「含 `#[cfg(test)]` ≤700」也超）。越限点一手定位
+  （`git show <rev>:<path> | wc -l`）：
+
+  | ref | `args.rs` | `run.rs` |
+  |---|---|---|
+  | 主干 `bc887de` | 468 | 499 |
+  | 本分支 `934d5ad`（合并前倒数第二个提交） | 423 | 488 |
+  | 本分支 `1bcec83`（A2/A5 五条子命令那一次落地） | **812** | **577** |
+
+  也就是说**越限不是历史累积，是本 PR 那一次 `feat` 提交造成的**（上面两个 ref 都在限内），
+  合并只把它从 812/577 推到 859/588；前几轮汇报里「连续加子命令累积的」那句是错的口径，
+  此处按实测改判。本轮不顺手拆：拆分是纯结构改动，要按 §3「按职责拆子模块」单独一轮走，
+  且 `args.rs` 已含 `query`/`compare`/`plan`/`deploy`/`call` 五套解析器，切分线清晰
+  （每个解析器一文件 + 共享夹具），适合作为下一轮的独立 PR。
 - 主干那节的执行面数字（memo/prepared/COPY）在合并树上未复测——合并没碰它们的判据代码，
   但 `run.rs` 的注册循环换成了 `read_source_strict`（本分支 D9① 的判定），
   若主干曾按旧 `read_source` 元组接口计时，口径差异属读入路径，不影响其结论的判据面。
