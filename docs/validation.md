@@ -3795,6 +3795,43 @@ V32（原 V31）那条 `should_take_every_positional_as_an_argument_when_call_us
 | 黄金层（A 模式容器） | `cargo test --features gauss`（`SPINDUCK_OG_PORT` 取自 `docker port spinduck-gaussdb 5432/tcp` = 5433；口令经 `docker exec … printenv GS_PASSWORD` 注入环境，不落命令行、不入库） | **6 passed / 0 failed**（`gauss_e2e` 2、`golden_corpus_gauss` 2、`golden_corpus_purchase` 1、`golden_gauss` 1）；`gauss_sha256` 收集 0 条 = **feature 级门控**（该层要 `--features gauss-sha256`），不是环境假绿 |
 | Security Audit | `cargo audit` | 4 条公告，编号与 CI 豁免清单**逐条相同**（`RUSTSEC-2026-0367/0368/0369/0429`，构建期 `zip`）；豁免面未扩大 |
 
+**发版二进制冒烟（`cargo build --release --features cli --locked`，合并树重取）**
+契约层跑的是 `CARGO_BIN_EXE_spinduck`（release 目录下同一 target 的 debug 版），
+下面这组跑的是**发版口径的 release 产物**，逐字记录：
+
+```text
+$ spinduck version
+spinduck 0.1.3                                    ← 主干 bump 的结果，二进制内自述一致
+
+$ spinduck help | grep -n 'call '
+20:  call [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>] <routine> [args...]
+21:  call --plan <计划.toml> [--db <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>] [args...]
+
+$ spinduck plan prc_seed_count | tail -1
+plan: target=prc_seed_count routines=1 tables=1 missing=0
+$ spinduck deploy <plan> --db work.duckdb | tail -1
+deploy: target=prc_seed_count ddl_files=1 routine_files=1 db=/tmp/.../work.duckdb
+$ spinduck call --plan <plan> --db work.duckdb --batch-commit --step-budget 1000000 0
+OUT p_o = 1                                       rc=0
+$ spinduck call --plan <plan> --step-budget 0
+[ENG-0010] usage: --step-budget <n>（正整数）      rc=2   ← 未碰计划文件，见 V36 变异取证
+
+$ spinduck query work.duckdb --sql-file q.sql --out a.json
+query: rows=1 cols=1 out=/tmp/.../a.json          ← `od -c` 末字节仍是 \n
+$ spinduck compare a.json b.json ; echo rc=$?     → compare: rows=1/1 diffs=0 / rc=0
+$ spinduck compare a.json c.json --key n          → DIFF only-in-a row=1 a=[1] / DIFF only-in-b row=1 b=[9]
+                                                     compare: key=n rows=1/1 diffs=2 逐值不一致 / rc=1
+
+$ spinduck call --plan <缺件计划> --db work.duckdb --batch-commit --step-budget 1000000 0
+MISS relation:t_a <- prc_seed_count
+MISS sequence:seq_a <- prc_seed_count
+call: target=prc_seed_count missing=2 拒绝执行（补齐缺件后重跑 plan）   rc=1
+ls work.duckdb → No such file or directory        ← 红之后不留半成品库
+```
+
+两面并存最直接的产物侧证据：release 二进制上 `call --plan` + 两个执行面开关同条命令生效，
+且缺件门仍然早于开库（rc=1 且没有库文件）。
+
 **仍是推算的 / 未覆盖**
 
 - CI 五 job 在合并后 head SHA 上的一手日志还没有——本轮只做到"分支能与 main 干净合并 + 本机同口径门禁全绿"。
