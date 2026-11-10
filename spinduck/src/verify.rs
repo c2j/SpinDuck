@@ -11,9 +11,15 @@ mod manifest;
 mod run;
 
 pub use chain::{chain_object_refs, routine_refs, ObjectKind, ObjectRef};
+pub(crate) use chain::{expr_func_names, is_object_name, normalize, sql_object_refs, tokens, Tok};
 pub use deploy::{
     clamp_sequence_bounds, deploy_project, deploy_routines, deploy_schema, deploy_seeds,
-    drop_cache_option, sql_units, strip_defaults, verify_project,
+    drop_cache_option, sql_units, strip_defaults, verify_project, ENGINE_PROVIDED_TABLES,
 };
 pub use manifest::{manifest_text, sync_runtime_manifest, ManifestSync};
+// 计划面 `deploy`（`src/plan/deploy.rs`）复用的逐文件下发实现：口径只有一条，
+// 允许 crate 内消费，不对外扩接缝。
+pub(crate) use deploy::{
+    deploy_ddl_file, deploy_view_file, ensure_engine_provided_tables, register_routine_files,
+};
 pub use run::{kernel_objects, verify_entry, ChainFacts, Check, CheckKind, EntryReport, Status};

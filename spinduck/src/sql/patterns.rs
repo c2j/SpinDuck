@@ -64,7 +64,13 @@ pub fn apply_text_patterns(sql_text: &str, rules: &RuleRegistry) -> Result<Strin
     Ok(text)
 }
 
-/// `(+)` 外连接标记 → ANSI `LEFT JOIN … ON`（语料 8 处：逗号 FROM + 末表带标记）。
+/// `(+)` 外连接标记 → ANSI `LEFT JOIN … ON`。
+///
+/// 命中数口径：清单 `oracle_outer_join_marker`（`config/corpus_forms.toml:54` = 8）数的是
+/// **出现次数**（正则 `\(\s*\+\s*\)`），且全部落在同一文件代号 F140——**不要**把"8 处"读成
+/// "8 处都已成功改写"：适配形态在命中数里占多少没有同口径统计。交付件级命中面（数量级
+/// 更大）与其后果登记在 `docs/validation.md` V27.2，守护用例
+/// `tests/guard/guard_patterns_outer_join_residual.rs`。
 ///
 /// 只在确实改写时重排文本；未命中的语句原样返回，避免无谓地把语料文本重排一遍。
 /// 标记节点在 formatter 里还原成 `x(+)`（ogsql 无表达式就地改写入口，AGENTS §1
@@ -140,9 +146,11 @@ fn apply_on_body(sel: &mut SelectStatement) -> bool {
 
 /// `from` 逗号表清单 + `where` 的 `(+)` 谓词 → 末表 `LEFT JOIN … ON`。
 ///
-/// 保守边界（语料只出现其一，其余形态原样交内核报错）：至少两张表、全部标记
-/// 落在同一张表且该表位于清单末位、谓词按顶层 AND 链组织。标记侧必须是末表——
-/// `LEFT JOIN` 只能接在连接链末端，插在中间会改连接顺序语义。
+/// 保守边界：至少两张表、全部标记落在同一张表且该表位于清单末位、谓词按顶层 AND
+/// 链组织。标记侧必须是末表——`LEFT JOIN` 只能接在连接链末端，插在中间会改连接顺序语义。
+/// 不适配时**原样保留标记**，由内核在解析阶段拒绝（实测 `Parser Error: syntax error
+/// at or near ")"`，守护见 `tests/guard/guard_patterns_outer_join_residual.rs`）。
+/// 不声称"语料只出现适配形态"：形态占比没有同口径统计。
 fn apply_on_from_where(from: &mut Vec<TableRef>, where_clause: &mut Option<Expr>) -> bool {
     let Some(w) = where_clause.take() else {
         return false;

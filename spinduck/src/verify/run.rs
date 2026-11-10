@@ -355,7 +355,8 @@ pub fn kernel_objects(ex: &dyn SqlExecutor) -> Result<BTreeSet<ObjectRef>, Engin
         let mut s = ex.query(sql, &BindMap::new())?;
         for row in s.fetch_many(100_000) {
             if let Some(v) = row.first() {
-                let name = v.as_str_loose();
+                // 内核按书写保留大小写，链路名归一小写：不归一则大写声明的对象恒判缺件。
+                let name = v.as_str_loose().to_ascii_lowercase();
                 if !name.is_empty() {
                     out.insert(ObjectRef { kind, name });
                 }
@@ -375,6 +376,26 @@ mod tests {
             routine: name.into(),
             kind,
         }
+    }
+
+    #[test]
+    fn should_lowercase_kernel_catalog_names() {
+        // 内核按书写保留标识符大小写（DuckDB 的匹配不区分），链路名一律归一小写。
+        // 目录侧不归一，`CREATE … VIEW V_DAT_INST_BASE_INFO` 这类大写声明在核验里恒判缺件
+        // （考题语料实测）。
+        use crate::exec::FakeExecutor;
+        use crate::value::SpinValue;
+        let ex = FakeExecutor::with_rows(
+            vec!["name".into()],
+            vec![vec![SpinValue::Str("main.V_X".into())]],
+        );
+        let objects = kernel_objects(&ex).unwrap();
+        assert!(
+            objects
+                .iter()
+                .any(|o| o.kind == ObjectKind::Relation && o.name == "main.v_x"),
+            "内核目录名要归一小写: {objects:?}"
+        );
     }
 
     #[test]

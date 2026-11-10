@@ -33,6 +33,10 @@ duckdb = { version = "=1.10505.0", features = ["bundled"], optional = true }
 # rev 锁定与 hepta-dbcli 同基线；git 依赖不进 cargo audit 面，豁免登记见 CI workflow 注释。
 gaussdb = { git = "https://github.com/c2j/rust-opengauss", rev = "b95ed0b96c1ccf11827dde24c8fdf778a1bdbc03", default-features = false, features = ["sync"], optional = true }
 thiserror = "2"
+# D9② 的 GBK 编码表（design §3.5）。版本与 lockfile 里既有的那一版逐字一致——它已由
+# `ogsql-parser` 引入，故这条只是把传递依赖提为直接依赖，零新增 crate、零新 CVSS 面。
+# 带 `fast`（默认）即 enough：只在读入时整文件解码，不做逐流增量。
+encoding_rs = "=0.8.44"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -72,8 +76,16 @@ path = "tests/guard/guard_sql_pipeline_parity.rs"
 name = "guard_register_silent_drop"
 path = "tests/guard/guard_register_silent_drop.rs"
 
+[[test]]
+name = "guard_patterns_outer_join_residual"
+path = "tests/guard/guard_patterns_outer_join_residual.rs"
 
+# CLI 契约层（AGENTS §4.1）跑真 `[[bin]] spinduck`，该 bin 要 `cli` feature。用
+# required-features 而非 `#![cfg]`：后者在 `--features native` 下收集 0 条 = "跳过即绿"。
+# CI 的 Test job 因此单步 `cargo test --features cli`（cli ⊇ native，覆盖面只增不减，
+# 见 AGENTS §9 与 workflow 注释）。
 [[test]]
 name = "cli"
 path = "tests/cli.rs"
 required-features = ["cli"]
+

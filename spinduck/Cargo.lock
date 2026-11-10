@@ -1575,6 +1575,7 @@ name = "spinduck"
 version = "0.1.3"
 dependencies = [
  "duckdb",
+ "encoding_rs",
  "gaussdb",
  "ogsql-parser",
  "serde",

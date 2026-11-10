@@ -47,33 +47,10 @@ pub fn og() -> Option<GaussConn> {
 }
 
 /// 数值/文本归一（与既有 golden 用例同口径：按值比较，忽略 scale 与尾零）。
-pub fn norm(v: Option<String>) -> String {
-    let Some(s) = v else {
-        return "NULL".to_string();
-    };
-    let t = s.trim().trim_start_matches('+');
-    // A 模式（Oracle 语义）：空字符串即 NULL，两侧归一同口径
-    if t.is_empty() {
-        return "NULL".to_string();
-    }
-    let t = if let Some(rest) = t.strip_prefix('.') {
-        format!("0.{rest}")
-    } else if let Some(rest) = t.strip_prefix("-.") {
-        format!("-0.{rest}")
-    } else {
-        t.to_string()
-    };
-    if t.contains('.') {
-        let t2 = t.trim_end_matches('0').trim_end_matches('.');
-        if t2.is_empty() || t2 == "-" {
-            "0".to_string()
-        } else {
-            t2.to_string()
-        }
-    } else {
-        t
-    }
-}
+///
+/// 实现已收口到 `spinduck_core::norm`（A5）：这里曾是第二份逐字相同的副本，只有测试
+/// 目录看得见，`compare` 复用不到——两侧再各有口径就必然漂移。本层只引用，不改判定。
+pub use spinduck_core::norm::norm;
 
 /// Oracle 风格 `/` 分隔符拆块：参照侧逐字下发语料文本。
 ///

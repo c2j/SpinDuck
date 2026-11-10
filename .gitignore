@@ -19,6 +19,8 @@ tarpaulin-report.html
 
 # ───────────── 运行态（SPINDUCK_HOME 开发实例） ─────────────
 .spinduck/
+# 本地 git worktree 检出（分支并行开发用，体积大且各有独立 .git 文件）
+.worktrees/
 *.duckdb
 *.duckdb.wal
 *.wal
