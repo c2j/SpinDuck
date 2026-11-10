@@ -3899,3 +3899,92 @@ CONFLICTING + `statusCheckRollup: []`（CI 根本不启动）变成 UNSTABLE + �
 | `spinduck/tests/cli/deploy.rs` | 新增 1 条计划面组合契约 | 新行为 |
 | `docs/validation.md`、`docs/architecture.md`、`docs/design-production-gaussdb.md`、若干注释行 | V26–V34 → V27–V35 编号让位 + 本节 V36 | 实证与引用面 |
 | `.github/workflows/ci.yml`、`spinduck/Cargo.toml` | 采主干单步 `--features cli` 口径；`[[test]]` 注释改写 | 接合 |
+
+---
+
+## V37. 审核应修：`compare --key` 的键列只在本地侧校验 ⇒ 参照侧改名时产出 `diffs=0` 的假绿
+
+**触发**：PR #8 的审核结论（`gh pr view 8 --json reviews` 一手：author `c2j`、state
+`COMMENTED`、submittedAt `2026-11-10T09:22:14Z`）。🔴 一条：`compare_by_key` 调
+`key_indices(a, key)` 只查左快照的 schema，参照侧从未校验；🟡 三条不阻断（规模越限、
+CI 未跑、`Snapshot::from_json_str` 不校验行宽）。
+
+**这条缺口是真的，且最坏的形态被 Red 一手抓到**。修法前的实现是：
+
+```rust
+let idx = key_indices(a, key)?;      // 只问左快照
+… key_tuple(rb, &idx) …             // 却按同一组下标位置读右快照
+```
+
+三条单测先写、先跑，全部红（`cargo test --features cli --lib should_reject_a_key_column`，
+一手 panic 原文，未截断）：
+
+```
+should_reject_a_key_column_renamed_only_in_the_reference_snapshot
+  called `Result::unwrap_err()` on an `Ok` value: []
+should_reject_a_key_column_missing_in_the_narrower_reference_snapshot
+  called `Result::unwrap_err()` on an `Ok` value: [Diff { kind: OnlyInA, row: 1, … },
+  Diff { kind: OnlyInA, row: 2, … }, Diff { kind: OnlyInB, row: 1, … b: "[x]" },
+  Diff { kind: OnlyInB, row: 2, … b: "[y]" }]
+should_reject_a_key_column_that_sits_at_a_different_position_on_the_right
+  called `Result::unwrap_err()` on an `Ok` value: [Diff { kind: OnlyInA, row: 1, … },
+  Diff { kind: OnlyInB, row: 1, … b: "[x, 1]" }]
+```
+
+第一行的 `Ok value: []` 就是审核点名的**假绿**：参照侧把键列改名成 `k_id`、列数不变，
+`key_tuple` 按位置读到参照侧的第 0 列（真实键值 1、2），两侧值恰好对上 ⇒
+`diffs=0`、退出码 0。这不是"比得不严"，是**把没比成说成比过了**——`compare` 模块头与
+architecture §13.9 的「找不到即 `ENV-0031`，绝不退化成位置序」对参照侧本来就没生效。
+第二、三行是同一条缺口的另外两种给法：参照侧更窄时右侧键恒 `NULL`，判成整片
+`OnlyIn*` 洪水（报因指错方向）；参照侧只是换了位置时同样读到错列。
+
+**修法**（`src/snapshot/compare.rs`，一个行为 = 键列两侧都校验）：新增 `key_indices_both`，
+对 a、b 各跑一遍 `key_indices`，再要求两组下标**相等**（列序不一致时"第 j 列对第 j 列"
+没有意义，故判红而不是报成 `DIFF`），`compare_by_key` 取它的返回值为唯一 `idx`。
+错误码沿用 `ENV-0031`（§5 归域：输入形状不对这一类，与 `case.toml` 缺 `[case]` 同族），
+消息带上参照侧真实列名——审核要求的"点名"落在诊断文本里，不是只落在码上。
+
+三条单测（形态各一）+ 两条 CLI 二进制契约（`tests/cli/compare.rs`：参照侧改名、参照侧换位；
+都断言 `[ENV-0031]` 且 stdout 不含 `diffs=` / `DIFF `，即**判红早于产出**）同批落地。
+既有那条 `should_reject_a_key_column_that_is_not_in_the_schema` 用 `&a, &a` 同一份快照，
+结构上看不见两侧的不对称——保留（它锁的是本地侧），缺口由新三条补。
+
+**非空洞性（一手变异）**：把参照侧那遍改回 `let idx_b = idx_a.clone();`（等价于
+"只校验左快照"，其余一字未动），5 条新测试全红、其余照绿：
+
+| 套件 | 变异后 | 还原后 |
+|---|---|---|
+| `--lib snapshot::compare` | 17 passed; **3 failed** | 20 passed; 0 failed |
+| `--test cli compare` | 10 passed; **2 failed** | 12 passed; 0 failed |
+
+随后按字节还原（`cp /tmp/compare.rs.bak`），判据不是"看起来差不多"。
+
+**门禁（本机，均在改动后的树上重跑）**
+
+| 命令 | 结果 |
+|---|---|
+| `cargo fmt --all` + `--check` | 干净 |
+| `cargo clippy --all-features -- -D warnings` | 无告警 |
+| `cargo test --features cli --lib` | 319 passed; 0 failed（316 → +3） |
+| `cargo test --features cli --test cli` | 80 passed; 0 failed（78 → +2） |
+| `cargo test --features cli` | 480 passed; 0 failed（475 → +5） |
+| `cargo test --features gauss --no-fail-fast` | 406 passed; 0 failed（口令由 `docker exec spinduck-gaussdb printenv GS_PASSWORD` 取入 env，未落 argv、未落文件） |
+| `cargo audit` | 本机抓取 advisory-db 失败，改用 `--no-fetch` 复核，见下注 |
+
+> audit 那格说清楚：本机 `cargo audit` 这轮 `couldn't fetch advisory database … error sending
+> request for url (…/info/refs)`，属网络面而非依赖面；`--no-fetch` 用本地缓存库跑出
+> **4 条 `zip` 漏洞，全部为既有豁免项**（口径见 architecture「审计豁免」与 V25），
+> 与本轮改动无关。CI 的 audit job 会带网络重取，作为该格的正式证据面。
+
+**与 CI 口径的对账**（审核 🟡「CI 未跑：本分支尚无 checks」）：该结论写在 09:22:14Z，
+而 `e7f238f` 的 run `42789980924` 起在 09:21:09Z（早 65 秒），审核时确实看不到；现在
+`gh run view` 一手 = 五个 job 全 `success`，`--log` 断言面 `test result: ok` 44 行、
+`passed` 合计 **878**（test job 475 + golden job 403）、`FAILED|panicked` 命中 **0**。
+所以本 head 的 §9 门禁是**已满足**的，合并门槛只随本轮新增提交移动。数字互证：本机
+`--features gauss` = 406，CI 在 `957cb8d` = 403，差值恰为本轮新增的 3 条单测——
+golden job 下一轮预期 406，若不等必须现场解释，不接受"数字差不多"。
+
+**🟡 两条按审核口径留给下一轮**（不在本轮动，避免把结构改动混进正确性修复）：
+`src/cli/args.rs` 859 行 / `src/cli/run.rs` 588 行的 §3 拆分轮，以及顺带补
+`Snapshot::from_json_str` 的行宽 == schema 长度形态校验。本轮 `compare.rs` 自身规模
+= 代码 225 行 / 含 `#[cfg(test)]` 总 537 行，在"含测试总行 ≤700"限内，不构成新增越限。

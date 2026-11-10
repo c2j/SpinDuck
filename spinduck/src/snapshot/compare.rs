@@ -54,6 +54,7 @@ pub fn compare(a: &Snapshot, b: &Snapshot) -> Vec<Diff> {
 ///
 /// 为什么要它：千万级实例上 `SELECT` 不保证行序，位置序比对会把同一份数据判成一片红。
 /// 键**只定位行，不重排列**——两侧列序仍须一致，否则"第 j 列对第 j 列"没有意义。
+/// 键列名在**两侧**都必须存在且同位（[`key_indices_both`]），只校验一侧等于对另一侧放弃判定。
 /// 重复键：排序稳定，键相同则保持文件序，于是同键的几行按各自顺序配对。
 /// 报告里的 `row` 取**左快照**的行号——`Diff` 没有第二个行号槽位，而裁决时先看本地结果。
 pub fn compare_by_key(
@@ -61,7 +62,7 @@ pub fn compare_by_key(
     b: &Snapshot,
     key: &[String],
 ) -> Result<Vec<Diff>, EngineError> {
-    let idx = key_indices(a, key)?;
+    let idx = key_indices_both(a, b, key)?;
     let order_a = rows_sorted_by_key(a, &idx);
     let order_b = rows_sorted_by_key(b, &idx);
     let mut out = Vec::new();
@@ -94,7 +95,7 @@ pub fn compare_by_key(
     Ok(out)
 }
 
-/// 键列下标：列名按大小写不敏感定位（参照侧给回 `K`、本地给回 `k` 是真实差异）。
+/// 键列下标（单侧）：列名按大小写不敏感定位（参照侧给回 `K`、本地给回 `k` 是真实差异）。
 ///
 /// 找不到即红，**绝不退回位置序**：把"没比成"说成"比过了"是本文最警惕的静默形态。
 fn key_indices(snap: &Snapshot, key: &[String]) -> Result<Vec<usize>, EngineError> {
@@ -114,6 +115,28 @@ fn key_indices(snap: &Snapshot, key: &[String]) -> Result<Vec<usize>, EngineErro
                 })
         })
         .collect()
+}
+
+/// 键列下标（两侧）：同一把刀过两遍，再要求两侧落在同一列序上。
+///
+/// 只校验左快照时，参照侧的键列名对不上就**静默退化成位置序**：改名 ⇒ 按位置读到错列当键，
+/// 值恰好对上就产出 `diffs=0` 的假绿；换位或行更窄 ⇒ 键读到 `NULL`，判成整片未匹配洪水，
+/// 报因指错方向。列序不一致在这里一并判红——键只定位行、不重排列，错位时"第 j 列对第 j 列"
+/// 本来就没有意义。
+fn key_indices_both(a: &Snapshot, b: &Snapshot, key: &[String]) -> Result<Vec<usize>, EngineError> {
+    let idx_a = key_indices(a, key)?;
+    let idx_b = key_indices(b, key)?;
+    if idx_a != idx_b {
+        return Err(EngineError::env(
+            31,
+            format!(
+                "compare: --key 列在两侧快照里位置不同（本地: {} / 参照: {}）",
+                a.schema.join(", "),
+                b.schema.join(", ")
+            ),
+        ));
+    }
+    Ok(idx_a)
 }
 
 /// 行的键值元组（逐列归一，所以 `1.50` 与 `1.5` 是同一个键）。
@@ -456,6 +479,50 @@ mod tests {
         assert_eq!(e.code.to_string(), "ENV-0031");
         assert!(e.message.contains("nope"), "{}", e.message);
         assert!(e.message.contains("k"), "{}", e.message);
+    }
+
+    #[test]
+    fn should_reject_a_key_column_renamed_only_in_the_reference_snapshot() {
+        // 上面那条用 a、a 同一份快照，看不见两侧的不对称：参照侧键列改名 + 列数相同时，
+        // 按位置读参照侧的第 j 列读到的是**别的列**，其值恰好对得上就产出 diffs=0 的假绿
+        let a = keyed(&[&["1", "x"]]);
+        let b = Snapshot {
+            schema: vec!["k_id".into(), "v".into()],
+            rows: vec![vec![Some("1".into()), Some("x".into())]],
+        };
+        let e = compare_by_key(&a, &b, &k(&["k"])).unwrap_err();
+        assert_eq!(e.code.to_string(), "ENV-0031", "{}", e.message);
+        assert!(e.message.contains("k"), "诊断要点名键列: {}", e.message);
+        assert!(
+            e.message.contains("k_id"),
+            "诊断要给出参照侧真实列名: {}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn should_reject_a_key_column_missing_in_the_narrower_reference_snapshot() {
+        // 参照侧行更窄时按位置读全落 None ⇒ 键恒 NULL ⇒ 整片 OnlyInB 洪水，报因指错方向
+        let a = keyed(&[&["1", "x"], &["2", "y"]]);
+        let b = Snapshot {
+            schema: vec!["v".into()],
+            rows: vec![vec![Some("x".into())], vec![Some("y".into())]],
+        };
+        let e = compare_by_key(&a, &b, &k(&["k"])).unwrap_err();
+        assert_eq!(e.code.to_string(), "ENV-0031", "{}", e.message);
+    }
+
+    #[test]
+    fn should_reject_a_key_column_that_sits_at_a_different_position_on_the_right() {
+        // 键列名两侧都在、但参照侧换了位置：值比对仍是"第 j 列对第 j 列"，
+        // 于是键读到错列——与改名同一种假绿，不能因为"名字找得到"就放过
+        let a = keyed(&[&["1", "x"]]);
+        let b = Snapshot {
+            schema: vec!["v".into(), "k".into()],
+            rows: vec![vec![Some("x".into()), Some("1".into())]],
+        };
+        let e = compare_by_key(&a, &b, &k(&["k"])).unwrap_err();
+        assert_eq!(e.code.to_string(), "ENV-0031", "{}", e.message);
     }
 
     #[test]

@@ -2,7 +2,8 @@
 //!
 //! 裁决只有两条承诺，本层各锁一条：判**值**不判文本（口径是 `crate::norm`，与黄金层
 //! 同一份实现），以及红 = **退出码非 0 + 逐条 DIFF**。列名不是判据，行序只在 `--key`
-//! 下才不是判据。
+//! 下才不是判据。`--key` 的键列**两侧各校验一遍**：只认本地侧时，参照侧改名或换位会让
+//! 右侧按位置读到错列——"没比成"就此伪装成 `diffs=0`，本层两条契约专门堵它。
 
 use super::{cli, write, EXIT_FAIL, EXIT_OK, EXIT_USAGE};
 
@@ -107,6 +108,57 @@ fn should_reject_a_key_column_that_is_not_in_the_snapshot() {
     assert_eq!(code, EXIT_FAIL, "{out}");
     assert!(out.contains("[ENV-0031]"), "{out}");
     assert!(out.contains("nope"), "诊断要点名写错的键列: {out}");
+    assert_eq!(err, "", "全部输出走 stdout");
+}
+
+#[test]
+fn should_reject_a_key_column_renamed_only_in_the_reference_snapshot() {
+    // 参照侧键列改名、列数不变：只校验左快照时按位置读到参照侧的**别的列**当键，
+    // 两侧值恰好对上就产出 `diffs=0` 的绿——`--key` 的全部意义被一句话抹掉
+    let tmp = tempfile::tempdir().unwrap();
+    let a = snap(
+        tmp.path(),
+        "a.json",
+        r#"{"schema":["k","v"],"rows":[["1","x"],["2","y"]]}"#,
+    );
+    let b = snap(
+        tmp.path(),
+        "b.json",
+        r#"{"schema":["k_id","v"],"rows":[["1","x"],["2","y"]]}"#,
+    );
+    let (code, out, err) = cli(&["compare", &a, &b, "--key", "k"]);
+    assert_eq!(code, EXIT_FAIL, "{out}");
+    assert!(out.contains("[ENV-0031]"), "{out}");
+    assert!(out.contains("k_id"), "诊断要给出参照侧真实列名: {out}");
+    assert!(
+        !out.contains("diffs="),
+        "判红必须早于产出，不许留下比对摘要: {out}"
+    );
+    assert_eq!(err, "", "全部输出走 stdout");
+}
+
+#[test]
+fn should_reject_a_key_column_at_another_position_in_the_reference_snapshot() {
+    // 键列名两侧都在、参照侧换了位置：值比对仍按"第 j 列对第 j 列"，于是键读到错列。
+    // 键只定位行、不重排列 ⇒ 列序不一致本身就该判红，不是差异
+    let tmp = tempfile::tempdir().unwrap();
+    let a = snap(
+        tmp.path(),
+        "a.json",
+        r#"{"schema":["k","v"],"rows":[["1","x"],["2","y"]]}"#,
+    );
+    let b = snap(
+        tmp.path(),
+        "b.json",
+        r#"{"schema":["v","k"],"rows":[["x","1"],["y","2"]]}"#,
+    );
+    let (code, out, err) = cli(&["compare", &a, &b, "--key", "k"]);
+    assert_eq!(code, EXIT_FAIL, "{out}");
+    assert!(out.contains("[ENV-0031]"), "{out}");
+    assert!(
+        !out.contains("DIFF "),
+        "列序不一致不是逐值差异，报成 DIFF 会把因指错方向: {out}"
+    );
     assert_eq!(err, "", "全部输出走 stdout");
 }
 
