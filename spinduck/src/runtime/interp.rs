@@ -17,6 +17,7 @@ mod flow;
 mod routine;
 mod sqlstmts;
 mod trace;
+pub(in crate::runtime) mod writebuf;
 
 pub(crate) use binds::resolve_binds;
 use trace::spinduck_trace_event;
@@ -28,7 +29,9 @@ pub enum RunOutcome {
     Returned(Option<SpinValue>),
 }
 
-const MAX_STEPS: u64 = 1_000_000;
+/// 解释器步数预算默认值：防死循环护栏（ENG-0032）。
+/// 大业务（如十万行游标循环）合法超过默认值，由 `Engine::step_budget` 按调用面放大。
+pub const DEFAULT_STEP_BUDGET: u64 = 1_000_000;
 
 /// 运行 IR 程序（SQL 语句经 executor 下发；测试注入 FakeExecutor）。
 pub fn run(
@@ -54,10 +57,32 @@ pub fn run_with_trace(
     sink: &mut dyn TraceSink,
 ) -> Result<RunOutcome, EngineError> {
     let cat = crate::catalog::RoutineCatalog::new();
-    run_with_catalog(prog, frame, ex, sink, &cat, 0)
+    run_with_catalog(prog, frame, ex, sink, &cat, 0, RunLimits::default())
+}
+
+/// 运行期调参：步数预算（ENG-0032 护栏）与合并 COMMIT 开关。
+#[derive(Debug, Clone, Copy)]
+pub struct RunLimits {
+    /// 顶层调用的解释器步数预算（ENG-0032 护栏；嵌套例程仍各自取默认值）。
+    pub budget: u64,
+    /// 合并 COMMIT 开关（默认 false）：ON 时过程内 INSERT 攒批、COMMIT 吞并，
+    /// 出口统一刷盘。语义边界见 writebuf.rs。
+    pub batch_commit: bool,
+}
+
+impl Default for RunLimits {
+    fn default() -> Self {
+        Self {
+            budget: DEFAULT_STEP_BUDGET,
+            batch_commit: false,
+        }
+    }
 }
 
 /// 带例程目录与深度的运行（M6：CALL/FuncCall 例程直调）。
+///
+/// `limits.batch_commit` = `Engine::batch_commit`（默认 false）：ON 时过程内
+/// INSERT 攒批、COMMIT 吞并，出口统一刷盘 + 由 engine.call 提交。
 pub fn run_with_catalog(
     prog: &IrProg,
     frame: &mut Frame,
@@ -65,6 +90,7 @@ pub fn run_with_catalog(
     sink: &mut dyn TraceSink,
     cat: &crate::catalog::RoutineCatalog,
     depth: usize,
+    limits: RunLimits,
 ) -> Result<RunOutcome, EngineError> {
     let mut traps: Vec<TrapFrame> = Vec::new();
     let mut pc = 0usize;
@@ -75,11 +101,23 @@ pub fn run_with_catalog(
         sink,
         cat,
         depth,
+        budget: limits.budget,
+        batch: limits.batch_commit,
+        wbuf: if limits.batch_commit {
+            writebuf::shared_buffer()
+        } else {
+            None
+        },
         current_error: None,
     };
     loop {
         match run_inner(prog, &mut env, &mut traps, &mut pc, &mut steps) {
-            Ok(out) => return Ok(out),
+            Ok(out) => {
+                // 出口统一刷盘：缓冲 INSERT 在同一事务内下发，随 engine.call 的
+                // 最终 COMMIT 一起持久化；失败则错误正常上抛（触发外层 ROLLBACK）
+                writebuf::flush_all(&mut env)?;
+                return Ok(out);
+            }
             Err(e) => {
                 // 自顶向下找匹配处理器；进入处理器前写 SQLERRM/SQLCODE 帧变量
                 let mut handled = false;
@@ -118,6 +156,8 @@ pub fn run_with_catalog(
                     }
                 }
                 if !handled {
+                    // 最终未处理：缓冲语句与已执行语句一起回滚，丢弃缓冲后外抛
+                    writebuf::discard(&mut env);
                     return Err(e);
                 }
                 // pc 已指向处理器体；handler 末尾的 Jump(resume) 负责跳回 resume
@@ -133,6 +173,12 @@ pub(super) struct Env<'a> {
     pub sink: &'a mut dyn TraceSink,
     pub cat: &'a crate::catalog::RoutineCatalog,
     pub depth: usize,
+    /// 本层调用的步数预算（ENG-0032 护栏）。
+    pub budget: u64,
+    /// 合并 COMMIT 开关（嵌套例程沿调用链传播，各自持有独立缓冲）。
+    pub batch: bool,
+    /// 本层调用的延迟写缓冲（batch = true 时 Some；嵌套例程各自独立）。
+    pub(super) wbuf: writebuf::WBufOpt,
     /// 进入异常处理器体时写入的当前错误——裸 `RAISE;` 的重抛源。
     pub current_error: Option<EngineError>,
 }
@@ -147,10 +193,13 @@ fn run_inner(
 ) -> Result<RunOutcome, EngineError> {
     loop {
         *steps += 1;
-        if *steps > MAX_STEPS {
+        if *steps > env.budget {
             return Err(EngineError::invariant(
                 32,
-                format!("step budget exceeded ({MAX_STEPS}): possible infinite loop"),
+                format!(
+                    "step budget exceeded ({}): possible infinite loop",
+                    env.budget
+                ),
             ));
         }
         let pc_cur = *pc;
@@ -164,10 +213,15 @@ fn run_inner(
             IrStmt::Nop => *pc += 1,
             // 事务语句即时作用于当前事务并重开（最外层统一边界见 engine.call）
             IrStmt::TxCommit => {
-                flow::tx(env, true)?;
+                // 合并开关 ON：COMMIT 吞并（持久化延迟到调用出口统一提交）
+                if env.wbuf.is_none() {
+                    flow::tx(env, true)?;
+                }
                 *pc += 1;
             }
             IrStmt::TxRollback => {
+                // ROLLBACK：缓冲从未下发，直接丢弃后再回滚当前事务
+                writebuf::discard(env);
                 flow::tx(env, false)?;
                 *pc += 1;
             }
@@ -190,6 +244,7 @@ fn run_inner(
                 into,
                 fn_sites,
             } => {
+                writebuf::flush_if_touches(env, sql)?;
                 sqlstmts::query(env, sql, binds, into, fn_sites)?;
                 *pc += 1;
             }
@@ -198,13 +253,18 @@ fn run_inner(
                 binds,
                 fn_sites,
             } => {
-                sqlstmts::exec(env, sql, binds, fn_sites)?;
+                let buffered = writebuf::take_insert(env, sql, binds, fn_sites)?;
+                if !buffered {
+                    sqlstmts::exec(env, sql, binds, fn_sites)?;
+                }
                 *pc += 1;
             }
             IrStmt::SqlExecDynamic {
                 text_expr,
                 into_targets,
             } => {
+                // 动态 SQL 目标不可静态判定：保守整缓冲刷盘
+                writebuf::flush_all(env)?;
                 sqlstmts::exec_dynamic(env, text_expr, into_targets)?;
                 *pc += 1;
             }
@@ -213,6 +273,8 @@ fn run_inner(
                 args,
                 out_targets,
             } => {
+                // 嵌套例程边界即刷盘点（嵌套缓冲独立，读自己写跨边界保守保证）
+                writebuf::flush_all(env)?;
                 routine::call(env, name, args, out_targets)?;
                 *pc += 1;
             }

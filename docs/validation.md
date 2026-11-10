@@ -1454,6 +1454,14 @@ V9 表已补记。
   以及仓库内的 `./spinduck/target/debug/spinduck compile golden/case_corpus_purchase/sql`
   → `files=7 ok=7 failed=0 routines=6`（本轮实跑）。
 
+
+> **后续事实（2026-11-08，V26.5 回写）**：V21.9–V21.12 的「参照实例不可作为
+> 过程执行基线」结论**只在 5.0.0 amd64 成立**。开发机复现确认（干净实例裸
+> CALL → postmaster exit 0，RestartCount 0→1→2，服务端零错误日志）后，
+> 性能基准改用 openGauss 7.0.0-RC3 作替代参照：同夹具 3 行种子冒烟产物与
+> 黄金断言逐值一致后才采用；裸 CALL 同语句在 7.0-RC3 上正常完成并落行。
+> 口径详见 V26.5。
+
 ## V24. 数据通道认证面：sha256 实测可连，驱动由 `postgres` 换为 `gaussdb::sync`
 
 **结论**：README「已知限制」里"GaussDB 侧若为 sha256 口令认证，纯 Rust `postgres`
@@ -1708,11 +1716,320 @@ rust-cache 修复的取证方式与结论（对 `gh run view --log` 的计数，
   与已验证 head 同内容）各五 job 全绿，tag 指在该 merge commit 上。后续发版沿用
   "bump 随 PR 落地、tag 打在 CI 已验证的 main head"这条顺序（AGENTS §9）。
 
-## V26. 生产 GaussDB 接入的前置取证（A0a，本机半程）：三处"看着绿、其实没跑"取到一手证据，并订正本节自记的两个数
+## V26. 三段引擎优化与数据搬运批量通道的实证（记忆化 / prepared / 合并 COMMIT 开关 / COPY）
+
+> **与 V24 的关系（rebase 后口径）**：本节初稿基于 `postgres` 驱动的旧树，V24
+> （sha256 认证面、驱动换 `gaussdb::sync`）落在同一窗口。V26.4 的回写通道已按
+> 新驱动重做——`gaussdb::sync` 自带 `copy_in`/`CopyInWriter`（openGauss 官方
+> 驱动 fork，协议层含 CopyInResponse），手写线协议会话随之退役；sha256 口令
+> 实例不再需要任何降级（V24 结论原样成立）。V26.4 的重做实测见本节内更新值。
+
+**结论先说**：100k 行语料过程 `prc_trd_deal_purchase`（openGauss 参照 vs SpinDuck，
+`golden/case_corpus_purchase` 全套夹具）三段逐项迭代、逐项基准对比：引擎执行
+698.9s→264.3s（首跑）/ 938.2s→316.2s（稳态含 DELETE），物化 244.7s→26.0s，回写
+204.0s→1.18s；全链路 1,147.6s→291.5s（−75%）。每段默认语义不变或显式 opt-in
+开关（`Engine::batch_commit` 默认 OFF）。产物（`dat_trd_repurchase` 逐值）在
+三段全部运行中与基线一致。本节只做实证记录与口径钉死；机制描述见
+architecture §3.5 补注与 `writebuf.rs` 头注释。
+
+### 基准环境（一次声明，全节适用）
+
+- 参照：openGauss **7.0.0-RC3**（`opengauss/opengauss:latest`，amd64，127.0.0.1:5435）。
+  采用依据见 V26.5（5.0.0 amd64 的过程调用自杀在本机复现，V21.9–V21.12 补充证据）。
+  部署夹具与 golden 同源（tables/views/stubs/routines/seed 逐字），3 行种子冒烟
+  `CALL pkg_split_trade_step3_sh.prc_trd_deal_purchase('20250715', NULL)` 产物
+  `[2, 300, 30000, 6]` 与黄金断言逐值一致后才做基准。
+- 被测：SpinDuck release 构建，`golden/case_corpus_purchase` 部署口径
+  （`verify::deploy_schema/deploy_routines` + 项目规则），数据集与参照同一份
+  SQL 文件装入（37 列 ×100k，含 2% A999 异常行=partner 未维护走行级跳过路径）。
+- 计时口径：参照为 gsql 客户端墙钟（含 ~0.3s 启动）；SpinDuck 为进程内
+  `Engine::call` 墙钟（部署/编译/装数在计时圈外）。语句计数来自
+  `MeterExecutor`（按 SQL 文本聚合下发的装饰器，随 bench 存证）。
+- 两侧写路径对称：过程内逐行 INSERT+COMMIT（fsync 同价）。
+
+### V26.1 迭代①：纯标量语句执行期记忆化（MemoizingExecutor）
+
+- 依据：Meter 计量显示**解释器只占 wall 2.7%**，97% 在内核下发；每行 16 条语句
+  中 5 条是纯标量表达式宏（`substr`/`to_char(to_date()+n)`/date_diff），参数组合
+  仅 4 种。白名单（substring/strftime/strptime/to_days/date_diff）按
+  （SQL 文本, 绑定值）缓存，`Engine::call` 入口清空。
+- 实测（10k 稳态）：68.12s→46.60s（**−31.6%**）；语句 157,006→78,617（−50%）。
+  **口径注记（V26.7 修后）**：该数字采集于「memo 对任意 DDL 失效」的版本——
+  失效口径收窄到 MACRO 后（V26.7），带 sqlfn 下沉的游标循环不再每行清缓存，
+  该类过程的实际收益应高于本数字；重跑见 V26.7 口径标注。
+- 测试 6 个：合并命中、按绑定值区分、表查询/非确定性函数/execute 不缓存、
+  clear 后重执行（`exec::tests::should_memoize_*` 等）。
+
+### V26.2 迭代②：内核 prepared 语句缓存 + 一个内核缺陷被实测钉死
+
+- `prepare`→`prepare_cached`（容量 512，内核默认 16）：微查询均摊 212→91µs、
+  BEGIN 70→46µs；但 wall 持平——大项（COMMIT 1.05ms / 单行 INSERT 0.99ms /
+  点查 0.8ms）是执行硬成本（WAL fsync / MVCC / 管线固定），parse 只占小头。
+- **实测钉死的内核缺陷（1.5.5）**：缓存的 `CREATE OR REPLACE TEMP TABLE` plan
+  二次执行留下 **0 列残表**（`Binder Error: table sd_fn0 has 0 columns but 2
+  values were supplied`），sqlfn 物化路径（`materialize_fn_sites`）必踩——
+  V24 前该路径在开关 OFF 下由既有测试 `should_execute_pl_function_calls_inside_
+  sql_statements` 抓出。修复（复核决断 1 后的现行口径）：**DDL 本体绕过语句
+  缓存** + execute 期 rebind 兜底——不做全缓存 flush（sqlfn 物化路径每行一次
+  CREATE TEMP TABLE，全 flush 等于把 512 容量抵消掉）。守护测试
+  `guard_should_recreate_temp_table_across_prepared_cache` /
+  `guard_should_rebind_prepared_shape_after_table_recreate` 集中登记于
+  `tests/guard/guard_exec_native_prepared_cache.rs`，在**无 flush 前提**下钉住。
+- 接缝纪律：DuckDB API 触碰只在 `sql/exec_native.rs`（AGENTS §1）。
+
+### V26.3 迭代③：合并 COMMIT 开关（`Engine::batch_commit`，默认 OFF）
+
+- 依据：COMMIT 1.05ms + 单行 INSERT 0.99ms 占内核时间 44%，只能靠事务边界
+  合批消化——属对 §3.5「过程内 COMMIT 即时生效」的显式偏离，故为 opt-in 开关。
+- 语义（四条，`writebuf.rs` 头注释为准）：① 过程内 COMMIT 吞并，INSERT 攒批
+  合并（同前缀连续攒入为一组，每组刷盘为一条多值 INSERT；缓冲行数上限
+  10,000），出口统一刷盘由 `engine.call` 最终 COMMIT 持久化；② 触及
+  缓冲表的语句先刷盘（读自己写）；③ 合并失败回退逐行重放，失败行**数据级
+  跳过**——与 OFF 的差异是该行不进 PL 异常处理器（inst_log 缺失），组内首行
+  失败视为表级错误上抛；④ 嵌套例程边界即刷盘点（各自独立缓冲；SQL 上下文
+  函数调用不批——语料函数体无 INSERT）。
+- 实测（10k 稳态）：46.6s→23.6s（**−49%**）；100k 首跑 439.3→264.3s、稳态
+  911.7→316.2s；语句 786,017→494,015。产物逐值一致（三组运行）。
+- 评审修复（V24 PR 审查实测抓出，各带回归覆盖）：① `INSERT … SELECT`
+  不可缓冲形态回落即时下发（原 ENG-0033 上抛，语料合法形态）；② flush
+  失败时逐组出账（原多组部分成功后重复下发）；③ `INSERT INTO sch.t`
+  限定名的读自己写命中（原 token 切分漏判）；④ 字符串字面量内的 `$`
+  不再误判为占位符；⑤ push 改收已验证前缀（原不可达错误分支）。
+- 测试 10 个（V26.10 修后实数；interp 层 FakeExecutor 计数），按面分组：
+  语义四条（合并+吞并 ON、逐行 COMMIT OFF 默认守护、触及缓冲表先刷盘、
+  无空格表名形态触表刷盘）、回落两条（INSERT…SELECT、带 fn_sites 的
+  INSERT）、回放一条（合并失败回退跳行）、事件面两条（刷盘点 SqlExec、
+  回放跳行 BatchSkip）、上限一条（WRITE_BUF_CAP 满则先刷盘）。
+- 实现中由测试/基准抓出的自身缺陷（各一条，均修复）：
+  ① md5 外层摘要误用 16 字节 raw digest——正确输入是 inner 的 **32 字符
+  hex ASCII 串**（服务端 28P01）；
+  ② 行级业务异常（NO_DATA_FOUND，语料空表 commission 查询每行合法抛出）的
+  trap 重入路径误清缓冲 → 全部行丢失（实测 count=0）——discard 收敛到
+  「handler 不可重入的最终异常」；
+  ③ 字面量行（`VALUES ('x')`，无占位符）需原样采用；
+  ④ VALUES 表达式是复合形态（`round(($a-$b)/$c, 2)`）——字面量化必须
+  占位符**就地文本替换**，按值提取会拆散表达式导致列/值错位（22→26 值实测）。
+
+### V26.4 数据搬运批量通道：postgres crate 的 copy_in 静默无效 → `gaussdb::sync` 驱动通道
+
+- **旧驱动缺陷存证**：`postgres` crate 0.19 的 `copy_in`（扩展协议
+  Parse/Bind/Execute）对 openGauss 5.0.0/7.0.0-RC3 均**不报错且 0 行落库**
+  （CSV 与文本两种格式变体实测）；同表 gsql `\copy` 成功——服务端 COPY
+  能力正常，缺口在扩展协议交互。历史对照：手写简单协议会话（TcpStream
+  Startup → md5 → `Q`/`G`/`d`/`c`）曾在此驱动上打通（10 万行 104–143ms），
+  探针存证于 V24 初稿（未入库，结论保留在此）。
+- **落地（V26 重做口径）**：驱动换 `gaussdb::sync`（V24）后，其 `copy_in` /
+  `CopyInWriter`（`opengauss-protocol` 独立协议实现，**非** tokio-postgres
+  fork）对 openGauss 实测可用——`sync_append` 切换为驱动 `copy_in`
+  （COPY FROM STDIN，CSV 分块写入，`finish()` 行数与本地计数交叉校验，
+  单事务原子追加）；`materialize` 为 500 行/语句批量多值 INSERT。双内核
+  e2e（`gauss_e2e`）与 100k/98k 全量实测通过。
+- **实测（V26 重做后）**：回写 98k 204.0s→**0.89s**（480→110,236 行/s）；
+  物化 100k 244.7s→**25.6s**（409→3,903 行/s）。行数核对：回写前后服务端
+  行数精确 +98,000。
+- **退役说明**：初稿的手写线协议会话（含 md5-only 限制与四条协议契约
+  ——md5 长度含 `\0` / `G` 即转数据流 / COPY 期禁发 `Q` / `G` body[0]
+  为格式码）随驱动通道退役，不再构成回写路径的认证面限制（sha256 实例
+  由驱动原生支持，V24 结论原样成立）。
+
+### V26.5 参照实例 V21.9 的本机复现；7.0.0-RC3 替代口径的验证依据
+
+- **V21.9–V21.11 在开发机复现**：5.0.0 amd64（`187da08af341`，与 CI 同 artifact）
+  干净实例裸 `CALL` → postmaster 自杀：`RestartCount` 0→1→2、`ExitCode=0`、
+  服务端日志零错误（V21.10/21.11 的判定协议逐条执行，本机 100% 复现）。
+  首次 CALL 幸存一次但 0 行插入（未做工作）——与 CI"3/3 轮"口径一致：
+  参照实例不可作为过程执行基线，证据链闭合。
+- **7.0.0-RC3 替代口径**：Lite 镜像入口在 `/entrypoint.sh`（非 5.0.0 的
+  `/var/lib/opengauss/entrypoint.sh`），`GS_HOST_AUTH_METHOD=md5` 原生支持、
+  `OTHER_PG_CONF` 不支持（无需——实测 `password_encryption_type=0` md5 为
+  默认）；`datcompatibility=A` 由 initdb 默认给出（实测查询确认）。镜像缺陷：
+  缺 `libopenblas.so.0`/`libgfortran.so.5`（openEuler RPM + 宿主 so 注入后
+  正常，探针脚本存证）。部署口径与 golden 逐字一致；冒烟产物与黄金断言
+  逐值一致后才采用。**黄金 pin 的 5.0.0 参照地位不变**——7.0-RC3 仅作为
+  性能比对替代参照，绝对耗时不可与黄金基线历史混比。
+- 端口适配：宿主 5433 被既有 dota-gaussdb（同 5.0.0 镜像，同缺陷）占用——
+  按golden/README 处置方式改绑端口，未触碰他人实例。
+
+### V26.6 门禁与测试清单
+
+- fmt / clippy（gauss，`-D warnings`）✓；`cargo audit` 无新增告警
+  （既有 zip 维持 CI 豁免口径）。
+- `cargo test --features cli` 全量 **322/0**（V26.10 修后口径，cli 蕴含
+  native；V24 批次时 native 口径为 307/0）：新增 memo 8（含 FUNCTION/短形态
+  MACRO 判定 1）、prepared 守护 2、batch_commit 10（见 V26.3 分组）、
+  回放跳行事件 1、CLI 解析 1、cases_native 6
+  （OFF 4 + **ON 2**，见 V26.8 应修 1）、CLI 契约 3（bin 面，V26.10）。
+- golden 回归（5.0.0 容器，默认 OFF 路径）：cases_native 4/4、
+  golden_corpus_purchase 1/1、gauss_e2e 2/2（**新 COPY/批量通道在 5.0.0 实测**）
+  ——7/0。ON 模式的内核级 A/B（cases_native ON 2 条）走 native 门禁（进程内
+  内核、无容器依赖），断言集与 OFF 完全一致。
+- 基准与探针工具存证口径（与 V26.4 一致，复核修）：`spinduck_bench`、
+  `tests/wire_probe.rs`、`tests/io_probe.rs` 三者**均未入库**——本节全部
+  基准数字为开发机一次性测量，结论保留在此，不可从仓库复现。
+
+### 边界（不声称做到的）
+
+- 合并 COMMIT 开关 ON 的两处偏差（失败行不进 inst_log、嵌套边界即刷盘）是
+  **文档化偏离**而非等效实现；默认 OFF 的行为由 OFF 守护测试锁定。
+- ON 模式刷盘点补发的 `SqlExec` 事件（V26.7）`elapsed_us` 记 0——与
+  `sqlstmts::exec` 现行口径一致，合并语句未单独计时。
+- 攒批多行共享一张按元组缓存的下沉表（sd_fnN）是独立设计题，本节不覆盖
+  （带下沉的 INSERT 一律回落即时下发，见 V26.7 准入条件）。
+- 7.0-RC3 参照的绝对耗时不可与黄金基线历史混比（不同内核版本）；本节所有
+  "对比"都是同机同数据同时点的 A/B。
+- 参照侧计时含 gsql 客户端（~0.3s 启动），SpinDuck 为进程内 call——两口径
+  差异相对 200s/264s 的量级可忽略，未做归一。
+- 动态 SQL（`EXECUTE IMMEDIATE`）在开关 ON 下走保守整缓冲刷盘，未单独基准。
+- `lib/fastaas` 考题语料不在本仓库跟踪面内（V21.5 口径），本节数据全部来自
+  `golden/case_corpus_purchase` 在库夹具。
+
+### V26.7 第二轮复核修复：fn_sites 攒批漏物化、memo 失效收窄、刷盘事件、CLI 预算入口
+
+第二轮复核（head `a267748`，2026-11-09）抓出的数据级阻塞项与后续修：
+
+- **阻塞项（数据级）**：ON 模式带 sqlfn 下沉（`fn_sites` 非空）的 INSERT 被
+  `take_insert` 攒批——`materialize_fn_sites` 是 `sqlstmts::exec` 的执行期
+  副作用，攒批跳过它 → `sd_fnN` 未建（KERNEL-0010 硬失败）或滞留旧元组
+  （静默写错值）。语料形态 `PKG_SPLIT_TRADE_STEP3_SH.prc_trd_hz_byfund` 的
+  `INSERT … VALUES (… fnc_get_rate_info2 …)` 即是此形态；V26 基准恰好未覆盖
+  带下沉的 INSERT 故未暴露。修复：`take_insert` 增加显式准入条件——fn_sites
+  非空一律按表命中刷盘后回落即时下发；回填为「缓冲 = 只能替换 `ex.execute`，
+  原路径其余副作用一律回落」的原则。回归：
+  `should_fall_back_to_immediate_exec_for_insert_with_fn_sites_when_batch_commit_on`
+  （修前实测红：sd_fn0 未物化）。
+- **memo 失效收窄（复核应修 A）**：DDL 即清 memo 与 sqlfn 每行一次
+  CREATE TEMP TABLE 相乘，带下沉的游标循环每行清空缓存。收窄到只认
+  `CREATE OR REPLACE MACRO|FUNCTION` / `DROP MACRO`（`is_macro_ddl`；
+  TEMP TABLE 不改变白名单纯表达式语义）。回归：`should_keep_memo_across_
+  temp_table_ddl`（修前红）+ `should_clear_memo_after_macro_ddl`。
+  V26.1 的 −31.6% 为收窄前采集，已加口径注记；重跑需 7.0-RC3 参照实例，
+  未在本轮执行。
+- **刷盘点补发 SqlExec 事件（复核应修 B）**：被合并的 INSERT 原在 JSONL
+  面完全消失。`flush` 现对每条实际下发的语句（合并语句 + 回放行）发
+  `TraceEvent::SqlExec`（`elapsed_us` 记 0，与 `sqlstmts::exec` 同口径）。
+  回归：`should_emit_sql_exec_event_for_merged_insert_at_flush_point`。
+- **CLI 步数预算入口（复核应修 C）**：`Engine::step_budget` 原有字段无入口
+  ——按步数模型推断，`call --batch-commit` 跑 100k 级游标循环会撞 ENG-0032
+  （基准工具未入库，当时的实际步数/预算未留档，此为推断口径而非实测）。
+  补 `spinduck call --step-budget <n>`（正整数，0 拒绝），与 `--batch-commit`
+  同处接线。**注意：该入口只放大顶层 `RunLimits.budget`，嵌套例程仍沿各自
+  默认预算**。回归：`should_parse_call_with_step_budget`（解析层；CLI 接线的
+  契约测试面 `tests/cli.rs` 仓库尚不存在，属既有缺口、非本 PR 引入）。
+- **小项**：`is_insert` 字节切片改 `chars().take(12)`（与 `is_ddl` 同口径）；
+  不可达的 `last_mut()` None 分支改按索引取尾组；`writebuf.rs` 头注释补
+  `borrow_mut` 跨 `ex.execute` 的重入约束一行。空组分支在第三轮整支删除
+  （V26.8：本节初稿写「随逐组出账重写消除」不成立——它只是改成了
+  `-= 0` 的不可达形态）。
+- **文档一致性（复核文档 6 条）**：V26.6 探针口径与 V26.4 统一为「未入库」；
+  V26.2 改述为决断 1 后的现行修复（DDL 绕缓存 + rebind 兜底，无全 flush）
+  并指向 `tests/guard/` 现行守护；「采用依据见 V24.5」改 V26.5；
+  architecture §3.5 删除代码中不存在的「组随例程内业务异常边界切分」、
+  「协议级细节」措辞随 WireCopy 退役改为「机制细节」；README 能力矩阵数字
+  回传 V26.4 更新值、删除线/杂行清理。
+
+### V26.8 第三轮复核修复：ON 模式内核级 A/B、回放跳行留痕、表名解析、is_macro_ddl 口径
+
+第三轮复核（head `66cebd3`，2026-11-09）无阻塞项；三条应修 + 两条建议落地：
+
+- **应修 1（ON 模式内核级 A/B）**：`cases_native.rs` 的 `run_project` 增加
+  `batch_commit` 形参，`case_split_agg`（INSERT 带 `fnc_fee` 下沉，钉住准入
+  回落路径）与 `case_corpus_purchase`（大 INSERT 循环，真攒批）各加 ON 变体
+  ——**同一部署、同一断言集**在 ON 下逐值复跑，合并 INSERT 产物由真实
+  DuckDB 解析，「开关不改变数据」从文档承诺变成门禁。两条一次通过。
+- **应修 2（回放跳行留痕）**：`flush` 回放期被跳过的坏行补发
+  `TraceEvent::BatchSkip { rows, first_error }`（枚举新变体）。第四轮复审
+  ② 的决策为**接受并入契约**：事件枚举与 JSONL 形态已登记
+  architecture §11.2（`first_error` 自第四轮起携带错误码）。口径更正
+  （第四轮③）：当前全仓无 JSONL writer、CLI 无 `--trace`——事件面是
+  「可订阅」，**JSONL 落盘属 §11.2 未完成项**，本节不断言其已可见；
+  `first_error` 携带错误码使引擎缺陷与业务跳行在事件层可区分。
+  回归：`should_emit_batch_skip_event_when_replay_drops_rows`（修前编译红：
+  变体不存在；第四轮②断言收紧为必须含 `KERNEL-` 错误码）。
+- **应修 3（表名解析）**：`tables()` 对 `INSERT INTO t(a, …)`（表名与列清单
+  无空格，golden `case_split_agg` 的 routine.sql 即此写法）曾取到 `"t(a,"`
+  → 读自己写永不命中。按 `'('` 截掉列清单。回归：
+  `should_flush_buffer_before_touching_table_when_insert_has_no_space_before_cols`
+  （修前红：DELETE 先于刷盘下发）。
+- **建议 4（is_macro_ddl 口径）**：`chars().take(24)` 字符窗口使
+  FUNCTION 分支永不匹配（26 字符被截），`CREATE MACRO` 短形态 /
+  `DROP FUNCTION` / TEMP 修饰同漏。改前 5 个空白分隔 token 判定，覆盖
+  `CREATE [OR REPLACE] [TEMP] MACRO|FUNCTION`、`CREATE MACRO` 与
+  `DROP MACRO|FUNCTION`。回归：
+  `should_clear_memo_after_function_and_short_form_macro_ddl`（修前红：
+  FUNCTION 不清缓存）。
+- **建议 5（回落分支断言保护 + 代码收敛）**：`INSERT … SELECT` 与 fn_sites
+  两条回落测试改为**顺序断言**（预置同表缓冲行 → 缓冲合并 INSERT 必须先于
+  回落语句下发；删掉 flush 分支会红）；`take_insert` 三处内联的
+  「取 tables → touches → flush」收敛为 `flush_if_touches` 单一调用。
+- **文档口径**：V26.6 测试计数回传（307→318，分类明细见上）；V26.3
+  batch_commit 测试数 5→7；V26.7 的「必撞 ENG-0032」改推断口径并注明
+  `--step-budget` 只作用顶层预算；「空组分支已消除」的不实表述更正（本节
+  整支删除，V26.7 已附注）。
+- **规模注记（§3）**：`exec.rs` 含测试 543 行（第四轮修后 `wc -l` 实测；该
+  数字随 memo 口径微调会小幅漂移，判定以当场 wc 为准，两轴 500/700 内）。
+  **书面豁免**：本 PR 对 exec.rs 的后续改动（is_macro_ddl）即 memo 口径
+  本身，拆 memo 子模块属独立重构、另开 PR，不在本 PR 范围内。`interp/tests.rs` 的
+  682 行注记在写下后被第四轮修复推过 700 上限（793 行）——已在第四轮**拆分
+  为 `tests/mod.rs`（共享 helper，401 行）+ `tests/writebuf.rs`（batch/writebuf 块，452 行）**，
+  两个文件均在限内；本条历史数字保留作口径教训。
+- ~~**非本 PR 缺口（存档）**：AGENTS §4.1 的 CLI 契约层~~ **已在 V26.10 落地**：`tests/cli.rs`
+  （bin 契约 3 条，`required-features = ["cli"]`），CI Test 口径改
+  `--features cli`（蕴含 native）——`cli/run.rs` 两个开关的接线自此有测试面。
+
+### V26.9 第四轮复核：契约决策落地、tests 拆分、缓冲上限入测
+
+第四轮复审（head `65f3bad`）确认第三轮五条应修全部真落地、无数据正确性
+阻塞项；本轮把被挂起的契约决策定案并收口小尾巴：
+
+- **契约决策（第四轮②①）**：`TraceEvent::BatchSkip` **接受并入契约**——
+  事件枚举与 JSONL 形态登记 architecture §11.2（`BATCH_SKIP` detail 携带
+  `rows` 与 `first_error`）；`first_error` 从只含 message 改为
+  `"CODE message"` 形态（错误码在产生点携带，§5），回归断言收紧为必须含
+  `KERNEL-` 前缀（修前红）；「引擎缺陷与业务异常行自此可在 JSONL 面区分」
+  的超出口径更正为「事件接缝可订阅，JSONL 落盘属 §11.2 未完成项」。
+- **应修 ④（tests 拆分）**：`interp/tests.rs` 793 行破 700 上限 → 拆为
+  `tests/mod.rs`（共享 helper 与 interp 层测试）+ `tests/writebuf.rs`
+  （batch/writebuf 全部测试与 fixture），仅移动、断言不变，全量复绿。
+- **应修 ⑤（缓冲上限入测）**：`WRITE_BUF_CAP`「满则先刷盘」此前无任何测试。
+  `WriteBuffer` 增加 `cap` 字段 + 测试专用 `shared_buffer_with_cap`（生产
+  入口恒为 10,000）；回归 `should_flush_partial_batch_when_write_buf_cap_
+  reached`（cap=2 注入：第 3 行攒入前刷出两行合并 INSERT，出口再刷 1 行，
+  两条下发各为独立语句；编译红起步）。
+- **小项**：`is_macro_ddl` 的 TEMP 修饰放宽为前缀匹配（`TEMPORARY` 同义，
+  潜在面收口）并加回归用例；`VecSink` 消歧 match 的 `_ => {}` 兜底改为
+  显式分支；V26.3 测试清单补齐 2 个漏列名字；V26.8 规模注记更正
+  （682→793→拆分后实际行数）。
+- **计数（V26.9 修后）**：`cargo test --features native` 全量 **319/0**
+  （V26.8 的 318 + cap 回归 1）。
+
+### V26.10 第五轮复核：CLI 契约层落地、CI Test 口径升 cli、文档精度收口
+
+第五轮复审（head `c1adc5a`）确认第四轮四条全部真落地、无阻塞项；本轮处理
+三处文档精度与那个需要显式定案的缺口：
+
+- **CLI 契约层落地（复审「合并前唯一需要显式定的事」，取本 PR 内补）**：
+  新建 `tests/cli.rs`（`required-features = ["cli"]`，AGENTS §4.1 口径），
+  驱动**打包后的二进制**走完整 parse → run → Engine::call 路径：开关同开
+  成功调用（`--batch-commit` + `--step-budget 1000000`，语料同款
+  LOOP/COMMIT/EXIT 例程）、`--step-budget 0` 拒绝（usage 退出码 2）、
+  默认 OFF 路径同例程——`cli/run.rs` 对 `eng.batch_commit` /
+  `eng.step_budget` 的接线自此有测试面。3/3 一次通过。
+- **CI Test 口径升 `--features cli`**：cli 蕴含 native（既有覆盖一条不减）
+  并使 cli 契约层在常驻 Test job 真实运行；AGENTS §8/§9 与 workflow 注释
+  同步。**计数（V26.10 修后）**：`cargo test --features cli` 全量
+  **322/0**（V26.9 的 319 + cli 契约 3）。
+- **文档精度三处**：V26.8 规模注记改为不随行号漂移的表述（543 行 +
+  「is_macro_ddl 即 memo 口径本身、拆 memo 另开 PR」的书面豁免）；V26.3
+  batch_commit 测试 7→**10**（按语义/回落/回放/事件面/上限分组）；V26.9
+  拆分注记补实际行数 401/452。
+- **口径注记**：`KERNEL-0010` 是 exec_native 对所有 DuckDB 错误的统一映射，
+  **不承担 BatchSkip 的判别维度**——判别信号是事件本身 + message 文本
+  （architecture §11.2 已注）。
+## V27. 生产 GaussDB 接入的前置取证（A0a，本机半程）：三处"看着绿、其实没跑"取到一手证据，并订正本节自记的两个数
 
 **范围口径**：`docs/design-production-gaussdb.md` 把取证阶段拆成 A0a（本机，零功能改动）与
-A0b（等真实例）。**V26 只覆盖 A0a**——所有需要连实例的数字一律进"仍是推算"（V26.6），
-不在此处出现。A0b 完成后从 **V26.8** 起追加子节（V26.6/V26.7 已占用）。
+A0b（等真实例）。**V27 只覆盖 A0a**——所有需要连实例的数字一律进"仍是推算"（V27.6），
+不在此处出现。A0b 完成后从 **V27.8** 起追加子节（V27.6/V27.7 已占用）。
 
 **取证环境**：`spinduck 0.1.2` 的 release 产物（`cargo build --release --features cli --locked`，
 rustc 1.98.0，main `cbaaae5` + 本轮未提交改动，改动只有注释与新测试，不影响被测行为）。
@@ -1727,7 +2044,7 @@ rustc 1.98.0，main `cbaaae5` + 本轮未提交改动，改动只有注释与新
 同口径全绿；`cargo audit` 报 4 条**全部是 `zip 6.0.0`**，与 CI 豁免清单四条 ID 一一对应
 （`RUSTSEC-2026-0367/0368/0369/0429`，`.github/workflows/ci.yml:84-87`），未新增豁免。
 
-### V26.1 `call` 的三种命令形态：缺表时到底响不响（design §3.3）
+### V27.1 `call` 的三种命令形态：缺表时到底响不响（design §3.3）
 
 被测 = `golden/case_corpus_purchase` 的 `fnc_get_purchase_js_days('20250715','0130000001')`，
 参照基线 `'90'`（`golden/case_corpus_purchase/cases/baselines/expected.json` 场景 1）。
@@ -1755,7 +2072,7 @@ rustc 1.98.0，main `cbaaae5` + 本轮未提交改动，改动只有注释与新
    场景 4「日期不在生效区间 → 同归 `'0'`」）。⇒ C 的产物连值域都对得上一次正确复现，
    这是它比报错危险的实证理由，也是 DoD #2 要求"不存在 rc=0 但值为 0/空"的依据。
 
-### V26.2 `(+)` 不适配形态的后果：显式红，不是静默错值（design §4 硬事实 #2、§8）
+### V27.2 `(+)` 不适配形态的后果：显式红，不是静默错值（design §4 硬事实 #2、§8）
 
 新增守护 `spinduck/tests/guard/guard_patterns_outer_join_residual.rs`（`Cargo.toml` 注册
 `[[test]]`），三条 **已实测** 全绿：
@@ -1789,7 +2106,7 @@ Parser Error: syntax error at or near ")"\n\nLINE 1: ... a.id, b.id, c.id FROM t
 > 问题只在**没写清是哪一份语料**。注释已按此改写（本轮改动之一），并显式禁止把"8 处"读成
 > "8 处都改写成功"。
 
-### V26.3 交付件画像重测：本节自记的两个数被推翻（design §4）
+### V27.3 交付件画像重测：本节自记的两个数被推翻（design §4）
 
 | 项 | 旧值（错） | 新值（已实测） | 错因 |
 |---|---|---|---|
@@ -1797,10 +2114,10 @@ Parser Error: syntax error at or near ")"\n\nLINE 1: ... a.id, b.id, c.id FROM t
 | 源码编码 | "GBK" | **混合**：UTF-8 可解 **11,462** / 需 GBK **3,149** / 两者都不通 **0** | 旧值取自 `file -I` 对个别文件的判断（GBK 文件若无中文行则为纯 ASCII，`file` 会报 us-ascii）。逐文件 `decode('utf-8')` 失败再试 `decode('gbk')` 的全量口径才有意义。需 GBK 的分布：`数据拆分PROGRAM--GAUSS` 2,710/2,947、`012_VIEW` 395/1,210、`sequence` 44/1,188、`sql` **0**/9,266 |
 
 新增一条与正确性直接相关的画像（**已实测**）：3,149 个需 GBK 的文件里，**2,384 个（75.7%）**
-在**单引号字面量内**出现 CJK，合计 **182,723 处**；仅注释含 CJK 的 761 个。这条是 V26.4 的
+在**单引号字面量内**出现 CJK，合计 **182,723 处**；仅注释含 CJK 的 761 个。这条是 V27.4 的
 风险体量来源——有损解码污染的**不只是注释**。
 
-### V26.4 非 UTF-8 源码：三条入口三种行为，只有 `call` 是静默的（design §3.5，R9/D9）
+### V27.4 非 UTF-8 源码：三条入口三种行为，只有 `call` 是静默的（design §3.5，R9/D9）
 
 | 入口 | 读源码方式 | 实测行为 | rc |
 |---|---|---|---|
@@ -1818,11 +2135,11 @@ UTF-8 源 + UTF-8 参数 → RETURN MATCH      rc=0
 ```
 
 **同源码、同参数，只差文件编码 → 结论相反且两条都绿。** 有损解码把字面量里的中文换成
-U+FFFD，比较条件永不成立。按 V26.3 的体量，交付件里 2,384 个文件在射程内。
+U+FFFD，比较条件永不成立。按 V27.3 的体量，交付件里 2,384 个文件在射程内。
 处置顺序记在 design D9：**先让 `call` 变响**（零依赖，把 `non_utf8` 透出并判红，新增错误码挂
 探针），真 GBK 解码（新依赖 = Ask-first）另批。守护测试随 A2 落，本轮**未**改行为——A0a 只补证据。
 
-### V26.5 能力面改判：`verify` 已具备"建表 + 缺件红"（design §3.1、R3、§6.2）
+### V27.5 能力面改判：`verify` 已具备"建表 + 缺件红"（design §3.1、R3、§6.2）
 
 设计文档初稿把"执行 DDL 的部署"整体判为不存在，与 V20 自己的登记冲突。本轮实跑复核
 （**已实测**，用的就是发版二进制）：
@@ -1845,9 +2162,9 @@ verify: entries=1 checks=11 failed=0 skipped=1        rc=0
 资产按目录发现且 `sql_files` **忽略递归参数**（`spinduck/src/project/fs.rs:49`）→ 深层碎目录扫不到、
 也表达不了闭包子集；`[[entry]]` 要求包限定（`spinduck/src/project/entry.rs:50`，实测裸函数名报
 `入口/例程全名必须为 package.procedure 形态`）→ 独立函数（交付件 2,148 个）进不了门禁；
-`call` 自己那条路**没有**部署（V26.1）。
+`call` 自己那条路**没有**部署（V27.1）。
 
-### V26.6 仍是推算的（明确不声称）
+### V27.6 仍是推算的（明确不声称）
 
 - **千万级取数/回写的任何时长与内存数字**：本轮一个都没测。`fetch_rows` 收全 `Vec` +
   逐行字面量 `INSERT`（`spinduck/src/io/gauss.rs:88,111`）与逐行 `execute` 无事务（`:142`）
@@ -1860,13 +2177,13 @@ verify: entries=1 checks=11 failed=0 skipped=1        rc=0
   取自前一轮同机会话，本轮**未重跑** codeweb；口径与命令在 design 附录 A，复跑属 A0b 的
   计划生成部分。
 
-### V26.7 本轮改动落点
+### V27.7 本轮改动落点
 
 | 文件 | 改动 | 性质 |
 |---|---|---|
 | `docs/design-production-gaussdb.md` | v3 → **v4**：§1 摘要两行改判、§3.1 重写、§3.3 三形态、新增 §3.5、§4 表 + 硬事实（三→四条）、R3/R7/R9 判定口径、新增 D9、§6.2 deploy/plan 契约重写、§7 拆 A0a/A0b、§8 三行状态更新、§9 DoD #2/#5、附录 A 命令与附录 B 第 5 条 | 仅设计文档 |
 | `spinduck/src/sql/patterns.rs` | 两处注释口径改写（`:67` 命中数口径来源；`:141` 保守边界不再声称"语料只出现适配形态"） | 注释，零行为变更 |
-| `spinduck/tests/guard/guard_patterns_outer_join_residual.rs` | 新增守护 3 条（V26.2 的实证来源） | 新增测试 |
+| `spinduck/tests/guard/guard_patterns_outer_join_residual.rs` | 新增守护 3 条（V27.2 的实证来源） | 新增测试 |
 | `spinduck/Cargo.toml` | 注册上述 `[[test]]` | 测试目标登记 |
 
 未做且**不该由本轮做**的：没碰 golden 夹具与断言、没改任何人类已有测试、没动
@@ -1875,7 +2192,7 @@ verify: entries=1 checks=11 failed=0 skipped=1        rc=0
 
 ---
 
-## V27. CLI 契约层落地：AGENTS §4.1 登记的 `tests/cli.rs` 从"规范里有、仓库里没有"变成 27 条真子进程用例
+## V28. CLI 契约层落地：AGENTS §4.1 登记的 `tests/cli.rs` 从"规范里有、仓库里没有"变成 27 条真子进程用例
 
 范围：只新增测试层与两处文档口径，**零引擎行为变更**（`src/` 一行未动）。
 
@@ -1885,7 +2202,7 @@ verify: entries=1 checks=11 failed=0 skipped=1        rc=0
   （`env!("CARGO_BIN_EXE_spinduck")`），feature 口径 = 发版矩阵那条（`release.yml` 的
   `--features cli`）。
 - 手工交叉印证用的是本机 release 0.1.2（`--features cli --locked`）：`version` 打印
-  `spinduck 0.1.2`；V27.2 的形态 C 仍 `RETURN 0` + rc=0；`materialize` 仍
+  `spinduck 0.1.2`；V28.2 的形态 C 仍 `RETURN 0` + rc=0；`materialize` 仍
   ``[ENV-0012] ... requires feature `gauss` `` + rc=1，且**没有**生成 `--db` 指向的本地库文件。
 
 门禁（本机）：
@@ -1895,11 +2212,11 @@ verify: entries=1 checks=11 failed=0 skipped=1        rc=0
 | `cargo fmt --all -- --check` | 干净 |
 | `cargo clippy --all-features --tests -- -D warnings` | 干净（`--all-features` 含 `cli`，本层被 lint 到） |
 | `cargo test --features cli` | **323 passed / 0 failed**（= native 的 296 + 本层 27） |
-| `cargo test --features native` | **296 passed / 0 failed**——与 V26 基线逐条相等，本层不参与 |
+| `cargo test --features native` | **296 passed / 0 failed**——与 V27 基线逐条相等，本层不参与 |
 | `cargo test --features cli,gauss --test cli` | **27 passed / 0 failed**（`gauss_boundary` 两条换成 ENV-0014 形态） |
-| `cargo audit` | 4 条，全部 `zip 6.0.0`，与 V26 同一豁免清单，无新增 |
+| `cargo audit` | 4 条，全部 `zip 6.0.0`，与 V27 同一豁免清单，无新增 |
 
-### V27.1 这一层独有的是什么（为什么不是把 `src/cli/run.rs` 单测抄一遍）
+### V28.1 这一层独有的是什么（为什么不是把 `src/cli/run.rs` 单测抄一遍）
 
 `src/cli/run.rs` 的 `run_str` **进程内**调 `run()` 拿返回码，它证明不到两件事：
 
@@ -1910,30 +2227,30 @@ verify: entries=1 checks=11 failed=0 skipped=1        rc=0
 `compile` 的 OK 行 + `FAIL` 行 + summary + `reason` 直方图 + `(non-utf8)` 标记 /
 `rules probe` 的 match=true|false 与缺文件 / `explain` 的逐字节 IR 行与 BIZ-0150 /
 `call` 的 `OUT p_o = 42`、`CALL p_null OK` 与 `[BIZ-0150]`/`[ENV-0010]` 两条红面，
-详见 V27.2）。断言一律给**整行或全文**
+详见 V28.2）。断言一律给**整行或全文**
 （`assert_eq!(out, "OUT p_o = 42\n")` 这一类），不用 `is_ok()`/`contains("error")` 式的宽断言。
 
-### V27.2 把 V26 的三条"取证结论"变成可复现回归
+### V28.2 把 V27 的三条"取证结论"变成可复现回归
 
-| 用例 | 锁定的契约 | V26 出处 |
+| 用例 | 锁定的契约 | V27 出处 |
 |---|---|---|
-| `call::should_ignore_ddl_and_seed_files_given_to_call` | 形态 **B ≡ A**：`stdout` 与退出码**逐字节相等**（`[KERNEL-0010] … fnc_com_if_deal_date does not exist!`，rc=1）——建表脚本经 `--file` 递进去完全无效 | V26.1 结论 1 |
-| `call::should_exit_0_returning_0_when_deps_registered_but_tables_missing` | 形态 **C**：`RETURN 0` 且 **rc=0**（缺表却绿）。`tests/guard/guard_register_silent_drop.rs` 只锁到 register 层，端到端的静默形态此前无 CLI 级裁决 | V26.1 结论 2/3 |
-| `call::should_distort_non_utf8_literals_on_call_without_any_warning` | GBK 源码走 `call` → 每个非法字节一个 U+FFFD、**无任何告警**、rc=0；同一段体的 UTF-8 写法得 `OUT p_o = 中文`——仅编码不同即两值 | V26.4 |
-| `compile::should_mark_non_utf8_corpus_in_compile_report` + `verify::should_exit_1_with_env_0030_when_corpus_is_not_utf8` | 编码三入口的另外两种行为：compile 打 `(non-utf8)` 仍 OK，verify 直接红 `[ENV-0030] 读取 … stream did not contain valid UTF-8` | V26.4 |
+| `call::should_ignore_ddl_and_seed_files_given_to_call` | 形态 **B ≡ A**：`stdout` 与退出码**逐字节相等**（`[KERNEL-0010] … fnc_com_if_deal_date does not exist!`，rc=1）——建表脚本经 `--file` 递进去完全无效 | V27.1 结论 1 |
+| `call::should_exit_0_returning_0_when_deps_registered_but_tables_missing` | 形态 **C**：`RETURN 0` 且 **rc=0**（缺表却绿）。`tests/guard/guard_register_silent_drop.rs` 只锁到 register 层，端到端的静默形态此前无 CLI 级裁决 | V27.1 结论 2/3 |
+| `call::should_distort_non_utf8_literals_on_call_without_any_warning` | GBK 源码走 `call` → 每个非法字节一个 U+FFFD、**无任何告警**、rc=0；同一段体的 UTF-8 写法得 `OUT p_o = 中文`——仅编码不同即两值 | V27.4 |
+| `compile::should_mark_non_utf8_corpus_in_compile_report` + `verify::should_exit_1_with_env_0030_when_corpus_is_not_utf8` | 编码三入口的另外两种行为：compile 打 `(non-utf8)` 仍 OK，verify 直接红 `[ENV-0030] 读取 … stream did not contain valid UTF-8` | V27.4 |
 | `gauss_boundary::*`（两条 feature 门禁 + 两条"本地库文件未被创建"） | release feature 口径下 `materialize`/`sync` 的失败点：ENV-0012「… requires feature `gauss`」（未开）/ ENV-0014「SPINDUCK_OG_HOST is required」（开了但零环境变量） | design §1 第一行、R1 |
-| `verify::should_exit_0_and_write_runtime_manifest_for_clean_project` | `verify` 的渲染契约：`manifest: … (updated)` + `verify: entries=1 checks=2 failed=0 skipped=1`，rc=0 | V26.5 |
+| `verify::should_exit_0_and_write_runtime_manifest_for_clean_project` | `verify` 的渲染契约：`manifest: … (updated)` + `verify: entries=1 checks=2 failed=0 skipped=1`，rc=0 | V27.5 |
 
 **两条期望值是"当前缺陷的快照"，改它们必须与行为改动同一个 PR**：
 形态 C（A2/D5 缺对象即红时转红）与 GBK 静默变形（D9② 真解码落地时转正确值）。
 用例注释里已就地写明，防止日后单点放宽断言。
 
-> **前向注记（V28）**：GBK 那条已在 V28 与行为**同批**改写，但改它的是 **D9① 判红**（rc=1），
+> **前向注记（V29）**：GBK 那条已在 V29 与行为**同批**改写，但改它的是 **D9① 判红**（rc=1），
 > 不是本节当时预期的 D9② 真解码（转正确值）——"同一个 PR"这条纪律兑现了，预期到的形态没有。
 > 形态 C 未动，仍锁 `RETURN 0` + rc=0，等 A2-4。
-> 另外本节把编码说成"三条入口"是少算了 `explain --file`，V28.2 已订正。
+> 另外本节把编码说成"三条入口"是少算了 `explain --file`，V29.2 已订正。
 
-### V27.3 落点、feature 门禁与由此留下的 CI 口径
+### V28.3 落点、feature 门禁与由此留下的 CI 口径
 
 - `spinduck/tests/cli.rs`：模块根（共享夹具 + 真子进程接缝 `cli()` + `write_gbk_routine()`），
   按职责拆 6 个子模块（AGENTS §3 单文件 ≤500 行；拆分后最大 147 行、总计 613 行）：
@@ -1943,16 +2260,16 @@ verify: entries=1 checks=11 failed=0 skipped=1        rc=0
   选 `required-features` 而不是 `#![cfg(feature = "cli")]`：前者在 feature 没开时**不构建该目标**，
   后者会收集 0 条测试——正是 AGENTS §4.1 禁止的"跳过即绿"形态。
 - **由此产生的口径，明确不声称**：常驻 CI 的 Test job 跑 `cargo test --features native`，
-  **不会**构建 `[[test]] cli`。所以 V27 的 27 条目前只有本机证据；`--features cli` 进入常驻
+  **不会**构建 `[[test]] cli`。所以 V28 的 27 条目前只有本机证据；`--features cli` 进入常驻
   门禁属改 `.github/workflows/ci.yml`（Ask-first），留给用户决策。本机复现命令：
   `cargo test --features cli`（323 passed）或 `cargo test --features cli --test cli`（27 passed）。
-  > **前向注记（V28）**：用户随后授权改 CI，Test job 已加 `cargo test --features cli` 一步
-  > （V28.4），本条"不进常驻门禁"不再成立；但 GitHub 侧尚未跑过，这一步目前也只有本机证据。
-  > V28 后本层是 29 条，两个口径变成 325 / 296。
+  > **前向注记（V29）**：用户随后授权改 CI，Test job 已加 `cargo test --features cli` 一步
+  > （V29.4），本条"不进常驻门禁"不再成立；但 GitHub 侧尚未跑过，这一步目前也只有本机证据。
+  > V29 后本层是 29 条，两个口径变成 325 / 296。
 - 黄金资产只读：形态 A/B/C 三条用 `golden/case_corpus_purchase` 的现成文件做输入，
   未新增 golden 用例、未改夹具、未改 `expected.json`（design §6.5 的承诺不变）。
 
-### V27.4 本轮改动落点
+### V28.4 本轮改动落点
 
 | 文件 | 改动 | 性质 |
 |---|---|---|
@@ -1960,20 +2277,20 @@ verify: entries=1 checks=11 failed=0 skipped=1        rc=0
 | `spinduck/tests/cli/*.rs` | 新增 6 个职责子模块，共 27 条用例 | 新增测试 |
 | `spinduck/Cargo.toml` | 注册 `[[test]] cli` + `required-features = ["cli"]` | 测试目标登记 |
 | `docs/design-production-gaussdb.md` | §6.5 的"落点与规范不一致"注记改为"已补齐 + 留下的 CI 口径一条"；顺带订正原注记把 `run_str` 说成"起子进程"的错定性 | 仅设计文档 |
-| `docs/validation.md` | 本节 V27 | 实证登记 |
+| `docs/validation.md` | 本节 V28 | 实证登记 |
 
 未做：没改 `src/` 任何行为、没改人类已有测试与断言、没动 `ci.yml`、没连任何外部实例、
 没有把 release 二进制纳入自动化（`CARGO_BIN_EXE_*` 指 cargo 现建的构建；release 侧只有
-V27 前言里的手工交叉印证三条）。
+V28 前言里的手工交叉印证三条）。
 
 ---
 
-## V28. A2-D9① 落地：执行面见非 UTF-8 判红（`call`/`explain` 两条入口），并订正 V26.4 的"三条入口"少算了一条
+## V29. A2-D9① 落地：执行面见非 UTF-8 判红（`call`/`explain` 两条入口），并订正 V27.4 的"三条入口"少算了一条
 
 范围：只改编码判红的执行面与它的回归面。design §7 A2 的其余三项（`plan`、`deploy`、缺件红扩到
 `call`）**未动**，形态 C 仍是 `RETURN 0` + rc=0。改动落在 CLI 壳与真子进程契约层，零新依赖。
 
-### V28.1 TDD 循环（Red 原文 → Green → 判红后实测）
+### V29.1 TDD 循环（Red 原文 → Green → 判红后实测）
 
 **Red**（先只改测试，`src/` 一行未动）：
 
@@ -1998,9 +2315,9 @@ UTF-8 校验失败 → `[ENV-0030] 读取 {path}: stream did not contain valid U
 
 **Refactor**：无。两处调用点替换 + 一个 helper，未触碰其它路径。
 
-### V28.2 订正 V26.4：受影响的入口是**四条**，不是三条
+### V29.2 订正 V27.4：受影响的入口是**四条**，不是三条
 
-V26.4 的表只列了 `compile` / `call` / `verify`，漏了 `explain --file`。它在改动前和 `call` 走同一处
+V27.4 的表只列了 `compile` / `call` / `verify`，漏了 `explain --file`。它在改动前和 `call` 走同一处
 丢弃标记（`run.rs:188` 的 `let (text, _)`），因此同样**静默**。Red 阶段的失败原文即一手证据：
 
 ```text
@@ -2009,10 +2326,10 @@ $ spinduck explain --file gbk.sql prc_gbk      # 改动前
 ```
 
 改动前的真实分布是四条入口两种行为：**执行面**（`call`、`explain`）静默有损；**核验面**里
-`compile` 有损 + 打标记、`verify` 直接红。V26.4 的结论方向不变（`call` 的静默变形成立），只是射程
+`compile` 有损 + 打标记、`verify` 直接红。V27.4 的结论方向不变（`call` 的静默变形成立），只是射程
 多一条。design §3.5 的表已按此订正并标注落地状态。
 
-### V28.3 判红后的四条契约（实测 stdout / 退出码）
+### V29.3 判红后的四条契约（实测 stdout / 退出码）
 
 | 用例（`spinduck/tests/cli/`） | 实测 |
 |---|---|
@@ -2021,7 +2338,7 @@ $ spinduck explain --file gbk.sql prc_gbk      # 改动前
 | `rules_explain::should_explain_utf8_literal_verbatim` | `0<TAB>assign<TAB>p_o := '中文'` rc=0——红的是编码，不是中文字面量 |
 | `compile::should_mark_non_utf8_corpus_in_compile_report`（本轮未改） | `… routines=1  (non-utf8)` rc=0——体检面口径不变 |
 
-MATCH/NO_MATCH 分叉（V26.4 最警惕的那条）在实测层面消失：同一份源码现在只可能「UTF-8 → 正常返回
+MATCH/NO_MATCH 分叉（V27.4 最警惕的那条）在实测层面消失：同一份源码现在只可能「UTF-8 → 正常返回
 值」或「非 UTF-8 → 判红」，不可能因编码不同返回两个不同的值。
 
 真二进制交叉印证（本机 release 重新构建，`cargo build --release --features cli --locked`；
@@ -2046,66 +2363,66 @@ OK   /tmp/sd-v28/utf8.sql  routines=1
 summary: files=4 ok=4 failed=0 routines=4                             rc=0
 ```
 
-（`f_chk` 的实参 `'已成交'` 一律 UTF-8 传入，正是 V26.4 那对分叉的输入形态。）
+（`f_chk` 的实参 `'已成交'` 一律 UTF-8 传入，正是 V27.4 那对分叉的输入形态。）
 
-V26.4 那对 `MATCH` / `NO_MATCH` 现在换成 **`MATCH`（rc=0）/ 判红（rc=1）**，体检面逐字未变。
+V27.4 那对 `MATCH` / `NO_MATCH` 现在换成 **`MATCH`（rc=0）/ 判红（rc=1）**，体检面逐字未变。
 
-### V28.4 门禁（本机）
+### V29.4 门禁（本机）
 
 | 命令 | 结果 |
 |---|---|
 | `cargo fmt --all -- --check` | 干净 |
 | `cargo clippy --all-features --tests -- -D warnings` | 干净 |
-| `cargo test --features cli --test cli` | **29 passed / 0 failed**（V27 是 27：+2 新用例，其中 V27 那条 `should_distort_non_utf8_literals_on_call_without_any_warning` 按 D9① 改写为判红形态） |
+| `cargo test --features cli --test cli` | **29 passed / 0 failed**（V28 是 27：+2 新用例，其中 V28 那条 `should_distort_non_utf8_literals_on_call_without_any_warning` 按 D9① 改写为判红形态） |
 | `cargo test --features cli` | **325 passed / 0 failed**（= native 的 296 + 本层 29） |
-| `cargo test --features native` | **296 passed / 0 failed**——与 V26/V27 基线逐条相等，执行面改动未波及内核通道 |
+| `cargo test --features native` | **296 passed / 0 failed**——与 V27/V28 基线逐条相等，执行面改动未波及内核通道 |
 | `cargo test --features cli,gauss --test cli` | **29 passed / 0 failed**——`gauss` 只换 `gauss_boundary` 两条的失败点（ENV-0012 → ENV-0014），编码判红与 feature 无关，这条是实测不是推断 |
 | `cargo test --features cli,gauss`（全量） | **2 条 FAILED**，都在 `tests/gauss_e2e.rs`（`gauss_e2e_materialize_with_where_clause`、`gauss_e2e_materialize_process_sync_back`），失败原文是"E2E 用例需要 A 模式容器（golden/gaussdb-docker）"。本机未起容器，改动前后同形态，与本轮无关 |
-| `cargo audit` | **本轮未复跑成功**：拉取 advisory-db 网络失败（`error sending request for url …/git-upload-pack`）。本轮零新增依赖，命中面与 V27 登记的 4 条 `zip 6.0.0` 不可能变化——这是**推断**，不是实测 |
+| `cargo audit` | **本轮未复跑成功**：拉取 advisory-db 网络失败（`error sending request for url …/git-upload-pack`）。本轮零新增依赖，命中面与 V28 登记的 4 条 `zip 6.0.0` 不可能变化——这是**推断**，不是实测 |
 
-契约层由此**首次成为一次行为改动的 Red/Green 载体**（V27 只登记现状）。V27.2 声明"两条期望值是
+契约层由此**首次成为一次行为改动的 Red/Green 载体**（V28 只登记现状）。V28.2 声明"两条期望值是
 当前缺陷的快照，改它们必须与行为改动同一个 PR"——本轮正是那条 GBK 用例与行为**同批**改写；形态 C
 那条未动（等 A2-4）。
 
-### V28.5 仍是推算的 / 明确未做
+### V29.5 仍是推算的 / 明确未做
 
-- **D9② 真 GBK 解码**：未做（新依赖 = Ask-first）。判红后的现实口径是：V26.3 数出的 3,149 个 GBK
+- **D9② 真 GBK 解码**：未做（新依赖 = Ask-first）。判红后的现实口径是：V27.3 数出的 3,149 个 GBK
   文件在 `call`/`explain` 上**一律红**，跑不起来。这是设计要的"不假装支持"，不是"已支持"。
 - **A2 其余三项**：`plan` / `deploy` / 缺件红扩到 `call` 均未动；design §7 A2 的三条退出判据只满足
   第三条（GBK 源经 `call` → 非 0）。形态 C（依赖齐全但缺表 → `RETURN 0` + rc=0）在
   `cargo test --features cli --test cli` 里仍以原期望通过，即**缺件静默绿这条路今天依然可达**。
 - **CI 里新增的 `cargo test --features cli` 这步没有 GitHub 证据**：本轮只改了 workflow 定义
-  （V28.4 表里的数字全部来自本机）。AGENTS §9 的 Test job 描述（只写 `--features native`）与
+  （V29.4 表里的数字全部来自本机）。AGENTS §9 的 Test job 描述（只写 `--features native`）与
   workflow 现状由此不一致，规范正文是否同步属用户决策，本轮**未改 AGENTS.md**。
 - **判红按文件、不按行**：`read_source_strict` 对整个文件做 UTF-8 校验，因此只有注释是非 UTF-8
-  的 761 个文件（V26.3）同样红。这条是代码事实；"这会不会让本可运行的语料一起出局"属推算，
+  的 761 个文件（V27.3）同样红。这条是代码事实；"这会不会让本可运行的语料一起出局"属推算，
   要等真实语料跑一遍才有数字。
 - **千万级数据、真实实例、回写**：一个都没碰，本轮全部在本机临时目录 + `golden/` 只读夹具上完成。
 
-### V28.6 本轮改动落点
+### V29.6 本轮改动落点
 
 | 文件 | 改动 | 性质 |
 |---|---|---|
 | `spinduck/src/cli/mod.rs` | 新增 `read_source_strict()`（+19 行）；`read_source()` 原样保留给体检面 | 行为改动（执行面入口） |
 | `spinduck/src/cli/run.rs` | `explain_cmd`（`:188`）与 `call_cmd` 的 `--file` 循环（`:244`）改调严格读取 | 行为改动（两处调用点） |
-| `spinduck/tests/cli/call.rs` | V27 的 GBK 静默变形用例改写为判红契约 `should_exit_1_with_env_0030_when_call_source_is_not_utf8` | 测试期望值与行为**同批**改 |
+| `spinduck/tests/cli/call.rs` | V28 的 GBK 静默变形用例改写为判红契约 `should_exit_1_with_env_0030_when_call_source_is_not_utf8` | 测试期望值与行为**同批**改 |
 | `spinduck/tests/cli/rules_explain.rs` | 新增 `should_exit_1_with_env_0030_when_explain_source_is_not_utf8` + `should_explain_utf8_literal_verbatim` | 新增测试 |
-| `spinduck/tests/cli.rs` | 头注的实证出处补 V28；`call` 子模块标题"编码丢失"→"编码判红" | 注释 |
+| `spinduck/tests/cli.rs` | 头注的实证出处补 V29；`call` 子模块标题"编码丢失"→"编码判红" | 注释 |
 | `.github/workflows/ci.yml` | Test job 在 `--features native` 之后加 `cargo test --features cli`（用户本轮授权） | CI 定义 |
-| `docs/validation.md` | 本节 V28 + V27.2/V27.3 的两处前向注记 | 实证登记 |
+| `docs/validation.md` | 本节 V29 + V28.2/V28.3 的两处前向注记 | 实证登记 |
 | `docs/design-production-gaussdb.md` | §1 编码行、§3.5（四条入口 + 落地状态）、§5.2 D9（①已落地的两处出入）、§7 A2 行、§8 两行、附录 A 复现块 | 仅设计文档 |
 
-Red 阶段那条 explain 用例起初写在 `tests/cli/call.rs`（V28.1 的失败原文即其当时的名字
+Red 阶段那条 explain 用例起初写在 `tests/cli/call.rs`（V29.1 的失败原文即其当时的名字
 `call::should_explain_utf8_literal_and_reject_the_gbk_sibling`），Green 时按职责移到
-`tests/cli/rules_explain.rs` 并改名，断言未变——表里 V28.3 记的是移动后的名字。
+`tests/cli/rules_explain.rs` 并改名，断言未变——表里 V29.3 记的是移动后的名字。
 
-## V29. A2-`plan` 落地：闭包 → 逐字节可复现的计划文件；真实语料把它逼出的三处抽取口径缺陷一并修掉
+## V30. A2-`plan` 落地：闭包 → 逐字节可复现的计划文件；真实语料把它逼出的三处抽取口径缺陷一并修掉
 
-范围：design §6.1 的 `run-plan` schema + `plan` 子命令（A2 的第二项，D9① 已在 V28）。
+范围：design §6.1 的 `run-plan` schema + `plan` 子命令（A2 的第二项，D9① 已在 V29）。
 `deploy`（A2-3）与缺件红扩到 `call`（A2-4，形态 C）**本轮未动**。零新增依赖、零新错误码
 （目标未登记复用 `BIZ-0150`），schema 正文入 architecture §13.5。
 
-### V29.1 交付面
+### V30.1 交付面
 
 | 件 | 落点 | 职责 |
 |---|---|---|
@@ -2113,14 +2430,14 @@ Red 阶段那条 explain 用例起初写在 `tests/cli/call.rs`（V28.1 的失�
 | 闭包求值 | `spinduck/src/plan/closure.rs` | 目标例程 → BFS（链路对象 + 被调例程）→ 文件清单 + 缺件表；只编译不下内核（`NoopExecutor`） |
 | `plan` 子命令 | `spinduck/src/cli/plan.rs`、`args.rs`、`run.rs` | 落盘 `<home>/plan/<target>.toml`，缺件即 rc=1 并照抄 `MISS <object> <- <from>` |
 | CLI 契约 | `spinduck/tests/cli/plan.rs`（6 条，本层 29→35） | 真子进程锁退出码 + stdout + 计划文件字节 |
-| 抽取口径修复 | `src/verify/chain/`（V30 起为目录）、`src/verify/run.rs`、`src/verify/deploy.rs` | 见 V29.4（三条都是 `verify` 现路径上的缺陷，不在新代码里绕行） |
+| 抽取口径修复 | `src/verify/chain/`（V31 起为目录）、`src/verify/run.rs`、`src/verify/deploy.rs` | 见 V30.4（三条都是 `verify` 现路径上的缺陷，不在新代码里绕行） |
 
 口径纪律：链路抽取、名字归一、包补全、尾段匹配**逐字复用 `verify::chain` / `verify::run` 的纯函数**，
 计划与核验不两套真相。两处刻意保留的"孪生实现"（`closure::resolve_routine` ↔
 `run::resolve_routine`、`closure::ddl_file_for` ↔ `run::present`）只因容器类型不同（`Engine` 目录 /
 `BTreeSet<ObjectRef>`），规则改动必须同步另一处——注释里已写明。
 
-### V29.2 TDD 循环与 Red 留档口径
+### V30.2 TDD 循环与 Red 留档口径
 
 本阶段 8 个循环（跨两次会话，前 4 项在上一段会话落地），**只有下表标"一手"的失败原文是本次逐字截留的**；
 循环 1–4 的 Red 在各自循环内跑过并转绿，原文未逐条留档，此处只登记用例名与终态计数——按本文件
@@ -2132,16 +2449,16 @@ Red 阶段那条 explain 用例起初写在 `tests/cli/call.rs`（V28.1 的失�
 | 2 | 闭包 BFS：文件清单 + 三类缺件 | `should_collect_routine_and_ddl_files_transitively_into_the_plan` 等 5 条 | 二手 |
 | 3 | `plan` 子命令契约（rc / stdout / 落盘） | `tests/cli/plan.rs` 6 条 | 二手 |
 | 4 | 改写后形态：`nextval('seq')`、`bigfund . t_a` | `should_collect_sequences_from_the_rewritten_nextval_form`、`should_join_qualified_names_printed_with_spaces_around_the_dot` | 二手（left/right 记录在本轮会话的循环日志里，非本文件留档） |
-| 5 | 同包裸名调用不是缺件 | `should_resolve_a_bare_sibling_call_inside_the_same_package` | 由真实语料逼出（V29.3 的三条 `MISS routine:` 原文即一手输入） |
-| 6 | 注释不参与词法扫描 | `should_ignore_names_inside_sql_comments`、`should_match_a_view_declared_behind_an_inline_comment` | **一手**（V29.4 ①） |
-| 7 | 引擎自建对象不算缺件 | `should_not_report_an_engine_provided_table_as_missing` | **一手**（V29.4 ②） |
-| 8 | 内核目录名归一小写 | `should_lowercase_kernel_catalog_names` | **一手**（V29.4 ③） |
+| 5 | 同包裸名调用不是缺件 | `should_resolve_a_bare_sibling_call_inside_the_same_package` | 由真实语料逼出（V30.3 的三条 `MISS routine:` 原文即一手输入） |
+| 6 | 注释不参与词法扫描 | `should_ignore_names_inside_sql_comments`、`should_match_a_view_declared_behind_an_inline_comment` | **一手**（V30.4 ①） |
+| 7 | 引擎自建对象不算缺件 | `should_not_report_an_engine_provided_table_as_missing` | **一手**（V30.4 ②） |
+| 8 | 内核目录名归一小写 | `should_lowercase_kernel_catalog_names` | **一手**（V30.4 ③） |
 
-终态计数：`--features native` **315 passed**（V28 基线 296 + 本轮 19：`plan::tests` 13 + `verify::chain`
+终态计数：`--features native` **315 passed**（V29 基线 296 + 本轮 19：`plan::tests` 13 + `verify::chain`
 3 + `verify::run` 1 + `cli/args` 2）、`--features cli` **350 passed**（= 315 + 契约层 35）、
 CLI 契约层 **35 passed**。
 
-### V29.3 真实语料：计划把三条假缺件逼了出来
+### V30.3 真实语料：计划把三条假缺件逼了出来
 
 考题语料（`golden/exam_split_trade`，136 文件只读夹具）改动前实测（循环 5 之前）：
 
@@ -2183,7 +2500,7 @@ $ cmp plan1.toml plan2.toml && echo IDENTICAL
 IDENTICAL     （1,186 字节，sha256 219038d91f11ba4bf8f90dc1eb20fa30e4c81d05aa862760cd476060c023f9ae）
 ```
 
-### V29.4 三处抽取口径缺陷（一手证据）
+### V30.4 三处抽取口径缺陷（一手证据）
 
 三条都不是"新代码没写好"，而是 `verify` 现路径上已经存在、被闭包第一次完整暴露出来的缺陷。
 每条先写会失败的测试再改实现；② ③ 会**改变 `verify` 的判定**，逐条列在结果里。
@@ -2260,7 +2577,7 @@ test verify::run::tests::should_lowercase_kernel_catalog_names ... FAILED
 考题语料那两条 FAIL 是**误判**（对象确实存在，只是名字大小写不同），修掉后判定面变干净；本轮没有
 任何一条 PASS 变成 FAIL。
 
-### V29.5 门禁（本机）
+### V30.5 门禁（本机）
 
 | 命令 | 结果 |
 |---|---|
@@ -2269,11 +2586,11 @@ test verify::run::tests::should_lowercase_kernel_catalog_names ... FAILED
 | `cargo test --features native` | **315 passed / 0 failed** |
 | `cargo test --features cli` | **350 passed / 0 failed**（含 CLI 契约层 35） |
 | `cargo test --features cli,gauss --test cli` | **35 passed / 0 failed**——`plan` 的契约与 `gauss` feature 无关，这条是实测不是推断 |
-| `cargo test --features cli,gauss`（全量） | **2 条 FAILED**，仍是 `tests/gauss_e2e.rs` 的两条（失败原文"需要 A 模式容器"），与 V28.4 同形态、本轮无关 |
-| `cargo audit` | **本轮复跑成功**（V28 因网络未跑成）：4 条命中 = `RUSTSEC-2026-0367/0368/0369/0429`，与 CI 豁免清单逐条相同；带 `--ignore` 四条后 0 命中（242 crate 依赖）。本轮零新增依赖，命中面不变这条现在有实测 |
-| `cargo build --release --features cli --locked` + 真二进制 `plan` | 见 V29.6 |
+| `cargo test --features cli,gauss`（全量） | **2 条 FAILED**，仍是 `tests/gauss_e2e.rs` 的两条（失败原文"需要 A 模式容器"），与 V29.4 同形态、本轮无关 |
+| `cargo audit` | **本轮复跑成功**（V29 因网络未跑成）：4 条命中 = `RUSTSEC-2026-0367/0368/0369/0429`，与 CI 豁免清单逐条相同；带 `--ignore` 四条后 0 命中（242 crate 依赖）。本轮零新增依赖，命中面不变这条现在有实测 |
+| `cargo build --release --features cli --locked` + 真二进制 `plan` | 见 V30.6 |
 
-### V29.6 发版形态二进制复核（A2 判据不要求，本轮顺手取证）
+### V30.6 发版形态二进制复核（A2 判据不要求，本轮顺手取证）
 
 ```text
 $ cargo build --release --features cli --locked            # exit 0
@@ -2291,7 +2608,7 @@ IDENTICAL
 计划里的 `generator = "spinduck 0.1.2 (plan schema 1)"` 与 `spinduck version` 同源（V25 版本守卫那条
 口径在 `plan` 侧同样成立）。本轮没有对 release 产物跑 `deploy`——它还不存在（A2-3）。
 
-### V29.7 仍是推算的 / 明确未做
+### V30.7 仍是推算的 / 明确未做
 
 - **`deploy`（A2-3）未动**：计划的消费方还不存在，`ddl_tables` 目前是"给人看的清单"。design §6.2
   要求的三点差异（输入换成计划、库落盘到 `--db`、缺件在 `[[entry]]` 之外也红）一条未落地，
@@ -2309,13 +2626,13 @@ IDENTICAL
   `1_V_*.sql` 的循环体一条都不下发，全部落到 `:158` 的**占位视图**（`SELECT 1`）分支。
   本轮只读到这个层面的形态：缺件判定不受影响（对象名仍登记，`verify` 侧 PASS 是实测），
   但"占位视图只有一列 ⇒ 后续读该视图列的语句在内核里取不到列"是推断，要等 A2-3 用计划真跑一次才有实测。
-  V29.4 ① 修的是抽取面（`chain::tokens` 与 DDL 扫描），**这条部署面本轮未动**，属 A2-3 的前置项。
-  > **V30 已修并实测**：`creates_view()` 改用链路同一把词法刀（V30.1），而"占位视图取不到列"这条
-  > 推断也在真题上跑出数字（V30.4 ②：修前 `call` 得 Binder Error，修后 `OUT p_o = 0`）。
-  > 同轮还逼出第二条更隐蔽的同类缺陷——逗号连表的第二、三张表对链路隐形（V30.4 ③）。
+  V30.4 ① 修的是抽取面（`chain::tokens` 与 DDL 扫描），**这条部署面本轮未动**，属 A2-3 的前置项。
+  > **V31 已修并实测**：`creates_view()` 改用链路同一把词法刀（V31.1），而"占位视图取不到列"这条
+  > 推断也在真题上跑出数字（V31.4 ②：修前 `call` 得 Binder Error，修后 `OUT p_o = 0`）。
+  > 同轮还逼出第二条更隐蔽的同类缺陷——逗号连表的第二、三张表对链路隐形（V31.4 ③）。
 - **千万级数据、真实实例、回写**：一个都没碰，全部在本机构架 + `golden/` 只读夹具上完成。
 
-### V29.8 本轮改动落点
+### V30.8 本轮改动落点
 
 | 文件 | 改动 | 性质 |
 |---|---|---|
@@ -2323,25 +2640,25 @@ IDENTICAL
 | `spinduck/src/cli/plan.rs` | 新增：落盘与渲染，缺件 rc=1 | 新子命令（CLI 仅壳） |
 | `spinduck/src/cli/{args.rs,run.rs,mod.rs}` | `Plan` 变体 + 两条 usage + 分发 + `mod plan` | 新子命令接线 |
 | `spinduck/src/lib.rs` | `pub mod plan;` | 接线 |
-| `spinduck/src/verify/chain.rs`（V30 起拆成 `src/verify/chain/`） | `tokens()` 剥注释；`join_dotted()` 拼回空格拆开的限定名；`sequence_calls()` 取改写后序列形态；3 条新单测；`normalize`/`tokens`/`is_object_name`/`Tok` 放开到 `pub(crate)` | 行为改动（核验面抽取口径） |
+| `spinduck/src/verify/chain.rs`（V31 起拆成 `src/verify/chain/`） | `tokens()` 剥注释；`join_dotted()` 拼回空格拆开的限定名；`sequence_calls()` 取改写后序列形态；3 条新单测；`normalize`/`tokens`/`is_object_name`/`Tok` 放开到 `pub(crate)` | 行为改动（核验面抽取口径） |
 | `spinduck/src/verify/run.rs` | `kernel_objects` 目录名归一小写 + 1 条单测 | 行为改动（核验面判定） |
 | `spinduck/src/verify/deploy.rs` | `ENGINE_PROVIDED_TABLES` 常量，建表语句按它生成 | 口径收口（同义改写） |
 | `spinduck/src/verify.rs` | 导出上述常量与四个 `pub(crate)` 项 | 接线 |
 | `spinduck/tests/cli/plan.rs` + `tests/cli.rs` | 6 条契约 + 子模块接线（本层 29→35） | 新增测试 |
 | `docs/architecture.md` | §13.5 运行计划 schema（design §6.1 要求的最终口径） | 设计正文 |
-| `docs/validation.md` | 本节 V29 + `:722` 表内裸 `\|` 转义 | 实证登记 |
+| `docs/validation.md` | 本节 V30 + `:722` 表内裸 `\|` 转义 | 实证登记 |
 | `docs/design-production-gaussdb.md` | §7 A2 行状态、§8 两条口径订正 | 仅设计文档 |
 
 
 ---
 
-## V30. A2-`deploy` 落地：计划 → 落盘库，换一个进程就能跑真题；同轮把"视图体从不下发"与"逗号连表隐形"两处部署面缺陷修掉
+## V31. A2-`deploy` 落地：计划 → 落盘库，换一个进程就能跑真题；同轮把"视图体从不下发"与"逗号连表隐形"两处部署面缺陷修掉
 
-范围：design §6.2 的 `deploy` 子命令（A2 第三项；`plan` 在 V29，缺件红扩到 `call` = A2-4 未动）。
+范围：design §6.2 的 `deploy` 子命令（A2 第三项；`plan` 在 V30，缺件红扩到 `call` = A2-4 未动）。
 零新增依赖、零新错误码（复用 `ENV-0012`/`ENV-0030`/`ENG-0010`，非幂等那条是内核原样带出的
 `KERNEL-0070`）。机制正文入 architecture §13.6。
 
-### V30.1 交付面
+### V31.1 交付面
 
 | 件 | 落点 | 职责 |
 |---|---|---|
@@ -2349,9 +2666,9 @@ IDENTICAL
 | 计划消费 | `spinduck/src/plan/deploy.rs`（80 行） | `resolve`（清单 → 逐条核对存在的文件，`ddl/views/` 分流到视图组）与 `apply`（逐文件下发）两段分开 |
 | CLI 壳 | `spinduck/src/cli/deploy.rs`（73 行） | 读计划 → 缺件即拒 → 定位项目 → 核对文件 → 开库 → 一行汇总。零引擎逻辑（§1） |
 | 下发复用 | `spinduck/src/verify/deploy.rs` 的 `deploy_ddl_file`/`deploy_view_file`/`ensure_engine_provided_tables`/`register_routine_files`（`pub(crate)`） | `verify` 与 `deploy` 共用同一套逐文件实现，不建第二套建表口径 |
-| 视图检测 | 同上 `creates_view()`（上一段会话，V29.7 那条登记项的修复） | 关键字判定改用链路同一把词法刀 `verify::tokens()`，注释插在 `CREATE OR REPLACE` 与 `VIEW` 中间（`/*FORCE*/`）也认得 |
+| 视图检测 | 同上 `creates_view()`（上一段会话，V30.7 那条登记项的修复） | 关键字判定改用链路同一把词法刀 `verify::tokens()`，注释插在 `CREATE OR REPLACE` 与 `VIEW` 中间（`/*FORCE*/`）也认得 |
 | 闭包展开视图体 | `spinduck/src/plan/closure.rs` `expand_view_bodies` + `view_sources` | 视图文件进清单后，其视图体引用的表/序列也进清单（视图套视图沿队列展开） |
-| 逗号连表抽取 | `spinduck/src/verify/chain/mod.rs` `comma_join_refs`/`subquery_tail_refs`/`matching_paren`/`in_relation_slot` | `FROM a t, b s` 的第二、三位也是关系引用（V30.4 ③） |
+| 逗号连表抽取 | `spinduck/src/verify/chain/mod.rs` `comma_join_refs`/`subquery_tail_refs`/`matching_paren`/`in_relation_slot` | `FROM a t, b s` 的第二、三位也是关系引用（V31.4 ③） |
 | CLI 契约 | `spinduck/tests/cli/deploy.rs`（7 条，本层 35→42） | 真子进程：落盘 + 跨进程可跑 + 三类拒 + 两条视图体形态 |
 
 design §6.2 的三点差异逐条对照（全部为实测，非推算）：
@@ -2359,28 +2676,28 @@ design §6.2 的三点差异逐条对照（全部为实测，非推算）：
 | 差异 | 现状 | 证据 |
 |---|---|---|
 | 输入是**计划里的文件清单**，非目录发现 | 已落地：`resolve` 只吃 `sources.ddl_routines`/`sources.ddl_tables`，清单外的资产一个都不下发 | `ddl_files=28 routine_files=7`（bjgsyh）与该计划的两条清单条数逐一对应 |
-| 库**落盘**到 `--db` | 已落地：CLI 接缝处 `DuckExecutor::open`，`verify` 侧仍 `open_in_memory`，`SqlExecutor` 接缝签名未动 | V30.3 |
+| 库**落盘**到 `--db` | 已落地：CLI 接缝处 `DuckExecutor::open`，`verify` 侧仍 `open_in_memory`，`SqlExecutor` 接缝签名未动 | V31.3 |
 | 缺件在 `[[entry]]` 之外也红 | 已落地：`[[missing]]` 非空 → rc=1 且**不开库**；计划列出的文件不存在 → `ENV-0030` 且不开库。两条都不要求项目有 `[[entry]]` | `tests/cli/deploy.rs` 三条 `should_refuse_*`；其中"缺文件"断言 `!db.exists()` |
 
-### V30.2 TDD 循环与 Red 留档口径
+### V31.2 TDD 循环与 Red 留档口径
 
-沿用 V29.2 的口径：只有下表标"一手"的失败原文是本次逐字截留的。
+沿用 V30.2 的口径：只有下表标"一手"的失败原文是本次逐字截留的。
 
 | 循环 | 行为 | 用例 | Red |
 |---|---|---|---|
 | 1 | 计划读侧往返（渲染 → 解析 → 逐字段相等）+ 版本/必填字段拒绝 | `plan::tests::should_read_back_*`、`should_reject_a_plan_*`（4 条） | **一手（变异）**：4 条里 2 条首跑即绿，把 `version != SCHEMA_VERSION` 改成 `if false && …` 后 `should_reject_a_plan_from_an_unknown_schema_version` 转红，随即还原 |
 | 2 | 落盘库换进程可跑 / 缺件即拒 / 缺文件即拒 / 版本不符即拒 / 缺 `--db` 用法红 | `tests/cli/deploy.rs` 前 5 条 | 上一段会话跑过并转绿，原文未逐字留档 ⇒ **二手** |
 | 3 | `/*FORCE*/` 插在关键字中间也要下发视图体 | `should_deploy_the_view_body_when_a_comment_splits_the_create_keywords` | 上一段会话 Red 落在 `call` rc=1 + Binder Error（形态记档，原文未留）⇒ **二手（形态一手）** |
-| 4 | 视图体的基表随视图进清单 | `plan::tests::should_include_the_base_table_that_a_planned_view_reads` | **一手**，原文见 V30.4 ② |
-| 5 | 逗号连表的每一张表都是关系引用 | `verify::chain::tests::should_take_every_relation_in_a_comma_separated_from_list` | **一手**，原文见 V30.4 ③（这条 Red 出现两次：先断在 `["Relation:t_a"]`，补完第一档后断在子查询形态 `[]`） |
-| 6 | 两处修复合起来的进程面 | `should_deploy_a_view_body_whose_comma_joined_base_tables_only_the_plan_knows` | 首跑即绿 ⇒ **补测**，用两次变异证明非永真（原文见 V30.4 ④） |
+| 4 | 视图体的基表随视图进清单 | `plan::tests::should_include_the_base_table_that_a_planned_view_reads` | **一手**，原文见 V31.4 ② |
+| 5 | 逗号连表的每一张表都是关系引用 | `verify::chain::tests::should_take_every_relation_in_a_comma_separated_from_list` | **一手**，原文见 V31.4 ③（这条 Red 出现两次：先断在 `["Relation:t_a"]`，补完第一档后断在子查询形态 `[]`） |
+| 6 | 两处修复合起来的进程面 | `should_deploy_a_view_body_whose_comma_joined_base_tables_only_the_plan_knows` | 首跑即绿 ⇒ **补测**，用两次变异证明非永真（原文见 V31.4 ④） |
 
-终态计数：`--features native` **323 passed**（V29 基线 315 + 循环 1 的 4 条 + 循环 4/5 各 1 条 - 其中 4 条在 V29 末已计入，净 +8）、`--features cli` **365 passed**（= 323 + 契约层 42）、CLI 契约层 **42 passed**。
+终态计数：`--features native` **323 passed**（V30 基线 315 + 循环 1 的 4 条 + 循环 4/5 各 1 条 - 其中 4 条在 V30 末已计入，净 +8）、`--features cli` **365 passed**（= 323 + 契约层 42）、CLI 契约层 **42 passed**。
 
-> 说明：V29 记的 315 里已含循环 1 的 4 条读侧用例（同轮落地），所以本轮 native 的净增是
+> 说明：V30 记的 315 里已含循环 1 的 4 条读侧用例（同轮落地），所以本轮 native 的净增是
 > 循环 4、循环 5 各 1 条 + 上一段会话 `deploy` 侧的 3 条单测。终态以命令输出为准，不靠加减法。
 
-### V30.3 落盘与跨进程（一手）
+### V31.3 落盘与跨进程（一手）
 
 ```text
 $ spinduck deploy <bjgsyh 计划> --db /tmp/examView2.duckdb
@@ -2408,11 +2725,11 @@ $ spinduck call --db /tmp/viewprobe/pkg_split_trade_step3_sh_prc_trd_deal_purcha
 "部署产物是一个可被 `call` 打开的 `--db` 文件"成立（表/视图/序列都在），但"打开即免传源码"不成立——
 那条归 A2-4 的 `call --plan`（design §6.2 / D5 尚未落地）。
 
-### V30.4 四处口径缺陷（一手前后对照）
+### V31.4 四处口径缺陷（一手前后对照）
 
-**① `deploy` 之前不存在**：V29.7 登记"计划是给人看的清单"。本轮补上消费面，`ddl_tables` 从此有语义。
+**① `deploy` 之前不存在**：V30.7 登记"计划是给人看的清单"。本轮补上消费面，`ddl_tables` 从此有语义。
 
-**② 视图体的基表不在闭包里**（循环 4）。V29 的闭包只从**例程**出发，视图文件本身进清单、它读的表不进。
+**② 视图体的基表不在闭包里**（循环 4）。V30 的闭包只从**例程**出发，视图文件本身进清单、它读的表不进。
 Red 原文：
 
 ```text
@@ -2434,7 +2751,7 @@ Candidate bindings: "1"                                                    rc=1
 OUT p_o = 0                                                                rc=0
 ```
 
-`Candidate bindings: "1"` 就是占位视图那一列——V29.7 那条"占位视图取不到列"的推断至此有了一手数字。
+`Candidate bindings: "1"` 就是占位视图那一列——V30.7 那条"占位视图取不到列"的推断至此有了一手数字。
 
 **③ 逗号连表只有第一个名字进链路**（循环 5）。② 修完再探测，语料仍有 4 张视图退化成占位视图
 （`BODY=3 PLACEHOLDER=4`）。三张的视图体都是 Oracle 逗号连表：
@@ -2473,7 +2790,7 @@ test verify::chain::tests::should_take_every_relation_in_a_comma_separated_from_
 
 **判定面（`verify`）的实测变化：零**。②③ 都动到 `verify` 共用的代码，所以逐条复跑：
 
-| 语料 | V29.4 之后（本轮起点） | V30 之后 |
+| 语料 | V30.4 之后（本轮起点） | V31 之后 |
 |---|---|---|
 | `golden/exam_split_trade`（10 entries） | `entries=10 checks=222 failed=0 skipped=9` | 逐字相同 |
 | `golden/case_corpus_purchase`（1 entry） | `entries=1 checks=11 failed=0 skipped=1` | 逐字相同 |
@@ -2482,7 +2799,7 @@ test verify::chain::tests::should_take_every_relation_in_a_comma_separated_from_
 也就是说：这两处修复**改变的是部署产物**（表与视图体真的进库了），没有改变核验结论——没有一条 PASS 变 FAIL，
 也没有一条 FAIL 变 PASS。计划侧 `missing=0` 在 10 条 entry 上仍然成立，`tables` 计数变化：
 
-| entry | V29.3 | ② 修后 | ③ 修后 |
+| entry | V30.3 | ② 修后 | ③ 修后 |
 |---|---|---|---|
 | `pkg_split_trade_step2.prc_pre_deal_shjycf` | 21 | 21 | 21 |
 | `pkg_split_trade_step2.prc_pre_deal_bjgsyh` | 12 | **28** | 28 |
@@ -2493,7 +2810,7 @@ test verify::chain::tests::should_take_every_relation_in_a_comma_separated_from_
 | `pkg_inst_domestic_purchase.prc_gen_inst` | 18 | **19** | **20** |
 | `pkg_split_trade_step9.prc_deal_bond_repurchase_inst` | 22 | **23** | 23 |
 
-### V30.5 顺带取到的一条 §8 未决项：purchase 夹具那"4 张缺表"
+### V31.5 顺带取到的一条 §8 未决项：purchase 夹具那"4 张缺表"
 
 §8 的"包限定名扁平化"行挂着一条 codeweb 时代的手数推算：真实闭包 14 表里 4 张不在
 `case_corpus_purchase` 夹具 DDL，"是否真缺件要等 `deploy` 用计划实跑一次"。实跑结果：
@@ -2507,9 +2824,9 @@ $ grep -rli "par_oper_close_date\|par_sys_marketrate\|split_log_info" golden/cas
 
 三个名字在该夹具的 `sql/` 里**根本不出现**（这些例程是 `0_SIMPLIFIED_*` 简化版），故 SpinDuck 的
 闭包既看不到它们也不报缺件。结论：这条推算**不适用于当前夹具形态**，因此不需要"对齐 fixture =
-动 golden = Ask-first"那一步；`sys_dummy` 的改判（V29.4 ②）继续成立。
+动 golden = Ask-first"那一步；`sys_dummy` 的改判（V30.4 ②）继续成立。
 
-### V30.6 门禁（本机）
+### V31.6 门禁（本机）
 
 | 命令 | 结果 |
 |---|---|
@@ -2518,9 +2835,9 @@ $ grep -rli "par_oper_close_date\|par_sys_marketrate\|split_log_info" golden/cas
 | `cargo test --features native` | **323 passed / 0 failed** |
 | `cargo test --features cli` | **365 passed / 0 failed**（含契约层 42） |
 | `cargo audit` | `error: 4 vulnerabilities found!`——全部 `zip 6.0.0`（RUSTSEC-2026-0367/0368/0369/0429，Solution 一律 `>=9.0.0`），与既有豁免清单同集合、零新增（本轮零新依赖）。一手：本机 `cargo audit --no-fetch --stale`，advisory-db 缓存提交 `899077d9`（2026-11-09）；`--no-fetch` 是因为此刻取不到 GitHub（`error: couldn't fetch advisory database … error sending request for url (…/info/refs?service=git-upload-pack)`），不是"跳过审计" |
-| `verify` 两语料 | 逐字未变，见 V30.4 末表 |
+| `verify` 两语料 | 逐字未变，见 V31.4 末表 |
 
-### V30.7 仍是推算的 / 明确未做
+### V31.7 仍是推算的 / 明确未做
 
 - **`deploy` 非幂等**（一手）：对已装配的库文件再跑一次即撞内核报错，原样带出、不静默跳过：
   `[KERNEL-0070] 建表 …/sql/ddl/tables/dat_trd_repurchase.sql: Catalog Error: Table with name "dat_trd_repurchase" already exists!` rc=1。
@@ -2541,7 +2858,7 @@ $ grep -rli "par_oper_close_date\|par_sys_marketrate\|split_log_info" golden/cas
   黄金层是否受影响只有 CI golden job 有资格回答。本轮**没有**跑 `--features gauss`（容器面见 V21.12/V25）。
 - **千万级数据、真实实例、回写**：一个都没碰，全部在本机构架 + `golden/` 只读夹具上完成。
 
-### V30.8 本轮改动落点
+### V31.8 本轮改动落点
 
 | 文件 | 改动 | 性质 |
 |---|---|---|
@@ -2555,21 +2872,21 @@ $ grep -rli "par_oper_close_date\|par_sys_marketrate\|split_log_info" golden/cas
 | `spinduck/src/cli/{deploy.rs,args.rs,mod.rs,run.rs}` | `deploy` 子命令 + 变体 + 解析 + usage + 分发 | 新子命令（CLI 仅壳） |
 | `spinduck/tests/cli/deploy.rs` + `tests/cli.rs` | 7 条契约 + 子模块接线（本层 35→42） | 新增测试 |
 | `docs/architecture.md` | §13.5 增"视图体的基表"一行；新增 §13.6 `deploy` | 设计正文 |
-| `docs/validation.md` | 本节 V30 + V29.7 那条登记项标注已修 + V29.1/29.8 的 `chain.rs` 路径标注 | 实证登记 |
+| `docs/validation.md` | 本节 V31 + V30.7 那条登记项标注已修 + V30.1/29.8 的 `chain.rs` 路径标注 | 实证登记 |
 | `docs/design-production-gaussdb.md` | §6.2 `deploy` 行改判已落地、§7 A2 行、§8 三行（视图体两行合并为已修 + 新增 `plan.schema`/非幂等/例程不落盘三行）、§8 purchase 缺表面已实测 | 仅设计文档 |
 
 ---
 
-## V31. A2-4 落地：`call` 第一次红在 `eng.call` **之前**（design D5），并新增计划面入口 `call --plan`
+## V32. A2-4 落地：`call` 第一次红在 `eng.call` **之前**（design D5），并新增计划面入口 `call --plan`
 
 本轮把 A2 的最后一条本机项做掉：§3.3 的静默形态 C（补齐依赖函数、仍不建表 ⇒ `RETURN 0` + rc=0）
 在 CLI 面上不复存在，且缺件清单在**执行任何一句例程体**之前就打印出来。同时补上 `call --plan`——
-`deploy` 那条"例程不落盘"的限制（V30.3）由此有了免传源码的正路。
+`deploy` 那条"例程不落盘"的限制（V31.3）由此有了免传源码的正路。
 
 前提：**三条人类已有测试的期望值随行为同批改写**，用户在 2026-11-10 明确授权（原话"1、可以动"），
-改判清单见 V31.2 末表。除此之外本轮**没有**删、跳、放宽任何一条测试。
+改判清单见 V32.2 末表。除此之外本轮**没有**删、跳、放宽任何一条测试。
 
-### V31.1 交付面
+### V32.1 交付面
 
 | 段 | 落点 | 内容 |
 |---|---|---|
@@ -2588,7 +2905,7 @@ call: target=<归一小写名> missing=N 未执行（design D5 缺件即红）  
 call: target=<计划目标>     missing=N 拒绝执行（补齐缺件后重跑 plan）  ← 计划门（发生在开库之前）
 ```
 
-### V31.2 TDD 循环、改动前形态、以及三条改判
+### V32.2 TDD 循环、改动前形态、以及三条改判
 
 **循环 1（执行面门）** — Red：`should_list_the_missing_relation_and_execute_nothing_when_a_chained_table_is_absent`
 （合成夹具：一条链、两次引用同一张 `t_gap_a`、一张 `t_gap_b`、一个未登记的被调过程）。断言簇是**逐字全文**：
@@ -2603,10 +2920,10 @@ call: target=<计划目标>     missing=N 拒绝执行（补齐缺件后重跑 p
 形态 C（补齐两个依赖函数、仍不建表）→ RETURN 0   rc=0
 ```
 
-后两条与 V26.1 登记**逐字一致**（等于在当前代码上二次确认了那轮取证），第一条补上了本轮新写的
+后两条与 V27.1 登记**逐字一致**（等于在当前代码上二次确认了那轮取证），第一条补上了本轮新写的
 合成夹具在门前的形态：内核死在哪张表就只报哪张表，**没有清单**。变异还原后同批命令转红为 MISS 形态。
 
-> 这处变异与 V31.3 的变异 A **不是同一改法**：这里是 `false &&` 短路，整块门（含打印）都不介入，用来复现
+> 这处变异与 V32.3 的变异 A **不是同一改法**：这里是 `false &&` 短路，整块门（含打印）都不介入，用来复现
 > "改动前"；变异 A 只把 gaps 清空，MISS 行仍打印但不早退，用来单独证明"早退这一步"非虚。
 
 **循环 2（计划面入口）** — Red：`should_call_the_plan_target_without_passing_any_source_file`（deploy 后
@@ -2628,10 +2945,10 @@ Green 之后同一断言簇另加 `!db.exists()`。
 | 测试 | 旧期望 | 新期望 |
 |---|---|---|
 | `call.rs::should_exit_0_returning_0_when_deps_registered_but_tables_missing` → 改名 `should_exit_1_with_the_missing_relation_when_deps_are_registered_but_tables_are_absent` | rc=0 + `RETURN 0` | rc=1 + `MISS relation:par_sys_purchase <- fnc_get_purchase_js_days` + 摘要行，且 `!out.contains("RETURN")` |
-| `call.rs::should_ignore_ddl_and_seed_files_given_to_call`（形态 B≡A） | 两条都 rc=1 + `[KERNEL-0010] … does not exist`，并断言 B 与 A 输出**逐字相同** | 两条都 rc=1 + 同一条 MISS 摘要，**B≡A 的逐字相等断言原样保留**（本条意图不变：建表脚本对 `call` 彻底无效）；内核面那条证据仍留在 V26.1 与 `tests/guard/guard_register_silent_drop.rs`，未删改 |
+| `call.rs::should_ignore_ddl_and_seed_files_given_to_call`（形态 B≡A） | 两条都 rc=1 + `[KERNEL-0010] … does not exist`，并断言 B 与 A 输出**逐字相同** | 两条都 rc=1 + 同一条 MISS 摘要，**B≡A 的逐字相等断言原样保留**（本条意图不变：建表脚本对 `call` 彻底无效）；内核面那条证据仍留在 V27.1 与 `tests/guard/guard_register_silent_drop.rs`，未删改 |
 | `args.rs` 内 `should_parse_call_with_flags_and_args` | `routine: "prc_x"` | `target: CallTarget::Routine("prc_x")`（纯形状跟随，行为断言不变） |
 
-### V31.3 非虚断言：两处变异各自只红该红的用例
+### V32.3 非虚断言：两处变异各自只红该红的用例
 
 | 变异 | 改法 | 转红 | 红点 |
 |---|---|---|---|
@@ -2641,13 +2958,13 @@ Green 之后同一断言簇另加 `!db.exists()`。
 两次随即还原，还原后契约层 48/48 绿。判据的另一半（**门不是永红**）同批取证：
 `should_leave_a_persisted_database_a_second_process_can_run_against`（deploy 后的库 + `--file` 调用，门静默、rc=0）、
 `should_call_routine_from_file_and_print_out_params`（无表夹具照常返回 `OUT p_o = 42`）、
-以及 V31.6 那条考题语料正例。
+以及 V32.6 那条考题语料正例。
 
-### V31.4 语料侧：闭包重构输出中性、判定面逐字未变
+### V32.4 语料侧：闭包重构输出中性、判定面逐字未变
 
 `build` 改成走 `walk_chain` 是**搬家不是改判**，10 条 entry 逐条复跑 `plan`：
 
-| entry | V30.4 末列 | V31 之后 |
+| entry | V31.4 末列 | V32 之后 |
 |---|---|---|
 | `prc_pre_deal_shjycf` / `prc_pre_deal_bjgsyh` / `prc_trd_hz_byfund` / `prc_trd_deal_purchase` / `prc_split_sh_cjqs` | 21 / 28 / 27 / 7 / 20 | 21 / 28 / 27 / 7 / 20 |
 | `prc_general_deal_inst_sh_{buy,sell,other}` | 14 / 14 / 14 | 14 / 14 / 14 |
@@ -2655,12 +2972,12 @@ Green 之后同一断言簇另加 `!db.exists()`。
 
 `routines` 计数与 `missing=0` 全部不变。核验面（`verify`，与本轮无共用代码路径，仍复跑确认）：
 
-| 语料 | V30.4 之后 | V31 之后 |
+| 语料 | V31.4 之后 | V32 之后 |
 |---|---|---|
 | `golden/exam_split_trade`（10 entries） | `entries=10 checks=222 failed=0 skipped=9` | 逐字相同 |
 | `golden/case_corpus_purchase`（1 entry） | `entries=1 checks=11 failed=0 skipped=1` | 逐字相同 |
 
-### V31.5 新登记的盲区：表达式级被调函数**不在闭包里**（一手）
+### V32.5 新登记的盲区：表达式级被调函数**不在闭包里**（一手）
 
 `routine_refs` 只采语句级 `CallRoutine`。最小夹具（`prc_outer` 一条语句读 `t_ok`、一条赋值 `v := fnc_hidden()`，
 `fnc_hidden` 的体读 `t_hidden`）实测：
@@ -2685,7 +3002,7 @@ MISS relation:t_hidden <- fnc_hidden                        ← 同一个对象�
 合法值。收口办法是把 PL 表达式里的函数调用纳入 `routine_refs`（建议编号 A2-5，本轮未排期），
 `plan`/`deploy`/`call` 门三处一起受益。此条已入 design §8「缺件门的盲区」行与 architecture §13.7 的口径段。
 
-### V31.6 发版形态二进制复核
+### V32.6 发版形态二进制复核
 
 `cargo build --release --features cli --locked` 产物（`spinduck 0.1.2`）：
 
@@ -2705,7 +3022,7 @@ call --plan … --db …/fresh.duckdb 同一份计划换一个空库
 **`OUT p_o_succeed = 0` 只是管道证据**（计划→装配→注册→执行→回读这条链在真语料上通），
 **不是**业务基线：库里没有任何数据，`0` 不来自任何一次比对。A5/B 阶段接 `compare` 才有裁决资格。
 
-### V31.7 门禁（本机）
+### V32.7 门禁（本机）
 
 | 命令 | 结果 |
 |---|---|
@@ -2713,15 +3030,15 @@ call --plan … --db …/fresh.duckdb 同一份计划换一个空库
 | `cargo clippy --all-features --tests -- -D warnings` | 干净（无 `#[allow]`、无新增 lint 抑制） |
 | `cargo test --features native` | **324 passed / 0 failed** |
 | `cargo test --features cli` | **372 passed / 0 failed**（含契约层 48） |
-| `cargo audit` | 与 V30.6 同一集合：4 条全部 `zip 6.0.0`（RUSTSEC-2026-0367/0368/0369/0429），**零新增**（本轮零新依赖，`Cargo.lock` 未变）。一手：本机 `cargo audit --no-fetch --stale`，advisory-db 缓存提交 `899077d9`（2026-11-09）；`--no-fetch` 的原因是此刻取不到 GitHub，不是"跳过审计" |
-| `verify` 两语料 | 逐字未变，见 V31.4 末表 |
+| `cargo audit` | 与 V31.6 同一集合：4 条全部 `zip 6.0.0`（RUSTSEC-2026-0367/0368/0369/0429），**零新增**（本轮零新依赖，`Cargo.lock` 未变）。一手：本机 `cargo audit --no-fetch --stale`，advisory-db 缓存提交 `899077d9`（2026-11-09）；`--no-fetch` 的原因是此刻取不到 GitHub，不是"跳过审计" |
+| `verify` 两语料 | 逐字未变，见 V32.4 末表 |
 
-### V31.8 仍是推算的 / 明确未做
+### V32.8 仍是推算的 / 明确未做
 
 - **内核门判红时 `--db` 文件已经创建**（一手）：`call --plan <干净计划> --db <不存在的路径>` 在缺件红之后
   留下一个 12,288 字节的空库文件（`fresh.duckdb`）。这不是疏漏而是判定顺序的必然——内核门的参照面**就是
   内核 catalog**，不开库读不到它。**未做**：`--dry-run` 之类的"只判不建"入口（要先定它归 `plan` 还是归 `call`）。
-  计划门那一道不受影响：它在开库之前拒，`!db.exists()` 有断言（V31.2 循环 3）。
+  计划门那一道不受影响：它在开库之前拒，`!db.exists()` 有断言（V32.2 循环 3）。
 - **内核门的参照面是"开库那一刻"的 catalog**（推算，未在语料撞到）：例程自己 `CREATE TABLE` 再读的形态
   会被判成缺件。本轮 10 条 entry + purchase 夹具都没有这种写法，故只登记不处理。
 - **golden（`--features gauss`）侧未本机实测**：门在 `cli/run.rs`，黄金层走进程内 `Engine::call` 不经 CLI 壳，
@@ -2731,31 +3048,31 @@ call --plan … --db …/fresh.duckdb 同一份计划换一个空库
 - **D9② 真 GBK 解码**：已授权、未动工（本轮零新依赖）。§4 那 3,149 个 GBK 文件在落地前一律跑不起来。
 - **千万级数据、真实实例、回写**：一个都没碰。
 
-### V31.9 本轮改动落点
+### V32.9 本轮改动落点
 
 | 文件 | 改动 | 性质 |
 |---|---|---|
-| `spinduck/src/plan/closure.rs` | `walk_chain`（BFS 抽成唯一实现）+ `kernel_gaps` + `kernel_has`；`build` 改回调式 | 口径收口（`plan` 侧输出中性，见 V31.4）+ 新能力（执行面判定） |
+| `spinduck/src/plan/closure.rs` | `walk_chain`（BFS 抽成唯一实现）+ `kernel_gaps` + `kernel_has`；`build` 改回调式 | 口径收口（`plan` 侧输出中性，见 V32.4）+ 新能力（执行面判定） |
 | `spinduck/src/plan/mod.rs` | `pub(crate) use closure::kernel_gaps;`；过期路径注释订正 | 接线 |
 | `spinduck/src/cli/run.rs` | `call_target_and_sources` + `refuse_on_kernel_gaps`；`call_cmd` 走两道门（67→54 行，回到 AGENTS §3 上限内） | 行为改动（执行面） |
 | `spinduck/src/cli/args.rs` | `CallTarget` 枚举、`--plan` 解析、usage 两行、缺目标用法错；单测 +1/改 1 | 新能力（CLI 仅壳） |
-| `spinduck/tests/cli/call.rs` | +1 条门契约；2 条人类测试期望改判（V31.2 末表） | 新增测试 + **授权改判** |
+| `spinduck/tests/cli/call.rs` | +1 条门契约；2 条人类测试期望改判（V32.2 末表） | 新增测试 + **授权改判** |
 | `spinduck/tests/cli/deploy.rs` | +4 条 `call --plan` 契约（正例、计划门、`ENV-0010` 缺计划、`ENV-0030` 缺例程源） | 新增测试 |
 | `spinduck/tests/cli/usage.rs` | +1 条（`call` 无目标） | 新增测试 |
-| `spinduck/tests/cli.rs` | 头部实证索引补 V31 一行 | 文档性 |
+| `spinduck/tests/cli.rs` | 头部实证索引补 V32 一行 | 文档性 |
 | `docs/architecture.md` | 新增 §13.7（`call` 的两道门 + 计划面入口 + 已知盲区） | 设计正文 |
-| `docs/validation.md` | 本节 V31 | 实证登记 |
+| `docs/validation.md` | 本节 V32 | 实证登记 |
 | `docs/design-production-gaussdb.md` | §1 三行改判（最危险缺口已封 / 裁决仍无人管 / A2 进度）、§3.3 现状段、§7 A2 行、§8 两行（`call --plan` 已落地 + 新增表达式级盲区行）、§9 DoD 2、附录复现命令现状 | 仅设计文档 |
 
 ---
 
-## V32（2026-11-10）：D9② 真 GBK 解码——源码读入收口成一把判定，语料字节不动
+## V33（2026-11-10）：D9② 真 GBK 解码——源码读入收口成一把判定，语料字节不动
 
 范围：A2 的最后一项本机设计项（design D9②、§3.5、§7 A2 行）。用户 2026-11-10 授权新增运行时
-依赖（Ask-first 项之一）。零 PR、零提交（工作树等用户过目）；零 CI 改动（V28.4 的
+依赖（Ask-first 项之一）。零 PR、零提交（工作树等用户过目）；零 CI 改动（V29.4 的
 `cargo test --features cli` 一步已覆盖本层新增契约）。
 
-### V32.1 交付面
+### V33.1 交付面
 
 | 能力 | 落点 | 契约 |
 |---|---|---|
@@ -2767,7 +3084,7 @@ call --plan … --db …/fresh.duckdb 同一份计划换一个空库
 一句话口径：**同一份源码、只差文件编码，现在只能给出同一个结果**；给不出结果的那种字节
 （UTF-8 与 GBK 都不合法）仍是一条响亮红。
 
-### V32.2 TDD 循环与一手 Red 记录
+### V33.2 TDD 循环与一手 Red 记录
 
 四个循环，每循环先有会失败的断言。原文如下（未润色）。
 
@@ -2831,12 +3148,12 @@ test verify::should_exit_1_with_env_0030_when_corpus_is_valid_in_neither_encodin
 
 Green = `verify/deploy.rs` 四处换调 `source::read_text`。
 
-### V32.3 契约层：52 条，改判 3 条的原文
+### V33.3 契约层：52 条，改判 3 条的原文
 
-本轮改动全部落在**我自己新建的 CLI 契约层**（V27 起），人类已有测试零改动。三条 V28 时代的
+本轮改动全部落在**我自己新建的 CLI 契约层**（V28 起），人类已有测试零改动。三条 V29 时代的
 期望值随行为改判，理由与 diff 含义：
 
-| 测试 | 旧期望（V28.3） | 新期望（V32） | 行为为什么应该变 |
+| 测试 | 旧期望（V29.3） | 新期望（V33） | 行为为什么应该变 |
 |---|---|---|---|
 | `call::should_exit_1_with_env_0030_when_call_source_is_not_utf8` | GBK 源 → `ENV-0030` + rc=1，且不出现 `中文` | 拆成两条：`call::should_decode_a_gbk_source_and_return_the_same_literal_as_its_utf8_twin`（GBK 与 UTF-8 两份同内容源码**同为** `OUT p_o = 中文` rc=0）+ `call::should_exit_1_with_env_0030_when_call_source_is_valid_in_neither_encoding`（输入换成 `0xFF 0xFE`） | D9① 判红是"D9② 之前的中间态"，design §3.5 末段写明它的代价是 3,149 个文件跑不起来。旧断言里"不得出现 `中文`"这一半在 D9② 之后**语义反转**：GBK 的 `中文` 字节本来就该还原成 `中文` |
 | `rules_explain::should_exit_1_with_env_0030_when_explain_source_is_not_utf8` | GBK 源 → rc=1 且不产出 IR | 拆成两条：`…should_explain_gbk_literal_verbatim_as_the_same_ir_as_its_utf8_twin`（`0\tassign\tp_o := '中文'`，两文件逐字相同）+ `…_valid_in_neither_encoding` | 同上：不产出 IR 的前提（"读不懂就是读不懂"）已不成立 |
@@ -2856,11 +3173,11 @@ Green = `verify/deploy.rs` 四处换调 `source::read_text`。
 test result: ok. 1 passed; 0 failed
 ```
 
-三代口径同图：改动前 `NO_MATCH`/`MATCH` 两条 rc=0（V26.4）→ D9① 后 `ENV-0030` rc=1（V28）
+三代口径同图：改动前 `NO_MATCH`/`MATCH` 两条 rc=0（V27.4）→ D9① 后 `ENV-0030` rc=1（V29）
 → 现在两条同为 `MATCH` rc=0。本文最警惕的"静默错值"形态在这一条上给出正向证据，
 而不只是"不再静默"。
 
-### V32.4 非平凡性：把 GBK 分支摘掉，谁红
+### V33.4 非平凡性：把 GBK 分支摘掉，谁红
 
 变异 = 只删 `had_errors` 那三句，让非 UTF-8 一律回红（即退回 D9① 形态），其余不动：
 
@@ -2877,14 +3194,14 @@ Err(refused(path))
 红的面正是新增的 4 条正例，一条不多一条不少 ⇒ 新行为由新断言守护，且解码分支不是死代码。
 变异体已回滚（`git diff` 无残留，`src/source.rs` 与登记一致）。
 
-### V32.5 语料侧：本仓语料输出中性 + 交付件侧的一手计数
+### V33.5 语料侧：本仓语料输出中性 + 交付件侧的一手计数
 
 **本仓五份 golden 语料逐文件编码普查**（`*.sql` 共 167 个）：UTF-8 **167 / 需 GBK 0 / 都不通 0**
 （`case_corpus_min_tax` 3、`case_corpus_purchase` 8、`case_corpus_stock_kind` 3、
 `case_split_agg` 4、`exam_split_trade` 149）。⇒ 本轮对仓内语料**不可能**改判任何输出，
 下面两张"逐字未变"表因此是判定面而非巧合：
 
-| entry（`--schema bigfund`） | V31.4 | V32 之后 |
+| entry（`--schema bigfund`） | V32.4 | V33 之后 |
 |---|---|---|
 | `prc_pre_deal_shjycf` / `prc_pre_deal_bjgsyh` / `prc_trd_hz_byfund` / `prc_trd_deal_purchase` / `prc_split_sh_cjqs` | 21 / 28 / 27 / 7 / 20 | 21 / 28 / 27 / 7 / 20 |
 | `prc_general_deal_inst_sh_{buy,sell,other}` | 14 / 14 / 14 | 14 / 14 / 14 |
@@ -2892,7 +3209,7 @@ Err(refused(path))
 
 `routines` 计数与 `missing=0` 十条全不变。核验面：
 
-| 语料 | V31.4 | V32 之后 |
+| 语料 | V32.4 | V33 之后 |
 |---|---|---|
 | `golden/exam_split_trade`（10 entries） | `entries=10 checks=222 failed=0 skipped=9` | 逐字相同 |
 | `golden/case_corpus_purchase`（1 entry） | `entries=1 checks=11 failed=0 skipped=1` | 逐字相同 |
@@ -2925,7 +3242,7 @@ Big5 歧义面用 python 复核（`decode('gbk')` 与 `decode('big5')` 对同一
 **python 与 Rust 的 GBK 表不同源**（Python 的 `gbk` codec 对 0x80 等字节有自己的映射，
 `encoding_rs` 按 WHATWG），所以主口径取 Rust 侧那份；两侧对 3,149/0 这一组数字**结论相同**。
 
-### V32.6 发版形态二进制复核
+### V33.6 发版形态二进制复核
 
 `cargo build --release --features cli --locked` 产物（`spinduck 0.1.2`），自造两份同内容、
 不同编码的夹具（`fnc_flag` 比较实参与 `'已成交'`）+ 一份 GBK 包项目：
@@ -2952,40 +3269,40 @@ compile <项目>/sql  →  OK …/sql/routines/pkg_a.sql  routines=1  (non-utf8)
 `--locked` 通过 = `Cargo.toml` 的新依赖与 `Cargo.lock` 一致；lockfile 的 diff 只有一行
 （`encoding_rs` 进 `spinduck` 的依赖表），零新增 crate。
 
-### V32.7 门禁（本机）
+### V33.7 门禁（本机）
 
 | 命令 | 结果 |
 |---|---|
 | `cargo fmt --all` + `cargo fmt --all -- --check` | 干净 |
 | `cargo clippy --all-features --tests -- -D warnings` | 干净（无 `#[allow]`、无新增 lint 抑制） |
-| `cargo test --features native` | **327 passed / 0 failed**（V31.7 的 324 + `source::` 3 条） |
-| `cargo test --features cli` | **379 passed / 0 failed**（含契约层 **52**，V31.7 的 48 + 4） |
+| `cargo test --features native` | **327 passed / 0 failed**（V32.7 的 324 + `source::` 3 条） |
+| `cargo test --features cli` | **379 passed / 0 failed**（含契约层 **52**，V32.7 的 48 + 4） |
 | `cargo build --release --features cli --locked` | 通过，产物 `spinduck 0.1.2` |
-| `cargo audit --no-fetch --stale` | 与 V31.7 同一集合：4 条全部 `zip 6.0.0`（RUSTSEC-2026-0367/0368/0369/0429），**零新增**。新提为直接依赖的 `encoding_rs 0.8.44` 无公告；advisory-db 缓存提交 `899077d9`（2026-11-09），`--no-fetch` 的原因是此刻取不到 GitHub，不是"跳过审计" |
-| `plan` 十条 entry + `verify` 两语料 | 逐字未变，见 V32.5 三张表 |
+| `cargo audit --no-fetch --stale` | 与 V32.7 同一集合：4 条全部 `zip 6.0.0`（RUSTSEC-2026-0367/0368/0369/0429），**零新增**。新提为直接依赖的 `encoding_rs 0.8.44` 无公告；advisory-db 缓存提交 `899077d9`（2026-11-09），`--no-fetch` 的原因是此刻取不到 GitHub，不是"跳过审计" |
+| `plan` 十条 entry + `verify` 两语料 | 逐字未变，见 V33.5 三张表 |
 
-### V32.8 仍是推算的 / 明确未做
+### V33.8 仍是推算的 / 明确未做
 
 - **`verify` 侧"文件读不到"的错误码由 `ENV-0030` 变 `ENV-0010`**（一手代码改动，**无契约覆盖**）：
   四处 `read_to_string` 原本把 IO 失败也归 `ENV-0030`，收口后 IO 失败走 `source::read_text` 的
   `ENV-0010 read <path>: <io>`。可达面只有"列举之后、读取之前文件消失"（TOCTOU）或目录被并发改动，
-  本轮**没有**为它写契约，也没有实测过一次红。判红面（两把都不成立）另有契约，见 V32.3。
+  本轮**没有**为它写契约，也没有实测过一次红。判红面（两把都不成立）另有契约，见 V33.3。
 - **GBK 判定采信的是"交付件是简体中文环境"这一先验，不是检测器**（一手计数 418，判定推算）：
-  见 V32.5 末行与 §13.8。若日后接入繁体/日文语料，这条会从理论变成静默错值——届时应显式指定
+  见 V33.5 末行与 §13.8。若日后接入繁体/日文语料，这条会从理论变成静默错值——届时应显式指定
   编码而不是给 `source::decode` 加启发式。
 - **`encoding_rs` 的 GBK 解码与 GaussDB 实例侧的 GBK 不是同一实现**（未取证）：本仓语料文件字节
   与实例 `SERVER_ENCODING` 的关系属 A0b（附录 B 的 `SHOW server_encoding`），实例未到手前
-  不能声称"引擎还原出的汉字与实例端比较结果一致"。V32.3 的判据实验比的是**引擎自身两侧一致**，
+  不能声称"引擎还原出的汉字与实例端比较结果一致"。V33.3 的判据实验比的是**引擎自身两侧一致**，
   不是引擎 vs GaussDB。
 - **`compile` 体检面未接解码**（刻意，design §3.5 末段）：它的 `(non-utf8)` 标记在 D9② 之后
   读起来像"还能再优化成 `(gbk)`"。**未做**，理由是不想让体检面参与判定——体检要的是
   一趟扫完并按错误码分类，一旦它也开始解码，"体检 OK"与"执行可跑"这两件事就再次混在一条
   退出码里。
 - **golden 侧（`--features gauss`）未本机实测**：本轮改动全在 CLI 壳与读入层，黄金层走进程内
-  `Engine::call` 不经这些读入点，故**推算**影响为 0；同 V31.8 的容器面限制（V21.12/V25）。
+  `Engine::call` 不经这些读入点，故**推算**影响为 0；同 V32.8 的容器面限制（V21.12/V25）。
 - **千万级数据、真实实例、回写**：一个都没碰。A2 之后（A3 起）全部要实例。
 
-### V32.9 本轮改动落点
+### V33.9 本轮改动落点
 
 | 文件 | 改动 | 性质 |
 |---|---|---|
@@ -2995,36 +3312,36 @@ compile <项目>/sql  →  OK …/sql/routines/pkg_a.sql  routines=1  (non-utf8)
 | `spinduck/Cargo.lock` | +1 行（`spinduck` 的依赖表多 `encoding_rs`），无新 crate 条目 | 同上 |
 | `spinduck/src/cli/mod.rs` | `read_source_strict` 13 行实现 → 一行转调；`read_source`（有损面）**未动** | 行为改动 + 口径收口 |
 | `spinduck/src/verify/deploy.rs` | 四处 `read_to_string` → `source::read_text` | 行为改动（核验/部署面） |
-| `spinduck/tests/cli.rs` | +`write_bytes`、+`write_gbk_package` 与 `PACKAGE_GBK_*`、+`write_flag_routine`、`write_gbk_routine` 改为复用 `write_bytes`；头部索引补 V32 | 新增夹具 |
+| `spinduck/tests/cli.rs` | +`write_bytes`、+`write_gbk_package` 与 `PACKAGE_GBK_*`、+`write_flag_routine`、`write_gbk_routine` 改为复用 `write_bytes`；头部索引补 V33 | 新增夹具 |
 | `spinduck/tests/cli/call.rs` | 改判 1 条 → 2 条，+1 条判据实验（`should_return_the_same_match…`） | **授权改判** + 新增 |
 | `spinduck/tests/cli/rules_explain.rs` | 改判 1 条 → 2 条（GBK 逐字 IR + 都不合法判红） | **授权改判** + 新增 |
 | `spinduck/tests/cli/verify.rs` | 改判 1 条 → 2 条（GBK 包体 rc=0 + 都不合法判红） | **授权改判** + 新增 |
 | `docs/architecture.md` | §6.1 编码条文改判（原"引擎不做运行时编码探测"作废）+ 新增 §13.8 | 设计正文 |
-| `docs/validation.md` | 本节 V32 | 实证登记 |
+| `docs/validation.md` | 本节 V33 | 实证登记 |
 | `docs/design-production-gaussdb.md` | §1 两行改判（编码能吃下 / A2 本机项全部完成）、§3.5 表与处置段、§4 编码行 + 新增歧义行、§6 D9 决策记录补 ②、§7 A2 行与退出判据、§8 编码行与 CI 数字、§9 DoD 2、附录 §3.5 复现现状 | 仅设计文档 |
 
 ---
 
-## V33. A2-5 落地：表达式级被调函数**进闭包**，缺件门与计划第一次看见"被调函数它自己的表"
+## V34. A2-5 落地：表达式级被调函数**进闭包**，缺件门与计划第一次看见"被调函数它自己的表"
 
-本轮收的是 V31.5 登记的最后一个本机盲区（design §8「缺件门的盲区」行）。判定口径不变
+本轮收的是 V32.5 登记的最后一个本机盲区（design §8「缺件门的盲区」行）。判定口径不变
 （一条 BFS、两个参照面、缺件即红），变的是**采集面**：PL 表达式里的裸名函数调用过去
 只被内核看见，现在按例程目录命中后进闭包。三条 `plan` 契约 + 一条 `call` 契约 + 一条
 采集面单测为新增，**本轮没有改判任何一条既有期望值**——既有契约一条不减、一条不改，
-改的只有语料侧计划清单的长度（V33.4，属"计划漏件"被修掉的直接后果，逐条给数）。
+改的只有语料侧计划清单的长度（V34.4，属"计划漏件"被修掉的直接后果，逐条给数）。
 
-### V33.1 交付面
+### V34.1 交付面
 
 | 项 | 内容 |
 |---|---|
 | 采集面 | `spinduck/src/verify/chain/mod.rs`：`Walk` 新增 `expr_names` 面，`walk_expr` 改为持 `&mut Walk`（一趟遍历同时交"结论"与"候选"），新增 `pub fn expr_func_names` |
 | 闭包 | `spinduck/src/plan/closure.rs` 的 `walk_chain`：BFS 里在 `routine_refs` 之后加一段候选解析——裸名逐个 `eng.catalog.lookup` 精确命中才排进队列 |
-| 口径来源 | `spinduck/src/runtime/eval.rs:89` 的 `eval_funccall`：单次 `catalog.lookup(name)`，未命中即 `eval_builtin` 下内核。闭包用**同一个键、同一个精确度**，不补包名（V33.7 记为有意的残余） |
+| 口径来源 | `spinduck/src/runtime/eval.rs:89` 的 `eval_funccall`：单次 `catalog.lookup(name)`，未命中即 `eval_builtin` 下内核。闭包用**同一个键、同一个精确度**，不补包名（V34.7 记为有意的残余） |
 | 三处受益 | `plan`（清单与 `[[missing]]`）、`deploy`（下发的例程源与表）、`call`/`call --plan`（内核门）——同一条 BFS，不存在第二套 |
-| 契约 | `tests/cli/plan.rs` +3、`tests/cli/call.rs` +1、`src/verify/chain/tests.rs` +1 → 契约层 **56**（V32.7 的 52 + 4） |
+| 契约 | `tests/cli/plan.rs` +3、`tests/cli/call.rs` +1、`src/verify/chain/tests.rs` +1 → 契约层 **56**（V33.7 的 52 + 4） |
 | 文档 | architecture §13.7（原「已知盲区」条文改判为「表达式级被调函数进闭包」+「仍然看不见的两类」，判定行补采集面说明）、design §1 两行 + §7 A2 行与退出判据 + §8 盲区行改判 |
 
-### V33.2 TDD 循环与 Red 原文
+### V34.2 TDD 循环与 Red 原文
 
 **循环 1（计划面）** — 夹具：`prc_outer` 一条赋值 `v_n := fnc_hidden()`；`fnc_hidden` 单独
 一个源文件，其体读 `t_hidden`；DDL 只声明 `t_a`。
@@ -3042,11 +3359,11 @@ plan: target=prc_outer routines=1 tables=0 missing=0        ← 期望 routines=
 
 Green 后同一批：`MISS relation:t_hidden <- fnc_hidden` + `routines=2`（两个例程源文件）、
 干净形态 `routines=2 tables=1 missing=0`。第三条 `should_not_report_a_missing_object_for_a_builtin_expression_call`
-（`v_n := trunc(1)`）在实现**之前**就是绿的，它是"新规则不许把内建函数判成缺件"的哨兵（V33.3 变异 M2 只红它和另外两条既有契约）。
+（`v_n := trunc(1)`）在实现**之前**就是绿的，它是"新规则不许把内建函数判成缺件"的哨兵（V34.3 变异 M2 只红它和另外两条既有契约）。
 
 **循环 2（执行面门）** — 夹具：`pkg_a.prc_outer(p_o OUT NUMBER)` 体里 `v := fnc_hidden();`，
 `fnc_hidden` 读内核里没有的 `t_hidden`。实现落地后这条直接绿，故它的 Red 用**摘掉新循环**
-的同一条闭包复现（与 V31/V32 同一手法）：
+的同一条闭包复现（与 V32/V33 同一手法）：
 
 ```text
 $ spinduck call --file expr_gap.sql pkg_a.prc_outer            # 门放行 → 走到实参检查
@@ -3058,7 +3375,7 @@ MISS relation:t_hidden <- fnc_hidden
 call: target=pkg_a.prc_outer missing=1 未执行（design D5 缺件即红）
 ```
 
-契约锁第三种形态（rc=1、逐字清单、无 `OUT`、无 `KERNEL-0010`），把 V31.5 那句
+契约锁第三种形态（rc=1、逐字清单、无 `OUT`、无 `KERNEL-0010`），把 V32.5 那句
 "红还是红，只是由内核报、且不是一份清单"改判成门点名。
 
 **循环 3（采集面单测）** — `src/verify/chain/tests.rs::should_report_bare_expression_calls_as_candidates_not_as_routine_refs`：
@@ -3076,20 +3393,20 @@ $ spinduck call --plan /tmp/a25c/.spinduck/plan/pkg_a.prc_outer.toml --db /tmp/a
 OUT p_o = 3                                                  ← t_hidden 三行，闭包此前少一个例程源
 ```
 
-### V33.3 非虚断言：两处变异各自只红该红的用例
+### V34.3 非虚断言：两处变异各自只红该红的用例
 
 | 变异 | 改法 | 红面 |
 |---|---|---|
-| M1 摘掉候选解析 | 新循环换成 `let _ = expr_func_names(&r.prog);` | 3 条新契约全红：2 条 `plan`（`routines=1 missing=0`）+ 1 条 `call`（红面随实参形态为 `BIZ-0151` 或 `KERNEL-0010`，V33.2） |
+| M1 摘掉候选解析 | 新循环换成 `let _ = expr_func_names(&r.prog);` | 3 条新契约全红：2 条 `plan`（`routines=1 missing=0`）+ 1 条 `call`（红面随实参形态为 `BIZ-0151` 或 `KERNEL-0010`，V34.2） |
 | M2 把候选当结论 | 未命中目录的裸名也 `missing.insert(gap("routine:{name}"))` | `cargo test --features cli --test cli` **53 passed / 3 failed**，三条恰是：新哨兵 `plan::should_not_report_a_missing_object_for_a_builtin_expression_call`（`MISS routine:trunc <- prc_builtin`）+ 两条既有 `call` 契约（`should_exit_1_with_the_missing_relation_when_deps_are_registered_but_tables_are_absent`、`should_ignore_ddl_and_seed_files_given_to_call`） |
 
 M2 的第三条证人最有价值：语料夹具里 `nvl` 一类改名后的内建**确实出现**在表达式中，
 放宽规则会把它们判成缺件——"保守"不是偷懒，是被这两条既有契约钉住的口径。
 
-### V33.4 语料侧：计划清单变大、缺件仍为 0、核验面逐字未变
+### V34.4 语料侧：计划清单变大、缺件仍为 0、核验面逐字未变
 
 考题语料 10 条 `[[entry]]`（`--schema bigfund`）。"改动前"一列里 entry1/entry5 与 purchase 夹具
-是**本轮实测**（把新循环摘掉后复跑同一条闭包），其余 8 条引 V31.4/V29.3 登记值，抽查吻合：
+是**本轮实测**（把新循环摘掉后复跑同一条闭包），其余 8 条引 V32.4/V30.3 登记值，抽查吻合：
 
 | entry | routines 前 → 后 | tables 前 → 后 | missing |
 |---|---|---|---|
@@ -3111,7 +3428,7 @@ M2 的第三条证人最有价值：语料夹具里 `nvl` 一类改名后的内�
 
 核验面（`verify`，采集面之一 `routine_refs` 未动 ⇒ 判定不变，仍复跑确认）：
 
-| 语料 | V32 之后 | V33 之后 |
+| 语料 | V33 之后 | V34 之后 |
 |---|---|---|
 | `golden/exam_split_trade`（10 entries） | `entries=10 checks=222 failed=0 skipped=9` | 逐字相同 |
 | `golden/case_corpus_purchase`（1 entry） | `entries=1 checks=11 failed=0 skipped=1` | 逐字相同 |
@@ -3128,13 +3445,13 @@ IDENTICAL / SAME_AS_FIRST_RUN
 残余盲区的**大小**有数：把 M2（未命中即报缺件）在同一条闭包上跑考题语料，9 条 entry
 共 23 行 `MISS routine:`，去重后只有 4 个名字——`coalesce`、`now`、`round`、`substring`，
 全部是内建或规则改名后的内建（`NVL`→`coalesce`、`SYSDATE`→`now`、`SUBSTR`→`substring`）。
-即"裸名调到登记为 `pkg.fnc_x` 的同包成员函数"这一形态在本语料为 **0 条**（一手，V33.1 口径表的最后一行）。
+即"裸名调到登记为 `pkg.fnc_x` 的同包成员函数"这一形态在本语料为 **0 条**（一手，V34.1 口径表的最后一行）。
 
 计划耗时（debug 构建，单次采样）：entry5 `2.67s → 2.69s`、entry1 `0.56s → 0.54s`——
 每条例程的 IR 遍历从 2 趟变 3 趟，但被遍历的例程数仍是闭包规模决定，实测无可分辨差异
 （另注：一次采样曾得 4.30s，本机噪声量级即此，故不给倍数）。
 
-### V33.5 发版形态复核
+### V34.5 发版形态复核
 
 `cargo build --release --features cli --locked`（`spinduck 0.1.2`）四条面各自实测：
 
@@ -3149,18 +3466,18 @@ IDENTICAL / SAME_AS_FIRST_RUN
 `call --file 10_outer.sql --file t_hidden.sql pkg_a.prc_outer 0` ⇒
 `[KERNEL-0010] Catalog Error: Scalar Function with name fnc_hidden does not exist!`。
 
-### V33.6 门禁（本机）
+### V34.6 门禁（本机）
 
 | 门禁 | 结果 |
 |---|---|
 | `cargo fmt --all -- --check` | 干净（本轮 `cargo fmt` 只动了新增测试与 `verify.rs` 的 use 列表换行） |
 | `cargo clippy --all-features -- -D warnings` | 0 warning |
-| `cargo test --features native` | **328 passed / 0 failed**（V32.7 的 327 + `verify::chain` 1 条） |
+| `cargo test --features native` | **328 passed / 0 failed**（V33.7 的 327 + `verify::chain` 1 条） |
 | `cargo test --features cli` | **384 passed / 0 failed**（= 328 + 契约层 56） |
-| `cargo audit --no-fetch --stale` | 与 V32.7 同一集合：4 条全部 `zip 6.0.0`，**零新增**；本轮未加依赖 |
-| `cargo build --release --features cli --locked` | 通过，V33.5 四场面即该产物 |
+| `cargo audit --no-fetch --stale` | 与 V33.7 同一集合：4 条全部 `zip 6.0.0`，**零新增**；本轮未加依赖 |
+| `cargo build --release --features cli --locked` | 通过，V34.5 四场面即该产物 |
 
-### V33.7 仍是推算的 / 明确未做
+### V34.7 仍是推算的 / 明确未做
 
 - **真实例侧完全未碰**：门与计划现在都只证明"项目 DDL 声明过 / 内核目录此刻有"，
   实例里那张表到底存不存在属 A0b/A1（实例未到手）。`call --db` 面在真实例上的缺件判定
@@ -3172,15 +3489,15 @@ IDENTICAL / SAME_AS_FIRST_RUN
 - **交付件全量语料（14,611 文件）未跑 `plan`**：那个目录没有 `spinduck.toml`，
   就地建项目会改动交付件目录本身（AGENTS §6 语料纪律），本轮只在两个在库夹具上取证。
   ⇒ "真实交付代码里表达式级被调函数的命中量"仍是**推算**（按考题语料形态：日历/区间公共函数
-  几乎必然命中，V33.4 的 17 个新例程源即证据链）。
+  几乎必然命中，V34.4 的 17 个新例程源即证据链）。
 - **M1/M2 两处变异不是发布形态**：它们只为证明断言非虚，跑完即还原；
   还原由 `grep -c expr_func_names src/plan/closure.rs == 2`（use 列表 + 循环）核对。
 - **视图体展开的表达式调用面未扩**：`expand_view_bodies` 仍只看 SQL 文本的关系位，
   视图体里不会有 PL 表达式，故**推算**无影响。
 - 计划文件的 `[[missing]]` 形状、`deploy` 非幂等、`plan.schema` 不下发三条限制**未变**
-  （V30.5/V31.8 口径仍适用）。
+  （V31.5/V32.8 口径仍适用）。
 
-### V33.8 本轮改动落点
+### V34.8 本轮改动落点
 
 | 文件 | 改动 | 性质 |
 |---|---|---|
@@ -3190,22 +3507,22 @@ IDENTICAL / SAME_AS_FIRST_RUN
 | `spinduck/tests/cli/plan.rs` | +3 条契约（缺件面 / 干净面 / 内建哨兵）+ `ROUTINES_EXPR_*`、`ROUTINE_FNC_HIDDEN` 夹具 | 新增测试 |
 | `spinduck/tests/cli/call.rs` | +1 条门契约（红面逐字 + 不许出现 `KERNEL-0010`） | 新增测试 |
 | `spinduck/src/verify/chain/tests.rs` | +1 条采集面单测 | 新增测试 |
-| `spinduck/tests/cli.rs` | 头部实证索引补 V33 一行 | 文档性 |
+| `spinduck/tests/cli.rs` | 头部实证索引补 V34 一行 | 文档性 |
 | `docs/architecture.md` | §13.7：判定行 + 「已知盲区」条文改判为两条（进闭包 / 仍看不见的两类） | 设计正文 |
-| `docs/validation.md` | 本节 V33 | 实证登记 |
+| `docs/validation.md` | 本节 V34 | 实证登记 |
 | `docs/design-production-gaussdb.md` | §1 两行（源码进引擎 / A2 本机项）、§7 A2 行与退出判据、§8 盲区行改判 | 仅设计文档 |
 
 ---
 
-## V34. A5 本机半边落地：`query` 把一条 SQL 的结果落成快照，`compare` 按值裁决；归一两份副本收口成一份
+## V35. A5 本机半边落地：`query` 把一条 SQL 的结果落成快照，`compare` 按值裁决；归一两份副本收口成一份
 
 本轮收 design §6.2 / §7 A5 的**本机半边**：结果快照（`query`）与逐值比对（`compare`）。
 实例半边（从 GaussDB 取数、`run <plan>` 端到端编排）仍卡在 A0b/A1/A3，本轮不碰。
 另一条同时收的旧账是 `norm`：`tests/common/mod.rs` 与 `tests/corpus_forms/mod.rs` 各有一份
 实现，本轮搬到 core 成唯一一份，两处测试目录改成 re-export。搬动是**纯收口**，等价性的
-一手证据在 V34.3（diff 原文 + 三层复跑 + 容器黄金层）。
+一手证据在 V35.3（diff 原文 + 三层复跑 + 容器黄金层）。
 
-### V34.1 交付面
+### V35.1 交付面
 
 | 项 | 内容 |
 |---|---|
@@ -3215,12 +3532,12 @@ IDENTICAL / SAME_AS_FIRST_RUN
 | 壳 | `src/cli/query.rs`（55 行）、`src/cli/compare.rs`（75 行）：只做读入、渲染、退出码；判据一条都不在壳里（design §5.2 D1） |
 | 参数面 | `src/cli/args.rs:113-114` 两条 dispatch + `parse_query` / `parse_compare` + `Command::Query/Compare` + `usage()` 两行；`src/cli/run.rs` 两个 arm 接线；+4 条解析单测 |
 | 契约层 | `tests/cli/query.rs` 8 条、`tests/cli/compare.rs` 10 条 ⇒ 契约层 **56 → 74** |
-| 内核取证 | `snapshot::kernel_evidence_tests::should_run_every_statement_and_return_only_the_last_result_set`（`native` gate，见 V34.2 循环 3） |
+| 内核取证 | `snapshot::kernel_evidence_tests::should_run_every_statement_and_return_only_the_last_result_set`（`native` gate，见 V35.2 循环 3） |
 | 文档 | architecture §13.9（新增，`query`/`compare` 口径）；design §1 / §6.2 / §7 A5 / §8 改判 |
 
 规模口径：新文件最长 470 行，§3 的 500 行上限与"含 `#[cfg(test)]` ≤700"都在面内。
 
-### V34.2 TDD 循环与 Red 原文
+### V35.2 TDD 循环与 Red 原文
 
 **循环 1（归一收口，Refactor 型）** — 这条不是新行为，是"唯一实现"这条结构约束的取证。
 本轮反向复跑了一次：把 `src/lib.rs` 的 `pub mod norm;` 注释掉，消费者立刻编译不过——
@@ -3232,7 +3549,7 @@ error[E0432]: unresolved import `crate::norm`
 
 合法 Red 形态（AGENTS §2：缺 API 导致编译失败即合法）。第一个红的是 lib 自己
 （`error: could not compile spinduck (lib)`，`src/snapshot/compare.rs:10` 那条 use），
-所以这条证明的是"core 里那一份在被真实使用"。至于**只剩一份**，钉住它的是 V34.1 那条
+所以这条证明的是"core 里那一份在被真实使用"。至于**只剩一份**，钉住它的是 V35.1 那条
 grep（全文再无第二处 `fn norm(`）与两处 re-export 的行号，不是这条编译错——两者别说
 不同的事，别把前者读成后者。
 
@@ -3269,10 +3586,10 @@ test snapshot::kernel_evidence_tests::should_run_every_statement_and_return_only
 
 **循环 4（字节契约的结尾换行）** — 发版冒烟里 `cat` 把快照和下一条提示符黏在一起，暴露
 `to_json_string` 缺结尾 `\n`。改判先落测试（2 条 core 字节断言 + 2 条 CLI 字节断言改成
-`}\n` 结尾），再改实现。四条断言现在分别覆盖"有行"和"空 rows"两条落盘路径（V34.4 的
+`}\n` 结尾），再改实现。四条断言现在分别覆盖"有行"和"空 rows"两条落盘路径（V35.4 的
 M5/M5b 各只红自己那一对）。
 
-### V34.3 归一收口的等价性：diff 原文 + 怪癖锁定
+### V35.3 归一收口的等价性：diff 原文 + 怪癖锁定
 
 两份副本与 core 实现的 diff（`git show HEAD:…` 取旧体，去掉参数名差异后逐字比）：
 
@@ -3290,7 +3607,7 @@ M5/M5b 各只红自己那一对）。
 
 即：**语句序列完全相同**，差的只有标识符命名与一行注释 ⇒ 同输入必然同输出（结构论证）。
 行为侧另给一手证据：用 `norm` 的三层复跑逐条绿——`corpus_sql_forms` 9/0、`cases_native` 4/0、
-`gauss` 黄金层 6/0（V34.6），期望值一个没收。
+`gauss` 黄金层 6/0（V35.6），期望值一个没收。
 
 怪癖照搬并锁进单测，不改判：
 
@@ -3301,7 +3618,7 @@ norm(Some("100")) == "100"    // 无小数点不去尾零（否则 100 会被削
 
 前者锁在 `should_strip_trailing_zeros_and_dot`，后者锁在 `should_keep_integer_text_untouched`。
 
-### V34.4 非虚断言：六处变异各自只红该红的用例
+### V35.4 非虚断言：六处变异各自只红该红的用例
 
 每条都是临时改实现、跑 `cargo test --features cli --no-fail-fast`、还原（还原由 `cmp` 与
 改前备份**逐字节相同**核对，并复跑 `294 lib + 74 契约` 全绿）。基数 445。
@@ -3319,7 +3636,7 @@ norm(Some("100")) == "100"    // 无小数点不去尾零（否则 100 会被削
 这在验证场景里是最坏的一类假绿。契约把它钉在 `ENV-0031` 且消息里列出有的列名，
 `compare` 因此**永不**从键序退化成位置序。
 
-### V34.5 发版形态冒烟（`cargo build --release --features cli --locked`，`spinduck 0.1.2`）
+### V35.5 发版形态冒烟（`cargo build --release --features cli --locked`，`spinduck 0.1.2`）
 
 夹具：`t_a(id INT)` + `prc_ins`，`plan → deploy --db work.duckdb → call … 1 / … 2` ⇒ 库里两行。
 
@@ -3343,18 +3660,18 @@ DIFF arity row=1 a=2 列 b=3 列
 compare: rows=1/1 diffs=1 逐值不一致
 ```
 
-### V34.6 门禁（本机）
+### V35.6 门禁（本机）
 
 | 门禁 | 结果 |
 |---|---|
 | `cargo fmt --all -- --check` | 干净 |
 | `cargo clippy --all-features -- -D warnings` | 0 warning |
-| `cargo test --features native` | **371 passed / 0 failed**（V33 的 328 + 43：core 39 条 + `cli::args` 4 条） |
+| `cargo test --features native` | **371 passed / 0 failed**（V34 的 328 + 43：core 39 条 + `cli::args` 4 条） |
 | `cargo test --features cli` | **445 passed / 0 failed**（= 371 + 契约层 74） |
-| `cargo test --features cli --test cli` | **74 passed / 0 failed**（V33 的 56 + query 8 + compare 10） |
+| `cargo test --features cli --test cli` | **74 passed / 0 failed**（V34 的 56 + query 8 + compare 10） |
 | `cargo test --features gauss` | **377 passed / 0 failed**（= 371 + 实例黄金层 6；容器 `spinduck-gaussdb` healthy，口令与端口由 `docker inspect` / `docker port` 在命令替换里取，全程未打印） |
-| `cargo audit --no-fetch --stale` | 与 V32/V33 同一集合：4 条全部 `zip 6.0.0`，**零新增**；本轮未加依赖 |
-| `cargo build --release --features cli --locked` | 通过，V34.5 八场面即该产物 |
+| `cargo audit --no-fetch --stale` | 与 V33/V34 同一集合：4 条全部 `zip 6.0.0`，**零新增**；本轮未加依赖 |
+| `cargo build --release --features cli --locked` | 通过，V35.5 八场面即该产物 |
 
 `gauss` 层本轮有一次**配置错被读成行为错**的踩坑，登记在此以免下轮误判：第一次跑取
 `SPINDUCK_OG_PORT` 时直接读了容器的 `GS_PORT`（那是**容器内**端口 5432），宿主映射其实是
@@ -3368,7 +3685,7 @@ connect gaussdb: EngineError { domain: Env, code: ErrorCode("ENV-0020"), message
 改成 `docker port` 反查宿主端口后同一批全绿——红面是 `ENV-0020`（环境域）而不是任何比对断言，
 这条区分本身也是故障域归位在实证里的用处。
 
-### V34.7 仍是推算的 / 明确未做
+### V35.7 仍是推算的 / 明确未做
 
 - **实例半边未动**：`query` 的 `--db` 只接本地 DuckDB 文件；"从 GaussDB 取同一份形状的快照"
   依赖 A3 的 COPY OUT/流式通道，本轮不预判其口径。`run <plan>` 端到端编排同样未做。
@@ -3388,7 +3705,7 @@ connect gaussdb: EngineError { domain: Env, code: ErrorCode("ENV-0020"), message
 - **M1–M5b 六处变异不是发布形态**：只为证明断言非虚，跑完即还原，还原证据是 `cmp` 逐字节相同
   + 全绿复跑。
 
-### V34.8 本轮改动落点
+### V35.8 本轮改动落点
 
 | 文件 | 改动 | 性质 |
 |---|---|---|
@@ -3404,5 +3721,103 @@ connect gaussdb: EngineError { domain: Env, code: ErrorCode("ENV-0020"), message
 | `spinduck/tests/cli/query.rs`、`tests/cli/compare.rs` | 新增 8 + 10 条契约（含 `seeded_db` 夹具复用） | 新增测试 |
 | `spinduck/tests/cli.rs` | 头部实证索引 + 职责清单补 `query`/`compare` | 文档性 |
 | `docs/architecture.md` | 新增 §13.9（口径四段表 + 退出码）；§13.8 表行扩为"执行/计划/部署/核验/比对面" | 设计正文 |
-| `docs/validation.md` | 本节 V34 | 实证登记 |
+| `docs/validation.md` | 本节 V35 | 实证登记 |
 | `docs/design-production-gaussdb.md` | §1 A5 行、§6.2 口径、§7 A5 本机半边判据、§8 残余 | 仅设计文档 |
+## V36. 与主干 V26（性能轮 / `v0.1.3`）合并：编号让位、两套 CLI 契约并存，全部门禁在合并树上重取
+
+**为什么有这一节**：PR #8 的基线是 `cbaaae5`（V25 之后），主干随后合入 PR #7 =
+`bc887de`（三段引擎优化 + 批量搬运，实证登记 **它自己的 V26**，版本 bump 到 0.1.3）。
+两条线都在 V25 后面追加了一节 `## V26`，且都改了 `call` 的 CLI 面与 `tests/cli.rs`。
+CI 因此根本不启动：`gh pr view 8 --json statusCheckRollup` 实测返回 `[]`，
+`mergeStateStatus = CONFLICTING`。**先合并、再取证**是唯一的顺序（AGENTS §9 的
+"tag 打在 CI 已验证的 main head"同样要求分支先能对上 main）。
+
+**冲突面（一手：`git pull --no-rebase origin main` 的实测输出）**
+
+| 文件 | hunk | 接法 |
+|---|---|---|
+| `.github/workflows/ci.yml` | 1 | 采主干：Test job 单步 `cargo test --features cli`（`cli ⊇ native`），注释里主干那两步并存的口径退役 |
+| `spinduck/Cargo.toml` | 1 | 本分支的 `[[test]] guard_patterns_outer_join_residual` 保留 + `[[test]] cli` 的 `required-features` 理由改写为合并后口径 |
+| `spinduck/src/cli/args.rs` | 3 | `parse_call` 头（`--plan` 预摘 + 两面旗标）、`usage()` 文本、测试簇（两条都留，主干那条的期望换成 `target: CallTarget::Routine(...)`） |
+| `spinduck/src/cli/run.rs` | 1 | `eng.batch_commit` / `eng.step_budget` 赋值挪到注册循环**之前**，源码循环仍用本分支的 `sources` + `read_source_strict` |
+| `spinduck/tests/cli.rs` | 1（add/add） | 采本分支的"夹具 + `#[path]` 分派器"结构，主干那 3 条二进制契约折进 `tests/cli/call.rs` |
+| `docs/validation.md` | 1（大块） | 编号让位，见下 |
+
+**编号让位的判定**：主干的 V26 已在 `origin/main` 并随 `v0.1.3` 发布，引用面一手计数
+= 该节内 **49 处** + V23 区前向引用 **2 处**（`> 后续事实（2026-11-08，V26.5 回写）`，
+指的是主干自己那节的 sha256/参照实例口径）；本分支的 V26–V34 只活在未合并的 PR 里。
+已发布的证据编号不动，未发布的让位——所以**我这侧整段 +1**（V26→V27 … V34→V35），
+并把主干那节排在前面，恢复"编号单调 = 文件顺序单调"这条排版不变量。
+
+改写面（脚本单次遍历 `V(2[6-9]|3[0-4]) → V(n+1)`，实测计数）：
+
+| 文件 | 改写 | 说明 |
+|---|---|---|
+| `docs/validation.md` 本分支段 | 240 处 | 含 9 个 `## V..` 小节标题与全部自引用 |
+| `docs/design-production-gaussdb.md` | 127 处 | 该文件整体是本分支新增，引用只可能指本分支各节 |
+| `docs/architecture.md` | 9 行 | 只改指向我这几节的行；主干那 3 行（`V26` 批量 COMMIT、`V26.3/V26.7`、`V26` BATCH_SKIP）逐字未动 |
+| `spinduck/tests/cli.rs` | 8 行 | 头部实证索引 + 两条夹具注释 |
+| `spinduck/tests/cli/{call,compile,deploy,rules_explain,verify}.rs`、`tests/guard/guard_patterns_outer_join_residual.rs` | 6 + 2 行 | 注释里的节号 |
+| `spinduck/src/{cli/args.rs,sql/patterns.rs,verify/deploy.rs,verify/chain/tests.rs}` | 各 1 行 | 同上 |
+| 主干侧引用面（`README.md` 3 行、`AGENTS.md` 1 行、`ci.yml` 1 行、`src/io/gauss.rs` 4 行、`src/exec.rs` 1 行、`src/cli/args.rs` 的 batch_commit 文档行 1 行） | **0 改动** | 这些 "V26" 全部指主干那节 |
+
+判据：合并后的文件里 `^## V` 序列实测为 `1..35` 且单调（脚本断言 `monotonic: True`），
+`V26` 只剩一节。
+
+**代码接合的 Red 口径（诚实说明）**：上表前三行是**接合**，不是新行为——两侧原有测试
+各自原样保留、合并后全绿，没有需要复现的 Red；`call --plan` 的位置参数口径与本分支
+V32（原 V31）那条 `should_take_every_positional_as_an_argument_when_call_uses_a_plan`
+一致，主干的 `should_parse_call_with_step_budget` 只是把期望里的 `routine:` 换成
+`target: CallTarget(...)`，断言强度未变。
+
+**本轮唯一新增行为 = 计划面也吃下执行面开关**（两条线各自的测试面都覆盖不到的组合）：
+`spinduck/tests/cli/deploy.rs` 的
+`should_apply_the_execution_flags_on_the_plan_face_too`（1 条，两半）。
+
+- 半边 1：`deploy` 出计划与落盘库后，`call --plan P --db D --batch-commit --step-budget 1000000 0`
+  的 stdout 与不带开关时**逐字相同**（`OUT p_o = 1\n`），stderr 恒空。
+- 半边 2（判据的判别力所在）：`call --plan <不存在的文件> --step-budget 0` ⇒
+  **退出码 2（usage）**、消息含 `--step-budget`、且**不含** `[ENV-0010]`——用法判定排在计划 IO 之前。
+- 非空断言证据（变异）：删掉 `src/cli/args.rs` 里 `--step-budget` 的 `if v == 0 { … }` 守卫后单跑该条，
+  实测转红：`assertion left == right failed: usage 要先于计划读取: [ENV-0010] read /tmp/.../nope.toml: No such file or directory`
+  + `left: 1 / right: 2`；随后 `cp` 还原并 `cmp` 确认逐字节一致。
+  同一条路径单独给缺计划文件时仍是 `EXIT_FAIL + [ENV-0010]`（既有契约
+  `should_exit_1_with_env_0010_when_the_plan_file_given_to_call_is_absent`，未改判）。
+
+**门禁（全部在合并树上重取，本机）**
+
+| 门禁 | 命令 | 实测 |
+|---|---|---|
+| Format | `cargo fmt --all -- --check` | 干净（接合期间 `usage()` 与测试簇由 `cargo fmt --all` 收敛） |
+| Clippy | `cargo clippy --all-features -- -D warnings` | `Finished`，零告警 |
+| 单元+集成（内核通道） | `cargo test --features native` | **397 passed / 0 failed**（23 个 result 行全部 `0 failed`） |
+| 含契约层（CI Test 同口径） | `cargo test --features cli` | **475 passed / 0 failed**，其中 `tests/cli.rs` 收集 **78 条** = 上一轮实测 74（`1bcec83` 提交说明同数）+ 主干折入 3 + 本轮新增 1 |
+| 黄金层（A 模式容器） | `cargo test --features gauss`（`SPINDUCK_OG_PORT` 取自 `docker port spinduck-gaussdb 5432/tcp` = 5433；口令经 `docker exec … printenv GS_PASSWORD` 注入环境，不落命令行、不入库） | **6 passed / 0 failed**（`gauss_e2e` 2、`golden_corpus_gauss` 2、`golden_corpus_purchase` 1、`golden_gauss` 1）；`gauss_sha256` 收集 0 条 = **feature 级门控**（该层要 `--features gauss-sha256`），不是环境假绿 |
+| Security Audit | `cargo audit` | 4 条公告，编号与 CI 豁免清单**逐条相同**（`RUSTSEC-2026-0367/0368/0369/0429`，构建期 `zip`）；豁免面未扩大 |
+
+**仍是推算的 / 未覆盖**
+
+- CI 五 job 在合并后 head SHA 上的一手日志还没有——本轮只做到"分支能与 main 干净合并 + 本机同口径门禁全绿"。
+  PR #8 的 CI 要等这次 push 之后才启动（V25 记过同一形态：本地绿 ≠ CI 绿）。
+- `--batch-commit` 与 `--step-budget` 在**千万级游标循环**上的实际放大效果仍无一手数字：
+  本轮新增的组合契约只证明"计划面吃下开关、结果逐字不变"，性能与预算阈值属 A3/A4（需实例）。
+- **AGENTS §3 规模**：合并后 `src/cli/args.rs` 859 行、`src/cli/run.rs` 588 行，均越过
+  单文件 500 行（args.rs 连"含 `#[cfg(test)]` ≤700"也超）。一手对照：主干 `bc887de` 上
+  分别是 468 / 499 行（在限内），本分支 `934d5ad` 上是 812 / 577 行——**越限是本分支
+  A2/A5 连续加子命令累积的，合并只把它加深**。本轮不顺手拆：拆分是纯结构改动，要按 §3
+  "按职责拆子模块"单独一轮走，且 `args.rs` 已含 `query`/`compare`/`plan`/`deploy`/`call`
+  五套解析器，切分线清晰（每个解析器一文件 + 共享夹具），适合作为下一轮的独立 PR。
+- 主干那节的执行面数字（memo/prepared/COPY）在合并树上未复测——合并没碰它们的判据代码，
+  但 `run.rs` 的注册循环换成了 `read_source_strict`（本分支 D9① 的判定），
+  若主干曾按旧 `read_source` 元组接口计时，口径差异属读入路径，不影响其结论的判据面。
+
+**改动落点**
+
+| 文件 | 改动 | 性质 |
+|---|---|---|
+| `spinduck/src/cli/args.rs` | `parse_call` 合并两面旗标 + `--plan` 预摘；`usage()` 两条 call 行补开关；两条测试并存 | 接合 |
+| `spinduck/src/cli/run.rs` | `call_cmd` 内开关赋值前置于注册循环；源码循环保留严格读入 | 接合 |
+| `spinduck/tests/cli.rs` + `tests/cli/call.rs` | 主干 3 条二进制契约折进分派器结构（`cli()` 夹具：stdout/stderr 分离断言） | 接合 |
+| `spinduck/tests/cli/deploy.rs` | 新增 1 条计划面组合契约 | 新行为 |
+| `docs/validation.md`、`docs/architecture.md`、`docs/design-production-gaussdb.md`、若干注释行 | V26–V34 → V27–V35 编号让位 + 本节 V36 | 实证与引用面 |
+| `.github/workflows/ci.yml`、`spinduck/Cargo.toml` | 采主干单步 `--features cli` 口径；`[[test]]` 注释改写 | 接合 |

@@ -59,6 +59,11 @@ pub enum Command {
         files: Vec<PathBuf>,
         target: CallTarget,
         args: Vec<String>,
+        /// 合并 COMMIT 开关（V26，默认关；见 writebuf.rs 语义边界）。
+        batch_commit: bool,
+        /// 步数预算覆盖（复核应修 C：默认预算跑不动 100k 级游标循环，
+        /// 大业务经此入口放大；None = 用引擎默认值）。
+        step_budget: Option<u64>,
     },
 }
 
@@ -68,7 +73,7 @@ pub enum Command {
 /// `target` 与例程源清单，两处不一致时谁说了算本就没有答案。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallTarget {
-    /// 裸例程名：源码必须逐个 `--file` 传进来（V30.3 那条"例程注册在进程内"的口径）。
+    /// 裸例程名：源码必须逐个 `--file` 传进来（V31.3 那条"例程注册在进程内"的口径）。
     Routine(String),
     /// 运行计划文件：目标例程与例程源都从计划取。
     Plan(PathBuf),
@@ -263,7 +268,9 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
         }
     }
 
-    let mut db = None;
+    let mut db: Option<PathBuf> = None;
+    let mut batch_commit = false;
+    let mut step_budget: Option<u64> = None;
     let mut rules = None;
     let mut files = Vec::new();
     let mut routine = None;
@@ -285,6 +292,20 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
                 files.push(PathBuf::from(
                     it.next().ok_or_else(|| usage_err("--file <path>"))?,
                 ));
+            }
+            "--batch-commit" => {
+                batch_commit = true;
+            }
+            "--step-budget" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| usage_err("--step-budget <n>"))?
+                    .parse::<u64>()
+                    .map_err(|_| usage_err("--step-budget <n>（正整数）"))?;
+                if v == 0 {
+                    return Err(usage_err("--step-budget <n>（正整数）"));
+                }
+                step_budget = Some(v);
             }
             t if t.starts_with("--") => {
                 return Err(usage_err(format!("unknown flag {t}")));
@@ -311,6 +332,8 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
         files,
         target,
         args,
+        batch_commit,
+        step_budget,
     })
 }
 
@@ -445,8 +468,8 @@ pub fn usage() -> &'static str {
      \x20                                从 GaussDB 物化到本地 DuckDB（需 feature gauss）\n\
      \x20 sync --db <f> --table <t> --cols a,b\n\
      \x20                                本地 DuckDB 回写追加到 GaussDB（需 feature gauss）\n\
-     \x20 call [--db <f>] [--rules <f>] [--file <sql>]... <routine> [args...]\n\
-     \x20 call --plan <计划.toml> [--db <f>] [--file <sql>]... [args...]\n\
+     \x20 call [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>] <routine> [args...]\n\
+     \x20 call --plan <计划.toml> [--db <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>] [args...]\n\
      \x20                                注册例程并调用；计划面自带目标与源清单，缺件即红\n\
      \x20                                （args: 整数/小数/'串'/null；--plan 下位置参数全是实参）\n"
 }
@@ -498,6 +521,8 @@ mod tests {
                 files: vec![PathBuf::from("pkg.sql")],
                 target: CallTarget::Routine("prc_x".to_string()),
                 args: v(&["1", "2"]),
+                batch_commit: false,
+                step_budget: None,
             }
         );
     }
@@ -524,8 +549,30 @@ mod tests {
                 files: vec![],
                 target: CallTarget::Plan(PathBuf::from("p.toml")),
                 args: v(&["'20250715'", "'0130000001'"]),
+                batch_commit: false,
+                step_budget: None,
             }
         );
+    }
+
+    #[test]
+    fn should_parse_call_with_step_budget() {
+        // 复核应修 C：100k 级游标循环默认预算（1M 步）跑不动，CLI 需放大入口
+        let c = parse(&v(&["call", "--step-budget", "20000000", "prc_x"])).unwrap();
+        assert_eq!(
+            c,
+            Command::Call {
+                db: None,
+                rules: None,
+                files: vec![],
+                target: CallTarget::Routine("prc_x".to_string()),
+                args: vec![],
+                batch_commit: false,
+                step_budget: Some(20_000_000),
+            }
+        );
+        let bad = parse(&v(&["call", "--step-budget", "0", "prc_x"])).unwrap_err();
+        assert!(bad.message.contains("--step-budget"));
     }
 
     #[test]

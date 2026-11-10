@@ -27,7 +27,7 @@ fn should_collect_relations_and_sequences_from_sql_text() {
 fn should_take_every_relation_in_a_comma_separated_from_list() {
     // 考题语料的连表主形态是逗号（`FROM par_fund_rate_info t, par_drv_config s`）。
     // 只取 `FROM` 后第一个名字，后半边的表对链路就是隐形的：verify 不核它、计划闭包
-    // 也不收它，部署出来的库里因此没有这张表（V30.4 实测：语料 4 张视图退化成占位视图）。
+    // 也不收它，部署出来的库里因此没有这张表（V31.4 实测：语料 4 张视图退化成占位视图）。
     assert_eq!(
         names("SELECT * FROM t_a a, t_b b WHERE a.id = b.id"),
         vec!["Relation:t_a", "Relation:t_b"]

@@ -61,10 +61,9 @@ jobs:
         with:
           # uses: 步骤不跟随 defaults.working-directory；缺这行会静默退化成只缓存 registry（V25）
           workspaces: spinduck
-      - run: cargo test --features native
-      # CLI 契约层（AGENTS §4.1 的 tests/cli.rs）跑真 bin，而该 bin 带
-      # `required-features = ["cli"]` ⇒ 上面那步根本不构建它。两步并存各证一件事：
-      # native = 内核通道，cli = 发版 feature 口径的壳（退出码/stdout，V27）。
+      # cli 蕴含 native（覆盖面只增不减），并使 tests/cli.rs 的二进制契约层
+      # 真实运行（V26.10：--batch-commit/--step-budget 接线此前无测试面）。
+      # AGENTS §9 的 Test 口径同此步：单步 `--features cli`，不再并列 native。
       - run: cargo test --features cli
 
   audit:

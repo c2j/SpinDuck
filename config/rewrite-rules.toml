@@ -26,6 +26,9 @@ INTERVALTONUM = "@intertonum" # → date_diff('day', b, a)；参数形态限定 
 DECODE  = "@case"   # verified@1.5.5：缺失，解析级 CASE 变换        # 特殊：DECODE(a,b,x,c,y,z) → CASE a WHEN b THEN x WHEN c THEN y ELSE z END（语法变换，非重命名）
 SYSDATE = "CURRENT_TIMESTAMP"  # 探针@1.5.5：now() 需括号，CURRENT_TIMESTAMP 免括号可直接 token 重命名
 SUBSTR  = "SUBSTRING"
+# ↑ 映射值若与 exec.rs 的记忆化白名单（PURE_SCALAR_FNS）相关，两侧须同步：
+#   白名单是保守固定集（substring/strftime/strptime/to_days/date_diff），
+#   新增可缓存函数在 exec.rs 登记并补探针（validation V24.2 / 评审应修 10）。
 LISTAGG = "@unsupported"  # WITHIN GROUP 语法不兼容，运行时报错并给出迁移指引（M8 处理）
 TO_NUMBER = "@cast_decimal"  # verified@1.5.5：仍无原生实现（V6）
 

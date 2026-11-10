@@ -2,8 +2,8 @@
 
 use super::{
     cli, purchase_file, write, write_bytes, write_flag_routine, write_gbk_routine, EXIT_FAIL,
-    EXIT_OK, PURCHASE_DATE, PURCHASE_DDL, PURCHASE_GETDAY, PURCHASE_ID, PURCHASE_IF_DEAL,
-    PURCHASE_MAIN, PURCHASE_ROUTINE, PURCHASE_SEED, P_LITERAL_UTF8, P_NULL, P_X,
+    EXIT_OK, EXIT_USAGE, PURCHASE_DATE, PURCHASE_DDL, PURCHASE_GETDAY, PURCHASE_ID,
+    PURCHASE_IF_DEAL, PURCHASE_MAIN, PURCHASE_ROUTINE, PURCHASE_SEED, P_LITERAL_UTF8, P_NULL, P_X,
 };
 
 #[test]
@@ -103,7 +103,7 @@ fn should_exit_1_with_env_0030_when_call_source_is_valid_in_neither_encoding() {
 
 #[test]
 fn should_return_the_same_match_for_a_gbk_and_a_utf8_source_with_one_utf8_actual() {
-    // design §3.5 的判据实验（A0a / V26.4）在 D9② 后的复跑。改动前实测：
+    // design §3.5 的判据实验（A0a / V27.4）在 D9② 后的复跑。改动前实测：
     //   GBK  源 + UTF-8 参数 → RETURN NO_MATCH rc=0   ← 静默错值，本文最警惕的形态
     //   UTF-8 源 + UTF-8 参数 → RETURN MATCH   rc=0
     // 即 `WHERE status = '已成交'` 会因为源码编码而变成永不成立的比较，且两条都绿。
@@ -135,12 +135,12 @@ fn should_return_the_same_match_for_a_gbk_and_a_utf8_source_with_one_utf8_actual
 fn should_ignore_ddl_and_seed_files_given_to_call() {
     // 形态 B ≡ 形态 A：`Engine::register` 只编译例程声明，表/种子 DDL 既不执行也不告警
     // （`src/engine.rs:124`）。`tests/guard/guard_register_silent_drop.rs` 锁的是
-    // register 层，本条锁它在真语料 + 真二进制上的端到端形态（V26.1 结论 1）。
+    // register 层，本条锁它在真语料 + 真二进制上的端到端形态（V27.1 结论 1）。
     //
     // 期望随 D5（A2-4）同批改写：旧断言锁 `[KERNEL-0010] fnc_com_if_deal_date does not
     // exist`，那是"一路跑到内核才炸"的证据；现在红发生在内核之前，A/B/C 三形态在 CLI 面上
     // 同形。本条的意图反而更好证明——**带上 tables.sql 与 seed.sql 也照样报同一张缺表**，
-    // 说明这两个文件对 `call` 彻底无效。内核面那条证据仍留在 V26.1 与守护测试里，未被删改。
+    // 说明这两个文件对 `call` 彻底无效。内核面那条证据仍留在 V27.1 与守护测试里，未被删改。
     let main = purchase_file(PURCHASE_MAIN);
     let ddl = purchase_file(PURCHASE_DDL);
     let seed = purchase_file(PURCHASE_SEED);
@@ -210,7 +210,7 @@ END;
 
 #[test]
 fn should_exit_1_with_the_missing_relation_when_deps_are_registered_but_tables_are_absent() {
-    // 形态 C 的旧结局（V26.1 结论 2/3，本条原期望）：补齐依赖函数、仍不建表 ⇒
+    // 形态 C 的旧结局（V27.1 结论 2/3，本条原期望）：补齐依赖函数、仍不建表 ⇒
     // `RETURN 0` + rc=0。`0` 恰是语料自己 `WHEN OTHERS` 归的合法值，rc=0 时没有任何
     // 东西能把它和一次正确复现区分开——这就是 design D5 要消灭的静默形态。
     // 期望值随行为一起改（用户 2026-11-10 授权），旧断言 `RETURN 0`/rc=0 一并作废。
@@ -285,4 +285,50 @@ END;
         !out.contains("KERNEL-0010"),
         "缺件门要拦在撞内核之前: {out}"
     );
+}
+
+// ------------------------------------------------- 执行面开关接线（V26.10 / 复核应修 C）
+
+/// 语料同款 LOOP/COMMIT/EXIT 例程：`COMMIT` 走 `--batch-commit` 的吞并路径。
+const LOOP_COMMIT_SQL: &str = "CREATE OR REPLACE PROCEDURE prc_fill(p_n IN INT) IS\n  v_i INT := 0;\nBEGIN\n  LOOP\n    v_i := v_i + 1;\n    COMMIT;\n    EXIT WHEN v_i >= p_n;\n  END LOOP;\nEND;\n/\n";
+
+#[test]
+fn should_call_routine_with_batch_commit_and_step_budget_flags() {
+    // 开关的实际接线此前只有解析层测试面：这里驱动**打包后的二进制**走完
+    // parse → cli::run → Engine::call，证明 `eng.batch_commit` / `eng.step_budget` 真被赋值。
+    let tmp = tempfile::tempdir().unwrap();
+    let f = write(tmp.path(), "routines.sql", LOOP_COMMIT_SQL);
+    let (code, out, err) = cli(&[
+        "call",
+        "--file",
+        &f.to_string_lossy(),
+        "--batch-commit",
+        "--step-budget",
+        "1000000",
+        "prc_fill",
+        "5",
+    ]);
+    assert_eq!(code, EXIT_OK, "{out}");
+    assert_eq!(out, "CALL prc_fill OK\n", "{out}");
+    assert_eq!(err, "", "全部输出走 stdout");
+}
+
+#[test]
+fn should_reject_step_budget_zero_with_usage_exit() {
+    // 0 拒绝在解析层：usage 退出码 2 + 消息含 flag 名
+    let (code, out, err) = cli(&["call", "--step-budget", "0", "prc_x"]);
+    assert_eq!(code, EXIT_USAGE, "{out}");
+    assert!(out.contains("--step-budget"), "{out}");
+    assert_eq!(err, "", "全部输出走 stdout");
+}
+
+#[test]
+fn should_call_routine_on_default_off_path() {
+    // 与 ON 路径同例程：锁「开关缺省不改变契约」
+    let tmp = tempfile::tempdir().unwrap();
+    let f = write(tmp.path(), "routines.sql", LOOP_COMMIT_SQL);
+    let (code, out, err) = cli(&["call", "--file", &f.to_string_lossy(), "prc_fill", "5"]);
+    assert_eq!(code, EXIT_OK, "{out}");
+    assert_eq!(out, "CALL prc_fill OK\n", "{out}");
+    assert_eq!(err, "", "全部输出走 stdout");
 }

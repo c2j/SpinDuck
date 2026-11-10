@@ -51,7 +51,7 @@ fn should_explain_routine_body_as_exact_ir_line() {
 #[test]
 fn should_explain_gbk_literal_verbatim_as_the_same_ir_as_its_utf8_twin() {
     // D9② 的 IR 侧证据：GBK 源经 `explain` 产出的那一行与 UTF-8  twin **逐字相同**，
-    // 说明还原发生在读入时、且没有把字面量送进 U+FFFD（V26.4 的旧形态是
+    // 说明还原发生在读入时、且没有把字面量送进 U+FFFD（V27.4 的旧形态是
     // `0\tassign\tp_o := '<U+FFFD>…'` + rc=0）。
     let tmp = tempfile::tempdir().unwrap();
     let gbk = write_gbk_routine(tmp.path(), "gbk.sql");

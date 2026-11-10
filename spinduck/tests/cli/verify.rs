@@ -39,7 +39,7 @@ fn should_verify_a_gbk_package_without_complaining_about_encoding() {
 
 #[test]
 fn should_exit_1_with_env_0030_when_corpus_is_valid_in_neither_encoding() {
-    // 核验面的判红另一半仍在（V26.4 的"verify 直接红"形态，输入换成两把判定都不成立的字节）。
+    // 核验面的判红另一半仍在（V27.4 的"verify 直接红"形态，输入换成两把判定都不成立的字节）。
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "spinduck.toml", PROJECT_GBK);
     write_bytes(

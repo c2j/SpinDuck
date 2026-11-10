@@ -58,7 +58,7 @@ fn should_mark_non_utf8_corpus_in_compile_report() {
     write_gbk_routine(tmp.path(), "gbk.sql");
     let dir = tmp.path().to_string_lossy().into_owned();
     let (code, out, _) = cli(&["compile", &dir]);
-    // 编码契约的第一种行为（V26.4）：有损解码 + 显式 (non-utf8) 标记，仍算 OK
+    // 编码契约的第一种行为（V27.4）：有损解码 + 显式 (non-utf8) 标记，仍算 OK
     assert_eq!(code, EXIT_OK, "{out}");
     assert!(
         out.contains(&format!("{dir}/gbk.sql  routines=1  (non-utf8)")),

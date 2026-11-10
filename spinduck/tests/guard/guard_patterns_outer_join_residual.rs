@@ -2,7 +2,7 @@
 //!
 //! 改写器只覆盖"逗号 FROM + 末表带标记"，其余形态**不剥标记**（保守边界，见
 //! `src/sql/patterns.rs` 的 `apply_on_from_where`）。本守护锁定两件事，供
-//! docs/validation.md V26 的交付件命中面结论有可复现依据：
+//! docs/validation.md V27 的交付件命中面结论有可复现依据：
 //! 1. 不适配形态的改写产物里 `(+)` 仍在（不静默改语义、也不静默丢标记）；
 //! 2. 该产物交给进程内内核执行是**显式失败**，不是返回空结果——即"没改写"的后果
 //!    是可诊断的错误，而非静默错值。
@@ -80,7 +80,7 @@ fn should_fail_loudly_in_kernel_on_residual_marker() {
         }
         Err(e) => e,
     };
-    // 实测（登记 docs/validation.md V26.2）：内核报 `Parser Error: syntax error at or
+    // 实测（登记 docs/validation.md V27.2）：内核报 `Parser Error: syntax error at or
     // near ")"`，且错误文本回显出错位置（含 `b.id(+)`）——"未改写"的后果是可诊断的
     // 解析错，不是静默空行集。断言按这一实测口径收紧，内核升级若改文案即红（V6 门禁复核）。
     let msg = err.message;

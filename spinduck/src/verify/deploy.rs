@@ -196,7 +196,7 @@ fn deploy_view(
 ///
 /// 按原文 `contains` 会漏掉语料的 `CREATE OR REPLACE /*FORCE*/ VIEW`（考题 9 个
 /// `1_V_*.sql`）：判定不成立 ⇒ 循环体一条都不下发，库里只剩 `SELECT 1` 占位视图，
-/// 视图体的列根本不存在（V29.4 ① 那条教训的部署面对偶）。
+/// 视图体的列根本不存在（V30.4 ① 那条教训的部署面对偶）。
 fn creates_view(unit: &str) -> bool {
     let toks = crate::verify::tokens(&unit.to_ascii_lowercase());
     let words: Vec<&str> = toks

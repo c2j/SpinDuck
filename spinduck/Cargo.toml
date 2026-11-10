@@ -1,6 +1,6 @@
 [package]
 name = "spinduck"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "GaussDB stored-procedure engine on DuckDB kernel"
 license = "MIT OR Apache-2.0"
@@ -57,6 +57,10 @@ name = "guard_tx_semantics"
 path = "tests/guard/guard_tx_semantics.rs"
 
 [[test]]
+name = "guard_exec_native_prepared_cache"
+path = "tests/guard/guard_exec_native_prepared_cache.rs"
+
+[[test]]
 name = "guard_execute_dynamic"
 path = "tests/guard/guard_execute_dynamic.rs"
 
@@ -77,8 +81,9 @@ name = "guard_patterns_outer_join_residual"
 path = "tests/guard/guard_patterns_outer_join_residual.rs"
 
 # CLI 契约层（AGENTS §4.1）跑真 `[[bin]] spinduck`，该 bin 要 `cli` feature。用
-# required-features 而非 #![cfg]：后者在 `--features native` 下收集 0 条 = "跳过即绿"。
-# 代价是常驻 CI 的 Test job（native）不构建本目标——补 CI 步骤属 Ask-first。
+# required-features 而非 `#![cfg]`：后者在 `--features native` 下收集 0 条 = "跳过即绿"。
+# CI 的 Test job 因此单步 `cargo test --features cli`（cli ⊇ native，覆盖面只增不减，
+# 见 AGENTS §9 与 workflow 注释）。
 [[test]]
 name = "cli"
 path = "tests/cli.rs"

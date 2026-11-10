@@ -281,6 +281,16 @@ PopFrame）。语义要点：
   默认**延迟事务模式**——过程体内的 COMMIT/ROLLBACK 记录为事务边界标记，
   在顶层 `CALL` 返回后统一执行；`strict_transactions = false` 选项下允许
   真实提交（文档明示与 GaussDB 的差异）。该差异必须写入兼容性清单。
+- **合并 COMMIT 开关**（`Engine::batch_commit`，默认 OFF；V26）：在"过程内
+  COMMIT 即时生效"的实现口径上，ON 时过程内 COMMIT 被吞并、INSERT 攒批
+  合并（同前缀连续攒入为一组，每组刷盘为一条多值 INSERT；缓冲行数上限
+  10,000），缓冲在例程出口统一刷盘、随顶层调用 COMMIT 一起
+  持久化。带 sqlfn 下沉（`fn_sites` 非空）或不可字面量化形态（INSERT … SELECT）
+  的语句不攒批、回落即时下发（`take_insert` 显式准入条件）。两处显式偏差：
+  ① 持久化粒度从行级变为调用级（连接中断不再留半截数据，亦不再逐行落盘）；
+  ② 合并语句失败回退逐行重放，失败行按数据
+  语义跳过、不进入 PL 异常处理器（inst_log 缺失）。机制细节见
+  `runtime/interp/writebuf.rs` 头注释，实证见 validation V26.3/V26.7。
 
 ### 3.6 目录与持久化
 
@@ -360,7 +370,7 @@ PACKAGE：spec+body 配对校验（ogsql 已有包一致性分析可复用），
 
 ## 6.1 字符集与时区声明（V1 兼容边界）
 
-- **编码统一 UTF-8（读入面判定，决策 2026-11-10 / D9②，实证 validation V32）**：引擎内部、
+- **编码统一 UTF-8（读入面判定，决策 2026-11-10 / D9②，实证 validation V33）**：引擎内部、
   结果、日志、golden 输出一律 UTF-8 不变。SQL **源文件**的读入走 `crate::source::decode`
   的两把严格判定：UTF-8 合法即用，否则按 GBK 解码（`encoding_rs`），两种都不合法即
   `ENV-0030` 判红——不猜第三种编码，也不退回有损解码。原条文"引擎不做运行时编码探测、
@@ -645,7 +655,13 @@ $SPINDUCK_HOME/                       # 根路径，配置项 home；默认 ./�
  "msg":"...", "err":"PL-04001"}            // 错误码来自异常映射表（规则数据）
 
 // audit 专属：{"user":"…","args_digest":"sha256:…","sql_count":12,"duration_ms":1843}
-// trace 专属：{"event":"SQL_EXEC|CURSOR_OPEN|FETCH|UDF_CALL|IR_STMT","detail":{…},"elapsed_us":97}
+// trace 专属：{"event":"SQL_EXEC|CURSOR_OPEN|FETCH|UDF_CALL|IR_STMT|BATCH_SKIP","detail":{…},"elapsed_us":97}
+//   BATCH_SKIP detail 形态（V26，第四轮复审确认并入契约）：
+//   {"event":"BATCH_SKIP","detail":{"rows":1,"first_error":"KERNEL-0010 constraint violation"},"elapsed_us":0}
+//   ——合并 COMMIT 开关 ON 的回放期被跳过行数与首个错误（含错误码）
+//   注意：exec_native 把所有 DuckDB 错误统一映射为 KERNEL-0010，因此该码
+//   不承担「引擎缺陷 vs 业务跳行」的判别维度——判别信号是 BatchSkip 事件
+//   本身 + first_error 的 message 文本，勿按错误码写告警规则（第五轮复审口径）
 // engine 专属：{"component":"interp|exec|catalog|rules","kv":{…}}
 ```
 
@@ -1061,13 +1077,13 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
   §13.1 的物化，装配面只管对象与例程。
 - `plan.schema` 只随计划透传、不参与下发：对象一律落在内核默认目录 `main`，与 `verify` 的既有
   判定口径一致。design §6.1 的草图只给了 `schema` 字段、没有约定 `deploy` 用它建 schema，
-  本文把它**明确记为未落地**（validation V30.7），不假装支持。
+  本文把它**明确记为未落地**（validation V31.7），不假装支持。
 - **非幂等**：对同一个已装配过的库文件再跑一次会撞 `CREATE TABLE` 已存在（内核报错原样带出，
   不静默跳过）。`deploy` 的语义是"从零装配一个库"，重来请换文件或先删。
 - **例程不落盘**（与上一条同量级的口径限制）：`register_routine_files` 走的是进程内例程目录
   （`src/catalog.rs` 的 `register`），写进库文件的只有表/序列/视图与数据。因此"部署好的库"
   只承诺**对象面**可跨进程复用；换一个进程 `call --db <库>` 而不带 `--file`，得到的是
-  `[BIZ-0150] routine … not registered`（一手证据见 validation V30.3）。免逐个传源码要靠
+  `[BIZ-0150] routine … not registered`（一手证据见 validation V31.3）。免逐个传源码要靠
   `call --plan`（design D5/R3，A2-4），不是靠 `deploy` 把存过存进库。
 
 退出码：`0` 装配完成 / `1` 计划带缺件 / `2` 用法错（缺 `--db`、多余位置参数）；
@@ -1079,8 +1095,8 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
 
 | 入口 | 目标与例程源从哪来 | 缺件门 |
 |---|---|---|
-| `call [--db <f>] [--file <sql>]... <routine> [args...]` | 位置参数给名，`--file` 给源码 | **内核目录**：链路上任何 `relation:`/`sequence:` 在内核 catalog 里没有 ⇒ 列清单、rc=1、不执行 |
-| `call --plan <计划.toml> [--db <f>] [--file <sql>]... [args...]` | 计划给目标与闭包内例程源，`--file` 退化为"计划外追加" | **两道**：计划自带 `[[missing]]` 非空 ⇒ 先拒且**不开库**；计划干净再走上一条的内核门 |
+| `call [--db <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>] <routine> [args...]` | 位置参数给名，`--file` 给源码 | **内核目录**：链路上任何 `relation:`/`sequence:` 在内核 catalog 里没有 ⇒ 列清单、rc=1、不执行 |
+| `call --plan <计划.toml> [--db <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>] [args...]` | 计划给目标与闭包内例程源，`--file` 退化为"计划外追加" | **两道**：计划自带 `[[missing]]` 非空 ⇒ 先拒且**不开库**；计划干净再走上一条的内核门 |
 
 落点三段：
 
@@ -1092,6 +1108,10 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
 
 口径：
 
+- **开关与目标形态无关**：`--batch-commit` / `--step-budget` 在同一个解析循环里读，
+  赋值发生在注册循环之前，所以裸名面与计划面吃下的是同一套执行面开关；且用法判定
+  （如 `--step-budget 0`）**排在计划文件读取之前**——缺计划文件不得掩盖用法错
+  （两个退出码分别是 2 与 1，判据见 validation V36）。
 - **红必须早于产出**：门判缺件时 stdout 只有 `MISS <object> <- <from>` 行 + 一行摘要，
   不含 `OUT`/`RETURN`/`CALL … OK`（`tests/cli/call.rs` 逐字锁死）。形态 C 那种
   `RETURN 0` + rc=0 的静默面就此消失（design §3.3）。
@@ -1101,7 +1121,7 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
 - `routine:` 缺件与表/序列缺件同列一份清单，按标识排序去重；`engine_provided`（`sys_dummy`）短路。
 - 名称口径与调用本身同源：目标走 `catalog.lookup`（与 `Engine::call` 同一个键），摘要行
   `target=` 用小写归一名，与 `plan`/`deploy` 一致——门不能比它守护的那次调用更宽或更严。
-- **表达式级被调函数进闭包（design A2-5，V33）**：`routine_refs` 只给"确定是例程"的名字
+- **表达式级被调函数进闭包（design A2-5，V34）**：`routine_refs` 只给"确定是例程"的名字
   （语句级 `CALL` + 带包限定的表达式调用 + SQL 下沉点），PL 表达式里的裸名调用
   （`v := fnc_x()`）走第三个采集面 `expr_func_names`——它交的是**候选**，不是结论：
   闭包逐个拿例程目录精确查名，命中才把被调函数排进 BFS，于是**它自己的表**同时进
@@ -1111,12 +1131,12 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
   假缺件，等于门比它守护的那次调用更严。考题语料实测：10 条 entry 的 `missing` 仍全为 0，
   而 `routines`/`tables` 两条清单同步变大（entry5 由 7/20 到 24/41）；把"未命中也报缺件"
   这一变体在同一条闭包上跑出来，9 条 entry 共 23 行 `MISS routine:`，去重只有 4 个名字
-  （`coalesce`、`now`、`round`、`substring`），全是内建或规则改名后的内建（V33.4）。
+  （`coalesce`、`now`、`round`、`substring`），全是内建或规则改名后的内建（V34.4）。
 - **仍然看不见的两类**（登记于 design §8「缺件门的盲区」行）：① 被调函数**源码不在本次
   注册面里**（`call` 少给了一个 `--file`）——目录里没有这个名字，门与运行期一样无从判断，
   后果仍是 `KERNEL-0010` 响亮报错；② 同包成员函数按裸名调用（登记名是 `pkg.fnc_x`）——
   这是**分派**面的缺口（`eval_funccall` 不做包名补全），不在闭包里补，否则计划要为一次
-  根本不会命中的调用铺表。语料实测此类为 0（V33.4），要收口须改解释器分派，属另立编号。
+  根本不会命中的调用铺表。语料实测此类为 0（V34.4），要收口须改解释器分派，属另立编号。
 
 退出码与通道沿用 §1 CLI 契约：`0` 正常返回 / `1` 缺件红或引擎错误 / `2` 用法错（`call` 无目标）。
 
@@ -1137,7 +1157,7 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
   是"`from_utf8_lossy` 把中文字面量换成 U+FFFD 却 rc=0"，有损兜底一旦回来，MATCH/NO_MATCH
   分叉就回来（判据实验见 design §3.5，`tests/cli/call.rs` 锁在 D9② 两侧都是 `RETURN MATCH`）。
 - **UTF-8 优先是判定不是风格**：交付件里 11,462 个 UTF-8 文件中 5,130 个的字节同时是合法 GBK，
-  按 GBK 读它们必然乱码。所以顺序先 UTF-8，且这份优先级有实测计数支撑（V32.4）。
+  按 GBK 读它们必然乱码。所以顺序先 UTF-8，且这份优先级有实测计数支撑（V33.4）。
 - **转码发生在读入时，语料文件逐字不动**（AGENTS §6）。引擎不写回源文件，也不提供
   `--encoding` 覆盖：一旦允许人工指定，同一份语料就能被解成两种文本，正是本轮要消灭的形态。
 - 错误码分工：读不到文件 = `ENV-0010`（`read <path>: <io>`），读到但两把判定都不成立 =
@@ -1174,7 +1194,7 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
 - **行序默认是判据，`--key` 下不是**：实例侧不保证行序。键列按大小写不敏感定位，
   **键列找不到即 `ENV-0031`，绝不退化成位置序**——把"没比成"说成"比过了"是本命令最危险的
   静默形态。重复键：排序稳定，同键的几行按文件序两两配对。
-- **多语句必须拒**（一手发现，validation V34.2）：DuckDB 的 `prepare` 对 `SELECT 1; SELECT 2`
+- **多语句必须拒**（一手发现，validation V35.2）：DuckDB 的 `prepare` 对 `SELECT 1; SELECT 2`
   **不报错**，它把两句都执行、只把最后一句的结果集给回来。若"交给内核报红"，两行的 `.sql`
   会得到一份只覆盖第二句的快照，而第一句若含写入已经落进库。故切句在 core：只在 `'…'`/`"…"`
   （`''`、`""` 为转义）、`--` 行注释、`/* */` 块注释**之外**的分号处切，切出来多于一条即
@@ -1189,7 +1209,7 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
   内核报错原样带出（`KERNEL-*`，§5 归域在产生点）。口令类参数一个都没有：`query`
   只接本地 DuckDB 文件，实例侧采集属 A0b/A1/A3。
 - 归一收口的性质：这是**纯去重**，两份副本的语句序列与 core 实现完全相同，只差形参名与一行
-  注释（diff 原文见 V34.3）。等价性的两手证据在 V34.3/V34.6（corpus 层、进程内 cases 层、
+  注释（diff 原文见 V35.3）。等价性的两手证据在 V35.3/V35.6（corpus 层、进程内 cases 层、
   真容器黄金层各自全绿，期望值一个没收），且 `-.0 → -0` 这一既有怪癖被新单测原样锁定，
   而不是"顺手修正"。
 

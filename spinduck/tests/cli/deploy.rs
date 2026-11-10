@@ -80,7 +80,7 @@ fn should_leave_a_persisted_database_a_second_process_can_run_against() {
 #[test]
 fn should_call_the_plan_target_without_passing_any_source_file() {
     // A2-4（design D5/R3）：计划里既有目标例程也有例程源清单，所以 `call --plan` 不必再
-    // 逐个 `--file`。这条同时是 V30.3 那条反面事实的解——例程注册在**进程内**目录，
+    // 逐个 `--file`。这条同时是 V31.3 那条反面事实的解——例程注册在**进程内**目录，
     // 换一个进程只带 `--db` 会得到 `BIZ-0150 not registered`；带计划即由计划补回源码面。
     let tmp = tempfile::tempdir().unwrap();
     let plan = deployed_plan(tmp.path());
@@ -104,6 +104,55 @@ fn should_call_the_plan_target_without_passing_any_source_file() {
     assert_eq!(code, EXIT_OK, "{out}");
     assert_eq!(out, "OUT p_o = 1\n", "计划面调用要跑库里已有的表: {out}");
     assert_eq!(err, "", "全部输出走 stdout");
+}
+
+#[test]
+fn should_apply_the_execution_flags_on_the_plan_face_too() {
+    // 合并轮（V36）：`--batch-commit` / `--step-budget` 是主干侧的执行面开关，`--plan`
+    // 是本分支的目标面入口。两者共用同一个解析循环与同一个 `call_cmd`，所以计划面也必须
+    // 吃下这两个开关——否则"发版二进制按计划跑千万级真题"就没有放大步数预算的入口。
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = deployed_plan(tmp.path());
+    let db = tmp.path().join("work.duckdb");
+    let (code, out, _) = cli(&[
+        "deploy",
+        &plan.to_string_lossy(),
+        "--db",
+        &db.to_string_lossy(),
+    ]);
+    assert_eq!(code, EXIT_OK, "{out}");
+
+    let (code, out, err) = cli(&[
+        "call",
+        "--plan",
+        &plan.to_string_lossy(),
+        "--db",
+        &db.to_string_lossy(),
+        "--batch-commit",
+        "--step-budget",
+        "1000000",
+        "0",
+    ]);
+    assert_eq!(code, EXIT_OK, "{out}");
+    assert_eq!(
+        out, "OUT p_o = 1\n",
+        "计划面带开关的输出要与不带时逐字相同: {out}"
+    );
+    assert_eq!(err, "", "全部输出走 stdout");
+
+    // 用法判定排在计划 IO 之前：缺文件不得掩盖 `--step-budget 0`（对比上面
+    // `env_0010_when_the_plan_file_given_to_call_is_absent`，同一条路径单给是 EXIT_FAIL）
+    let bogus = tmp.path().join("nope.toml");
+    let (code, out, _) = cli(&[
+        "call",
+        "--plan",
+        &bogus.to_string_lossy(),
+        "--step-budget",
+        "0",
+    ]);
+    assert_eq!(code, EXIT_USAGE, "usage 要先于计划读取: {out}");
+    assert!(out.contains("--step-budget"), "{out}");
+    assert!(!out.contains("[ENV-0010]"), "{out}");
 }
 
 #[test]

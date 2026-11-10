@@ -27,22 +27,35 @@ use std::path::{Path, PathBuf};
 
 #[test]
 fn native_asserts_split_agg() {
-    run_project("case_split_agg");
+    run_project("case_split_agg", false);
 }
 
 #[test]
 fn native_asserts_corpus_stock_kind() {
-    run_project("case_corpus_stock_kind");
+    run_project("case_corpus_stock_kind", false);
 }
 
 #[test]
 fn native_asserts_corpus_min_tax() {
-    run_project("case_corpus_min_tax");
+    run_project("case_corpus_min_tax", false);
 }
 
 #[test]
 fn native_asserts_corpus_purchase() {
-    run_project("case_corpus_purchase");
+    run_project("case_corpus_purchase", false);
+}
+
+/// ON 模式内核级 A/B（复核应修 1）：同一部署、同一断言集在 batch_commit = ON
+/// 下复跑——手工拼接的合并 INSERT 产物必须被真实内核解析且逐值一致；
+/// `case_split_agg` 的 INSERT 带 `fnc_fee` 下沉，同时钉住准入回落路径。
+#[test]
+fn native_asserts_split_agg_batch_commit_on() {
+    run_project("case_split_agg", true);
+}
+
+#[test]
+fn native_asserts_corpus_purchase_batch_commit_on() {
+    run_project("case_corpus_purchase", true);
 }
 
 fn golden_root() -> PathBuf {
@@ -58,7 +71,8 @@ fn probe_mode() -> bool {
 }
 
 /// 一个项目跑完：部署 → 每个用例的场景调用 + 断言集 → 一次性汇总失败。
-fn run_project(name: &str) {
+/// `batch_commit` 复核应修 1：ON 变体复用同一断言集（开关不改变数据的门禁）。
+fn run_project(name: &str, batch_commit: bool) {
     let root = golden_root().join(name);
     let project = ProjectConfig::load(&root)
         .unwrap_or_else(|e| panic!("[{name}] 项目加载失败: {}", e.message));
@@ -67,6 +81,7 @@ fn run_project(name: &str) {
         .unwrap_or_else(|e| panic!("[{name}] 规则加载失败: {}", e.message));
     let ex = DuckExecutor::open_in_memory().expect("open duckdb");
     let mut eng = Engine::new(Box::new(ex), rules);
+    eng.batch_commit = batch_commit;
     deploy_project(&mut eng, &project)
         .unwrap_or_else(|e| panic!("[{name}] 部署失败 [{}]: {}", e.code, e.message));
 

@@ -18,6 +18,15 @@ pub struct Engine {
     pub catalog: RoutineCatalog,
     /// 已装为 DuckDB 宏的表达式函数（这些名字不再参与 SQL 上下文下沉）
     macro_names: std::collections::BTreeSet<String>,
+    /// 顶层调用的解释器步数预算（ENG-0032 护栏；嵌套例程仍各自取默认值）
+    pub step_budget: u64,
+    /// 合并 COMMIT 开关（默认关 = §3.5「COMMIT 即时生效」不变）：ON 时过程内
+    /// INSERT 攒批合并、COMMIT 吞并，出口统一刷盘由调用 COMMIT 持久化。
+    /// 偏差点：失败行跳过发生在刷盘期，不进入 PL 异常处理器（见 writebuf.rs）。
+    pub batch_commit: bool,
+    /// 纯标量语句记忆化缓存（`ex` 内的 MemoizingExecutor 与本句柄共享），
+    /// 每次顶层调用入口清空，给缓存一个确定的内存上界。
+    memo: std::rc::Rc<crate::exec::MemoCache>,
 }
 
 pub struct CallResultExt {
@@ -28,11 +37,16 @@ impl Engine {
     pub fn new(ex: Box<dyn SqlExecutor>, rules: RuleRegistry) -> Self {
         let mut catalog = RoutineCatalog::new();
         catalog.set_sql_rules(rules.clone());
+        let memo = std::rc::Rc::new(crate::exec::MemoCache::default());
+        let ex = Box::new(crate::exec::MemoizingExecutor::with_cache(ex, memo.clone()));
         Self {
             ex,
             rules,
             catalog,
             macro_names: std::collections::BTreeSet::new(),
+            step_budget: crate::runtime::interp::DEFAULT_STEP_BUDGET,
+            batch_commit: false,
+            memo,
         }
     }
 
@@ -305,6 +319,7 @@ impl Engine {
 
     /// 调用例程（§12 P5）：IN 按值、OUT/INOUT 按位取回、函数返回标量。
     pub fn call(&mut self, name: &str, args: &[SpinValue]) -> Result<CallResult, EngineError> {
+        self.memo.clear();
         let routine = self
             .catalog
             .lookup(name)
@@ -332,6 +347,10 @@ impl Engine {
             &mut sink,
             &self.catalog,
             0,
+            crate::runtime::RunLimits {
+                budget: self.step_budget,
+                batch_commit: self.batch_commit,
+            },
         ) {
             Ok(out) => out,
             Err(mut e) => {

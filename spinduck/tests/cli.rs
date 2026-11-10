@@ -6,12 +6,15 @@
 //! "全部输出走 stdout、stderr 恒空"这条渲染纪律。
 //!
 //! 期望值均在 `--features cli` 构建的二进制上实测；实证登记见 docs/validation.md
-//! V26.1（`call` 三形态）、V26.4（编码三入口）、V26.5（`verify`）、V27（本层落地）、
-//! V28（D9① 执行面判红：`call`/`explain` 两条期望值随行为同批改）、V30（`deploy` 契约）、
-//! V31（D5 缺件门扩到 `call` 两条入口 + `call --plan`：形态 C/A/B 三条期望值同批改判）、
-//! V32（D9② 真 GBK 解码：编码三条期望值再改判 + 判据实验"同源码仅编码不同 → 同结果"）、
-//! V33（A2-5 表达式级被调函数进闭包：`plan` 与 `call` 各新增缺件契约，无既有期望值改判）、
-//! V34（A5 本地半边：新增 `query`/`compare` 两组契约，无既有期望值改判）。
+//! V27.1（`call` 三形态）、V27.4（编码三入口）、V27.5（`verify`）、V28（本层落地）、
+//! V29（D9① 执行面判红：`call`/`explain` 两条期望值随行为同批改）、V30（`plan` 闭包与
+//! 计划落盘：计划面契约）、V31（`deploy` 契约）、
+//! V32（D5 缺件门扩到 `call` 两条入口 + `call --plan`：形态 C/A/B 三条期望值同批改判）、
+//! V33（D9② 真 GBK 解码：编码三条期望值再改判 + 判据实验"同源码仅编码不同 → 同结果"）、
+//! V34（A2-5 表达式级被调函数进闭包：`plan` 与 `call` 各新增缺件契约，无既有期望值改判）、
+//! V35（A5 本地半边：新增 `query`/`compare` 两组契约，无既有期望值改判）、
+//! V36（与主干 V26 性能轮合并：`--batch-commit`/`--step-budget` 三条二进制契约折进
+//! `call` 子模块，并新增"计划面也吃下执行开关"的组合契约）。
 //!
 //! 按职责分子模块（AGENTS §3：单文件 ≤500 行），本文件只放共享夹具与接缝：
 //! `usage`（版本/用法/输出通道）、`compile`、`rules_explain`、`call`（含编码两代判定与
@@ -82,7 +85,7 @@ pub(crate) const RULES_DRIFT: &str = "target_duckdb = \"1.5.5\"\nprobe_duckdb = 
 /// "中文"的 GBK 字节（`0xD6 0xD0 0xCE 0xC4`）——非 UTF-8，编码契约的输入形态。
 pub(crate) const GBK_ZHONGWEN: [u8; 4] = [0xD6, 0xD0, 0xCE, 0xC4];
 
-/// `call` 三形态共用的主角、实参与资产相对路径（V26.1 同一口径）。
+/// `call` 三形态共用的主角、实参与资产相对路径（V27.1 同一口径）。
 pub(crate) const PURCHASE_ROUTINE: &str = "FNC_GET_PURCHASE_JS_DAYS";
 pub(crate) const PURCHASE_DATE: &str = "'20250715'";
 pub(crate) const PURCHASE_ID: &str = "'0130000001'";
@@ -136,7 +139,7 @@ pub(crate) fn write(dir: &Path, rel: &str, text: &str) -> PathBuf {
     p
 }
 
-/// 写出含 GBK 中文字面量的例程文件（V26.4 的输入形态）。
+/// 写出含 GBK 中文字面量的例程文件（V27.4 的输入形态）。
 pub(crate) fn write_gbk_routine(dir: &Path, rel: &str) -> PathBuf {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(
