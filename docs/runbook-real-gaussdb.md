@@ -71,11 +71,15 @@ export SPINDUCK_OG_PASSWORD=…   # 口令只经 env，不要写进任何文件
 export SPINDUCK_OG_DB=<库名>
 ```
 
-连通性冒烟（最小表、只读）：
+连通性冒烟（最小表、只读）。`materialize` 会先校验**本地库已存在目标表**
+（`ENV-0015`，物化只灌数据不建表），所以冒烟分两步——先建一张本地占位表：
 
 ```bash
-target/release/spinduck materialize --db /tmp/smoke.duckdb --table <一张小表> --where "1=0"
-# 成功 = 通道可达 + 认证通过；失败先看错误域（ENV-0014 = env 未配 / KERNEL = 连接层）
+printf 'CREATE TABLE smoke_t0(a INT);' > /tmp/smoke_t0.sql
+target/release/spinduck query /tmp/smoke.duckdb --sql-file /tmp/smoke_t0.sql --out /tmp/ddl.out
+target/release/spinduck materialize --db /tmp/smoke.duckdb --table smoke_t0 --where "1=0"
+# 成功（rows=0）= 通道可达 + 认证通过；失败先看错误域
+# （ENV-0014 = env 未配 / ENV-0015 = 本地目标表未建 / KERNEL = 连接层）
 ```
 
 > openGauss 官方镜像在 **arm64 宿主**上会解析到 amd64 userland，起容器即
@@ -119,27 +123,37 @@ target/release/spinduck plan <目标例程>     # 落盘到 .spinduck/plan/<目�
 
 ---
 
-## 4. 本地侧：物化数据 → 部署 → 执行 → 快照
+## 4. 本地侧：部署 → 物化 → 执行 → 快照
 
-按计划 `[sources].materialize` 清单把输入表从实例物化到本地 DuckDB
-（只读实例，`SELECT` 进本地库）：
+> 顺序是硬依赖：**先 deploy 后 materialize**。schema 的唯一来源是计划
+> `ddl_tables`（deploy 逐文件下发建表）；`materialize` 只灌数据、不建表，
+> 本地表缺失会以 `ENV-0015` 显式红并指路 deploy（零行 `--where "1=0"` 同样红，
+> 无"成功假象"）。
+
+第一步：部署——把计划清单（表/视图/例程 DDL）装进本地 DuckDB：
 
 ```bash
 PLAN=.spinduck/plan/<目标例程>.toml
+target/release/spinduck deploy "$PLAN" --db run/local.duckdb
+```
+
+第二步：物化——按计划 `[sources].materialize` 清单把输入表从实例拉进本地库
+（只读实例，`SELECT` 进本地库）：
+
+```bash
 for t in $(sed -n '/^\[sources\]/,/^\[/p' "$PLAN" | grep '^"' | tr -d '"'); do
   # 或直接逐条手敲清单里的表名
   target/release/spinduck materialize --db run/local.duckdb --table "$t"
 done
 ```
 
-部署与执行（两条路等价，按需选）：
+第三步：执行（两条路等价，按需选）：
 
 ```bash
-# 路线 A：显式两步（便于在部署后插桩、复查）
-target/release/spinduck deploy "$PLAN" --db run/local.duckdb
+# 路线 A：对已部署的落盘库执行（部署在第一步已完成，便于插桩、复查）
 target/release/spinduck call --db run/local.duckdb --plan "$PLAN" '20250715' '0130000001'
 
-# 路线 B：一步直呼（内存库）
+# 路线 B：一步直呼（内存库，部署在进程内完成）
 target/release/spinduck call --plan "$PLAN" '20250715' '0130000001'
 ```
 
