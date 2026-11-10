@@ -287,7 +287,7 @@ CI 定义 `.github/workflows/ci.yml`。常驻门禁五个 job 全部必须通过
   runner 必须是 amd64：官方镜像在 arm64 hosted runner 上解析到 amd64 userland，
   起容器即 `gosu: cannot execute binary file: Exec format error`，换平台这条路被
   CI 实测堵死，见 validation V21.12。语料级用例的黄金层只比最简函数，考题业务过程
-  的多维断言走进程内内核（`cargo test --features native --test cases_native`）；
+  的多维断言走进程内内核（`cargo test --features cli --test cases_native`）；
   调整的是**参照侧被测面划分**，不是断言——用例、期望基线、判定门禁一条不减）
 
 此外 **Platform Build**（发版触发，非常驻门禁）定义在 `.github/workflows/release.yml`：
