@@ -234,3 +234,36 @@ fn gauss_e2e_materialize_with_where_clause() {
         .unwrap();
     assert_eq!(s.fetch_many(1).len(), 1);
 }
+
+/// 物化前置守卫（回归守护，V26.11）：本地 DuckDB 缺目标表时必须**在任何
+/// GaussDB 拉取之前**显式红，且消息指路 deploy——`--where "1=0"` 这类零行
+/// 路径过去会静默"成功"（INSERT 不执行，缺表不暴露），是本次缺陷的形态。
+#[test]
+fn should_fail_materialize_when_local_table_missing() {
+    let Some(mut og) = og() else {
+        panic!(
+            "E2E 用例需要 A 模式容器（golden/gaussdb-docker）：\n\
+             docker compose -f golden/gaussdb-docker/docker-compose.yml up -d\n\
+             SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 SPINDUCK_OG_PASSWORD=… cargo test --features gauss"
+        );
+    };
+    let _ = og.exec("DROP TABLE IF EXISTS sd_guard");
+    og.exec("CREATE TABLE sd_guard(a VARCHAR(20), n INT)")
+        .unwrap();
+    og.exec("INSERT INTO sd_guard VALUES ('x', 1)").unwrap();
+
+    // 本地库存在但**没有** sd_guard：守卫必须在拉取前红
+    let ex = DuckExecutor::open_in_memory().unwrap();
+    let err = og
+        .materialize(&ex, "sd_guard", Some("n = 1"))
+        .expect_err("本地缺表必须显式红");
+    let text = err.to_string();
+    assert!(text.starts_with("[ENV-0015]"), "{text}");
+    assert!(text.contains("deploy"), "消息必须指路 deploy：{text}");
+
+    // 零行路径同样红：守卫先于 fetch，`1=0` 不再有假绿
+    let err0 = og
+        .materialize(&ex, "sd_guard", Some("1=0"))
+        .expect_err("零行路径也必须红（假绿禁止）");
+    assert!(err0.to_string().starts_with("[ENV-0015]"), "{err0}");
+}

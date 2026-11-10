@@ -107,8 +107,54 @@ impl GaussConn {
         Ok((schema, out))
     }
 
+    /// 物化前置守卫（V26.11）：本地 DuckDB 必须已有目标表——schema 所有权归
+    /// `deploy`（计划 `ddl_tables` 唯一真相），物化只灌数据。守卫先于 GaussDB
+    /// 拉取执行，`--where "1=0"` 的零行路径不再静默"成功"。
+    ///
+    /// 名字比较两侧 lower（DuckDB 标识符缺省小写，CLI 实参大小写不敏感）；
+    /// 表名走绑定传参，不拼字符串。缺表 = 本地前置未就绪，归 `ENV-0015`。
+    fn ensure_local_table(
+        duck: &dyn crate::exec::SqlExecutor,
+        table: &str,
+    ) -> Result<(), EngineError> {
+        let mut binds = BindMap::new();
+        binds.insert("t".into(), SpinValue::Str(table.into()));
+        let mut s = duck.query(
+            "SELECT count(*) FROM duckdb_tables() WHERE lower(table_name) = lower($t)",
+            &binds,
+        )?;
+        let n = match s.fetch_many(1).first() {
+            Some(row) => match row.first() {
+                Some(SpinValue::Int(c)) => *c,
+                other => {
+                    return Err(EngineError::env(
+                        15,
+                        format!("本地表存在性检查返回异常值 {other:?}（表 {table}）"),
+                    ))
+                }
+            },
+            None => {
+                return Err(EngineError::env(
+                    15,
+                    format!("本地表存在性检查无结果（表 {table}）"),
+                ))
+            }
+        };
+        if n == 0 {
+            return Err(EngineError::env(
+                15,
+                format!(
+                    "本地表 {table} 不存在：materialize 只灌数据不建表，\
+                 先执行 deploy <计划.toml> --db <本地库> 建好 schema 再物化"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// 物化（§13.1）：GaussDB 表（可带 WHERE）→ 本地 DuckDB 表（INSERT 文本承载）。
-    /// 要求 DuckDB 侧表已由 load 通道建好（类型一致，§13.1 类型保真）。
+    /// 要求 DuckDB 侧表已由 deploy 通道建好（类型一致，§13.1 类型保真）；
+    /// 缺表在拉取前由 [`ensure_local_table`] 显式红（V26.11，消灭零行假绿）。
     ///
     /// V26：逐行改 500 行/语句的批量多值 INSERT（字面量形态与逐行逐字一致，
     /// 类型转换仍由 DuckDB 列类型完成；100k 实测见 validation V26.4）。
@@ -118,6 +164,7 @@ impl GaussConn {
         table: &str,
         where_clause: Option<&str>,
     ) -> Result<usize, EngineError> {
+        Self::ensure_local_table(duck, table)?;
         let sql = match where_clause {
             Some(w) => format!("SELECT * FROM {table} WHERE {w}"),
             None => format!("SELECT * FROM {table}"),
@@ -211,5 +258,83 @@ fn csv_field(v: Option<&str>) -> String {
         Some("") => "\"\"".to_string(),
         Some(s) if s.contains([',', '"', '\n', '\r']) => format!("\"{}\"", s.replace('"', "\"\"")),
         Some(s) => s.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::{ExecOutcome, RowStream, SqlExecutor};
+    use std::cell::RefCell;
+
+    /// 假执行器：记录收到的 SQL，对 duckdb_tables 探针回放配置的 count 值。
+    /// 只服务 [`ensure_local_table`] 的行为断言（§4.1：单测不触真实内核）。
+    struct FakeDuck {
+        count: RefCell<i64>,
+        seen_sql: RefCell<Vec<String>>,
+        seen_t: RefCell<Option<String>>,
+    }
+
+    impl FakeDuck {
+        fn with_count(n: i64) -> Self {
+            Self {
+                count: RefCell::new(n),
+                seen_sql: RefCell::new(Vec::new()),
+                seen_t: RefCell::new(None),
+            }
+        }
+    }
+
+    impl SqlExecutor for FakeDuck {
+        fn query(&self, sql: &str, binds: &BindMap) -> Result<RowStream, EngineError> {
+            self.seen_sql.borrow_mut().push(sql.into());
+            *self.seen_t.borrow_mut() = binds.get("t").and_then(|v| match v {
+                SpinValue::Str(s) => Some(s.clone()),
+                _ => None,
+            });
+            Ok(RowStream::new(
+                vec!["count_star()".into()],
+                vec![vec![SpinValue::Int(*self.count.borrow())]],
+            ))
+        }
+
+        fn execute(&self, _sql: &str, _binds: &BindMap) -> Result<ExecOutcome, EngineError> {
+            unreachable!("守卫只发查询")
+        }
+    }
+
+    #[test]
+    fn should_err_env_0015_with_deploy_hint_when_table_missing() {
+        let duck = FakeDuck::with_count(0);
+        let err = GaussConn::ensure_local_table(&duck, "mid_yjqs_detail").unwrap_err();
+        let text = err.to_string();
+        assert!(text.starts_with("[ENV-0015]"), "{text}");
+        assert!(text.contains("deploy"), "必须指路 deploy：{text}");
+    }
+
+    #[test]
+    fn should_pass_when_table_present() {
+        let duck = FakeDuck::with_count(1);
+        assert!(GaussConn::ensure_local_table(&duck, "mid_yjqs_detail").is_ok());
+    }
+
+    #[test]
+    fn should_pass_case_insensitively_and_bind_table_name() {
+        let duck = FakeDuck::with_count(1);
+        assert!(GaussConn::ensure_local_table(&duck, "MID_YJQS_DETAIL").is_ok());
+        // 表名必须经绑定传参（$t），不进 SQL 字面量
+        assert!(
+            !duck
+                .seen_sql
+                .borrow()
+                .iter()
+                .any(|s| s.contains("MID_YJQS")),
+            "表名不得拼进 SQL 文本"
+        );
+        assert_eq!(
+            duck.seen_t.borrow().as_deref(),
+            Some("MID_YJQS_DETAIL"),
+            "表名应经 $t 绑定传入"
+        );
     }
 }
