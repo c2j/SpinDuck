@@ -3851,10 +3851,18 @@ CONFLICTING + `statusCheckRollup: []`（CI 根本不启动）变成 UNSTABLE + �
 整份日志 `grep -cE "test result: FAILED|panicked"` = **0**。两个 job 的总数与本机逐项相等，
 说明 CI 与本地不是"两套口径刚好都绿"，而是同一条命令面（`--features cli` / `--features gauss`）。
 
-合并提交本身那一次（run `42779313763`，head `d6e58bc`）也跑完且 `conclusion = success`，
-五个 job 同样全绿——但那一轮只核到 job conclusion，没再抓断言输出；被核到断言面的是
-上表这次 `aa8588f`，两者只差一个纯文档提交（`git diff d6e58bc aa8588f --stat` = 只有
-`docs/validation.md`）。按 V25 立的规矩，能当"CI 已验证"用的是**有断言输出的那一次**。
+**追平到 head SHA 的那一次（run `42780608895`，head `cde7ae1`）**：上面这张表核的是 `aa8588f`，
+而 PR 的最终 head 因这两个纯文档提交后移了两次，所以把同一套抓取重跑一遍——
+`gh run view 42780608895 --log` 按 job 聚合：`test` **475 passed**、
+`Running tests/cli.rs` 仍是 `test result: ok. 78 passed; 0 failed`、`golden` **403 passed**、
+全日志 `test result: FAILED|panicked` 计数 **0**，与上表逐项相等；
+`gh pr view 8` 侧 `mergeStateStatus = CLEAN`、`mergeable = MERGEABLE`。
+即**"CI 已验证的 head SHA"这条口径成立的是 `cde7ae1`**（数字面同一棵代码树，文档提交不动判定面）。
+
+更早的合并提交那一次（run `42779313763`，head `d6e58bc`）`conclusion = success`、五 job 全绿，
+但那一轮只核到 job conclusion、没抓断言输出，故不作为"CI 已验证"的引用对象。
+写下本段的这一个提交又是纯文档——按 V25 定的顺序，它不再往文档里追登记（否则无限递归），
+终局口径是：**要 bump/tag 时，tag 必须指在当次 CI 已验证的 main head 上**（AGENTS §9）。
 
 **仍是推算的 / 未覆盖**
 
