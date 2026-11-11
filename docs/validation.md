@@ -4074,7 +4074,9 @@ exit 2、真实参 `100` → RETURN 0.08 exit 0；规则项目 `compile` 绿且 
     单测：`should_not_fall_back_to_insert_when_copy_already_loaded`、
     `should_err_loaded_when_csv_rows_mismatch_loaded_rows`、
     `should_keep_file_and_succeed_when_csv_cleanup_fails`、
-    `should_count_csv_data_rows_quote_aware`。
+    `should_count_csv_records_byte_level_quote_aware`、
+    `should_count_non_utf8_csv_bytes_quote_aware`（P1 修正后按字节级计数，
+    旧的 `csv_data_rows` 文件读法已删除）。
   - **#17 降级可观测**：`MaterializeOutcome` 增 `degraded` 字段（回落原因），
     CLI 把它写成 stderr `WARN materialize <t>: …，已回落 INSERT 批量路径`；
     stdout 契约不变。TraceSink 分时事件仍随 JSONL 契约评审落地。

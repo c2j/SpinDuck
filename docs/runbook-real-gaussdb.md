@@ -170,16 +170,17 @@ rm "$(dirname run/local.duckdb)"/.spinduck-mat-*.csv
   两倍行数**——必须先清空该表再重跑：
 
 ```bash
-target/release/spinduck query run/local.duckdb --sql "DELETE FROM <表名>"
+# query 的契约是「跑一条 SQL 把结果集落成快照」：DELETE 无结果集，但会回
+# 受影响行数（rows），可安全用作清表门面；--out 必填（快照文件，可丢弃）
+printf 'DELETE FROM <表名>;\n' > /tmp/spinduck-clean.sql
+target/release/spinduck query --db run/local.duckdb \
+  --sql-file /tmp/spinduck-clean.sql --out /tmp/spinduck-clean.json
+# 也可用 DuckDB 客户端等价清表：
+#   duckdb run/local.duckdb -c "DELETE FROM <表名>"
 ```
 
 > architecture §13.1 的「幂等覆盖」（物化前按快照清表）在代码面上尚未实现，
 > 在此之前清表是手工步骤。
-
-```bash
-ls -la "$(dirname run/local.duckdb)"/.spinduck-mat-*.csv
-rm "$(dirname run/local.duckdb)"/.spinduck-mat-*.csv
-```
 
 第三步：执行（两条路等价，按需选）：
 
