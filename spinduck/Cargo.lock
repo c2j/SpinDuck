@@ -1572,7 +1572,7 @@ dependencies = [
 
 [[package]]
 name = "spinduck"
-version = "0.1.7"
+version = "0.1.18"
 dependencies = [
  "duckdb",
  "encoding_rs",
