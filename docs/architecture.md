@@ -1147,9 +1147,9 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
 
 | 段 | 落点 | 职责 |
 |---|---|---|
-| 壳 | `spinduck/src/cli/run.rs` 的 `call_target_and_sources` / `refuse_on_kernel_gaps` | 解析目标与源清单、按计划拒、按内核拒；零闭包逻辑（§1） |
+| 壳 | `spinduck/src/cli/run/call.rs` 的 `call_target_and_sources` / `refuse_on_kernel_gaps` | 解析目标与源清单、按计划拒、按内核拒；零闭包逻辑（§1） |
 | 判定 | `spinduck/src/plan/closure.rs` 的 `walk_chain`（BFS 本体）+ `kernel_gaps`（内核参照面） | **一份闭包实现，两个参照面**：`build`（`plan`）以项目 DDL 声明为参照，`kernel_gaps`（`call`）以 `verify::kernel_objects` 为参照。不允许再出现第二套 BFS——否则计划说干净、门说缺件的漂移只是换了个方向。被调面的采集同样只有一套：`chain::routine_refs`（结论）+ `chain::expr_func_names`（候选，由目录判），两个参照面共用 |
-| 解析 | `spinduck/src/cli/args.rs` 的 `CallTarget::{Routine, Plan}` | 目标形态是枚举不是可选字段：`--plan` 下位置参数**全部**归实参（不猜例程名），两者皆无即用法错且诊断同时点名两条路 |
+| 解析 | `spinduck/src/cli/args/mod.rs` 的 `CallTarget::{Routine, Plan}`（`--plan` 形态的解析在 `spinduck/src/cli/args/call.rs`） | 目标形态是枚举不是可选字段：`--plan` 下位置参数**全部**归实参（不猜例程名），两者皆无即用法错且诊断同时点名两条路 |
 
 口径：
 

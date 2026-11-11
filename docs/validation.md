@@ -4131,5 +4131,108 @@ advisory-db（网络 IO 错，非漏洞结论），沿用 V38 登记的 4 条 `z
 未接入事件面；`UDF_CALL` 变体无发射点；`FETCH` 行号为 `Some(1)`/`None` 而非内核真实游标位置；
 SQL 上下文函数下沉后缓存表自身的 DDL/DML 与 `distinct_sql` 直连内核、不产生事件；`--trace`
 未接 §11.2 的轮转/保留策略（单文件、无切割）；`src/cli/args.rs`（rebase 后 1398 行）与
-`src/cli/run.rs`（848 行）与上游 PR-A2 同文件增长，均已越过 §3 的 500 行线，按"范围限于当前
-改动路径"未在本轮拆分。
+`src/cli/run.rs`（848 行）与上游 PR-A2 同文件增长，均已越过 §3 的 500 行线——这一条**已被 V40
+关闭**（同 PR 内按职责拆成 `src/cli/args/` 与 `src/cli/run/` 两个目录），V39 原文写"未在本轮拆分"
+是当时的口径，不作为现状。
+
+---
+
+## V40. 审计轮：`--trace` 拒绝覆盖（ENV-0016）+ `args.rs`/`run.rs` 按 §3 拆分（2026-11-11）
+
+**评审意见原文两条**（PR #22）：
+
+1. `src/cli/args.rs`（1398 行）与 `src/cli/run.rs`（848 行）**第三次**越 §3 线。§3 明文
+   "同一文件的规模问题连续两次评审豁免 = 必须拆分"——PR-A2 豁免一次、V39 豁免一次，本轮起
+   不得再登记为"范围外"。
+2. `--trace` 以 `File::create` 打开日志 ⇒ 重跑同名路径**静默截断**上一轮审计证据；runbook
+   只提示磁盘余量，没写"重跑会清空"。审计语义下这是危险默认。
+
+### V40.1 意见 2：独占创建 + 新错误码 `ENV-0016`
+
+Red→Green 锁定行为：`tests/cli/trace.rs::should_refuse_to_overwrite_an_existing_trace_log`——
+先跑一次 `call --trace` 落日志，再用**同一路径**重跑，断言退出码 1、stdout 含 `[ENV-0016]` 与
+"拒绝覆盖"、stderr 恒空、**不含** `OUT p_o` 行（拒绝必须排在 `eng.call` 之前，否则等于"跑完再
+报错"）、旧文件字节逐字不变、`<日志>.sql` 不产出。修复前该测试实测 `rc=0` 并打出
+`OUT p_o = 42`——即静默截断的现场复现；修复后转绿。
+
+| 面 | 落地 | 判据 |
+|---|---|---|
+| 打开方式 | `src/cli/trace.rs` 的 `open_exclusive`：`OpenOptions::write().create_new(true)`，"已存在"由 **OS** 判定，不留 `exists()` → `create()` 的 TOCTOU 窗口 | 非 AlreadyExists 的 IO 错仍归 `ENV-0012`（原口径不变） |
+| 拒绝语义 | `ENV-0016`（故障域 ENV，产生点在打开日志文件处，不事后改判）+ rc=1 | 与缺件门同一条纪律：**拒绝执行不留"跑过什么"的痕迹**（§11.1） |
+| sidecar | 仍允许覆盖 | 它只在主日志独占打开成功之后才写；届时旧 `<日志>.sql` 只可能来自被人为删掉的主日志，不是可比对的上一轮 |
+| 备选方案 | "引擎按时间戳自动命名"**未采用** | 会改掉"日志路径由调用方给定"这条既有语义（轮转/保留属另一议题），需另行评审；本轮先在 runbook 给出 `trace-$(date +%Y%m%dT%H%M%S).log` 的手工命名口径 |
+
+文档同步四处（口径不得只活在注释里）：`docs/architecture.md` §11.2 落地口径新增「覆盖语义」行、
+`docs/runbook-real-gaussdb.md` §4（换路径重跑 + 不建议轮转）与 §7 排障表（ENV-0016 / ENV-0012
+两行，写明"别先删后跑——删掉的那份正是可比对的两轮证据"）、`README.md` §2.1、
+`spinduck/src/cli/args/mod.rs` 的 `usage()`（由
+`args::tests::usage_snapshot_should_mention_the_trace_overwrite_refusal` 断言 usage 文本含
+`ENV-0016`，防止只在源码里可查）。
+
+### V40.2 意见 1：两个超限文件按职责拆分
+
+先例是仓库里已有的形态（`tests/cli.rs` 用 `#[path = "cli/<x>.rs"] mod <x>;`，`src/plan/`、
+`src/verify/` 用目录模块），本轮沿用同一机制，不改任何行为。
+
+```
+spinduck/src/cli/args.rs (1398)  →  args/mod.rs 398  派发/usage/字面量/公共错误件
+                                      args/call.rs 389  call（含 --trace 三旗标、--plan 形态）
+                                      args/exec.rs 312  explain / materialize / sync
+                                      args/project.rs 192  verify / plan / deploy
+                                      args/snapshot.rs 197  query / compare
+spinduck/src/cli/run.rs  (848)   →  run/mod.rs  158  run/exec 派发、退出码、io_err
+                                      run/compile.rs 197  compile / explain 渲染与规则口径
+                                      run/call.rs 398  call 执行面（目标解析→规则链→两道门→审计）
+                                      run/io.rs 160  materialize / sync（GaussDB 数据面）
+```
+
+拆分只做三类机械改动，逐类可核对：① 归属重排；② 跨文件可见的项加 `pub(super)`
+（`Command`/`CallTarget`/`*Parts`/`cmd_*`/各 `*_cmd`/`io_err`/`discover_rules_files`），文件内部
+仍是私有；③ 只在某 feature 路径使用的导入逐条 `#[cfg]` gate——不用 `#[allow]` 压 lint（§Never）。
+
+**完整性证据（两条独立机械比对，不靠人眼）**：
+
+- 测试名集合逐字相同：`src/cli/args/` 36 条（34 条 `should_*` + 2 条 `usage_snapshot_*`）、
+  `src/cli/run/` 12 条，与拆分前
+  `git show <pre-split>:spinduck/src/cli/{args,run}.rs` 的测试名排序后 `diff` 为空——
+  无删除、无跳过、无改名（§4.3 守护测试面完整迁移）。
+- 逐行覆盖比对：把拆分前后各自"去空行 + 去缩进 + 排序"的行做 `diff`，落选行只剩三类
+  可解释项——被 `pub(super)`/`pub(crate)` 改写掉的旧签名行、新增的 `#[cfg(...)]`/`mod`/
+  `use` 接线、新增的模块头 `//!`。`run.rs` 侧比对结果另含 2 处 rustfmt 对长签名的换行，语义不变。
+
+### V40.3 门禁证据（本机，2026-11-11，最终树）
+
+- `cargo fmt --all -- --check` 干净。
+- `cargo clippy --all-features -- -D warnings` 干净。
+- `cargo check --all-features --tests` **零告警**。
+- `cargo test --features cli`：24 个 suite 全绿，549 passed / 0 failed。
+- `cargo audit`：本机重取仍拉不动 advisory-db（网络 IO 错，不构成结论），沿用 V38 的 4 条 `zip`
+  豁免口径；CI audit job 为准。
+
+**门禁面的一条实测发现**：`cargo clippy --all-features`（不带 `--tests`/`--all-targets`）**不编译
+lib 的 `#[cfg(test)]` 代码**，因此 args 拆分留下的一条未用导入（`src/cli/args/call.rs` 测试模块里的
+`use crate::value::SpinValue;`）当场不可见，只有 `cargo check --all-features --tests` 抓到。本轮把
+后者列入门禁证据；是否把 `--all-targets` 加进 `ci.yml` 的 clippy job 属 CI 变更，未在本 PR 动，
+留作待评审项。
+
+### V40.4 变更面登记
+
+- **新增错误码**：`ENV-0016`（审计日志目标已存在，拒绝覆盖既有审计）。按 §5 挂测试：
+  `tests/cli/trace.rs::should_refuse_to_overwrite_an_existing_trace_log`（端到端契约）+
+  `src/cli/args/mod.rs` 的 usage 快照断言。故障域 ENV，退出码 1，与 ENV-0012/0013 分工不重叠。
+- **零接缝变更**：`TraceSink`/`SqlExecutor` 签名未动；`src/cli/run.rs` → `src/cli/run/` 与
+  `src/cli/args.rs` → `src/cli/args/` 不改 `pub` 面（外部只见 `cli::run::run` 与 `EXIT_*`，
+  二者路径与可见性逐字不变，见 `src/bin/spinduck.rs`、`tests/verify_chain.rs`、`src/cli/verify.rs`
+  等消费者的既有 `use crate::cli::run::{EXIT_FAIL, EXIT_OK}`）。
+- **行为不变**：默认面（不带 `--trace`）、stdout 契约、退出码语义、缺件门顺序全部未动；
+  本轮唯一新增的可观察行为是"日志目标已存在 ⇒ `ENV-0016` + rc=1 + 不执行 + 不写文件"。
+
+### V40.5 已知缺口（本轮口径）
+
+- §3 债务只关闭了评审点名的两个文件。仓库内仍有超长文件，最大 `src/engine.rs` 711 行（无内联
+  `mod tests`，纯代码即越线），另有 `src/sql/patterns.rs` 609、`src/verify/run.rs` 607、
+  `src/trace/render.rs` 573、`src/exec.rs` 545——本轮按"范围限于当前改动路径"未触碰，需在各自
+  路径被实际改动时拆分。
+- `--trace` 的轮转/保留仍未落地（§11.2 既有缺口）；"按时间戳自动命名"仍是**待评审的备选**，
+  不是实现。
+- CI clippy 是否补 `--all-targets`：见 V40.3 末段，未决。
