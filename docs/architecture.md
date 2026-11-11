@@ -987,6 +987,7 @@ SQL 侧对象名取自改写前的静态扫描（`FROM`/`JOIN`/`UPDATE`/`INSERT 
 | 增量策略 | 表级声明物化键（清算场景天然按业务日期列）：全量 / 按分区键增量（`WHERE bcrq = :date` 物化当日分区，幂等覆盖） |
 | 类型保真 | 物化列类型按规则文件 `[types]` 反向映射；NUMERIC 精度/DATE/时区往返保真是探针必测项（物化→回写→高斯再读，逐列比对） |
 | 一致点 | 物化即快照：记录每表物化时间戳与过滤条件入 catalog；过程执行期间数据与快照一致（本地处理不受源端变化影响） |
+| 物化通道（V27 现状） | 默认 COPY STREAM 快路径：GaussDB `COPY TO STDOUT` CSV 流式落盘（与目标库同目录，裸文件名 `--db` 显式落 CWD；成功即删、失败保留供诊断）→ DuckDB `COPY FROM`（两侧显式 `NULL '\N'`，D14 空串保真）。**回落阶梯**：仅「入库前失败」自动回落 500 行批量 INSERT（降级原因经 stderr `WARN` 可观测，stdout 契约不变）；`COPY` 已入库后的任何失败（行数查询、CSV 行数交叉核对——部分加载/重复加载哨兵）一律报错不回落，防止 INSERT 追加把本地表灌成两倍行数。多表 `--jobs` 进程内并行（每线程独立 GaussDB + DuckDB 连接，单表失败不中断其余表）；重复表名 = 用法错。显式逃生门 `mode = "insert_batch"` 与 PR-B 并行分片未落地，见 `docs/materialize-copystream-design.md` |
 
 ### 13.2 回写（Sync）
 

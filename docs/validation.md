@@ -4055,6 +4055,35 @@ exit 2、真实参 `100` → RETURN 0.08 exit 0；规则项目 `compile` 绿且 
   `should_reject_where_with_multi_table_before_touching_db` 锁定不建库）；
   `--jobs 0`/非数字用法错。容器 e2e：
   `should_materialize_multiple_tables_in_parallel_with_failure_isolation`
-  （3 表 2 并发，含源端缺表失败隔离样本，快路径 `CopyStream` 断言）。
-  CLI 端到端：4 张夹具表 `--jobs 2` 全部成功 + 1 张源端缺表 FAIL 隔离，
+  （3 表 2 并发，含**本地缺表**失败隔离样本，快路径 `CopyStream` 断言；
+  口径修正见 V27.1——`sd_mt_c` 命中的是 `ensure_local_table` 的 `ENV-0015`，
+  发生在任何 GaussDB 拉取之前，不证明源端故障隔离）。
+  CLI 端到端：4 张夹具表 `--jobs 2` 全部成功 + 1 张本地缺表 FAIL 隔离，
   总耗时 0.092s（真实例吞吐收益随 PR-A 的 CPU 让出而放大，§1.1）。
+- **V27.1（PR #14 审核修正落地，issues #16–#21，2026-11-11）**：
+  - **#16 入库后失败绝不回落**：快路径收尾拆出 `finalize_copystream` 接缝——
+    `COPY FROM` 成功后的行数查询失败 / CSV 行数交叉核对失败带 `loaded = true`
+    上抛，回落判据改由 `apply_fast_failure` 按 `loaded` 分岔（入库前失败才回落
+    INSERT）；CSV 清理失败按 §3.1 降级为「保留文件 + 正常成功」，不再致命。
+    行数交叉核对（设计 §4 第 4 项）同步落地：引号感知统计 CSV 数据行数，
+    与本地行数差值不一致即 `[ENV-0020]`（部分加载/重复加载哨兵）。
+    单测：`should_not_fall_back_to_insert_when_copy_already_loaded`、
+    `should_err_loaded_when_csv_rows_mismatch_loaded_rows`、
+    `should_keep_file_and_succeed_when_csv_cleanup_fails`、
+    `should_count_csv_data_rows_quote_aware`。
+  - **#17 降级可观测**：`MaterializeOutcome` 增 `degraded` 字段（回落原因），
+    CLI 把它写成 stderr `WARN materialize <t>: …，已回落 INSERT 批量路径`；
+    stdout 契约不变。TraceSink 分时事件仍随 JSONL 契约评审落地。
+  - **#18 重复表名 = 用法错**：`--table` 重复 flag 或逗号值内重复均 parse 层判红
+    （EXIT_USAGE=2），不静默去重（同表并发双写/同名临时 CSV 互踩的根）。
+    守护：`should_reject_duplicate_table_names_as_usage_error`。
+  - **#19 workdir 口径修正**：裸文件名 `--db local.duckdb` 的 `Path::parent()`
+    返回 `Some("")`，旧实现 `create_dir_all("")` 隐式成功、临时 CSV 落 CWD；
+    改为空目录显式落 `.`（`materialize_workdir` 单测三例锁定分叉）。
+  - **#21-4**：`materialize_parallel` 表/执行器长度前置条件 `debug_assert_eq!`
+    改硬断言 `assert_eq!`（release 下越界 panic ≠ `Err`，违背单表失败隔离承诺）。
+    守护：`should_panic_when_executor_count_mismatches_tables`。
+  - **口径修正（未动代码）**：PR body「错误并入消息/无静默路径」只对双失败成立，
+    修正为 §3.4 的 `degraded` + stderr 口径；失败隔离样本「源端缺表」改「本地缺表」；
+    显式逃生门 `mode = "insert_batch"`（设计 §3.3）确认未实现，口径降级为设计目标；
+    源端故障隔离样本待补（夹具表存在但 `--where` 引用不存在的列）。

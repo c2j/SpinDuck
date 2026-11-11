@@ -1,8 +1,12 @@
 # 物化 COPY STREAM 快路径设计（V27 提案）
 
-> 状态：**设计已验证，实现未开始**。本文档记录可行性验证结论与实现方案；
-> 实证数字落地后按仓库纪律更新 `docs/validation.md`（V27 节），机制描述在
-> 实现合入时同步 `docs/architecture.md` §13.1——三者不互相越界。
+> 状态：**PR-A（单流 COPY STREAM）与 PR-A2（多表并行）已落地**（validation
+> V27）；**未开始**：PR-B 并行分片（§3.5）、显式逃生门 `mode = "insert_batch"`
+> （§3.3，仅自动回落已实现）、指纹跳过（§3.7）、TraceSink 分时事件（§3.4，
+> 降级可观测暂以 `MaterializeOutcome.degraded` + CLI stderr WARN 承载）。
+> 本文档记录可行性验证结论与实现方案；实证数字落地后按仓库纪律更新
+> `docs/validation.md`（V27 节），机制描述在实现合入时同步
+> `docs/architecture.md` §13.1——三者不互相越界。
 
 ## 1. 背景与问题
 
@@ -91,7 +95,8 @@ PG CSV 写出：空串 → `""`（带引号空字段）、NULL → 空字段；D
 - **默认 = COPY STREAM**；**每表可显式指定**走现有 500 行批量 INSERT 路径——载体用
   §13.1 既有的项目声明（`spinduck.toml` 物化清单），形如 `mode = "insert_batch"`；
   显式指定是对"特殊表"的逃生门（如源端禁 COPY 权限、表上有触发器语义、列形态
-  走文本更稳），不是快路径的降级开关；
+  走文本更稳），不是快路径的降级开关。**落地状态：未实现**——当前只有运行期
+  自动回落（§3.4）；本条保留为设计目标，落在后续 PR；
 - 快路径**运行期失败仍自动回落 INSERT**（3.5 阶梯），与显式指定互不干扰：
   显式指定 = 不尝试快路径；默认 = 先快路径后自动回落；
 - CLI 面不加开关（默认快路径 + 自动降级），fastaas 的 `copy-stream-enabled` 配置位
@@ -105,10 +110,15 @@ PG CSV 写出：空串 → `""`（带引号空字段）、NULL → 空字段；D
 （后续项，见 §7：大表并行分片 ──分片失败──▶ 单流 COPY ──▶ INSERT）
 ```
 
-- 降级必须**可观测**：`materialize` 返回 `MaterializeOutcome { rows, mode }`
-  （PR-A 已落地，测试可断言 `mode=InsertBatch` 回落）；TraceSink 分时事件
-  （`unload_ms`/`load_ms`/`shards` 等）属 JSONL 契约（§11.2）破坏性变更，
-  **随契约评审单独落地**，PR-A 不改事件面；CLI stdout 契约不变。
+- 降级必须**可观测**：`materialize` 返回 `MaterializeOutcome { rows, mode,
+  degraded }`——回落时 `degraded` 携带快路径失败原因（PR-A 已落地，测试可断言
+  `mode=InsertBatch`）；CLI 侧把 `degraded` 写成 stderr `WARN` 行（#17，stdout
+  契约不变）；TraceSink 分时事件（`unload_ms`/`load_ms`/`shards` 等）属
+  JSONL 契约（§11.2）破坏性变更，**随契约评审单独落地**，落地后 stderr 只留摘要。
+- **回落边界（#16，硬约束）**：只有「入库前失败」才回落——`COPY FROM` 已成功
+  入库之后的任何失败（行数查询、CSV 行数交叉核对、收尾）一律带 `loaded = true`
+  上抛，**绝不回落 INSERT**（不清表只追加，回落即两倍行数）；CSV 清理失败是唯一
+  例外，按 §3.1「保留供诊断」降级为成功。
 
 ### 3.5 并行分片 COPY（后续项，无主键表同样适用）
 
@@ -139,7 +149,9 @@ CPU 被文本成本占满时并行无收益；COPY STREAM 让出 CPU 后瓶颈�
 ```bash
 # 现有契约不变（单表 + --where 完全向后兼容）
 spinduck materialize --db aaspubs.db --table t1 --where "bcrq='20250715'"
-# 新增：多表（重复 --table 或逗号分隔）；--where 与多表同用 = 用法错（语义歧义）
+# 新增：多表（--table 可重复/逗号分隔，取并集；**重复表名 = 用法错**，#18：
+# 同表并发双写会冲突或静默灌两遍，宁可红不悄悄去重）
+# --where 与多表同用 = 用法错（语义歧义，EXIT_USAGE=2）
 spinduck materialize --db aaspubs.db --table t1 --table t2 --table t3
 spinduck materialize --db aaspubs.db --table t1,t2,t3 --jobs 2
 ```
@@ -171,20 +183,28 @@ issue #85 形态）。三条纪律原样继承：**保守失败**（探针失败
    相等（含空串 ≠ NULL）；
 2. **Green**：`GaussConn::copy_to_csv` + `materialize` 接入快路径；
 3. **降级守护**：人为制造快路径失败（如只读临时目录不可写），断言回落 INSERT
-   路径且 TraceSink 事件 `mode=insert_batch` 可见；
+   路径且降级可见——TraceSink 事件未落地，当前以 `degraded` 字段 + stderr `WARN`
+   承载（#17）；**入库后失败（#16）不回落**，由
+   `should_not_fall_back_to_insert_when_copy_already_loaded` 锁定；
 4. **行数交叉核对**：快路径返回行数（CSV 行数-1）与物化后 `count(*)` 一致，
-   不一致即 ENV 错误（对齐回写通道的行数校验纪律）；
+   不一致即 ENV 错误（对齐回写通道的行数校验纪律）。**已落地**（#16/#20-5）：
+   `finalize_copystream` 内引号感知统计 CSV 数据行数并与行数差值核对，
+   `should_err_loaded_when_csv_rows_mismatch_loaded_rows` 锁定；
 5. **吞吐实证**：100k 夹具计时入 `validation.md` V27（含环境声明与"一次性测量"
    口径注记，同 V26.4 纪律）。
 
 **PR-A2（多表并行 CLI，§3.6）**：
 
-6. **契约守护**：`--table` 重复/逗号分隔解析；`--where` 与多表同用 → 用法错
-   （ENV，退出码 1，不连源不建库）；单表形式与现契约逐字一致；
+6. **契约守护**：`--table` 重复/逗号分隔解析（**重复表名 = 用法错**，#18：
+   `should_reject_duplicate_table_names_as_usage_error`）；`--where` 与多表同用 →
+   用法错（EXIT_USAGE=2，不连源不建库）；单表形式与现契约逐字一致；
 7. **并发行为**（容器探针）：jobs=2 物化 3 张夹具表，断言全部成功、输出行数
    与单表一致；`--jobs 0` / 负数 → 用法错；
-8. **失败隔离**：夹具中一张源端不存在的表，断言其余表仍物化成功、该表报
-   FAIL、整体退出码 1；
+8. **失败隔离**：夹具中一张本地不存在的表（`ensure_local_table` 一线红），
+   断言其余表仍物化成功、该表报 FAIL、整体退出码 1。**口径修正（#20-1）**：
+   现有用例证明的是「本地缺表隔离」；**源端故障**（连接断开/copy_out 被拒）下的
+   隔离样本待补（夹具表存在但 `--where` 引用不存在的列，使失败点落在 prepare/
+   copy_out 上）；
 9. **并发写同一 DuckDB 文件**：多线程各持独立连接句柄写不同表，行数核对
    （MVCC 并发写的回归守护）。
 
@@ -196,6 +216,13 @@ issue #85 形态）。三条纪律原样继承：**保守失败**（探针失败
 - 不做 Parquet 中间落盘：fastaas 成功路径同样不导出 Parquet，CSV 临时文件用完即删；
 - 不动 `sync` 回写通道（已是 COPY 最优形态）；
 - 键序不承诺：CSV 由源端 `SELECT` 顺序产出，物化表无 ORDER BY 语义（与现路径一致）。
+- **标识符不加引号（#21-1）**：`COPY {table} ({cols})`、`INSERT INTO {table}` 中的
+  表名/列名为裸文本拼接（INSERT 路径同口径，非快路径回归）。带引号建的大小写
+  敏感列（`"BizDate"`）、含空格/保留字列名会让快路径 SQL 语法错或错列——失败形态
+  是整表回落（入库前，安全）。列名加引号方案待评估；在此之前**不承诺**此类标识符。
+- **值恰为字面 `\N` 的往返未测（#21-2）**：openGauss 侧写出 `"\N"`（带引号），
+  DuckDB CSV reader 的 nullstr 比对与去引号次序决定其塌缩为 NULL 与否；未验证前
+  **不承诺**该值往返保真（待夹具补 `chr(92)||'N'` 行后定论）。
 
 ## 6. 评审决议（2026-11-11）
 

@@ -138,14 +138,26 @@ target/release/spinduck deploy "$PLAN" --db run/local.duckdb
 ```
 
 第二步：物化——按计划 `[sources].materialize` 清单把输入表从实例拉进本地库
-（只读实例，`SELECT` 进本地库）。V27 起支持多表并行（`--table` 重复/逗号分隔，
-`--jobs` 默认 4；`--where` 仅限单表形态；单表失败不中断其余表，任一失败退出码 1）：
+（只读实例，`SELECT` 进本地库）。V27 起支持多表并行（`--table` 重复/逗号分隔
+取并集，**重复表名 = 用法错**；`--jobs` 默认 4；`--where` 仅限单表形态；单表失败
+不中断其余表，任一失败退出码 1）。快路径默认走 COPY STREAM；若 stderr 出现
+`WARN materialize … 已回落 INSERT 批量路径`，说明该表降级到了慢速路径（大表上
+会整表驻留内存），需按失败原因排查后重跑：
 
 ```bash
 TABLES=$(sed -n '/^\[sources\]/,/^\[/p' "$PLAN" | grep '^"' | tr -d '"' | paste -sd, -)
 target/release/spinduck materialize --db run/local.duckdb --table "$TABLES" --jobs 4
 # 或沿用逐表形态：
 # for t in …; do target/release/spinduck materialize --db run/local.duckdb --table "$t"; done
+```
+
+物化失败后残留的临时 CSV（`.spinduck-mat-<表名>-<pid>.csv`，点开头隐藏文件，
+与目标库同目录）保留供诊断，**不会自动清理**；反复失败的宽表会在 run 目录堆积，
+重跑前按前缀清点、确认无用后删除：
+
+```bash
+ls -la "$(dirname run/local.duckdb)"/.spinduck-mat-*.csv
+rm "$(dirname run/local.duckdb)"/.spinduck-mat-*.csv
 ```
 
 第三步：执行（两条路等价，按需选）：
