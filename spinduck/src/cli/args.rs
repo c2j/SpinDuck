@@ -690,7 +690,8 @@ pub fn usage() -> &'static str {
      \x20                                （args: 整数/小数/'串'/null；--plan 下位置参数全是实参；\n\
      \x20                                  规则口径：内置种子 < 项目发现 < --rules；\n\
      \x20                                  --trace 把审计日志逐行落盘（默认 text），sidecar <日志>.sql\n\
-     \x20                                  按行内 sqlid 存 SQL 全文，可 grep 反查）\n"
+     \x20                                  按行内 sqlid 存 SQL 全文，可 grep 反查；日志目标已存在即\n\
+     \x20                                  ENV-0016 拒绝执行、不覆盖上一轮审计，重跑请换路径）\n"
 }
 
 #[cfg(test)]
@@ -886,6 +887,17 @@ mod tests {
         assert!(
             u.contains("内置种子 < 项目发现 < --rules"),
             "规则口径说明缺失: {u}"
+        );
+    }
+
+    #[test]
+    fn usage_snapshot_should_mention_the_trace_overwrite_refusal() {
+        // 重跑会清掉上一轮审计这件事必须能在 usage 里查到，而不是只写在源码注释里
+        let u = usage();
+        assert!(u.contains("ENV-0016"), "usage 须写明拒绝覆盖的错误码: {u}");
+        assert!(
+            u.contains("不覆盖上一轮审计"),
+            "usage 须说明为什么拒绝: {u}"
         );
     }
 

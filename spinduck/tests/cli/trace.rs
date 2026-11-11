@@ -176,6 +176,43 @@ fn should_exit_usage_when_the_trace_level_is_not_a_known_name() {
 }
 
 #[test]
+fn should_refuse_to_overwrite_an_existing_trace_log() {
+    // 审计语义：重跑等于清掉上一轮"跑过什么"的证据——拒绝，且拒绝在执行之前。
+    let dir = tempfile::tempdir().unwrap();
+    let src = write(dir.path(), "pkg.sql", P_SQL);
+    let log = dir.path().join("run.log");
+    let prior = "上一轮的审计，不能被静默清掉\n";
+    std::fs::write(&log, prior).unwrap();
+    let (code, out, err) = cli(&[
+        "call",
+        "--file",
+        &src.to_string_lossy(),
+        "--trace",
+        &log.to_string_lossy(),
+        "prc_probe",
+        "21",
+        "null",
+    ]);
+    assert_eq!(code, EXIT_FAIL, "{out}");
+    assert!(out.contains("[ENV-0016]"), "既有文件必须指认出来: {out}");
+    assert!(out.contains("拒绝覆盖"), "要说清为什么不跑: {out}");
+    assert_eq!(err, "", "全部输出走 stdout");
+    assert!(
+        !out.contains("OUT p_o"),
+        "拒绝先于执行，不能跑完再报错: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        prior,
+        "既有审计日志逐字保留"
+    );
+    assert!(
+        !Path::new(&format!("{}.sql", log.display())).exists(),
+        "拒绝时不得写 sidecar"
+    );
+}
+
+#[test]
 fn should_annotate_explain_ir_lines_with_hits_from_the_trace_log() {
     // 关联形态 A：explain 的静态 SQL 与日志行同一指纹，逐行给出命中次数与绑定跨度。
     let dir = tempfile::tempdir().unwrap();

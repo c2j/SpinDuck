@@ -1,8 +1,11 @@
 //! `call --trace` 的落盘装配：本模块只管生命周期，渲染与级别过滤全在 `src/trace/`。
 //!
-//! 三条纪律在此落地：日志文件在**缺件门之后**才创建（拒绝执行不该留下"跑过什么"的
-//! 假象）；时钟与 sid/cid 由运行环境注入（AGENTS §2.6 接缝 3，`src/trace/` 自己不信时钟）；
-//! 日志通道的写失败必须返回错误而不是静默少一份审计（§11.1 禁止静默丢弃）。
+//! 四条纪律在此落地：日志文件在**缺件门之后**才创建（拒绝执行不该留下"跑过什么"的
+//! 假象）；日志文件**独占创建**——目标已存在一律 ENV-0016 拒绝，重跑等于清掉上一轮的
+//! 审计证据；sidecar 允许覆盖，因为它只在主日志独占打开成功后才写，此时旧的
+//! `<log>.sql` 只可能来自被人为删掉的主日志；时钟与 sid/cid 由运行环境注入
+//! （AGENTS §2.6 接缝 3，`src/trace/` 自己不信时钟）；日志通道的写失败必须返回错误
+//! 而不是静默少一份审计（§11.1 禁止静默丢弃）。
 
 use crate::error::EngineError;
 use crate::exec::TraceSink;
@@ -25,8 +28,7 @@ impl TraceRun {
         level: TraceLevel,
         proc: &str,
     ) -> Result<Self, EngineError> {
-        let file = std::fs::File::create(path)
-            .map_err(|e| EngineError::env(12, format!("trace log {}: {e}", path.display())))?;
+        let file = open_exclusive(path)?;
         let sid = session_id(std::process::id(), epoch_millis());
         let sink = AuditSink::new(
             SinkCfg {
@@ -68,6 +70,29 @@ impl TraceRun {
             None => Ok(()),
         }
     }
+}
+
+/// 独占打开：`create_new` 让"已存在"由操作系统判定，不留 TOCTOU 窗口。
+/// 审计日志是一次运行的证据，覆盖等于把上一轮"跑过什么"清掉，故 ENV-0016 拒绝；
+/// 其余打开失败（权限、目录不存在）仍是 ENV-0012。
+fn open_exclusive(path: &Path) -> Result<std::fs::File, EngineError> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                EngineError::env(
+                    16,
+                    format!(
+                        "审计日志 {} 已存在：--trace 拒绝覆盖既有审计，重跑请换路径（或先归档/删除旧日志）",
+                        path.display()
+                    ),
+                )
+            } else {
+                EngineError::env(12, format!("trace log {}: {e}", path.display()))
+            }
+        })
 }
 
 /// sidecar 与主日志同前缀：`run.log` → `run.log.sql`（扩展名不参与，避免改名错位）。

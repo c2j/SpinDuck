@@ -61,21 +61,23 @@ clone 后即可复现（语料在仓库内）：
 ### 2.1 运行日志（`--trace`）
 
 一条调用执行了哪些 SQL、绑定值是什么，用 `--trace` 落盘（stdout 契约不受影响；缺件即红时
-不产出任何日志文件）：
+不产出任何日志文件；**日志目标已存在即 `ENV-0016` 拒绝执行**——重跑等于清掉上一轮的审计证据，
+所以宁可不动，请换新路径）：
 
 ```bash
+LOG=/tmp/run-$(date +%Y%m%dT%H%M%S).log   # 一次调用一份新日志；旧的那份不会被碰
 ./target/debug/spinduck call --plan .spinduck/plan/<包>.<过程>.toml --db /tmp/w.duckdb \
-  --trace /tmp/run.log '20260105' ''
-tail -f /tmp/run.log                    # 默认 text：每行一个事件，SQL 只给 sqlid + 前 96 字符
-grep '^sq-978f03531652' /tmp/run.log.sql   # sidecar：sqlid → SQL 全文（同前缀 + .sql）
+  --trace "$LOG" '20260105' ''
+tail -f "$LOG"                        # 默认 text：每行一个事件，SQL 只给 sqlid + 前 96 字符
+grep '^sq-978f03531652' "$LOG.sql"    # sidecar：sqlid → SQL 全文（同前缀 + .sql）
 
 # 日志 ↔ IR 对齐：这条静态 SQL 在这次运行里跑了几次、绑定怎么变的、哪条一次都没跑
-./target/debug/spinduck explain --file sql/routines/PKG_X.sql --trace /tmp/run.log pkg_x.prc_y
+./target/debug/spinduck explain --file sql/routines/PKG_X.sql --trace "$LOG" pkg_x.prc_y
 ```
 
 `--trace-format jsonl` 切机器可读形态（§11.2 字段契约），`--trace-level stmt|sql|bind|all`
 控制详细度（默认 `bind`：绑定值入行；`all` 才逐条记 IR 指令）。落地口径与已知缺口见
-`docs/architecture.md` §11.2「落地口径」与 `docs/validation.md` V39。
+`docs/architecture.md` §11.2「落地口径」与 `docs/validation.md` V39 / V40。
 
 ### 3. GaussDB 物化 / 回写
 
