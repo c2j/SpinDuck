@@ -95,6 +95,21 @@ pub(super) fn parse_materialize(rest: &[String]) -> Result<Command, EngineError>
     if tables.is_empty() {
         return Err(usage_err("materialize --db <path> --table <name>[,name…]"));
     }
+    // 重复表名 = 手误（#18）：多表并行的前提是每线程写不同表（设计 §3.6），
+    // 同表并发双写会 write-write 冲突或静默灌两遍；临时 CSV 文件名也按表名
+    // 生成，同表会互踩。「用户写的」与「实际做的」不一致时宁可红，绝不悄悄去重。
+    // 判定按大小写不敏感——与引擎侧 lower(table_name) 同口径（DuckDB 标识符
+    // 缺省小写，--table T1 与 --table t1 是同一张表）。
+    {
+        let mut seen = std::collections::BTreeSet::new();
+        for t in &tables {
+            if !seen.insert(t.to_lowercase()) {
+                return Err(usage_err(format!(
+                    "materialize --table 重复表名 {t}：同一批快照每表只物化一次",
+                )));
+            }
+        }
+    }
     // WHERE 与多表同用是语义歧义（过滤条件归属哪张表？）——用法错，绝不猜
     if tables.len() > 1 && where_clause.is_some() {
         return Err(usage_err(
@@ -305,6 +320,42 @@ mod tests {
             }
             other => panic!("wrong command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn should_reject_duplicate_table_names_as_usage_error() {
+        // #18 回归守护：重复 --table 是手误——同表并发双写会冲突或静默灌两遍，
+        // 「用户写的」与「实际做的」不一致时宁可红，绝不悄悄去重
+        let err = parse(&v(&[
+            "materialize",
+            "--db",
+            "w.duckdb",
+            "--table",
+            "t1",
+            "--table",
+            "t1",
+        ]))
+        .unwrap_err();
+        assert!(err.message.contains("重复表名"), "{err}");
+        assert!(err.message.contains("t1"), "{err}");
+
+        // 逗号分隔形态同一口径
+        let err = parse(&v(&["materialize", "--db", "w.duckdb", "--table", "t1,t1"])).unwrap_err();
+        assert!(err.message.contains("重复表名"), "{err}");
+
+        // 大小写等价（评审 P2）：DuckDB 标识符缺省小写、引擎按 lower(table_name)
+        // 判存在，T1 与 t1 是同一张表——双双漏过就是静默双写形态
+        let err = parse(&v(&[
+            "materialize",
+            "--db",
+            "w.duckdb",
+            "--table",
+            "T1",
+            "--table",
+            "t1",
+        ]))
+        .unwrap_err();
+        assert!(err.message.contains("重复表名"), "{err}");
     }
 
     #[test]

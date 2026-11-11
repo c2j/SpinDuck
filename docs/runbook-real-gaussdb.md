@@ -138,8 +138,11 @@ target/release/spinduck deploy "$PLAN" --db run/local.duckdb
 ```
 
 第二步：物化——按计划 `[sources].materialize` 清单把输入表从实例拉进本地库
-（只读实例，`SELECT` 进本地库）。V27 起支持多表并行（`--table` 重复/逗号分隔，
-`--jobs` 默认 4；`--where` 仅限单表形态；单表失败不中断其余表，任一失败退出码 1）：
+（只读实例，`SELECT` 进本地库）。V27 起支持多表并行（`--table` 重复/逗号分隔
+取并集，**重复表名 = 用法错**；`--jobs` 默认 4；`--where` 仅限单表形态；单表失败
+不中断其余表，任一失败退出码 1）。快路径默认走 COPY STREAM；若 stderr 出现
+`WARN materialize … 已回落 INSERT 批量路径`，说明该表降级到了慢速路径（大表上
+会整表驻留内存），需按失败原因排查后重跑：
 
 ```bash
 TABLES=$(sed -n '/^\[sources\]/,/^\[/p' "$PLAN" | grep '^"' | tr -d '"' | paste -sd, -)
@@ -147,6 +150,37 @@ target/release/spinduck materialize --db run/local.duckdb --table "$TABLES" --jo
 # 或沿用逐表形态：
 # for t in …; do target/release/spinduck materialize --db run/local.duckdb --table "$t"; done
 ```
+
+物化失败后残留的临时 CSV（`.spinduck-mat-<表名>-<pid>.csv`，点开头隐藏文件，
+与目标库同目录）保留供诊断，**不会自动清理**；反复失败的宽表会在 run 目录堆积，
+重跑前按前缀清点、确认无用后删除：
+
+```bash
+ls -la "$(dirname run/local.duckdb)"/.spinduck-mat-*.csv
+rm "$(dirname run/local.duckdb)"/.spinduck-mat-*.csv
+```
+
+**重跑前的强制清表口径（V27.1）**：`materialize` 是纯追加（全路径无
+`DELETE`/`TRUNCATE`），失败分两类处理——
+
+- stderr 出现 `WARN … 已回落 INSERT 批量路径` 且最终 `rows=N` 正常：数据只有
+  一份（快路径在入库前失败，0 行入库），排查原因后**直接重跑**；
+- 命令报 `[ENV-0020] 行数交叉核对失败`：此时 `COPY FROM` **已成功入库**，数据
+  已在本地表中（错误消息里的「CSV 已保留供诊断」即此含义）。**直接重跑 =
+  两倍行数**——必须先清空该表再重跑：
+
+```bash
+# query 的契约是「跑一条 SQL 把结果集落成快照」：DELETE 无结果集，但会回
+# 受影响行数（rows），可安全用作清表门面；--out 必填（快照文件，可丢弃）
+printf 'DELETE FROM <表名>;\n' > /tmp/spinduck-clean.sql
+target/release/spinduck query --db run/local.duckdb \
+  --sql-file /tmp/spinduck-clean.sql --out /tmp/spinduck-clean.json
+# 也可用 DuckDB 客户端等价清表：
+#   duckdb run/local.duckdb -c "DELETE FROM <表名>"
+```
+
+> architecture §13.1 的「幂等覆盖」（物化前按快照清表）在代码面上尚未实现，
+> 在此之前清表是手工步骤。
 
 第三步：执行（两条路等价，按需选）：
 

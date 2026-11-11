@@ -9,6 +9,8 @@ use super::{io_err, EXIT_FAIL, EXIT_OK};
 use crate::cli::args::Command;
 use crate::error::EngineError;
 use std::io::Write;
+#[cfg(feature = "gauss")]
+use std::path::Path;
 use std::path::PathBuf;
 
 pub(super) struct MaterializeParts {
@@ -84,22 +86,39 @@ fn open_gauss() -> Result<crate::io::GaussConn, EngineError> {
     crate::io::GaussConn::connect_parts(&host, port, &user, &password, &dbname)
 }
 
+/// 临时 CSV 落盘目录（#19）：与目标库同目录（失败诊断现场自包含，设计 §7）。
+/// 裸文件名 `--db local.duckdb` 时 `Path::parent()` 返回 `Some("")` 而非
+/// `None`，空目录统一落 CWD（`create_dir_all("")` 会隐式成功并掩盖该分叉）。
+#[cfg(feature = "gauss")]
+pub(super) fn materialize_workdir(db: &Path) -> PathBuf {
+    match db.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    }
+}
+
+/// 降级可观测（#17）：回落 INSERT 时往 stderr 写 WARN——stdout 契约不变
+/// （设计 §3.4），而「回落 = GB 级整表内存驻留」这条风险的唯一预警通道
+/// 不能是静默的。TraceSink 分时事件落地后 stderr 只留摘要。
+#[cfg(feature = "gauss")]
+fn warn_degraded(table: &str, degraded: Option<&str>) {
+    if let Some(reason) = degraded {
+        eprintln!("WARN materialize {table}: {reason}，已回落 INSERT 批量路径");
+    }
+}
+
 #[cfg(feature = "gauss")]
 pub(super) fn materialize_cmd(
     parts: MaterializeParts,
     out: &mut dyn Write,
 ) -> Result<i32, EngineError> {
-    // 临时 CSV 与目标库同目录（失败诊断现场自包含；成功即删，设计文档 §3.1）
-    let workdir = parts
-        .db
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .to_path_buf();
+    let workdir = materialize_workdir(&parts.db);
     let duck = crate::sql::DuckExecutor::open(&parts.db.to_string_lossy())?;
     if let [table] = parts.tables.as_slice() {
         // 单表形态：与 V26 语义逐字一致（允许 --where）
         let mut og = open_gauss()?;
         let outcome = og.materialize(&duck, table, parts.where_clause.as_deref(), &workdir)?;
+        warn_degraded(table, outcome.degraded.as_deref());
         writeln!(out, "MATERIALIZE {} rows={}", table, outcome.rows).map_err(io_err)?;
         return Ok(EXIT_OK);
     }
@@ -126,6 +145,7 @@ pub(super) fn materialize_cmd(
     for (table, result) in &outcomes {
         match result {
             Ok(o) => {
+                warn_degraded(table, o.degraded.as_deref());
                 writeln!(out, "MATERIALIZE {} rows={}", table, o.rows).map_err(io_err)?;
             }
             Err(e) => {
@@ -166,11 +186,7 @@ pub(super) fn sync_cmd(parts: SyncParts, out: &mut dyn Write) -> Result<i32, Eng
         parts.where_clause.as_deref(),
     )?;
     // 临时 CSV 与目标库同目录（失败诊断现场自包含；成功即删，设计 §4.1）
-    let workdir = parts
-        .db
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .to_path_buf();
+    let workdir = materialize_workdir(&parts.db);
     let mut og = open_gauss()?;
     let duck = crate::sql::DuckExecutor::open(&parts.db.to_string_lossy())?;
     let oc = og.sync_write(&duck, &parts.table, &parts.cols, &mode, &workdir)?;
@@ -199,4 +215,30 @@ pub(super) fn sync_cmd(parts: SyncParts, _out: &mut dyn Write) -> Result<i32, En
             parts.db.display()
         ),
     ))
+}
+
+#[cfg(all(test, feature = "gauss"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_put_workdir_beside_db_when_db_has_parent_dir() {
+        // Path::parent() 对带目录的路径返回目录段本身
+        let db = std::path::Path::new("run/local.duckdb");
+        assert_eq!(materialize_workdir(db), std::path::PathBuf::from("run"));
+    }
+
+    #[test]
+    fn should_fall_back_to_cwd_when_db_is_bare_filename() {
+        // #19 回归守护：裸文件名的 parent() 是 Some("") 而非 None，
+        // 旧行为 create_dir_all("") 隐式成功、CSV 落 CWD 而非库旁
+        let db = std::path::Path::new("local.duckdb");
+        assert_eq!(materialize_workdir(db), std::path::PathBuf::from("."));
+    }
+
+    #[test]
+    fn should_fall_back_to_cwd_when_db_has_no_parent() {
+        let db = std::path::Path::new("/");
+        assert_eq!(materialize_workdir(db), std::path::PathBuf::from("."));
+    }
 }

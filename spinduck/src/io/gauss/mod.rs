@@ -10,7 +10,6 @@ use crate::exec::BindMap;
 use crate::value::SpinValue;
 use gaussdb::sync::{Client, NoTls};
 use std::io::Write;
-use std::path::Path;
 
 /// 回写批大小（单次从 DuckDB 取的行数）。
 pub(crate) const SYNC_BATCH: usize = 1000;
@@ -18,23 +17,9 @@ pub(crate) const SYNC_BATCH: usize = 1000;
 /// 结果集：列名顺序 + 每行文本值（NULL → None）。
 pub type GaussRows = (Vec<String>, Vec<Vec<Option<String>>>);
 
-/// 物化实际生效的通道（观测与测试断言用；CLI stdout 契约不变）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MaterializeMode {
-    /// COPY TO STDOUT CSV → DuckDB COPY FROM（V27 快路径，默认）。
-    CopyStream,
-    /// 500 行批量多值 INSERT（V26 路径；快路径失败自动回落）。
-    InsertBatch,
-}
+mod materialize;
 
-/// 一次物化的结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MaterializeOutcome {
-    /// 物化行数（本地表行数差值，含回落路径）。
-    pub rows: usize,
-    /// 实际生效的通道。
-    pub mode: MaterializeMode,
-}
+pub use materialize::{materialize_parallel, MaterializeMode, MaterializeOutcome};
 
 /// GaussDB 连接（同步，无 TLS；v1 单连接）。
 pub struct GaussConn {
@@ -171,157 +156,6 @@ impl GaussConn {
         Ok(())
     }
 
-    /// 物化（§13.1）：GaussDB 表（可带 WHERE）→ 本地 DuckDB 表。
-    /// 要求 DuckDB 侧表已由 deploy 通道建好（类型一致，§13.1 类型保真）；
-    /// 缺表在拉取前由 [`Self::ensure_local_table`] 显式红（V26.11，消灭零行假绿）。
-    ///
-    /// V27：默认走 COPY STREAM 快路径（D14：两侧显式 `NULL '\N'`，空串不塌缩），
-    /// 任一失败自动回落 V26 的 500 行批量 INSERT（错误并入最终错误消息，不静默）。
-    /// `workdir` 为临时 CSV 的落盘目录（成功即删，失败保留供诊断）。
-    pub fn materialize(
-        &mut self,
-        duck: &dyn crate::exec::SqlExecutor,
-        table: &str,
-        where_clause: Option<&str>,
-        workdir: &Path,
-    ) -> Result<MaterializeOutcome, EngineError> {
-        Self::ensure_local_table(duck, table)?;
-        let select_sql = match where_clause {
-            Some(w) => format!("SELECT * FROM {table} WHERE {w}"),
-            None => format!("SELECT * FROM {table}"),
-        };
-        match self.materialize_copystream(duck, table, &select_sql, workdir) {
-            Ok(out) => Ok(out),
-            Err(fast_err) => self
-                .materialize_insert_batch(duck, table, &select_sql)
-                .map_err(|insert_err| {
-                    EngineError::env(
-                        20,
-                        format!("快路径失败（{fast_err}），INSERT 回落亦失败：{insert_err}"),
-                    )
-                })
-                .map(|rows| MaterializeOutcome {
-                    rows,
-                    mode: MaterializeMode::InsertBatch,
-                }),
-        }
-    }
-
-    /// V27 快路径：COPY TO STDOUT CSV（流式落盘，不整表驻留内存）→
-    /// DuckDB `COPY ... FROM`。任意失败交由调用方回落，本方法不吞错。
-    fn materialize_copystream(
-        &mut self,
-        duck: &dyn crate::exec::SqlExecutor,
-        table: &str,
-        select_sql: &str,
-        workdir: &Path,
-    ) -> Result<MaterializeOutcome, EngineError> {
-        let before = Self::local_count(duck, table)?;
-        // 列名经 prepare 取语句元数据（0 行查询在简单协议下无 Row 消息、
-        // fetch_rows 的 schema 会是空的），COPY 的列清单按名对齐，
-        // 与 INSERT 路径同一口径
-        let cols = self.source_columns(select_sql)?.join(", ");
-        std::fs::create_dir_all(workdir).map_err(|e| {
-            EngineError::env(20, format!("物化临时目录 {}: {e}", workdir.display()))
-        })?;
-        let csv = workdir.join(format!(".spinduck-mat-{table}-{}.csv", std::process::id()));
-        self.copy_to_csv(select_sql, &csv)?;
-        let load = format!(
-            "COPY {table} ({cols}) FROM '{}' (FORMAT CSV, HEADER true, \
-             DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULLSTR '\\N')",
-            csv.display().to_string().replace('\'', "''")
-        );
-        let result = duck.execute(&load, &BindMap::new());
-        if let Err(e) = result {
-            // 失败保留 CSV 供诊断（设计文档 §3.1），错误带路径
-            return Err(EngineError::env(
-                20,
-                format!("DuckDB COPY FROM {} 失败（CSV 已保留）：{e}", csv.display()),
-            ));
-        }
-        let rows = (Self::local_count(duck, table)? - before) as usize;
-        std::fs::remove_file(&csv)
-            .map_err(|e| EngineError::env(20, format!("清理临时 CSV {}: {e}", csv.display())))?;
-        Ok(MaterializeOutcome {
-            rows,
-            mode: MaterializeMode::CopyStream,
-        })
-    }
-
-    /// V26 批量 INSERT 路径（快路径回落；500 行/语句批量多值 INSERT，
-    /// 字面量形态与逐行逐字一致，类型转换仍由 DuckDB 列类型完成）。
-    fn materialize_insert_batch(
-        &mut self,
-        duck: &dyn crate::exec::SqlExecutor,
-        table: &str,
-        select_sql: &str,
-    ) -> Result<usize, EngineError> {
-        let (schema, rows) = self.fetch_rows(select_sql)?;
-        let cols = schema.join(", ");
-        let mut n = 0;
-        const MAT_BATCH: usize = 500;
-        for chunk in rows.chunks(MAT_BATCH) {
-            let mut stmt = format!("INSERT INTO {table} ({cols}) VALUES ");
-            for (i, r) in chunk.iter().enumerate() {
-                if i > 0 {
-                    stmt.push(',');
-                }
-                stmt.push('(');
-                let vals: Vec<String> = r
-                    .iter()
-                    .map(|c| match c {
-                        Some(s) => format!("'{}'", s.replace('\'', "''")),
-                        None => "NULL".into(),
-                    })
-                    .collect();
-                stmt.push_str(&vals.join(", "));
-                stmt.push(')');
-            }
-            duck.execute(&stmt, &BindMap::new())?;
-            n += chunk.len();
-        }
-        Ok(n)
-    }
-
-    /// 本地表当前行数（物化行数差值统计的基准）。
-    fn local_count(duck: &dyn crate::exec::SqlExecutor, table: &str) -> Result<i64, EngineError> {
-        let mut s = duck.query(&format!("SELECT count(*) FROM {table}"), &BindMap::new())?;
-        match s.fetch_many(1).first().and_then(|r| r.first()) {
-            Some(SpinValue::Int(c)) => Ok(*c),
-            other => Err(EngineError::env(
-                15,
-                format!("本地行数检查返回异常值 {other:?}（表 {table}）"),
-            )),
-        }
-    }
-
-    /// COPY TO STDOUT（D14：显式 `NULL '\N'`——空串保持 `""`，NULL 保持 `\N`，
-    /// 两侧同一标记，空串不得塌缩成 NULL）流式写入 `csv_path`。
-    fn copy_to_csv(&mut self, select_sql: &str, csv_path: &Path) -> Result<(), EngineError> {
-        let copy_sql =
-            format!("COPY ({select_sql}) TO STDOUT WITH CSV HEADER DELIMITER ',' NULL '\\N'");
-        let mut reader = self.client.copy_out(&copy_sql).map_err(db_err)?;
-        let file = std::fs::File::create(csv_path)
-            .map_err(|e| EngineError::env(20, format!("创建 {}: {e}", csv_path.display())))?;
-        let mut writer = std::io::BufWriter::new(file);
-        std::io::copy(&mut reader, &mut writer)
-            .map_err(|e| EngineError::env(20, format!("gaussdb copy_out: {e}")))?;
-        writer
-            .flush()
-            .map_err(|e| EngineError::env(20, format!("gaussdb copy_out flush: {e}")))?;
-        Ok(())
-    }
-
-    /// 源端列名（按 SELECT 输出序）：prepare 的语句元数据在零行时同样完整。
-    fn source_columns(&mut self, select_sql: &str) -> Result<Vec<String>, EngineError> {
-        let stmt = self.client.prepare(select_sql).map_err(db_err)?;
-        Ok(stmt
-            .columns()
-            .iter()
-            .map(|c| c.name().to_string())
-            .collect())
-    }
-
     /// 回写（§13.2）：DuckDB 表 → GaussDB 追加。返回回写行数。
     ///
     /// V26：逐行 execute 改为驱动 `copy_in`（COPY FROM STDIN，单事务原子追加；
@@ -376,65 +210,6 @@ impl GaussConn {
     }
 }
 
-/// 多表并行物化（V27 §3.6）：`jobs` 个工作线程消费表队列，每线程经
-/// `open_source` 取**独立** GaussDB 连接（`copy_out` 需 `&mut client`），
-/// 并持有传入的第 i 个本地执行器（同库多连接，MVCC 处理并发写不同表）。
-///
-/// 单表失败不中断其余表（快照批次语义）；结果按输入表序返回，失败以
-/// `Err` 体现，由调用方决定呈现与退出码。表数少于 `jobs` 时按表数收敛。
-/// 线程聚合的逐表结果：(输入序, 表名, 物化结果/错误)。
-type TableResults = Vec<(usize, String, Result<MaterializeOutcome, EngineError>)>;
-
-pub fn materialize_parallel<T, F>(
-    jobs: usize,
-    tables: Vec<String>,
-    workdir: &Path,
-    open_source: F,
-    duck_executors: Vec<T>,
-) -> Vec<(String, Result<MaterializeOutcome, EngineError>)>
-where
-    T: crate::exec::SqlExecutor + Send + 'static,
-    F: Fn() -> Result<GaussConn, EngineError> + Sync,
-{
-    debug_assert_eq!(tables.len(), duck_executors.len(), "表与执行器须一一对应");
-    let jobs = jobs.max(1).min(tables.len());
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    // 执行器按索引所有权移交（take）：线程只触碰自己的 T，约束收敛到 Send 即可
-    let pool: std::sync::Mutex<Vec<Option<T>>> =
-        std::sync::Mutex::new(duck_executors.into_iter().map(Some).collect());
-    let results: std::sync::Mutex<TableResults> = std::sync::Mutex::new(Vec::new());
-    std::thread::scope(|s| {
-        for _ in 0..jobs {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if i >= tables.len() {
-                    break;
-                }
-                let Some(duck) = pool.lock().unwrap_or_else(|e| e.into_inner())[i].take() else {
-                    break;
-                };
-                let res = open_source()
-                    .and_then(|mut og| og.materialize(&duck, &tables[i], None, workdir));
-                // 锁中毒只在持锁线程 panic 时发生——结果聚合继续（该线程的结果已丢，
-                // 由对应表的缺失暴露），不放大成整体失败
-                results
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push((i, tables[i].clone(), res));
-            });
-        }
-    });
-    let mut out = results
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .drain(..)
-        .collect::<Vec<_>>();
-    out.sort_by_key(|(i, _, _)| *i);
-    out.into_iter()
-        .map(|(_, table, res)| (table, res))
-        .collect()
-}
-
 /// CSV 字段编码（FORMAT csv）：NULL → 空字段；空串 → `""`（与 NULL 区分）；
 /// 含 `,` `"` `\n` `\r` 的值加引号并在引号内翻倍。
 pub(crate) fn csv_field(v: Option<&str>) -> String {
@@ -453,7 +228,7 @@ mod tests {
     use std::cell::RefCell;
 
     /// 假执行器：记录收到的 SQL，对 duckdb_tables 探针回放配置的 count 值。
-    /// 只服务 [`ensure_local_table`] 的行为断言（§4.1：单测不触真实内核）。
+    /// 只服务 [`GaussConn::ensure_local_table`] 的行为断言（§4.1：单测不触真实内核）。
     struct FakeDuck {
         count: RefCell<i64>,
         seen_sql: RefCell<Vec<String>>,

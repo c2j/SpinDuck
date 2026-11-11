@@ -238,8 +238,10 @@ pub fn usage() -> &'static str {
      \x20                                跑一条 SQL，把结果集落成快照文件（内核文本，未归一）\n\
      \x20 compare <a.json> <b.json> [--key k1,k2]\n\
      \x20                                两份结果快照逐值比对（归一后判值；红 = 退出码 1 + DIFF）\n\
-     \x20 materialize --db <f> --table <t> [--where <expr>]\n\
-     \x20                                从 GaussDB 物化到本地 DuckDB（需 feature gauss）\n\
+     \x20 materialize --db <f> --table <t>[,<t>...] [--table <t>]... [--jobs <n>] [--where <expr>]\n\
+     \x20                                从 GaussDB 物化到本地 DuckDB（需 feature gauss）；\n\
+     \x20                                  --table 可重复/逗号分隔，重复表名（含大小写等价）= 用法错；\n\
+     \x20                                  --jobs 默认 4，多表进程内并行，单表失败不中断其余表\n\
      \x20 sync --db <f> --table <t> --cols a,b [--where <expr>]\n\
      \x20      [--mode append|slice|upsert] [--slice k=$ENV,...] [--key a,b]\n\
      \x20                                本地 DuckDB 回写 GaussDB（需 feature gauss；\n\
