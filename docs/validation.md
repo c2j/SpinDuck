@@ -4020,3 +4020,41 @@ cli 契约 80，0 failed）；`cargo audit` 4 条 = 既登记的 `zip` 豁免清
 exit 2、真实参 `100` → RETURN 0.08 exit 0；规则项目 `compile` 绿且 `call --file`（不带
 --rules）同绿（RETURN 5）——报告 F1 的"体检绿、运行红"路径关闭；`plan`/`verify` 定位失败
 消息不再含 verify 字样；usage `call --plan` 行含 `--rules` 与规则口径说明。
+
+## V27. 物化 COPY STREAM 快路径实证（V27 提案 PR-A，2026-11-11）
+
+> 设计与决策链见 `docs/materialize-copystream-design.md`（含 fastaas 参照、
+> 真实例 17 表 ≈740 万行 / 64 分钟的现状画像与 PR 划分）。本节只记实证。
+
+- **能力验证**：rust-opengauss（rev `b95ed0b`，当前锁定）sync 通道具备
+  `Client::copy_out → CopyOutReader`（`crates/opengauss/src/client.rs:520`），
+  零依赖变更。
+- **首次全链路探针**（openGauss 5.0.0 容器 → duckdb-rs 内存库，100k 行含
+  NULL 列与 DECIMAL 列）：unload 390ms + load 210ms = **600ms**，≈166k 行/s；
+  行数与 `sum(amt)` 精确核对。
+- **CLI 端到端实测**（release 二进制，落盘库，v0.1.6+V27）：100k 行
+  **0.216s（≈463k 行/s）**——对比 V26.4 INSERT 路径 25.6s 为 **~118 倍**；
+  `sum(amt) = 7,500,075,000.00` 精确。
+- **语义保真**（`should_preserve_null_empty_and_special_cells_via_copystream`）：
+  NULL / 多行含逗号引号字符串 / DECIMAL(15,3) 精度逐值往返无损。**A 模式口径
+  修正（D14）**：`datcompatibility=A` 下内核层 `'' ≡ NULL`（Oracle 语义），
+  源端 CSV 即写 `\N`——空串保真只对 PG 类源端成立，A 模式无空串可保；
+  CSV bytes 探针存证（row 2 `v=''` 源端即 `\N`）。
+- **降级守护**（`should_fall_back_to_insert_batch_when_fast_path_fails`）：
+  临时目录不可创建 → 自动回落 INSERT，行数与数据正确，`outcome.mode` 可断言。
+- **实现要点存证**：源端列名经 `prepare` 语句元数据获取——简单协议 0 行查询
+  无 Row 消息、`fetch_rows` 的 schema 为空（首版实现即踩此坑，表现为
+  `COPY t ()` 语法错，探针定位后修正）。
+- **遗留**：TraceSink 分时事件（`mode/unload_ms/load_ms/rows/shards`）随
+  JSONL 契约评审单独落地（设计文档 §3.4）；并行分片（PR-B）未实施。
+- **PR-A2 多表并行（同窗口落地）**：`--table` 可重复/逗号分隔，`--jobs` 默认 4；
+  进程内 `std::thread::scope` 工作线程消费表队列，每线程独立 GaussDB 连接 +
+  独立 DuckDB 连接句柄（`DuckExecutor::from_connection` + `try_clone`，同库
+  MVCC 并发写不同表）；单表失败不中断其余表，结果按输入序聚合，任一失败
+  退出码 1。契约：`--where` 与多表同用为用法错（exit 2，parse 层判红，
+  `should_reject_where_with_multi_table_before_touching_db` 锁定不建库）；
+  `--jobs 0`/非数字用法错。容器 e2e：
+  `should_materialize_multiple_tables_in_parallel_with_failure_isolation`
+  （3 表 2 并发，含源端缺表失败隔离样本，快路径 `CopyStream` 断言）。
+  CLI 端到端：4 张夹具表 `--jobs 2` 全部成功 + 1 张源端缺表 FAIL 隔离，
+  总耗时 0.092s（真实例吞吐收益随 PR-A 的 CPU 让出而放大，§1.1）。

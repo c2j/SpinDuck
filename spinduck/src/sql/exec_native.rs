@@ -38,6 +38,12 @@ impl DuckExecutor {
         &self.conn
     }
 
+    /// 由既有连接构造（V27 §3.6 多表并行：同库多连接句柄分发给工作线程）。
+    pub fn from_connection(conn: Connection) -> Self {
+        conn.set_prepared_statement_cache_capacity(PREPARED_CACHE_CAPACITY);
+        Self { conn }
+    }
+
     /// SpinValue → duckdb Value（NULL 以 Varchar 空类型承载，绑定语义等价）。
     fn to_duck(v: &SpinValue) -> Value {
         match v {

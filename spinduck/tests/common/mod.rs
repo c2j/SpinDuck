@@ -330,7 +330,9 @@ pub fn materialize_inputs(
     case: &CaseConfig,
 ) -> Result<(), spinduck_core::error::EngineError> {
     for table in &case.materialize {
-        let n = og.materialize(&*eng.ex, table, None)?;
+        let n = og
+            .materialize(&*eng.ex, table, None, std::env::temp_dir().as_path())?
+            .rows;
         println!("MAT {table} rows={n}");
     }
     Ok(())

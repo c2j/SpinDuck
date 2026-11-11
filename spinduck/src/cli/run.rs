@@ -110,20 +110,23 @@ fn cmd_call(cmd: Command) -> CallParts {
 
 struct MaterializeParts {
     db: PathBuf,
-    table: String,
+    tables: Vec<String>,
     where_clause: Option<String>,
+    jobs: Option<usize>,
 }
 
 fn cmd_materialize(cmd: Command) -> MaterializeParts {
     match cmd {
         Command::Materialize {
             db,
-            table,
+            tables,
             where_clause,
+            jobs,
         } => MaterializeParts {
             db,
-            table,
+            tables,
             where_clause,
+            jobs,
         },
         _ => unreachable!("cmd_materialize only for Materialize"),
     }
@@ -406,10 +409,55 @@ fn open_gauss() -> Result<crate::io::GaussConn, EngineError> {
 
 #[cfg(feature = "gauss")]
 fn materialize_cmd(parts: MaterializeParts, out: &mut dyn Write) -> Result<i32, EngineError> {
-    let mut og = open_gauss()?;
+    // 临时 CSV 与目标库同目录（失败诊断现场自包含；成功即删，设计文档 §3.1）
+    let workdir = parts
+        .db
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
     let duck = crate::sql::DuckExecutor::open(&parts.db.to_string_lossy())?;
-    let n = og.materialize(&duck, &parts.table, parts.where_clause.as_deref())?;
-    writeln!(out, "MATERIALIZE {} rows={}", parts.table, n).map_err(io_err)?;
+    if let [table] = parts.tables.as_slice() {
+        // 单表形态：与 V26 语义逐字一致（允许 --where）
+        let mut og = open_gauss()?;
+        let outcome = og.materialize(&duck, table, parts.where_clause.as_deref(), &workdir)?;
+        writeln!(out, "MATERIALIZE {} rows={}", table, outcome.rows).map_err(io_err)?;
+        return Ok(EXIT_OK);
+    }
+    // 多表形态（V27 §3.6）：--jobs 个工作线程，每线程独立 GaussDB 连接 +
+    // 独立 DuckDB 连接句柄（同进程同库多连接，MVCC 处理并发写不同表）
+    let jobs = parts.jobs.unwrap_or(4).min(parts.tables.len());
+    let executors = (0..parts.tables.len())
+        .map(|_| {
+            let cloned = duck
+                .connection()
+                .try_clone()
+                .map_err(|e| EngineError::env(20, format!("duckdb 连接克隆失败：{e}")))?;
+            Ok::<_, EngineError>(crate::sql::DuckExecutor::from_connection(cloned))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let outcomes = crate::io::materialize_parallel(
+        jobs,
+        parts.tables.clone(),
+        &workdir,
+        open_gauss,
+        executors,
+    );
+    let mut failed = 0;
+    for (table, result) in &outcomes {
+        match result {
+            Ok(o) => {
+                writeln!(out, "MATERIALIZE {} rows={}", table, o.rows).map_err(io_err)?;
+            }
+            Err(e) => {
+                failed += 1;
+                // 单表失败不中断其余表（快照批次语义），任一失败整体退出码 1
+                writeln!(out, "FAIL {} {}", table, e).map_err(io_err)?;
+            }
+        }
+    }
+    if failed > 0 {
+        return Ok(EXIT_FAIL);
+    }
     Ok(EXIT_OK)
 }
 
@@ -419,7 +467,7 @@ fn materialize_cmd(parts: MaterializeParts, _out: &mut dyn Write) -> Result<i32,
         12,
         format!(
             "materialize {} -> {} (where: {:?}) requires feature `gauss`",
-            parts.table,
+            parts.tables.join(","),
             parts.db.display(),
             parts.where_clause
         ),
