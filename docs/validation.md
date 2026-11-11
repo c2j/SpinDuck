@@ -4062,11 +4062,15 @@ exit 2、真实参 `100` → RETURN 0.08 exit 0；规则项目 `compile` 绿且 
   总耗时 0.092s（真实例吞吐收益随 PR-A 的 CPU 让出而放大，§1.1）。
 - **V27.1（PR #14 审核修正落地，issues #16–#21，2026-11-11）**：
   - **#16 入库后失败绝不回落**：快路径收尾拆出 `finalize_copystream` 接缝——
-    `COPY FROM` 成功后的行数查询失败 / CSV 行数交叉核对失败带 `loaded = true`
+    `COPY FROM` 成功后的行数查询失败 / 行数交叉核对失败带 `loaded = true`
     上抛，回落判据改由 `apply_fast_failure` 按 `loaded` 分岔（入库前失败才回落
     INSERT）；CSV 清理失败按 §3.1 降级为「保留文件 + 正常成功」，不再致命。
-    行数交叉核对（设计 §4 第 4 项）同步落地：引号感知统计 CSV 数据行数，
-    与本地行数差值不一致即 `[ENV-0020]`（部分加载/重复加载哨兵）。
+    行数交叉核对（设计 §4 第 4 项）同步落地：**字节级流式计数**（评审 P1 修正——
+    落盘与计数同一次循环完成，`"` `,` `\n` `\r` 是 ASCII 定界符、不落在多字节
+    序列内部，SQL_ASCII/GBK 等非 UTF-8 源端下同样安全；不事后读文件，零额外
+    I/O、零内存驻留），与本地行数差值不一致即 `[ENV-0020]`（部分加载/重复加载
+    哨兵）。注意该报错时**数据已入库**，materialize 纯追加，重跑前必须先清表
+    （runbook §4 清表口径）。
     单测：`should_not_fall_back_to_insert_when_copy_already_loaded`、
     `should_err_loaded_when_csv_rows_mismatch_loaded_rows`、
     `should_keep_file_and_succeed_when_csv_cleanup_fails`、
@@ -4077,12 +4081,20 @@ exit 2、真实参 `100` → RETURN 0.08 exit 0；规则项目 `compile` 绿且 
   - **#18 重复表名 = 用法错**：`--table` 重复 flag 或逗号值内重复均 parse 层判红
     （EXIT_USAGE=2），不静默去重（同表并发双写/同名临时 CSV 互踩的根）。
     守护：`should_reject_duplicate_table_names_as_usage_error`。
-  - **#19 workdir 口径修正**：裸文件名 `--db local.duckdb` 的 `Path::parent()`
-    返回 `Some("")`，旧实现 `create_dir_all("")` 隐式成功、临时 CSV 落 CWD；
-    改为空目录显式落 `.`（`materialize_workdir` 单测三例锁定分叉）。
+  - **#19 workdir 口径显式化**（非行为修复）：裸文件名的库本来就在 CWD，旧实现
+    `create_dir_all("")` 隐式成功后 CSV 落 CWD，与「库同目录」事实一致；改动只是
+    把该分叉显式化、错误消息可指认（`materialize_workdir` 单测三例锁定），
+    **落盘位置不变（新旧同为 CWD）**。
   - **#21-4**：`materialize_parallel` 表/执行器长度前置条件 `debug_assert_eq!`
     改硬断言 `assert_eq!`（release 下越界 panic ≠ `Err`，违背单表失败隔离承诺）。
+    口径注记：公共 API 前置条件的 fail-fast 不属 AGENTS §Never「库代码禁
+    `panic!` 做控制流」的控制流范畴（无错误恢复分支、调用方契约违反即红）。
     守护：`should_panic_when_executor_count_mismatches_tables`。
+  - **#21-5 拆分登记**：`src/io/gauss.rs`（525 行）拆为 `io/gauss/mod.rs`
+    （连接 + 回写）与 `io/gauss/materialize.rs`（物化 + 并行 + CSV 编码），
+    纯移动不改行为。
+  - **#18 补充口径**：重复判定按大小写不敏感（`to_lowercase`），与引擎侧
+    `lower(table_name)` 同口径——`--table T1 --table t1` 同样判红。
   - **口径修正（未动代码）**：PR body「错误并入消息/无静默路径」只对双失败成立，
     修正为 §3.4 的 `degraded` + stderr 口径；失败隔离样本「源端缺表」改「本地缺表」；
     显式逃生门 `mode = "insert_batch"`（设计 §3.3）确认未实现，口径降级为设计目标；

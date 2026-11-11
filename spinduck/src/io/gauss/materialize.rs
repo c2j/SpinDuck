@@ -4,6 +4,7 @@ use super::{db_err, GaussConn};
 use crate::error::EngineError;
 use crate::exec::BindMap;
 use crate::value::SpinValue;
+use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 
@@ -19,7 +20,8 @@ pub enum MaterializeMode {
 /// 一次物化的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaterializeOutcome {
-    /// 物化行数（本地表行数差值，含回落路径）。
+    /// 物化行数：快路径为本地表行数差值（且与 CSV 数据行数核对一致）；
+    /// 回落路径为 INSERT 推送的行数（chunk 计数）。
     pub rows: usize,
     /// 实际生效的通道。
     pub mode: MaterializeMode,
@@ -122,9 +124,11 @@ impl GaussConn {
             loaded: false,
         })?;
         let csv = workdir.join(format!(".spinduck-mat-{table}-{}.csv", std::process::id()));
-        if let Err(err) = self.copy_to_csv(select_sql, &csv) {
-            return Err(FastPathFailure { err, loaded: false });
-        }
+        // 卸载期失败发生在入库前（loaded = false），回落 INSERT 安全
+        let csv_rows = match self.copy_to_csv(select_sql, &csv) {
+            Ok(n) => n,
+            Err(err) => return Err(FastPathFailure { err, loaded: false }),
+        };
         let load = format!(
             "COPY {table} ({cols}) FROM '{}' (FORMAT CSV, HEADER true, \
              DELIMITER ',', QUOTE '\"', ESCAPE '\"', NULLSTR '\\N')",
@@ -141,7 +145,7 @@ impl GaussConn {
                 loaded: false,
             });
         }
-        Self::finalize_copystream(duck, table, before, &csv)
+        Self::finalize_copystream(duck, table, before, &csv, csv_rows)
     }
 
     /// 快路径入库后的收尾（#16 接缝，单测可直测）：行数差值、CSV 行数交叉
@@ -154,12 +158,14 @@ impl GaussConn {
         table: &str,
         before: i64,
         csv: &Path,
+        csv_rows: usize,
     ) -> Result<MaterializeOutcome, FastPathFailure> {
         let loaded = |err: EngineError| FastPathFailure { err, loaded: true };
         let after = Self::local_count(duck, table).map_err(loaded)?;
-        let rows = (after - before) as usize;
-        let csv_rows = csv_data_rows(csv).map_err(loaded)?;
-        if csv_rows != rows {
+        // 差值保持 i64 直呈（评审 nit）：after < before 时负数如实进错误消息，
+        // 不做 usize 环绕伪装；核对通过后差值必然非负，再收敛成 usize
+        let rows = after - before;
+        if rows != csv_rows as i64 {
             return Err(loaded(EngineError::env(
                 20,
                 format!(
@@ -168,12 +174,10 @@ impl GaussConn {
                 ),
             )));
         }
-        if let Err(e) = std::fs::remove_file(csv) {
-            // 清理失败非致命：保留文件（§3.1 失败诊断现场自包含），不回落不报错
-            let _ = e;
-        }
+        // 清理失败非致命（§3.1 失败诊断现场自包含）：保留文件，不回落不报错
+        let _ = std::fs::remove_file(csv);
         Ok(MaterializeOutcome {
-            rows,
+            rows: rows as usize,
             mode: MaterializeMode::CopyStream,
             degraded: None,
         })
@@ -228,19 +232,33 @@ impl GaussConn {
 
     /// COPY TO STDOUT（D14：显式 `NULL '\N'`——空串保持 `""`，NULL 保持 `\N`，
     /// 两侧同一标记，空串不得塌缩成 NULL）流式写入 `csv_path`。
-    fn copy_to_csv(&mut self, select_sql: &str, csv_path: &Path) -> Result<(), EngineError> {
+    /// 返回 CSV 数据行数（表头除外）：落盘与计数同一次流式循环完成（评审 P1
+    /// 修正——不事后读文件，编码无关、零额外 I/O、零内存驻留）。
+    fn copy_to_csv(&mut self, select_sql: &str, csv_path: &Path) -> Result<usize, EngineError> {
         let copy_sql =
             format!("COPY ({select_sql}) TO STDOUT WITH CSV HEADER DELIMITER ',' NULL '\\N'");
         let mut reader = self.client.copy_out(&copy_sql).map_err(db_err)?;
         let file = std::fs::File::create(csv_path)
             .map_err(|e| EngineError::env(20, format!("创建 {}: {e}", csv_path.display())))?;
         let mut writer = std::io::BufWriter::new(file);
-        std::io::copy(&mut reader, &mut writer)
-            .map_err(|e| EngineError::env(20, format!("gaussdb copy_out: {e}")))?;
+        let mut counter = CsvRecordCounter::default();
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let n = reader
+                .read(&mut buf)
+                .map_err(|e| EngineError::env(20, format!("gaussdb copy_out: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            counter.feed(&buf[..n]);
+            writer
+                .write_all(&buf[..n])
+                .map_err(|e| EngineError::env(20, format!("gaussdb copy_out: {e}")))?;
+        }
         writer
             .flush()
             .map_err(|e| EngineError::env(20, format!("gaussdb copy_out flush: {e}")))?;
-        Ok(())
+        counter.finish()
     }
 
     /// 源端列名（按 SELECT 输出序）：prepare 的语句元数据在零行时同样完整。
@@ -319,42 +337,50 @@ where
         .collect()
 }
 
-/// CSV 数据行数（含表头记录的记录数 − 1；设计 §4 第 4 项的行数交叉核对哨兵）。
-/// 引号感知：引号内的 `,` 与换行不算分隔/记录边界，含内嵌换行的字段不会被多计。
-fn csv_data_rows(path: &Path) -> Result<usize, EngineError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| EngineError::env(20, format!("读取 {} 失败：{e}", path.display())))?;
-    let mut records = 0usize;
-    let mut in_quotes = false;
-    let mut in_record = false;
-    let mut saw_any = false;
-    for ch in text.chars() {
-        saw_any = true;
-        match ch {
-            '"' => {
-                in_quotes = !in_quotes;
-                in_record = true;
-            }
-            '\n' if !in_quotes => {
-                if in_record {
-                    records += 1;
+/// CSV 记录计数状态机（评审 P1 修正）：字节级、编码无关——`"` `,` `\n` `\r`
+/// 均为 ASCII 定界符，不可能是 UTF-8 尾字节（≥0x80）或 GBK/Big5 尾字节
+/// （≥0x40）的组成部分，故 SQL_ASCII/GBK 等非 UTF-8 源端下扫描同样安全；
+/// 随卸载流式喂入，不读文件、不整文件驻内存。
+#[derive(Default)]
+struct CsvRecordCounter {
+    records: usize,
+    in_quotes: bool,
+    in_record: bool,
+    saw_any: bool,
+}
+
+impl CsvRecordCounter {
+    fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.saw_any = true;
+            match b {
+                b'"' => {
+                    self.in_quotes = !self.in_quotes;
+                    self.in_record = true;
                 }
-                in_record = false;
+                b'\n' if !self.in_quotes => {
+                    if self.in_record {
+                        self.records += 1;
+                    }
+                    self.in_record = false;
+                }
+                b'\r' if !self.in_quotes => {}
+                _ => self.in_record = true,
             }
-            '\r' if !in_quotes => {}
-            _ => in_record = true,
         }
     }
-    if in_record {
-        records += 1;
+
+    /// 数据行数（记录数 − 表头；空输入报错，调用方归域 ENV）。
+    fn finish(self) -> Result<usize, EngineError> {
+        let mut records = self.records;
+        if self.in_record {
+            records += 1;
+        }
+        if !self.saw_any {
+            return Err(EngineError::env(20, "CSV 为空，无法核对行数".to_string()));
+        }
+        Ok(records.saturating_sub(1))
     }
-    if !saw_any {
-        return Err(EngineError::env(
-            20,
-            format!("CSV {} 为空，无法核对行数", path.display()),
-        ));
-    }
-    Ok(records.saturating_sub(1))
 }
 
 #[cfg(test)]
@@ -433,7 +459,7 @@ mod tests {
         // 回落 INSERT 会把本地表灌成两倍行数
         let duck = FakeCopyDuck::broken(5);
         let (csv, dirs) = csv_fixture("loaded-count-fail", &["a,1"]);
-        let fast = GaussConn::finalize_copystream(&duck, "t", 0, &csv);
+        let fast = GaussConn::finalize_copystream(&duck, "t", 0, &csv, 1);
         assert!(fast.is_err(), "入库后失败必须报错，不得吞成成功");
         let fast = fast.unwrap_err();
         assert!(fast.loaded, "行数查询失败发生在入库后，必须标记 loaded");
@@ -455,7 +481,7 @@ mod tests {
         // 重复加载的唯一独立哨兵
         let duck = FakeCopyDuck::loaded(7);
         let (csv, dirs) = csv_fixture("row-mismatch", &["a,1", "b,2"]);
-        let fast = GaussConn::finalize_copystream(&duck, "t", 0, &csv);
+        let fast = GaussConn::finalize_copystream(&duck, "t", 0, &csv, 2);
         let err = fast.expect_err("行数不一致必须报错").err;
         let text = err.to_string();
         assert!(text.contains("行数交叉核对失败"), "{text}");
@@ -480,7 +506,7 @@ mod tests {
             .permissions();
         ro.set_mode(0o555);
         std::fs::set_permissions(dir, ro).expect("置只读目录");
-        let out = GaussConn::finalize_copystream(&duck, "t", 0, &csv);
+        let out = GaussConn::finalize_copystream(&duck, "t", 0, &csv, 1);
         let mut rw = dir
             .as_path()
             .metadata()
@@ -519,23 +545,40 @@ mod tests {
         assert_eq!(insert_sql.borrow().len(), 1, "回落必须真的执行 INSERT");
     }
 
-    // ---- #16 前置：CSV 行数统计（引号感知） ----
+    // ---- 行数哨兵：字节级计数（编码无关，评审 P1 守护） ----
 
-    #[test]
-    fn should_count_csv_data_rows_quote_aware() {
-        let (csv, dirs) = csv_fixture(
-            "csv-quote-count",
-            &["\"a,b\",1", "\"multi\nline\",2", "\"say \"\"hi\"\"\",3"],
-        );
-        assert_eq!(csv_data_rows(&csv).expect("统计成功"), 3);
-        let _ = dirs.iter().try_for_each(std::fs::remove_dir_all);
+    fn count_bytes(chunks: &[&[u8]]) -> usize {
+        let mut c = CsvRecordCounter::default();
+        for chunk in chunks {
+            c.feed(chunk);
+        }
+        c.finish().expect("计数成功")
     }
 
     #[test]
-    fn should_count_csv_data_rows_excluding_header() {
-        let (csv, dirs) = csv_fixture("csv-header-count", &["a,1"]);
-        assert_eq!(csv_data_rows(&csv).expect("统计成功"), 1);
-        let _ = dirs.iter().try_for_each(std::fs::remove_dir_all);
+    fn should_count_csv_records_byte_level_quote_aware() {
+        // 引号翻倍与内嵌换行不得多计；跨 chunk 喂入与单块等价
+        let body = b"a,b\n\"x,y\n,z\",1\n\"say \"\"hi\"\"\",2\n";
+        let split = body.len() / 2;
+        assert_eq!(count_bytes(&[body]), 2);
+        assert_eq!(count_bytes(&[&body[..split], &body[split..]]), 2);
+    }
+
+    #[test]
+    fn should_count_non_utf8_csv_bytes_quote_aware() {
+        // 评审 P1 守护：SQL_ASCII/GBK 源端原样落字节（0xD6 0xD0 = GBK「中」，
+        // 尾字节 ≥0x40），ASCII 定界符不可能落在多字节序列内部——引号感知
+        // 计数不受编码影响，含内嵌换行的字段照常不拆
+        let body = b"v,amt\n\"\xD6\xD0\xB9\xFA\",1\n\"\xC3\xF7\nx\",2\n";
+        assert_eq!(count_bytes(&[body]), 2);
+    }
+
+    #[test]
+    fn should_err_when_csv_stream_is_empty() {
+        let err = CsvRecordCounter::default()
+            .finish()
+            .expect_err("空流必须报错");
+        assert!(err.to_string().contains("ENV-0020"), "{err}");
     }
 
     // ---- #21-4：parallel 前置条件在 release 下同样生效 ----

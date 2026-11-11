@@ -210,6 +210,8 @@ impl GaussConn {
     }
 }
 
+/// CSV 字段编码（FORMAT csv）：NULL → 空字段；空串 → `""`（与 NULL 区分）；
+/// 含 `,` `"` `\n` `\r` 的值加引号并在引号内翻倍。
 fn csv_field(v: Option<&str>) -> String {
     match v {
         None => String::new(),

@@ -176,6 +176,11 @@ issue #85 形态）。三条纪律原样继承：**保守失败**（探针失败
 
 ## 4. 测试计划（TDD 顺序）
 
+> **守护测试落位例外口径（评审 P3-4）**：本通道的守护测试落在 `src/io/gauss/`
+> 的 `#[cfg(test)]`（`finalize_copystream` / `apply_fast_failure` 为私有接缝，
+> 集成测试不可见），**不进** `tests/guard/` 集中登记——AGENTS §4.3 的集中登记
+> 以「集成层可见」为前提，此处为例外，删改仍按 Ask first。
+
 **PR-A（单流 COPY STREAM）**：
 
 1. **Red（往返保真守护）**：容器夹具建含四类单元格的表——NULL、空串、含 `,"` 与

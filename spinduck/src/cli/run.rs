@@ -422,7 +422,7 @@ fn materialize_workdir(db: &Path) -> PathBuf {
 /// （设计 §3.4），而「回落 = GB 级整表内存驻留」这条风险的唯一预警通道
 /// 不能是静默的。TraceSink 分时事件落地后 stderr 只留摘要。
 #[cfg(feature = "gauss")]
-fn warn_degraded(table: &str, degraded: &Option<String>) {
+fn warn_degraded(table: &str, degraded: Option<&str>) {
     if let Some(reason) = degraded {
         eprintln!("WARN materialize {table}: {reason}，已回落 INSERT 批量路径");
     }
@@ -436,7 +436,7 @@ fn materialize_cmd(parts: MaterializeParts, out: &mut dyn Write) -> Result<i32, 
         // 单表形态：与 V26 语义逐字一致（允许 --where）
         let mut og = open_gauss()?;
         let outcome = og.materialize(&duck, table, parts.where_clause.as_deref(), &workdir)?;
-        warn_degraded(table, &outcome.degraded);
+        warn_degraded(table, outcome.degraded.as_deref());
         writeln!(out, "MATERIALIZE {} rows={}", table, outcome.rows).map_err(io_err)?;
         return Ok(EXIT_OK);
     }
@@ -463,7 +463,7 @@ fn materialize_cmd(parts: MaterializeParts, out: &mut dyn Write) -> Result<i32, 
     for (table, result) in &outcomes {
         match result {
             Ok(o) => {
-                warn_degraded(table, &o.degraded);
+                warn_degraded(table, o.degraded.as_deref());
                 writeln!(out, "MATERIALIZE {} rows={}", table, o.rows).map_err(io_err)?;
             }
             Err(e) => {

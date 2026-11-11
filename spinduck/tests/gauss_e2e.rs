@@ -450,7 +450,7 @@ fn should_materialize_multiple_tables_in_parallel_with_failure_isolation() {
         vec![
             "sd_mt_a".to_string(),
             "sd_mt_b".to_string(),
-            "sd_mt_c".to_string(), // 源端不存在：失败隔离样本
+            "sd_mt_c".to_string(), // 本地不存在：失败隔离样本（ensure_local_table 一线红，V27.1 口径修正）
         ],
         &workdir,
         || {

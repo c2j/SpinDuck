@@ -160,6 +160,27 @@ ls -la "$(dirname run/local.duckdb)"/.spinduck-mat-*.csv
 rm "$(dirname run/local.duckdb)"/.spinduck-mat-*.csv
 ```
 
+**重跑前的强制清表口径（V27.1）**：`materialize` 是纯追加（全路径无
+`DELETE`/`TRUNCATE`），失败分两类处理——
+
+- stderr 出现 `WARN … 已回落 INSERT 批量路径` 且最终 `rows=N` 正常：数据只有
+  一份（快路径在入库前失败，0 行入库），排查原因后**直接重跑**；
+- 命令报 `[ENV-0020] 行数交叉核对失败`：此时 `COPY FROM` **已成功入库**，数据
+  已在本地表中（错误消息里的「CSV 已保留供诊断」即此含义）。**直接重跑 =
+  两倍行数**——必须先清空该表再重跑：
+
+```bash
+target/release/spinduck query run/local.duckdb --sql "DELETE FROM <表名>"
+```
+
+> architecture §13.1 的「幂等覆盖」（物化前按快照清表）在代码面上尚未实现，
+> 在此之前清表是手工步骤。
+
+```bash
+ls -la "$(dirname run/local.duckdb)"/.spinduck-mat-*.csv
+rm "$(dirname run/local.duckdb)"/.spinduck-mat-*.csv
+```
+
 第三步：执行（两条路等价，按需选）：
 
 ```bash
