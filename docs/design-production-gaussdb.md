@@ -359,8 +359,8 @@ UTF-8 源 + UTF-8 参数 → RETURN MATCH      rc=0      ← 不变
 codeweb 图 → 一个目录内的计划文件（`.spinduck/plan/*.toml`，运行态布局遵循 architecture §11）。
 下方是**字段示意**（含省略号）；**最终 schema 已随 A2 落地并写进 architecture §13.5**（实证 V30），
 与草图有三处出入：对象前缀取 `relation:`/`sequence:`/`routine:`（链路抽取把视图与表归一类，没有
-`table:`）、`generator` 现记 SpinDuck 自身版本（codeweb 接入后换它的版本，字段语义不变）、闭包来源
-是 SpinDuck 自有的静态链路抽取而非 codeweb 图。
+`table:`）、新项目计划的 `generator` 是 `codeweb 0.9.7`（字段语义不变）、闭包来源
+是一次 codeweb 0.9.7 JSON 导出，不再用 SpinDuck 自有的链路抽取。
 
 ```toml
 [plan]

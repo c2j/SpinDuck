@@ -82,6 +82,11 @@ pub(crate) fn compile_with_export(
     })
 }
 
+/// 项目声明里的全部入口。`verify` 与不带 `--entry` 的项目态 compile 共用。
+pub(crate) fn project_entries(project: &ProjectConfig) -> Result<Vec<String>, EngineError> {
+    resolve_entries(project, &[])
+}
+
 fn resolve_entries(
     project: &ProjectConfig,
     explicit: &[String],

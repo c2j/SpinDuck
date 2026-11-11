@@ -1,7 +1,10 @@
 //! `src/plan/` 单测：计划的字节口径（纯函数，不触碰内核与文件系统）。
 
 use super::*;
+use crate::error::EngineError;
+use crate::plan::codeweb::CodewebExport;
 use crate::plan::MissingObject;
+use std::io::Read;
 use std::path::Path;
 
 pub(super) fn plan_with_two_routines_and_a_gap() -> RunPlan {
@@ -233,21 +236,71 @@ fn fixture_project(root: &Path, ddl: &str) {
     write_rel(root, "sql/ddl/tables.sql", ddl);
 }
 
-fn plan_for(root: &Path, target: &str) -> crate::plan::RunPlan {
+struct JsonExport(Vec<u8>);
+
+impl CodewebExport for JsonExport {
+    fn export_json(&self, _project: &Path) -> Result<Box<dyn Read + Send>, EngineError> {
+        Ok(Box::new(std::io::Cursor::new(self.0.clone())))
+    }
+}
+
+fn abs_file(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn cw(nodes: serde_json::Value, edges: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"nodes": nodes, "edges": edges})
+}
+
+fn plan_from(root: &Path, target: &str, json: serde_json::Value) -> Result<RunPlan, EngineError> {
+    std::fs::write(root.join("codeweb.toml"), b"").unwrap();
+    let export = JsonExport(serde_json::to_vec(&json).unwrap());
     crate::plan::build(
         &crate::project::ProjectConfig::load(root).unwrap(),
         target,
         None,
+        &export,
     )
-    .unwrap()
+}
+
+fn plan_for(root: &Path, target: &str, json: serde_json::Value) -> RunPlan {
+    plan_from(root, target, json).unwrap()
 }
 
 #[test]
 fn should_collect_routine_and_ddl_files_transitively_into_the_plan() {
     let tmp = tempfile::tempdir().unwrap();
-    fixture_project(tmp.path(), FULL_DDL);
-    let plan = plan_for(tmp.path(), "prc_main");
+    let root = tmp.path();
+    fixture_project(root, FULL_DDL);
+    let main = abs_file(&root.join("sql/routines/10_main.sql"));
+    let child = abs_file(&root.join("sql/routines/20_child.sql"));
+    let plan = plan_for(
+        root,
+        "prc_main",
+        cw(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_main", "file": main},
+                {"id": 2, "type": "procedure", "name": "prc_child", "file": child},
+                {"id": 3, "type": "package", "name": "pkg_a"},
+                {"id": 4, "type": "procedure", "name": "fnc_child", "file": child},
+                {"id": 5, "type": "table", "name": "t_a"},
+                {"id": 6, "type": "table", "name": "t_b"},
+                {"id": 7, "type": "table", "name": "t_c"},
+                {"id": 8, "type": "sequence", "name": "seq_b"}
+            ]),
+            serde_json::json!([
+                {"source": 3, "target": 4, "type": "contains_routine"},
+                {"source": 1, "target": 2, "type": "direct", "file": main, "line": 0},
+                {"source": 1, "target": 4, "type": "direct", "file": main, "line": 0},
+                {"source": 1, "target": 5, "type": "table_access", "modes": ["read"], "file": main, "line": 1},
+                {"source": 1, "target": 6, "type": "table_access", "modes": ["write"], "file": main, "line": 2},
+                {"source": 1, "target": 8, "type": "uses_sequence", "file": main, "line": 2},
+                {"source": 4, "target": 7, "type": "table_access", "modes": ["write"], "file": child, "line": 3}
+            ]),
+        ),
+    );
 
+    assert_eq!(plan.generator, "codeweb 0.9.7");
     assert_eq!(plan.target, "prc_main");
     assert_eq!(
         plan.ddl_routines,
@@ -280,14 +333,41 @@ fn should_collect_routine_and_ddl_files_transitively_into_the_plan() {
 fn should_record_a_referenced_table_with_no_declaring_ddl_as_missing() {
     let tmp = tempfile::tempdir().unwrap();
     // t_c 只在包体过程的 UPDATE 里出现，DDL 不建它
+    let root = tmp.path();
     fixture_project(
-        tmp.path(),
+        root,
         "CREATE TABLE t_a (id INT);
 CREATE TABLE t_b (id INT);
 CREATE SEQUENCE seq_b START WITH 1;
 ",
     );
-    let plan = plan_for(tmp.path(), "prc_main");
+    let main = abs_file(&root.join("sql/routines/10_main.sql"));
+    let child = abs_file(&root.join("sql/routines/20_child.sql"));
+    let plan = plan_for(
+        root,
+        "prc_main",
+        cw(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_main", "file": main},
+                {"id": 2, "type": "procedure", "name": "prc_child", "file": child},
+                {"id": 3, "type": "package", "name": "pkg_a"},
+                {"id": 4, "type": "procedure", "name": "fnc_child", "file": child},
+                {"id": 5, "type": "table", "name": "t_a"},
+                {"id": 6, "type": "table", "name": "t_b"},
+                {"id": 7, "type": "table", "name": "t_c"},
+                {"id": 8, "type": "sequence", "name": "seq_b"}
+            ]),
+            serde_json::json!([
+                {"source": 3, "target": 4, "type": "contains_routine"},
+                {"source": 1, "target": 2, "type": "direct", "file": main, "line": 0},
+                {"source": 1, "target": 4, "type": "direct", "file": main, "line": 0},
+                {"source": 1, "target": 5, "type": "table_access", "modes": ["read"], "file": main, "line": 1},
+                {"source": 1, "target": 6, "type": "table_access", "modes": ["write"], "file": main, "line": 2},
+                {"source": 1, "target": 8, "type": "uses_sequence", "file": main, "line": 2},
+                {"source": 4, "target": 7, "type": "table_access", "modes": ["write"], "file": child, "line": 3}
+            ]),
+        ),
+    );
     assert_eq!(
         plan.missing,
         vec![MissingObject {
@@ -301,14 +381,41 @@ CREATE SEQUENCE seq_b START WITH 1;
 #[test]
 fn should_record_a_sequence_with_no_declaring_ddl_as_missing() {
     let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
     fixture_project(
-        tmp.path(),
+        root,
         "CREATE TABLE t_a (id INT);
 CREATE TABLE t_b (id INT);
 CREATE TABLE t_c (id INT);
 ",
     );
-    let plan = plan_for(tmp.path(), "prc_main");
+    let main = abs_file(&root.join("sql/routines/10_main.sql"));
+    let child = abs_file(&root.join("sql/routines/20_child.sql"));
+    let plan = plan_for(
+        root,
+        "prc_main",
+        cw(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_main", "file": main},
+                {"id": 2, "type": "procedure", "name": "prc_child", "file": child},
+                {"id": 3, "type": "package", "name": "pkg_a"},
+                {"id": 4, "type": "procedure", "name": "fnc_child", "file": child},
+                {"id": 5, "type": "table", "name": "t_a"},
+                {"id": 6, "type": "table", "name": "t_b"},
+                {"id": 7, "type": "table", "name": "t_c"},
+                {"id": 8, "type": "sequence", "name": "seq_b"}
+            ]),
+            serde_json::json!([
+                {"source": 3, "target": 4, "type": "contains_routine"},
+                {"source": 1, "target": 2, "type": "direct", "file": main, "line": 0},
+                {"source": 1, "target": 4, "type": "direct", "file": main, "line": 0},
+                {"source": 1, "target": 5, "type": "table_access", "modes": ["read"], "file": main, "line": 1},
+                {"source": 1, "target": 6, "type": "table_access", "modes": ["write"], "file": main, "line": 2},
+                {"source": 1, "target": 8, "type": "uses_sequence", "file": main, "line": 2},
+                {"source": 4, "target": 7, "type": "table_access", "modes": ["write"], "file": child, "line": 3}
+            ]),
+        ),
+    );
     assert_eq!(
         plan.missing,
         vec![MissingObject {
@@ -323,8 +430,9 @@ CREATE TABLE t_c (id INT);
 fn should_record_a_called_routine_that_no_file_declares_as_missing() {
     let tmp = tempfile::tempdir().unwrap();
     write_rel(tmp.path(), "spinduck.toml", PROJECT_TOML);
+    let root = tmp.path();
     write_rel(
-        tmp.path(),
+        root,
         "sql/routines/10_main.sql",
         "CREATE OR REPLACE PROCEDURE prc_main IS
 BEGIN
@@ -333,7 +441,20 @@ END;
 /
 ",
     );
-    let plan = plan_for(tmp.path(), "prc_main");
+    let main = abs_file(&root.join("sql/routines/10_main.sql"));
+    let plan = plan_for(
+        root,
+        "prc_main",
+        cw(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_main", "file": main},
+                {"id": 2, "type": "unresolved", "raw_expr": "pkg_z.prc_ghost"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "direct", "file": main, "line": 0}
+            ]),
+        ),
+    );
     assert_eq!(
         plan.missing,
         vec![MissingObject {
@@ -351,9 +472,20 @@ END;
 #[test]
 fn should_fail_when_the_target_routine_is_not_declared_by_the_project() {
     let tmp = tempfile::tempdir().unwrap();
-    fixture_project(tmp.path(), FULL_DDL);
-    let project = crate::project::ProjectConfig::load(tmp.path()).unwrap();
-    let e = crate::plan::build(&project, "prc_nope", None).unwrap_err();
+    let root = tmp.path();
+    fixture_project(root, FULL_DDL);
+    let main = abs_file(&root.join("sql/routines/10_main.sql"));
+    let e = plan_from(
+        root,
+        "prc_nope",
+        cw(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_main", "file": main}
+            ]),
+            serde_json::json!([]),
+        ),
+    )
+    .unwrap_err();
     assert_eq!(
         e.code.to_string(),
         "BIZ-0150",
@@ -386,8 +518,29 @@ END;
 /
 ",
     );
-    write_rel(tmp.path(), "sql/ddl/tables.sql", FULL_DDL);
-    let plan = plan_for(tmp.path(), "pkg_a.prc_main");
+    let root = tmp.path();
+    write_rel(root, "sql/ddl/tables.sql", FULL_DDL);
+    let file = abs_file(&root.join("sql/routines/10_pkg.sql"));
+    let plan = plan_for(
+        root,
+        "pkg_a.prc_main",
+        cw(
+            serde_json::json!([
+                {"id": 1, "type": "package", "name": "pkg_a"},
+                {"id": 2, "type": "procedure", "name": "prc_helper", "file": file},
+                {"id": 3, "type": "procedure", "name": "prc_main", "file": file},
+                {"id": 4, "type": "table", "name": "t_a"},
+                {"id": 5, "type": "table", "name": "t_b"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "contains_routine"},
+                {"source": 1, "target": 3, "type": "contains_routine"},
+                {"source": 3, "target": 2, "type": "direct", "file": file, "line": 0},
+                {"source": 3, "target": 4, "type": "table_access", "modes": ["read"], "file": file, "line": 1},
+                {"source": 2, "target": 5, "type": "table_access", "modes": ["write"], "file": file, "line": 2}
+            ]),
+        ),
+    );
     assert!(
         plan.missing.is_empty(),
         "裸名同包调用不该落缺件: {:?}",
@@ -421,7 +574,21 @@ END;
         "sql/ddl/views/1_V_PAR_BOND.sql",
         "drop view if exists V_PAR_BOND;\nCREATE OR REPLACE /*FORCE*/ VIEW V_PAR_BOND (id) AS\n  SELECT 1 FROM dual;\n",
     );
-    let plan = plan_for(tmp.path(), "prc_main");
+    let root = tmp.path();
+    let file = abs_file(&root.join("sql/routines/10_main.sql"));
+    let plan = plan_for(
+        root,
+        "prc_main",
+        cw(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_main", "file": file},
+                {"id": 2, "type": "view", "name": "V_PAR_BOND"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "table_access", "modes": ["write"], "file": file, "line": 2}
+            ]),
+        ),
+    );
     assert!(
         plan.missing.is_empty(),
         "注释后的视图声明要能登记: {:?}",
@@ -461,7 +628,24 @@ END;
         "sql/ddl/tables/t_base.sql",
         "CREATE TABLE t_base (id INT);\n",
     );
-    let plan = plan_for(tmp.path(), "prc_main");
+    let root = tmp.path();
+    let file = abs_file(&root.join("sql/routines/10_main.sql"));
+    let view = abs_file(&root.join("sql/ddl/views/1_V_BOND.sql"));
+    let plan = plan_for(
+        root,
+        "prc_main",
+        cw(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_main", "file": file},
+                {"id": 2, "type": "view", "name": "v_bond"},
+                {"id": 3, "type": "table", "name": "t_base"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "table_access", "modes": ["read"], "file": file, "line": 1},
+                {"source": 2, "target": 3, "type": "depends_on", "file": view, "line": 1}
+            ]),
+        ),
+    );
     assert_eq!(
         plan.ddl_tables,
         vec![
@@ -496,7 +680,21 @@ END;
         "sql/ddl/tables.sql",
         "CREATE TABLE t_a (id INT);\n",
     );
-    let plan = plan_for(tmp.path(), "prc_main");
+    let root = tmp.path();
+    let file = abs_file(&root.join("sql/routines/10_main.sql"));
+    let plan = plan_for(
+        root,
+        "prc_main",
+        cw(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_main", "file": file},
+                {"id": 2, "type": "table", "name": "sys_dummy"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "table_access", "modes": ["read"], "file": file, "line": 1}
+            ]),
+        ),
+    );
     assert!(
         plan.missing.is_empty(),
         "内核自建对象不该落缺件: {:?}",
@@ -529,7 +727,21 @@ END;
         "sql/ddl/tables.sql",
         "CREATE TABLE t_a (id INT);\n",
     );
-    let plan = plan_for(tmp.path(), "prc_main");
+    let root = tmp.path();
+    let file = abs_file(&root.join("sql/routines/10_main.sql"));
+    let plan = plan_for(
+        root,
+        "prc_main",
+        cw(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_main", "file": file},
+                {"id": 2, "type": "table", "schema": "bigfund", "name": "t_a"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "table_access", "modes": ["write"], "file": file, "line": 1}
+            ]),
+        ),
+    );
     assert!(
         plan.missing.is_empty(),
         "尾段命中即不是缺件: {:?}",

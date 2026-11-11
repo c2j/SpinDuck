@@ -3,7 +3,7 @@
 //! 契约三件事：干净闭包 → rc=0 且计划落盘；有缺件 → rc=1 且逐条列出；
 //! 用法/目标错 → rc=2 / rc=1。计划文件字节必须可复现（同输入两次跑逐字节相同）。
 
-use super::{cli, write, EXIT_FAIL, EXIT_OK, EXIT_USAGE};
+use super::{abs_file, cli, cw_graph, plan_in_process, write, EXIT_FAIL, EXIT_OK, EXIT_USAGE};
 
 const PROJECT_PLAN: &str = "[project]\nname = \"p\"\nkernel = \"1.5.5\"\n\n[paths]\nddl = \"sql/ddl\"\nroutines = \"sql/routines\"\nhome = \".spinduck\"\n";
 
@@ -71,9 +71,26 @@ fn expr_call_project(dir: &std::path::Path, ddl: &str) {
 #[test]
 fn should_put_an_expression_called_function_and_its_own_table_in_the_closure() {
     let tmp = tempfile::tempdir().unwrap();
-    expr_call_project(tmp.path(), DDL_EMPTY);
-    let (code, out, err) = cli(&["plan", "--dir", &tmp.path().to_string_lossy(), "prc_outer"]);
-    assert_eq!(err, "", "全部输出走 stdout");
+    let root = tmp.path();
+    expr_call_project(root, DDL_EMPTY);
+    let outer = abs_file(&root.join("sql/routines/10_outer.sql"));
+    let hidden = abs_file(&root.join("sql/routines/20_hidden.sql"));
+    let (code, out) = plan_in_process(
+        root,
+        "prc_outer",
+        None,
+        cw_graph(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_outer", "file": outer},
+                {"id": 2, "type": "function", "name": "fnc_hidden", "file": hidden},
+                {"id": 3, "type": "table", "name": "t_hidden"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "direct", "file": outer, "line": 0},
+                {"source": 2, "target": 3, "type": "table_access", "modes": ["read"], "file": hidden, "line": 1}
+            ]),
+        ),
+    );
     assert_eq!(code, EXIT_FAIL, "被调函数的表没声明即缺件: {out}");
     assert!(
         out.contains("MISS relation:t_hidden <- fnc_hidden"),
@@ -91,11 +108,29 @@ fn should_put_an_expression_called_function_and_its_own_table_in_the_closure() {
 #[test]
 fn should_deploy_the_expression_called_function_when_its_table_is_declared() {
     let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
     expr_call_project(
-        tmp.path(),
+        root,
         "CREATE TABLE t_a (id INT);\nCREATE TABLE t_hidden (k INT);\n",
     );
-    let (code, out, _) = cli(&["plan", "--dir", &tmp.path().to_string_lossy(), "prc_outer"]);
+    let outer = abs_file(&root.join("sql/routines/10_outer.sql"));
+    let hidden = abs_file(&root.join("sql/routines/20_hidden.sql"));
+    let (code, out) = plan_in_process(
+        root,
+        "prc_outer",
+        None,
+        cw_graph(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_outer", "file": outer},
+                {"id": 2, "type": "function", "name": "fnc_hidden", "file": hidden},
+                {"id": 3, "type": "table", "name": "t_hidden"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "direct", "file": outer, "line": 0},
+                {"source": 2, "target": 3, "type": "table_access", "modes": ["read"], "file": hidden, "line": 1}
+            ]),
+        ),
+    );
     assert_eq!(code, EXIT_OK, "{out}");
     assert!(
         out.contains("plan: target=prc_outer routines=2 tables=1 missing=0"),
@@ -118,12 +153,23 @@ fn should_not_report_a_missing_object_for_a_builtin_expression_call() {
         ROUTINES_EXPR_BUILTIN,
     );
     write(tmp.path(), "sql/ddl/tables.sql", DDL_T_A);
-    let (code, out, _) = cli(&[
-        "plan",
-        "--dir",
-        &tmp.path().to_string_lossy(),
+    let root = tmp.path();
+    let file = abs_file(&root.join("sql/routines/10_builtin.sql"));
+    let (code, out) = plan_in_process(
+        root,
         "prc_builtin",
-    ]);
+        None,
+        cw_graph(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_builtin", "file": file},
+                {"id": 2, "type": "builtin_function", "name": "trunc"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "uses_builtin_function", "file": file, "line": 0},
+                {"source": 1, "target": 2, "type": "direct", "file": file, "line": 0}
+            ]),
+        ),
+    );
     assert_eq!(
         code, EXIT_OK,
         "内建函数不是项目例程，不该凭空多一条缺件: {out}"
@@ -135,10 +181,26 @@ fn should_not_report_a_missing_object_for_a_builtin_expression_call() {
 #[test]
 fn should_exit_0_and_write_the_plan_file_for_a_clean_closure() {
     let tmp = tempfile::tempdir().unwrap();
-    plan_project(tmp.path(), DDL_T_A);
-    let (code, out, err) = cli(&["plan", "--dir", &tmp.path().to_string_lossy(), "prc_main"]);
+    let root = tmp.path();
+    plan_project(root, DDL_T_A);
+    let file = abs_file(&root.join("sql/routines/10_main.sql"));
+    let (code, out) = plan_in_process(
+        root,
+        "prc_main",
+        None,
+        cw_graph(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_main", "file": file},
+                {"id": 2, "type": "procedure", "name": "prc_child", "file": file},
+                {"id": 3, "type": "table", "name": "t_a"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "direct", "file": file, "line": 0},
+                {"source": 1, "target": 3, "type": "table_access", "modes": ["read"], "file": file, "line": 1}
+            ]),
+        ),
+    );
     assert_eq!(code, EXIT_OK, "{out}");
-    assert_eq!(err, "", "全部输出走 stdout");
     assert!(
         out.contains("plan: target=prc_main routines=1 tables=1 missing=0"),
         "{out}"
@@ -167,8 +229,25 @@ fn should_exit_0_and_write_the_plan_file_for_a_clean_closure() {
 #[test]
 fn should_exit_1_and_list_every_missing_object() {
     let tmp = tempfile::tempdir().unwrap();
-    plan_project(tmp.path(), DDL_EMPTY);
-    let (code, out, _) = cli(&["plan", "--dir", &tmp.path().to_string_lossy(), "prc_main"]);
+    let root = tmp.path();
+    plan_project(root, DDL_EMPTY);
+    let file = abs_file(&root.join("sql/routines/10_main.sql"));
+    let (code, out) = plan_in_process(
+        root,
+        "prc_main",
+        None,
+        cw_graph(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_main", "file": file},
+                {"id": 2, "type": "procedure", "name": "prc_child", "file": file},
+                {"id": 3, "type": "table", "name": "t_a"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "direct", "file": file, "line": 0},
+                {"source": 1, "target": 3, "type": "table_access", "modes": ["read"], "file": file, "line": 1}
+            ]),
+        ),
+    );
     assert_eq!(code, EXIT_FAIL, "缺件即计划不可执行: {out}");
     assert!(
         out.contains("plan: target=prc_main routines=1 tables=0 missing=1"),
@@ -186,11 +265,23 @@ fn should_exit_1_and_list_every_missing_object() {
 #[test]
 fn should_write_byte_identical_plan_files_on_two_runs() {
     let tmp = tempfile::tempdir().unwrap();
-    plan_project(tmp.path(), DDL_T_A);
-    let args = ["plan", "--dir", &tmp.path().to_string_lossy(), "prc_main"];
-    let (code1, out1, _) = cli(&args);
-    let first = std::fs::read(tmp.path().join(".spinduck/plan/prc_main.toml")).unwrap();
-    let (code2, out2, _) = cli(&args);
+    let root = tmp.path();
+    plan_project(root, DDL_T_A);
+    let file = abs_file(&root.join("sql/routines/10_main.sql"));
+    let json = cw_graph(
+        serde_json::json!([
+            {"id": 1, "type": "procedure", "name": "prc_main", "file": file},
+            {"id": 2, "type": "procedure", "name": "prc_child", "file": file},
+            {"id": 3, "type": "table", "name": "t_a"}
+        ]),
+        serde_json::json!([
+            {"source": 1, "target": 2, "type": "direct", "file": file, "line": 0},
+            {"source": 1, "target": 3, "type": "table_access", "modes": ["read"], "file": file, "line": 1}
+        ]),
+    );
+    let (code1, out1) = plan_in_process(root, "prc_main", None, json.clone());
+    let first = std::fs::read(root.join(".spinduck/plan/prc_main.toml")).unwrap();
+    let (code2, out2) = plan_in_process(root, "prc_main", None, json);
     let second = std::fs::read(tmp.path().join(".spinduck/plan/prc_main.toml")).unwrap();
     assert_eq!((code1, code2), (EXIT_OK, EXIT_OK), "{out1}\n{out2}");
     assert_eq!(first, second, "§6.1：同一输入必须逐字节可复现");
@@ -204,15 +295,23 @@ fn should_write_byte_identical_plan_files_on_two_runs() {
 #[test]
 fn should_honor_the_schema_override() {
     let tmp = tempfile::tempdir().unwrap();
-    plan_project(tmp.path(), DDL_T_A);
-    let (code, out, _) = cli(&[
-        "plan",
-        "--dir",
-        &tmp.path().to_string_lossy(),
-        "--schema",
-        "BIGFUND",
+    let root = tmp.path();
+    plan_project(root, DDL_T_A);
+    let file = abs_file(&root.join("sql/routines/10_main.sql"));
+    let (code, out) = plan_in_process(
+        root,
         "prc_main",
-    ]);
+        Some("BIGFUND"),
+        cw_graph(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_main", "file": file},
+                {"id": 2, "type": "table", "name": "t_a"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "table_access", "modes": ["read"], "file": file, "line": 1}
+            ]),
+        ),
+    );
     assert_eq!(code, EXIT_OK, "{out}");
     let text = std::fs::read_to_string(tmp.path().join(".spinduck/plan/prc_main.toml")).unwrap();
     // 名字一律归一小写后入计划（与链路抽取、内核目录同口径）
@@ -231,8 +330,20 @@ fn should_exit_2_with_eng_0010_when_target_routine_is_absent() {
 #[test]
 fn should_exit_1_with_biz_0150_when_target_routine_is_not_declared() {
     let tmp = tempfile::tempdir().unwrap();
-    plan_project(tmp.path(), DDL_T_A);
-    let (code, out, _) = cli(&["plan", "--dir", &tmp.path().to_string_lossy(), "prc_ghost"]);
+    let root = tmp.path();
+    plan_project(root, DDL_T_A);
+    let file = abs_file(&root.join("sql/routines/10_main.sql"));
+    let (code, out) = plan_in_process(
+        root,
+        "prc_ghost",
+        None,
+        cw_graph(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_main", "file": file}
+            ]),
+            serde_json::json!([]),
+        ),
+    );
     assert_eq!(code, EXIT_FAIL, "{out}");
     assert!(out.starts_with("[BIZ-0150] "), "{out}");
     assert!(out.contains("prc_ghost"), "{out}");

@@ -91,7 +91,7 @@ pub(super) fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, Eng
         let text = crate::cli::read_source_strict(f)?;
         eng.register(&text)?;
     }
-    if refuse_on_kernel_gaps(&eng, &target, &objects, out)? {
+    if refuse_on_kernel_gaps(&eng, &target, &objects, t.codeweb_refs.as_deref(), out)? {
         return Ok(EXIT_FAIL);
     }
     let args: Vec<crate::value::SpinValue> = parts.args.iter().map(|a| parse_literal(a)).collect();
@@ -128,17 +128,22 @@ pub(super) fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, Eng
 
 /// 执行面的缺件门（design D5）：目标闭包里内核没有的对象 ⇒ 列清单并拒绝。
 ///
-/// BFS 与 `plan` 同一份实现（`src/plan/closure.rs::walk_chain`），只有参照面从"项目 DDL
-/// 声明"换成"内核目录"。返回 `true` = 已打印缺件行，调用方直接退出 1。目标未登记时
-/// `kernel_gaps` 给 `None`：那是 `BIZ-0150` 的故障域，本门不抢判。
+/// 裸 `call` 与旧计划仍走词法 `walk_chain`。`--plan` 且 `generator` 以 `codeweb ` 开头时
+/// 只核 `[[ref]]` 里的表/视图/序列，不走词法 BFS。返回 `true` = 已打印缺件行。
+/// 目标未登记时两个入口都给 `None`：那是 `BIZ-0150`，本门不抢判。
 #[cfg(feature = "native")]
 fn refuse_on_kernel_gaps(
     eng: &crate::engine::Engine,
     target: &str,
     objects: &std::collections::BTreeSet<crate::verify::ObjectRef>,
+    codeweb_refs: Option<&[crate::plan::PlanRef]>,
     out: &mut dyn Write,
 ) -> Result<bool, EngineError> {
-    let Some((resolved, gaps)) = crate::plan::kernel_gaps(eng, target, objects) else {
+    let found = match codeweb_refs {
+        Some(refs) => crate::plan::kernel_gaps_from_refs(eng, target, objects, refs),
+        None => crate::plan::kernel_gaps(eng, target, objects),
+    };
+    let Some((resolved, gaps)) = found else {
         return Ok(false);
     };
     if gaps.is_empty() {
@@ -172,6 +177,8 @@ struct CallTargeting {
     target: String,
     sources: Vec<PathBuf>,
     rules_files: std::collections::BTreeSet<PathBuf>,
+    /// `Some` 仅当 `--plan` 且 generator 以 `codeweb ` 开头。
+    codeweb_refs: Option<Vec<crate::plan::PlanRef>>,
 }
 
 #[cfg(feature = "native")]
@@ -185,6 +192,7 @@ fn call_target_and_sources(
             target: r.clone(),
             sources: parts.files.clone(),
             rules_files: discover_rules_files(&parts.files),
+            codeweb_refs: None,
         })),
         CallTarget::Plan(p) => {
             let text = crate::cli::read_source_strict(p)?;
@@ -206,10 +214,15 @@ fn call_target_and_sources(
             let deployment = crate::plan::deploy::resolve(&project, &plan)?;
             let mut files = deployment.routines;
             files.extend(parts.files.iter().cloned());
+            let codeweb_refs = plan
+                .generator
+                .starts_with("codeweb ")
+                .then(|| plan.refs.clone());
             Ok(Some(CallTargeting {
                 target: plan.target.clone(),
                 sources: files,
                 rules_files: project.rules_files.iter().cloned().collect(),
+                codeweb_refs,
             }))
         }
     }
@@ -319,11 +332,17 @@ mod tests {
              BEGIN RETURN MYNVL(x, y); END;",
         )
         .unwrap();
-        // plan 会把计划落到项目 .spinduck/plan 下，call --plan 直接消费它
-        let (plan_code, plan_out) = run_str(&["plan", "--dir", &root.to_string_lossy(), "fnc_nv"]);
-        assert_eq!(plan_code, EXIT_OK, "{plan_out}");
+        // 旧 generator：这条测的是规则链，不经过 codeweb 闭包。
         let plan_path = root.join(".spinduck/plan/fnc_nv.toml");
-        assert!(plan_path.is_file(), "plan 落盘缺失");
+        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &plan_path,
+            "[plan]\nschema_version = 1\ntarget = \"fnc_nv\"\n\
+             generator = \"spinduck test (plan schema 1)\"\nproject_dir = \"../..\"\n\
+             \n[sources]\nddl_routines = [\"sql/routines/r.sql\"]\n\
+             ddl_tables = []\nmaterialize = []\nwriteback = []\n",
+        )
+        .unwrap();
         let (code, out) = run_str(&["call", "--plan", &plan_path.to_string_lossy(), "5", "null"]);
         assert_eq!(code, EXIT_OK, "{out}");
         assert!(out.contains("RETURN 5"), "{out}");

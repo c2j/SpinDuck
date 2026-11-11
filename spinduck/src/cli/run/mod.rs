@@ -11,9 +11,8 @@ mod io;
 
 use call::{call_cmd, cmd_call};
 use compile::{compile_cmd, explain_cmd};
-#[cfg(test)]
-pub(crate) use compile_project::compile_with_export;
 use compile_project::{compile_project_cmd, ProjectCompile};
+pub(crate) use compile_project::{compile_with_export, project_entries};
 use io::{cmd_materialize, cmd_sync, materialize_cmd, sync_cmd};
 
 use crate::cli::args::{parse, usage, Command};
@@ -43,6 +42,10 @@ pub fn run(argv: &[String], out: &mut dyn Write) -> i32 {
             EXIT_FAIL
         }
     }
+}
+
+fn ambient_export() -> crate::plan::codeweb::AmbientCommandExport {
+    crate::plan::codeweb::AmbientCommandExport
 }
 
 fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError> {
@@ -101,12 +104,14 @@ fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError> {
         Command::Materialize { .. } => materialize_cmd(cmd_materialize(cmd), out),
         Command::Sync { .. } => sync_cmd(cmd_sync(cmd), out),
         Command::Call { .. } => call_cmd(cmd_call(cmd), out),
-        Command::Verify { path } => crate::cli::verify::verify_cmd(path.as_deref(), out),
+        Command::Verify { path } => {
+            crate::cli::verify::verify_cmd(path.as_deref(), &ambient_export(), out)
+        }
         Command::Plan {
             dir,
             routine,
             schema,
-        } => crate::cli::plan::plan_cmd(dir.as_deref(), &routine, schema, out),
+        } => crate::cli::plan::plan_cmd(dir.as_deref(), &routine, schema, &ambient_export(), out),
         Command::Deploy { plan, db } => crate::cli::deploy::deploy_cmd(&plan, &db, out),
         Command::Query {
             db,

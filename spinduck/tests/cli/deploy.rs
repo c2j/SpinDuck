@@ -4,7 +4,7 @@
 //! `--db` 就能在部署好的库上跑真题（`call` 走的是文件里已有的表，不是自己建的）。
 //! 缺件面另两个契约（缺件即拒、缺文件即红）见本文件后半。
 
-use super::{cli, write, EXIT_FAIL, EXIT_OK, EXIT_USAGE};
+use super::{abs_file, cli, cw_graph, plan_in_process, write, EXIT_FAIL, EXIT_OK, EXIT_USAGE};
 
 const PROJECT_DEPLOY: &str =
     "[project]\nname = \"d\"\nkernel = \"1.5.5\"\n\n[paths]\nddl = \"sql/ddl\"\nroutines = \"sql/routines\"\nhome = \".spinduck\"\n";
@@ -25,7 +25,23 @@ fn deployed_plan(dir: &std::path::Path) -> std::path::PathBuf {
     write(dir, "spinduck.toml", PROJECT_DEPLOY);
     write(dir, "sql/routines/10_main.sql", ROUTINE_SEED_COUNT);
     write(dir, "sql/ddl/tables.sql", DDL_TABLE_AND_SEQ);
-    let (code, out, _) = cli(&["plan", "--dir", &dir.to_string_lossy(), "prc_seed_count"]);
+    let file = abs_file(&dir.join("sql/routines/10_main.sql"));
+    let (code, out) = plan_in_process(
+        dir,
+        "prc_seed_count",
+        None,
+        cw_graph(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_seed_count", "file": file},
+                {"id": 2, "type": "table", "name": "t_a"},
+                {"id": 3, "type": "sequence", "name": "seq_a"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "table_access", "modes": ["write"], "file": file, "line": 1},
+                {"source": 1, "target": 3, "type": "uses_sequence", "file": file, "line": 1}
+            ]),
+        ),
+    );
     assert_eq!(code, EXIT_OK, "夹具计划本身要干净: {out}");
     dir.join(".spinduck/plan/prc_seed_count.toml")
 }
@@ -161,12 +177,23 @@ fn should_refuse_a_plan_that_still_carries_missing_objects() {
     write(tmp.path(), "spinduck.toml", PROJECT_DEPLOY);
     write(tmp.path(), "sql/routines/10_main.sql", ROUTINE_SEED_COUNT);
     write(tmp.path(), "sql/ddl/tables.sql", "-- 什么都没建\n");
-    let (code, out, _) = cli(&[
-        "plan",
-        "--dir",
-        &tmp.path().to_string_lossy(),
+    let file = abs_file(&tmp.path().join("sql/routines/10_main.sql"));
+    let (code, out) = plan_in_process(
+        tmp.path(),
         "prc_seed_count",
-    ]);
+        None,
+        cw_graph(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_seed_count", "file": file},
+                {"id": 2, "type": "table", "name": "t_a"},
+                {"id": 3, "type": "sequence", "name": "seq_a"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "table_access", "modes": ["write"], "file": file, "line": 1},
+                {"source": 1, "target": 3, "type": "uses_sequence", "file": file, "line": 1}
+            ]),
+        ),
+    );
     assert_eq!(code, EXIT_FAIL, "夹具计划要带缺件: {out}");
     let plan = tmp.path().join(".spinduck/plan/prc_seed_count.toml");
     let db = tmp.path().join("work.duckdb");
@@ -193,12 +220,23 @@ fn should_refuse_to_call_a_plan_that_still_carries_missing_objects() {
     write(tmp.path(), "spinduck.toml", PROJECT_DEPLOY);
     write(tmp.path(), "sql/routines/10_main.sql", ROUTINE_SEED_COUNT);
     write(tmp.path(), "sql/ddl/tables.sql", "-- 什么都没建\n");
-    let (code, out, _) = cli(&[
-        "plan",
-        "--dir",
-        &tmp.path().to_string_lossy(),
+    let file = abs_file(&tmp.path().join("sql/routines/10_main.sql"));
+    let (code, out) = plan_in_process(
+        tmp.path(),
         "prc_seed_count",
-    ]);
+        None,
+        cw_graph(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_seed_count", "file": file},
+                {"id": 2, "type": "table", "name": "t_a"},
+                {"id": 3, "type": "sequence", "name": "seq_a"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "table_access", "modes": ["write"], "file": file, "line": 1},
+                {"source": 1, "target": 3, "type": "uses_sequence", "file": file, "line": 1}
+            ]),
+        ),
+    );
     assert_eq!(code, EXIT_FAIL, "夹具计划要带缺件: {out}");
     let plan = tmp.path().join(".spinduck/plan/prc_seed_count.toml");
     let db = tmp.path().join("work.duckdb");
@@ -360,12 +398,21 @@ END;
         "sql/ddl/views/1_V_A.sql",
         "CREATE OR REPLACE /*FORCE*/ VIEW v_a AS SELECT 42 AS id;\n",
     );
-    let (code, out, _) = cli(&[
-        "plan",
-        "--dir",
-        &tmp.path().to_string_lossy(),
+    let file = abs_file(&tmp.path().join("sql/routines/10_main.sql"));
+    let (code, out) = plan_in_process(
+        tmp.path(),
         "prc_read_view",
-    ]);
+        None,
+        cw_graph(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_read_view", "file": file},
+                {"id": 2, "type": "view", "name": "v_a"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "table_access", "modes": ["read"], "file": file, "line": 1}
+            ]),
+        ),
+    );
     assert_eq!(code, EXIT_OK, "夹具计划要干净: {out}");
     let plan = tmp.path().join(".spinduck/plan/prc_read_view.toml");
     let db = tmp.path().join("work.duckdb");
@@ -431,12 +478,26 @@ END;
         "CREATE TABLE t_b (id INT);\n",
     );
 
-    let (code, out, _) = cli(&[
-        "plan",
-        "--dir",
-        &tmp.path().to_string_lossy(),
+    let file = abs_file(&tmp.path().join("sql/routines/10_main.sql"));
+    let view = abs_file(&tmp.path().join("sql/ddl/views/1_V_A.sql"));
+    let (code, out) = plan_in_process(
+        tmp.path(),
         "prc_read_view",
-    ]);
+        None,
+        cw_graph(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_read_view", "file": file},
+                {"id": 2, "type": "view", "name": "v_a"},
+                {"id": 3, "type": "table", "name": "t_a"},
+                {"id": 4, "type": "table", "name": "t_b"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "table_access", "modes": ["read"], "file": file, "line": 1},
+                {"source": 2, "target": 3, "type": "depends_on", "file": view, "line": 1},
+                {"source": 2, "target": 4, "type": "depends_on", "file": view, "line": 1}
+            ]),
+        ),
+    );
     assert_eq!(code, EXIT_OK, "例程只读视图，两张基表靠视图体进计划: {out}");
     let plan = tmp.path().join(".spinduck/plan/prc_read_view.toml");
     let text = std::fs::read_to_string(&plan).unwrap();

@@ -1104,7 +1104,7 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
 | 项 | 口径 |
 |---|---|
 | 对象标识 | `relation:` / `sequence:` / `routine:` 三前缀。视图与表同为 `relation`（链路抽取本就归一类），故没有 design 草图里的 `table:` |
-| 闭包来源 | SpinDuck 自有的静态链路抽取（`src/verify/chain/`）+ 例程目录解析，**逐字复用 `verify` 的纯函数**，不再写第二套真相；codeweb 图接入后替换的只是这一处输入 |
+| 闭包来源 | 项目闭包来自一次 codeweb 0.9.7 JSON 导出，不再用 SpinDuck 自有的链路抽取 |
 | 名字归一 | `db.schema.name` 截尾两段 + 小写；被调例程先按调用方所属包补全再试裸名，DDL 名先全名后尾段（同 `verify::run::resolve_routine` / `present`，两处实现分开的唯一原因是容器类型不同） |
 | 引擎自建对象 | `deploy_schema` 自己建的表（`ENGINE_PROVIDED_TABLES`，现为 `sys_dummy`）没有源文件：既不进 `ddl_tables` 也不报缺件 |
 | 文件清单 | 一个文件常声明多个闭包成员，故按**文件**去重排序；路径一律相对项目根、`/` 分隔 |

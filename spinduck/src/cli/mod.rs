@@ -12,6 +12,9 @@ pub mod run;
 mod trace;
 mod verify;
 
+pub use plan::plan_cmd;
+pub use verify::verify_cmd;
+
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::exec::{BindMap, ExecOutcome, RowStream, SqlExecutor};
