@@ -64,6 +64,21 @@ fn should_exit_2_when_call_gets_neither_a_routine_nor_a_plan() {
 }
 
 #[test]
+fn should_mention_project_compile_without_dropping_plan_verify_wording() {
+    let (code, out, err) = cli(&["help"]);
+    assert_eq!(code, EXIT_OK, "{out}");
+    assert_eq!(err, "");
+    assert!(out.contains("compile [--dir <项目目录>]"), "{out}");
+    assert!(out.contains("--codeweb-bin"), "{out}");
+    assert!(
+        out.contains("本发布周期的兼容入口，由项目态 compile 替换"),
+        "{out}"
+    );
+    assert!(out.contains("call --plan"), "{out}");
+    assert!(out.contains("内置种子 < 项目发现 < --rules"), "{out}");
+}
+
+#[test]
 fn should_write_contracts_to_stdout_and_leave_stderr_empty() {
     let (code, out, err) = cli(&["nosuchcommand"]);
     assert_eq!(code, EXIT_USAGE);

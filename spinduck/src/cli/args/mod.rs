@@ -8,11 +8,13 @@
 //! 工具与 usage 文案。
 
 mod call;
+mod compile;
 mod exec;
 mod project;
 mod snapshot;
 
 use call::parse_call;
+use compile::parse_compile;
 use exec::{parse_explain, parse_materialize, parse_sync};
 use project::{parse_deploy, parse_plan, parse_verify};
 use snapshot::{parse_compare, parse_query};
@@ -30,6 +32,14 @@ pub enum Command {
     Help,
     /// 语料编译体检（文件或目录，可多个）。
     Compile { paths: Vec<PathBuf> },
+    /// 项目态编译：一次 codeweb 导出，按入口落计划并做 IR 体检。
+    CompileProject {
+        dir: Option<PathBuf>,
+        schema: Option<String>,
+        entries: Vec<String>,
+        codeweb_bin: Option<PathBuf>,
+        codeweb_project: Option<PathBuf>,
+    },
     /// 规则文件探针（版本锚定检查）。
     RulesProbe { path: PathBuf },
     /// 打印例程 IR（调试/回归，不执行）。
@@ -137,23 +147,7 @@ pub fn parse(argv: &[String]) -> Result<Command, EngineError> {
     match head.as_str() {
         "version" | "--version" | "-V" => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
-        "compile" => {
-            // F4：与其余子命令同一旗标纪律——`--` 前缀一律拒，绝不当路径静默读
-            let paths: Vec<PathBuf> = argv[1..]
-                .iter()
-                .map(|t| {
-                    if t.starts_with("--") {
-                        Err(usage_err(format!("compile 不接受旗标，未知参数: {t}")))
-                    } else {
-                        Ok(PathBuf::from(t))
-                    }
-                })
-                .collect::<Result<_, _>>()?;
-            if paths.is_empty() {
-                return Err(usage_err("compile <path>..."));
-            }
-            Ok(Command::Compile { paths })
-        }
+        "compile" => parse_compile(&argv[1..]),
         "rules" => {
             if argv.get(1).map(|s| s.as_str()) != Some("probe") {
                 return Err(usage_err("rules probe <rules.toml>"));
@@ -227,12 +221,15 @@ pub fn usage() -> &'static str {
      commands:\n\
      \x20 version                         打印版本\n\
      \x20 compile <path>...               语料编译体检（递归 *.sql）\n\
+     \x20 compile [--dir <项目目录>] [--schema <名>] [--entry <routine>]...\n\
+     \x20      [--codeweb-bin <path>] [--codeweb-project <dir>]\n\
+     \x20                                项目态：一次导出 codeweb 图，按入口落盘计划并 IR 体检\n\
      \x20 rules probe <rules.toml>        规则文件版本锚定检查\n\
      \x20 explain --file <sql> [--trace <审计日志>] <routine>\n\
      \x20                                打印例程 IR（不执行）；给 --trace 则逐行标注该次真实运行的命中\n\
-     \x20 verify [项目目录]               从 [[entry]] 出发核验链路对象与场景\n\
+     \x20 verify [项目目录]               从 [[entry]] 出发核验链路对象与场景（本发布周期的兼容入口，由项目态 compile 替换）\n\
      \x20 plan [--dir <项目目录>] [--schema <名>] <routine>\n\
-     \x20                                求目标例程闭包并落盘运行计划（缺件即判红）\n\
+     \x20                                求目标例程闭包并落盘运行计划（缺件即判红；本发布周期的兼容入口，由项目态 compile 替换）\n\
      \x20 deploy <计划.toml> --db <f>    按运行计划把资产装进落盘的本地 DuckDB（缺件即拒）\n\
      \x20 query --db <f> --sql-file <F.sql> --out <F.json>\n\
      \x20                                跑一条 SQL，把结果集落成快照文件（内核文本，未归一）\n\

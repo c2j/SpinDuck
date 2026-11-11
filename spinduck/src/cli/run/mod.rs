@@ -6,10 +6,14 @@
 
 mod call;
 mod compile;
+mod compile_project;
 mod io;
 
 use call::{call_cmd, cmd_call};
 use compile::{compile_cmd, explain_cmd};
+#[cfg(test)]
+pub(crate) use compile_project::compile_with_export;
+use compile_project::{compile_project_cmd, ProjectCompile};
 use io::{cmd_materialize, cmd_sync, materialize_cmd, sync_cmd};
 
 use crate::cli::args::{parse, usage, Command};
@@ -73,6 +77,22 @@ fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError> {
             })
         }
         Command::Compile { paths } => compile_cmd(&paths, out),
+        Command::CompileProject {
+            dir,
+            schema,
+            entries,
+            codeweb_bin,
+            codeweb_project,
+        } => compile_project_cmd(
+            ProjectCompile {
+                dir,
+                schema,
+                entries,
+                codeweb_bin,
+                codeweb_project,
+            },
+            out,
+        ),
         Command::Explain {
             file,
             routine,

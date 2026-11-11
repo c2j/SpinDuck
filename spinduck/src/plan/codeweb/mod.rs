@@ -1,14 +1,19 @@
-//! codeweb 0.9.7 JSON 的瘦投影与闭包纯函数。
+//! codeweb 0.9.7 JSON 的瘦投影、闭包，以及一次导出映射成多份计划。
 //!
-//! 不启进程、不读盘：调用方给出已解析的图、SpinDuck 项目根，以及表/视图/序列
-//! 归一名到项目内相对 DDL 路径的索引。生产 `build` 不调用这里。
+//! `closure_from_graph` 不启进程。项目态 compile 经 [`plans_from_export`] 导出一次再按入口调用它。
+//! `plan::closure::build` 仍走词法，不进这里。
 
+mod export;
 mod parse;
+mod plans;
 mod walk;
 
 use std::path::Path;
 
-pub use parse::{parse_codeweb_json, CodewebGraph};
+pub use export::CodewebExport;
+pub(crate) use export::{resolve_codeweb_bin, CommandExport};
+pub use parse::{parse_codeweb_json, parse_codeweb_reader, CodewebGraph};
+pub use plans::plans_from_export;
 pub use walk::closure_from_graph;
 
 /// 闭包求值的项目侧输入：根用于剥路径，索引只回答「这个关系名的 CREATE 在哪」。

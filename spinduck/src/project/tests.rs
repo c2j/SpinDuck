@@ -404,3 +404,22 @@ want = "1""#,
         );
     }
 }
+
+#[test]
+fn should_read_optional_codeweb_path_and_ignore_unknown_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "spinduck.toml",
+        "[project]\nname = \"p\"\n[paths]\ncodeweb = \"cw\"\nnot_a_key = \"x\"\n",
+    );
+    let project = ProjectConfig::load(root).unwrap();
+    assert_eq!(
+        project.codeweb_dir.as_deref(),
+        Some(root.join("cw").as_path())
+    );
+    let bare = ProjectConfig::from_toml_str("[project]\nname = \"p\"\n[paths]\nextra = 1\n", root)
+        .unwrap();
+    assert_eq!(bare.codeweb_dir, None);
+}

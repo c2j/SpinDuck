@@ -92,8 +92,17 @@ pub(super) enum EdgeKind {
 /// 把一份导出 JSON 收成瘦图。Java/JSP/mapper/index/trigger/synonym/event/custom
 /// 以及碰到它们的边直接丢掉。
 pub fn parse_codeweb_json(text: &str) -> Result<CodewebGraph, EngineError> {
-    let raw: RawGraph = serde_json::from_str(text)
+    parse_codeweb_reader(std::io::Cursor::new(text.as_bytes()))
+}
+
+/// 从导出管道解析瘦图。生产路径不要先把整份文档读成 `Vec<u8>`。
+pub fn parse_codeweb_reader(reader: impl std::io::Read) -> Result<CodewebGraph, EngineError> {
+    let raw: RawGraph = serde_json::from_reader(reader)
         .map_err(|e| EngineError::env(30, format!("codeweb JSON 解析失败: {e}")))?;
+    Ok(graph_from_raw(raw))
+}
+
+fn graph_from_raw(raw: RawGraph) -> CodewebGraph {
     let mut nodes = BTreeMap::new();
     for node in raw.nodes {
         if let Some(kind) = node.kind.into_node() {
@@ -126,11 +135,11 @@ pub fn parse_codeweb_json(text: &str) -> Result<CodewebGraph, EngineError> {
             }
         }
     }
-    Ok(CodewebGraph {
+    CodewebGraph {
         nodes,
         out,
         contains,
-    })
+    }
 }
 
 #[derive(Debug, Deserialize)]
