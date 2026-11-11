@@ -58,6 +58,27 @@ clone 后即可复现（语料在仓库内）：
 
 参数按字面量推断：`42`（整数）、`1.25`（小数）、`'abc'`（字符串）、`null`、`true`。
 
+### 2.1 运行日志（`--trace`）
+
+一条调用执行了哪些 SQL、绑定值是什么，用 `--trace` 落盘（stdout 契约不受影响；缺件即红时
+不产出任何日志文件；**日志目标已存在即 `ENV-0016` 拒绝执行**——重跑等于清掉上一轮的审计证据，
+所以宁可不动，请换新路径）：
+
+```bash
+LOG=/tmp/run-$(date +%Y%m%dT%H%M%S).log   # 一次调用一份新日志；旧的那份不会被碰
+./target/debug/spinduck call --plan .spinduck/plan/<包>.<过程>.toml --db /tmp/w.duckdb \
+  --trace "$LOG" '20260105' ''
+tail -f "$LOG"                        # 默认 text：每行一个事件，SQL 只给 sqlid + 前 96 字符
+grep '^sq-978f03531652' "$LOG.sql"    # sidecar：sqlid → SQL 全文（同前缀 + .sql）
+
+# 日志 ↔ IR 对齐：这条静态 SQL 在这次运行里跑了几次、绑定怎么变的、哪条一次都没跑
+./target/debug/spinduck explain --file sql/routines/PKG_X.sql --trace "$LOG" pkg_x.prc_y
+```
+
+`--trace-format jsonl` 切机器可读形态（§11.2 字段契约），`--trace-level stmt|sql|bind|all`
+控制详细度（默认 `bind`：绑定值入行；`all` 才逐条记 IR 指令）。落地口径与已知缺口见
+`docs/architecture.md` §11.2「落地口径」与 `docs/validation.md` V39 / V40。
+
 ### 3. GaussDB 物化 / 回写
 
 连接信息走环境变量（口令不进命令行）：
@@ -153,6 +174,7 @@ kind = "function"
 | 黄金对比 | ✅ `golden/`：toy 用例 + 语料级逐字函数（stock_kind / min_tax）+ 核心过程（purchase） |
 | 合并 COMMIT 开关（`Engine::batch_commit`） | ✅ 默认 OFF（§3.5 逐行即时提交不变）；ON 时过程内 INSERT 攒批合并 + COMMIT 吞并 + 出口统一提交（100k 稳态 938s→316s；CLI `call --batch-commit`，大业务配 `--step-budget` 放大预算；失败行数据级跳过的偏差点见 writebuf.rs，validation V26.3/V26.7） |
 | 用例原生断言层（无容器） | ✅ `[[case.assert]]`（`rows`/`call`/`out`/`error` 四维，进程内内核逐值比对）+ 语料形态覆盖门禁 `config/corpus_forms.toml`（`architecture.md` §12.1、validation V21） |
+| 审计日志 `call --trace`（text/jsonl、四级阶梯、sqlid + sidecar 全文反查）与 `explain --trace` 关联视图 | ✅ 逐条全量、逐行 flush、缺件即红不留文件（validation V39；§11.2「落地口径」列明 `elapsed_us`/`step`/轮转未落地） |
 | 入口链路核验 `spinduck verify` | ✅ `[[entry]]` 全名声明 → 例程断点 / 表·序列缺失 / 场景可执行逐条判定 + 运行态 `conf/` 快照（`architecture.md` §11.1、§12.1） |
 | `RETURN NEXT` / `PIPE ROW` / 集合类型（嵌套表/数组）/ 带参游标 | ⛔ 待做（语料仅 3+1 例；`RETURN NEXT`/`PIPE ROW`/集合元素**赋值**/`OPEN c(args)` 编译期显式拒绝，集合元素**读取**不属拒绝面，见「已知限制」） |
 | 例程目录持久化 | ✅ 内核内 `spinduck_routines` 表存源 DDL 文本，`reload_catalog` 按当前规则重放编译（`--db` 落盘后跨进程恢复） |

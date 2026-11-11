@@ -12,7 +12,7 @@ use gaussdb::sync::{Client, NoTls};
 use std::io::Write;
 
 /// 回写批大小（单次从 DuckDB 取的行数）。
-const SYNC_BATCH: usize = 1000;
+pub(crate) const SYNC_BATCH: usize = 1000;
 
 /// 结果集：列名顺序 + 每行文本值（NULL → None）。
 pub type GaussRows = (Vec<String>, Vec<Vec<Option<String>>>);
@@ -23,7 +23,7 @@ pub use materialize::{materialize_parallel, MaterializeMode, MaterializeOutcome}
 
 /// GaussDB 连接（同步，无 TLS；v1 单连接）。
 pub struct GaussConn {
-    client: Client,
+    pub(crate) client: Client,
 }
 
 fn env_err(e: impl std::fmt::Display) -> EngineError {
@@ -32,7 +32,7 @@ fn env_err(e: impl std::fmt::Display) -> EngineError {
 
 /// 数据库错误保真呈现：SQLSTATE + 服务端消息（`gaussdb::sync::Error` 的 Display 只有
 /// "db error"，定位 DDL/DML 失败必须看 DbError 字段）。
-fn db_err(e: gaussdb::sync::Error) -> EngineError {
+pub(crate) fn db_err(e: gaussdb::sync::Error) -> EngineError {
     match e.as_db_error() {
         Some(d) => EngineError::env(
             20,
@@ -212,7 +212,7 @@ impl GaussConn {
 
 /// CSV 字段编码（FORMAT csv）：NULL → 空字段；空串 → `""`（与 NULL 区分）；
 /// 含 `,` `"` `\n` `\r` 的值加引号并在引号内翻倍。
-fn csv_field(v: Option<&str>) -> String {
+pub(crate) fn csv_field(v: Option<&str>) -> String {
     match v {
         None => String::new(),
         Some("") => "\"\"".to_string(),

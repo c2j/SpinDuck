@@ -251,6 +251,8 @@ pub enum TraceEvent {
         elapsed_us: u64,
     },
     CursorOpen {
+        /// 游标的查询文本（改写产物）：没有它，CURSOR_OPEN 无法算 sqlid 反查全文。
+        sql: String,
         schema: Vec<String>,
     },
     Fetch {

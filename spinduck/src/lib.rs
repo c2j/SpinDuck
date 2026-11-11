@@ -19,6 +19,7 @@ pub mod runtime;
 pub mod snapshot;
 pub mod source;
 pub mod sql;
+pub mod trace;
 pub mod types;
 pub mod value;
 pub mod verify;

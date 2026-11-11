@@ -1,9 +1,9 @@
 //! 动态 SQL 统一管线与 SQL 上下文例程下沉（自 `interp.rs` 拆分，AGENTS §3；行为一字不改）。
 
 use crate::error::EngineError;
-use crate::exec::{BindMap, SqlExecutor};
-use crate::runtime::frame::Frame;
+use crate::exec::BindMap;
 use crate::runtime::interp::binds::resolve_binds;
+use crate::runtime::interp::Env;
 use crate::value::SpinValue;
 
 /// 动态 SQL 统一管线（决策 2025-11-05 收口）：文本求值 → ogsql 解析校验 →
@@ -12,10 +12,7 @@ use crate::value::SpinValue;
 /// 解析失败显式报错（BIZ-061），不执行未解析文本。
 pub(super) fn prepare_dynamic_sql(
     text: &str,
-    frame: &Frame,
-    ex: &dyn SqlExecutor,
-    cat: &crate::catalog::RoutineCatalog,
-    depth: usize,
+    env: &mut Env<'_>,
 ) -> Result<(String, Vec<crate::sql::FnSite>), EngineError> {
     // 带错误通道解析（与静态语句同口径；不再静默吞解析失败）
     let (infos, errors) = ogsql_parser::parser::Parser::parse_sql(text);
@@ -37,11 +34,11 @@ pub(super) fn prepare_dynamic_sql(
     let unit = crate::ir::rewrite_sql(
         &sql,
         &Default::default(),
-        cat.sql_rules(),
-        &cat.routine_names(),
+        env.cat.sql_rules(),
+        &env.cat.routine_names(),
     )?;
     let sites = unit.fn_sites;
-    materialize_fn_sites(&sites, frame, ex, cat, depth)?;
+    materialize_fn_sites(&sites, env)?;
     Ok((unit.text, sites))
 }
 
@@ -51,15 +48,12 @@ pub(super) fn prepare_dynamic_sql(
 /// 调用例程、填充缓存表（拓扑序保证依赖表先建）。
 pub(super) fn materialize_fn_sites(
     sites: &[crate::sql::FnSite],
-    frame: &Frame,
-    ex: &dyn SqlExecutor,
-    cat: &crate::catalog::RoutineCatalog,
-    depth: usize,
+    env: &mut Env<'_>,
 ) -> Result<(), EngineError> {
     let max = crate::sql::sqlfn::MAX_TUPLES;
     for site in sites {
-        let binds = resolve_binds(&site.binds, frame)?;
-        let mut st = ex.query(&site.distinct_sql, &binds)?;
+        let binds = resolve_binds(&site.binds, env.frame)?;
+        let mut st = env.ex.query(&site.distinct_sql, &binds)?;
         let rows = st.fetch_many(max + 1);
         if rows.len() > max {
             return Err(EngineError::business(
@@ -73,7 +67,7 @@ pub(super) fn materialize_fn_sites(
         for j in 0..arity {
             cols.push(format!("sd_a{j} VARCHAR"));
         }
-        ex.execute(
+        env.ex.execute(
             &format!(
                 "CREATE OR REPLACE TEMP TABLE {} ({})",
                 site.table,
@@ -84,16 +78,14 @@ pub(super) fn materialize_fn_sites(
         for chunk in rows.chunks(500) {
             let mut tuples = Vec::with_capacity(chunk.len());
             for row in chunk {
-                let v = crate::runtime::interp::routine::call_routine_value(
-                    cat, &site.name, row, ex, depth,
-                )?;
+                let v = crate::runtime::interp::routine::call_routine_value(env, &site.name, row)?;
                 let mut items = vec![sql_literal(&v)];
                 for cell in row {
                     items.push(sql_literal(cell));
                 }
                 tuples.push(format!("({})", items.join(", ")));
             }
-            ex.execute(
+            env.ex.execute(
                 &format!("INSERT INTO {} VALUES {}", site.table, tuples.join(", ")),
                 &BindMap::new(),
             )?;

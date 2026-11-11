@@ -371,6 +371,8 @@ impl CsvRecordCounter {
     }
 
     /// 数据行数（记录数 − 表头；空输入报错，调用方归域 ENV）。
+    /// `COPY ... HEADER` 至少产出一行表头，空流属异常（连接被断/服务端未返回），
+    /// 报错而非放行 0 行。
     fn finish(self) -> Result<usize, EngineError> {
         let mut records = self.records;
         if self.in_record {

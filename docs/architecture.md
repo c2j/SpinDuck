@@ -675,6 +675,51 @@ $SPINDUCK_HOME/                       # 根路径，配置项 home；默认 ./�
 | 关联性 | `sid/cid` 贯穿 engine→trace→audit→error，任一条日志可反查全链路 |
 | Win7 | 文件名仅用 ASCII/日期，无符号链接，路径大小写不敏感安全 |
 
+#### 11.2 落地口径（V39：`call --trace` 与 `explain --trace`）
+
+上面是目标态契约；V39 落地 `call` 一条入口的 trace 通道，与契约的差别必须逐条写明，
+否则"文档有 `step`、日志里没有"会变成排障时的误判：
+
+| 项 | 落地形态 |
+|---|---|
+| 入口 | `spinduck call … --trace <日志路径>`；`--trace-format text\|jsonl`（默认 text）、`--trace-level stmt\|sql\|bind\|all`（默认 bind）。形态/级别只描述汇，脱离 `--trace` 单独给出即用法错 |
+| 缺件顺序 | 日志文件在 D5 缺件门**之后**创建：拒绝执行 = 一条 SQL 都没跑，因此既不留日志也不留 sidecar |
+| 覆盖语义 | 日志文件**独占创建**（`create_new`，由 OS 判定，无 TOCTOU）：目标已存在 ⇒ `ENV-0016` 拒绝执行，本次一条都不跑、一个字节都不写，退出码 1。理由：重跑同名路径等于把上一轮"跑过什么"的证据清掉，审计通道不接受静默销毁。sidecar 仍允许覆盖——它只在主日志独占打开成功后才写，届时旧的 `<日志>.sql` 只可能来自被人为删掉的主日志。备选「引擎按时间戳自动命名」未采用：那会改掉"路径由调用方给定"这条既有语义，需另行评审 |
+| `seq` | **契约新增字段**：本次调用内单调递增行号（首行 1），同毫秒事件排序的唯一依据 |
+| `sid` / `cid` | 真实值：`sid = s-<pid>-<进程启动 epoch 毫秒>`、`cid = c-<会话内第 N 次 CALL>`；一次 CLI 进程只有一条调用 ⇒ 恒 `c-000001` |
+| `event` | 落在**顶层**而非 `detail` 内（`{"ch":"trace","event":"SQL_EXEC","detail":{…}}`）；detail 只放该事件的专属字段 |
+| `step` | 未接入：步骤锚点在解释器里，尚未进入事件面 |
+| `elapsed_us` | 字段在、值恒 0：埋点未计耗时 |
+| 轮转/保留 | 未落地：写调用方给定的单个文件，逐行 flush（§11.1 at-least-once），无切割无压缩；日志通道的写失败上报为 ENV-0013，不静默少一份审计 |
+
+**语句全文不入日志行。** 每条 SQL 由 `sqlid` 标识：先归一（连续空白折叠为单空格，
+`src/trace/render.rs::flat`——与 `explain` 的 `one_line` 同源，同一个函数），再取 FNV-1a
+64bit 的低 48bit，渲染为 `sq-` + 12 位小写十六进制。日志行只给归一文本的前 96 字符，
+超出以 `…(+N chars)` 报出被削掉的字符数；全文落同前缀 sidecar `<日志路径>.sql`，每行
+`sqlid<TAB>归一全文`、按 id 升序去重，`grep '^sq-xxxx' <日志>.sql` 即反查。归一与哈希
+同口径 ⇒ 同一条语句在 IR、日志、sidecar 三处是同一个 id，且与源码缩进/换行无关。
+
+**级别阶梯**（`level_allows`，级别越高记越多；BATCH_SKIP 任何级别都不丢）：
+
+| 级别 | 记什么 |
+|---|---|
+| `stmt` | SQL_EXEC 的 sqlid 骨架（无文本无绑定） |
+| `sql` | 上述 + SQL 开头片段 + 游标开/取（`CURSOR_OPEN` 带查询文本、sqlid 与真实列名；`FETCH` 带行号） |
+| `bind` | 上述 + 绑定值原值（单值超 32 字符截断）——**默认档** |
+| `all` | 上述 + 每条 IR 指令（`IR_STMT`）与 UDF 调用（`UDF_CALL`） |
+
+**关联形态 A（`explain --trace`）**：`spinduck explain --file X.sql --trace <日志> <routine>`
+在既有 `<pc>\t<op>\t<detail>` 契约之外追加第四列——静态 SQL 行给 `[trace ×N …]`（绑定不变只报
+次数；首末不同报 `首 … 末 …`；日志里没有报 `[trace ×0]`），动态语句给 `[trace 动态：文本在运行期]`；
+末尾汇总 `[trace] 对齐 m/n 条静态 SQL · 日志 k 个 sqlid`，并逐条报出"日志里跑了、本 IR 里没有"的
+sqlid（三类来源：动态 SQL、攒批合并文本、被调例程自己的语句）。不给 `--trace` 时 explain 输出
+逐字不变，故黄金比对与既有契约不受影响。
+
+**覆盖面口径**（V39 已知缺口，排障时按此判读，不得当成完整序列）：`UDF_CALL` 变体尚无发射点；
+`FETCH` 的行号是 `Some(1)`/`None`（内核未提供真实游标位置）；SQL 上下文函数下沉后，缓存表自身的
+DDL/DML 与 `distinct_sql` 直连内核、不产生事件；`Engine::call` 与 `call_with_sink` 同一实现，
+不注入 sink 时事件面为空、既有行为逐字不变。
+
 ### 11.2.1 内核托管与 SpinDuck 托管的边界
 
 | 类别 | 文件/目录 | SpinDuck 职责边界 |
@@ -998,6 +1043,20 @@ SQL 侧对象名取自改写前的静态扫描（`FROM`/`JOIN`/`UPDATE`/`INSERT 
 | 幂等与校验 | 回写前校验本地待写行数 vs 上次回写水位；回写后行数/校验和双向核对；失败重跑按模式幂等（append 需业务键去重或 replace_partition） |
 | 失败语义 | 回写失败 = 该表回滚（GaussDB 事务保证），本地结果保留 → 修复后 `sync --retry` 单表重试；多表回写顺序按依赖拓扑（被业务链引用的先写） |
 
+> **落地实态（feat/sync-writeback，机制规格见 `docs/sync-writeback-design.md`）**：
+> `sync` 当前落地的模式集为 **append / slice / upsert**（`--mode`，缺省 append 与
+> V26 契约逐字一致；append 无 mode/where 时输出不变）。上表的
+> `replace_partition`（对应 slice 的分区整段替换语义）由 `--mode slice
+> --slice k=v` 承接——结构化等值谓词、同事务先 DELETE 后 COPY、幂等重跑；
+> `--slice` 值支持 `$ENV` / `${ENV}` 引用（缺失即 ENV-0016 红）。upsert 未用
+> GaussDB MERGE，改为 **staging 临时表 + join 式 UPDATE + INSERT NOT EXISTS**
+> （A 模式无 `ON CONFLICT`；语句数与行数无关）。通道为 DuckDB 内核 `COPY TO`
+> CSV 中转 → `copy_in` 流式灌入（快路径失败自动回落 V26 逐行通道）。
+> 前置守卫族（触碰目标数据之前执行，全部 fail-closed）：G1 目标 schema 漂移
+> （ENV-0021）/ G2 slice 越界（BIZ-0102）/ G3 staging key 完整性（BIZ-0103）/
+> G4 目标 key 唯一索引覆盖（ENV-0022）。实现位于 `src/io/sync.rs`（纯逻辑）与
+> `src/io/sync_tx.rs`（事务骨架与通道）。
+
 ### 13.3 运行时序（单次批处理）
 
 ```
@@ -1103,9 +1162,9 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
 
 | 段 | 落点 | 职责 |
 |---|---|---|
-| 壳 | `spinduck/src/cli/run.rs` 的 `call_target_and_sources` / `refuse_on_kernel_gaps` | 解析目标与源清单、按计划拒、按内核拒；零闭包逻辑（§1） |
+| 壳 | `spinduck/src/cli/run/call.rs` 的 `call_target_and_sources` / `refuse_on_kernel_gaps` | 解析目标与源清单、按计划拒、按内核拒；零闭包逻辑（§1） |
 | 判定 | `spinduck/src/plan/closure.rs` 的 `walk_chain`（BFS 本体）+ `kernel_gaps`（内核参照面） | **一份闭包实现，两个参照面**：`build`（`plan`）以项目 DDL 声明为参照，`kernel_gaps`（`call`）以 `verify::kernel_objects` 为参照。不允许再出现第二套 BFS——否则计划说干净、门说缺件的漂移只是换了个方向。被调面的采集同样只有一套：`chain::routine_refs`（结论）+ `chain::expr_func_names`（候选，由目录判），两个参照面共用 |
-| 解析 | `spinduck/src/cli/args.rs` 的 `CallTarget::{Routine, Plan}` | 目标形态是枚举不是可选字段：`--plan` 下位置参数**全部**归实参（不猜例程名），两者皆无即用法错且诊断同时点名两条路 |
+| 解析 | `spinduck/src/cli/args/mod.rs` 的 `CallTarget::{Routine, Plan}`（`--plan` 形态的解析在 `spinduck/src/cli/args/call.rs`） | 目标形态是枚举不是可选字段：`--plan` 下位置参数**全部**归实参（不猜例程名），两者皆无即用法错且诊断同时点名两条路 |
 
 口径：
 

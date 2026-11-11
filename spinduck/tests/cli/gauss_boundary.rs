@@ -75,6 +75,31 @@ fn should_exit_1_with_env_0012_when_multi_table_built_without_gauss() {
 }
 
 #[test]
+fn should_reject_duplicate_table_names_as_usage_error_before_touching_db() {
+    // #18 契约守护（评审：落 CLI 契约层，独立文件不会被同类合并覆盖）：
+    // 重复表名 = 手误，parse 层判用法错（exit 2），不建库。
+    // 大小写等价与引擎 lower(table_name) 同口径（T1/t1 是同一张表）。
+    let cases: [&[&str]; 3] = [
+        &["--table", "t1", "--table", "t1"],
+        &["--table", "t1,t1"],
+        &["--table", "T1", "--table", "t1"],
+    ];
+    for flags in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = contract_db(tmp.path());
+        let mut argv: Vec<String> = vec!["materialize".to_string(), "--db".to_string(), db];
+        argv.extend(flags.iter().map(|s| s.to_string()));
+        let (code, out, _) = run(&argv);
+        assert_eq!(code, EXIT_USAGE, "{flags:?}: {out}");
+        assert!(out.contains("重复表名"), "{flags:?}: {out}");
+        assert!(
+            !tmp.path().join("contract.duck").exists(),
+            "{flags:?}: 用法错不该打开本地库"
+        );
+    }
+}
+
+#[test]
 fn should_reject_where_with_multi_table_before_touching_db() {
     // 语义歧义在 parse 层判用法错（feature 无关，exit 2）：不连源、不建库
     let tmp = tempfile::tempdir().unwrap();

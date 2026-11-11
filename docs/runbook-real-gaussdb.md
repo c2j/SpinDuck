@@ -199,6 +199,27 @@ target/release/spinduck call --db run/local.duckdb --plan "$PLAN" \
   --batch-commit --step-budget 200000 …
 ```
 
+排障面：这条调用到底跑了哪些 SQL、绑定值怎么变，加 `--trace`（stdout 契约不受影响；
+缺件即红时日志与 sidecar 都不产出，因为一条都没执行；**日志目标已存在即 `ENV-0016`
+拒绝执行**——覆盖旧日志等于把上一轮"跑过什么"的证据清掉，所以宁可一条都不跑）：
+
+```bash
+TRACE=run/trace-$(date +%Y%m%dT%H%M%S).log   # 一次调用一份，旧证据不会被碰
+target/release/spinduck call --db run/local.duckdb --plan "$PLAN" \
+  --batch-commit --step-budget 200000 --trace "$TRACE" …
+tail -5 "$TRACE"                          # 每条 SQL 一行：sqlid + 前 96 字符 + 绑定值
+grep '^sq-978f03531652' "$TRACE.sql"      # 全文反查（sidecar 与日志同前缀 + .sql）
+# 日志 ↔ IR 对齐：哪条静态 SQL 一次都没跑（分支没走到 / 循环体没进）
+target/release/spinduck explain --file sql/routines/PKG_X.sql \
+  --trace "$TRACE" <包>.<过程>
+```
+
+`--trace-format jsonl` 给机器消费（§11.2 字段契约），`--trace-level stmt|sql|bind|all`
+控制详细度，默认 `bind`。日志是**逐条全量**（同形语句不合并），体量与执行语句数同阶——
+游标循环每取一行就多至少一条，`all` 级还另加每条 IR 指令；请先按 `run/` 的磁盘余量选级别，
+`run/trace-*.log` 攒多了自己归档或删（引擎侧不做轮转）。
+落地口径与已知缺口见 `architecture.md` §11.2「落地口径」、`validation.md` V39 / V40。
+
 把裁决对象落成快照（一条 SQL；文件里多语句会被拒绝，红在发出内核之前）：
 
 ```bash
@@ -249,3 +270,5 @@ target/release/spinduck compare cases/baselines/expected.json run/local.json --k
 | `stream is neither valid UTF-8 nor valid GBK` | ENV-0030 | 源文件/基线编码两种判定都不成立，修文件而不是改判定 |
 | `快照 JSON …` | ENV-0031 | 基线手写格式错：顶层必须 `{schema, rows}`，单元格只能是文本/数字/布尔/null |
 | `--key 列 x 不在快照 schema 里` | ENV-0031 | 键名写错或参照侧缺该列；先修基线/查询，不要去掉 `--key` |
+| `审计日志 … 已存在：--trace 拒绝覆盖` | ENV-0016 | 上一轮的日志还在原地，本次一条都没跑：换新路径（`run/trace-<时间戳>.log`）再跑，别"先删后跑"——删掉的那份正是可比对的两轮证据 |
+| `trace log …` 且不是"已存在" | ENV-0012 | `run/` 目录不存在或不可写；日志与 sidecar 都不该出现半成品，先修目录再重跑 |
