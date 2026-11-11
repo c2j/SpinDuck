@@ -14,6 +14,8 @@ fn plan_with_two_routines_and_a_gap() -> RunPlan {
         ddl_tables: vec!["sql/ddl/tables.sql".into()],
         materialize: vec![],
         writeback: vec![],
+        refs: vec![],
+        dynamic: vec![],
         missing: vec![
             MissingObject {
                 object: "relation:par_oper_close_date".into(),
@@ -152,6 +154,252 @@ fn should_reject_a_plan_missing_a_required_field() {
     assert!(
         e.message.contains("[plan].target"),
         "诊断要点名缺的字段：{}",
+        e.message
+    );
+}
+
+#[test]
+fn should_round_trip_refs_in_stable_order() {
+    // 空段不落盘：旧计划字节不能因为新字段而多出 [[ref]] / [[dynamic]]。
+    let legacy = plan_with_two_routines_and_a_gap();
+    let legacy_text = legacy.to_toml_string();
+    assert_eq!(SCHEMA_VERSION, 1);
+    assert!(
+        legacy_text.contains("schema_version = 1\n"),
+        "{legacy_text}"
+    );
+    assert!(!legacy_text.contains("[[ref]]"), "{legacy_text}");
+    assert!(!legacy_text.contains("[[dynamic]]"), "{legacy_text}");
+    assert!(
+        legacy_text.contains("generator = \"spinduck test (plan schema 1)\"\n"),
+        "{legacy_text}"
+    );
+    let legacy_back = RunPlan::from_toml_str(&legacy_text).unwrap();
+    assert!(legacy_back.refs.is_empty());
+    assert!(legacy_back.dynamic.is_empty());
+
+    // 不含换行/回车/制表符的字符串只沿用反斜杠与引号转义。
+    let mut plain = legacy;
+    plain.generator = "keep\\me\"plain".into();
+    let plain_text = plain.to_toml_string();
+    assert!(
+        plain_text.contains("generator = \"keep\\\\me\\\"plain\"\n"),
+        "{plain_text}"
+    );
+    assert!(
+        !plain_text.contains("\\n") && !plain_text.contains("\\r") && !plain_text.contains("\\t"),
+        "{plain_text}"
+    );
+
+    // 插入序故意打乱；相邻两条只在排序键的下一列上相反，错一列就会翻序。
+    let unsorted = vec![
+        PlanRef {
+            object: "m_obj".into(),
+            kind: "routine".into(),
+            role: "read".into(),
+            from: "pkg.a".into(),
+            at: "sql/a.sql:0".into(),
+        },
+        PlanRef {
+            object: "a_obj".into(),
+            kind: "view".into(),
+            role: "type".into(),
+            from: "pkg.a".into(),
+            at: "sql/a.sql:1".into(),
+        },
+        PlanRef {
+            object: "a_obj".into(),
+            kind: "sequence".into(),
+            role: "call".into(),
+            from: "pkg.a".into(),
+            at: "sql/a.sql:0".into(),
+        },
+        PlanRef {
+            object: "a_obj".into(),
+            kind: "routine".into(),
+            role: "write".into(),
+            from: "pkg.a".into(),
+            at: "sql/a.sql:1".into(),
+        },
+        PlanRef {
+            object: "a_obj".into(),
+            kind: "routine".into(),
+            role: "call".into(),
+            from: "pkg.z".into(),
+            at: "sql/a.sql:1".into(),
+        },
+        PlanRef {
+            object: "a_obj".into(),
+            kind: "routine".into(),
+            role: "call".into(),
+            from: "pkg.m".into(),
+            at: "sql/a.sql:0".into(),
+        },
+        PlanRef {
+            object: "zeta".into(),
+            kind: "table".into(),
+            role: "write".into(),
+            from: "pkg.b".into(),
+            at: "sql/z.sql:2".into(),
+        },
+    ];
+    let sorted = vec![
+        unsorted[5].clone(),
+        unsorted[4].clone(),
+        unsorted[3].clone(),
+        unsorted[2].clone(),
+        unsorted[1].clone(),
+        unsorted[0].clone(),
+        unsorted[6].clone(),
+    ];
+    plain.generator = "spinduck test (plan schema 1)".into();
+    plain.missing.clear();
+    plain.refs = unsorted;
+    plain.dynamic = vec![PlanDynamic {
+        raw: "PlVariable([\"v_sql\"])".into(),
+        from: "pkg.a".into(),
+        at: "sql/a.sql:0".into(),
+    }];
+    let text = plain.to_toml_string();
+    assert!(text.contains("schema_version = 1\n"), "{text}");
+    let expect = r#"[[ref]]
+object = "a_obj"
+kind = "routine"
+role = "call"
+from = "pkg.m"
+at = "sql/a.sql:0"
+
+[[ref]]
+object = "a_obj"
+kind = "routine"
+role = "call"
+from = "pkg.z"
+at = "sql/a.sql:1"
+
+[[ref]]
+object = "a_obj"
+kind = "routine"
+role = "write"
+from = "pkg.a"
+at = "sql/a.sql:1"
+
+[[ref]]
+object = "a_obj"
+kind = "sequence"
+role = "call"
+from = "pkg.a"
+at = "sql/a.sql:0"
+
+[[ref]]
+object = "a_obj"
+kind = "view"
+role = "type"
+from = "pkg.a"
+at = "sql/a.sql:1"
+
+[[ref]]
+object = "m_obj"
+kind = "routine"
+role = "read"
+from = "pkg.a"
+at = "sql/a.sql:0"
+
+[[ref]]
+object = "zeta"
+kind = "table"
+role = "write"
+from = "pkg.b"
+at = "sql/z.sql:2"
+
+[[dynamic]]
+raw = "PlVariable([\"v_sql\"])"
+from = "pkg.a"
+at = "sql/a.sql:0"
+"#;
+    assert!(text.contains(expect), "{text}");
+    assert!(!text.contains("[[missing]]"), "{text}");
+    let back = RunPlan::from_toml_str(&text).unwrap();
+    assert_eq!(back.refs, sorted);
+    assert_eq!(back.dynamic, plain.dynamic);
+}
+
+#[test]
+fn should_round_trip_dynamic_raw_containing_a_newline() {
+    let raw = "PlVariable([\"v_sql\"])\n\r\t";
+    let mut plan = plan_with_two_routines_and_a_gap();
+    plan.refs = vec![PlanRef {
+        object: "t_a".into(),
+        kind: "table".into(),
+        role: "read".into(),
+        from: "pkg.a".into(),
+        at: "sql/a.sql:0".into(),
+    }];
+    plan.dynamic = vec![PlanDynamic {
+        raw: raw.into(),
+        from: "pkg.a".into(),
+        at: "sql/a.sql:0".into(),
+    }];
+    let text = plan.to_toml_string();
+    assert!(
+        text.contains("raw = \"PlVariable([\\\"v_sql\\\"])\\n\\r\\t\"\n"),
+        "{text}"
+    );
+    let ref_at = text.find("[[ref]]").expect("ref");
+    let dyn_at = text.find("[[dynamic]]").expect("dynamic");
+    let miss_at = text.find("[[missing]]").expect("missing");
+    assert!(ref_at < dyn_at && dyn_at < miss_at, "{text}");
+    let back = RunPlan::from_toml_str(&text).unwrap();
+    assert_eq!(back.dynamic[0].raw, raw);
+    assert_eq!(back.refs, plan.refs);
+    assert_eq!(back.missing, plan.missing);
+}
+
+#[test]
+fn should_reject_illegal_ref_kind_with_env_0030() {
+    let text = "\
+[plan]
+schema_version = 1
+target = \"t\"
+generator = \"g\"
+project_dir = \".\"
+
+[[ref]]
+object = \"o\"
+kind = \"index\"
+role = \"read\"
+from = \"f\"
+at = \"a.sql:0\"
+";
+    let e = RunPlan::from_toml_str(text).unwrap_err();
+    assert_eq!(e.code.to_string(), "ENV-0030");
+    assert!(
+        e.message.contains("kind") && e.message.contains("index"),
+        "{}",
+        e.message
+    );
+}
+
+#[test]
+fn should_reject_illegal_ref_role_with_env_0030() {
+    let text = "\
+[plan]
+schema_version = 1
+target = \"t\"
+generator = \"g\"
+project_dir = \".\"
+
+[[ref]]
+object = \"o\"
+kind = \"table\"
+role = \"admin\"
+from = \"f\"
+at = \"a.sql:0\"
+";
+    let e = RunPlan::from_toml_str(text).unwrap_err();
+    assert_eq!(e.code.to_string(), "ENV-0030");
+    assert!(
+        e.message.contains("role") && e.message.contains("admin"),
+        "{}",
         e.message
     );
 }
