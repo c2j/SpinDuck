@@ -77,7 +77,8 @@ fn export_failure(err: EngineError) -> EngineError {
 }
 
 fn lowered_schema(schema: Option<String>) -> Option<String> {
-    schema.map(|s| crate::verify::normalize(&s).to_ascii_lowercase())
+    // 只写入计划，不参与名字归一：整段小写，点分段全部保留。
+    schema.map(|s| s.trim().to_ascii_lowercase())
 }
 
 fn plan_from_closure(
@@ -220,8 +221,12 @@ mod tests {
             ],
             "edges": []
         });
-        let (code, out, calls) =
-            compile(&project, json, &["pkg_a.prc_a", "pkg_b.prc_b"], Some("AbC"));
+        let (code, out, calls) = compile(
+            &project,
+            json,
+            &["pkg_a.prc_a", "pkg_b.prc_b"],
+            Some(" A.B.C "),
+        );
         assert_eq!(calls, 1, "两个入口必须共用一次导出");
         assert_eq!(code, 0, "{out}");
         assert!(
@@ -232,7 +237,7 @@ mod tests {
             let text =
                 std::fs::read_to_string(root.join(format!("x/y/plan/{target}.toml"))).unwrap();
             assert!(text.contains("generator = \"codeweb 0.9.7\""), "{text}");
-            assert!(text.contains("schema = \"abc\""), "{text}");
+            assert!(text.contains("schema = \"a.b.c\""), "{text}");
             assert!(text.contains("project_dir = \"../../..\""), "{text}");
             assert!(text.contains("materialize = []"), "{text}");
             assert!(!text.contains("[[missing]]"), "{text}");
