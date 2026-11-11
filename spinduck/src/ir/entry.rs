@@ -26,7 +26,10 @@ pub fn compile_stmts_with(
     };
     c.stmts(stmts)?;
     c.resolve_fixups()?;
-    Ok(IrProg { code: c.code })
+    Ok(IrProg {
+        code: c.code,
+        ..IrProg::default()
+    })
 }
 
 /// 从完整 PL 块编译：声明段静态游标在此编译（§7.2）。
@@ -65,6 +68,7 @@ pub fn compile_routine_with_names(
         routine_names: routine_names.clone(),
         ..Default::default()
     };
+    let mut var_types = std::collections::BTreeMap::new();
     use ogsql_parser::ast::plpgsql::PlDeclaration;
     // 声明段：变量入变量集并生成初始化指令（GaussDB 语义：声明即变量，
     // 未给初值时为 NULL）；游标编译为静态 SQL 待 OPEN 使用
@@ -89,6 +93,11 @@ pub fn compile_routine_with_names(
                     c.rowtype_of
                         .insert(name.0.clone(), anchor.to_ascii_lowercase());
                 }
+                if let ogsql_parser::ast::plpgsql::PlDataType::TypeName(raw) = &v.data_type {
+                    if let Some(ty) = c.rules.spin_type(raw) {
+                        var_types.insert(name.0.clone(), ty);
+                    }
+                }
                 let init = match &v.default {
                     Some(e) => c.expr(e)?,
                     None => IrExpr::Const(SpinValue::Null),
@@ -109,7 +118,10 @@ pub fn compile_routine_with_names(
         None => c.stmts(&block.body)?,
     }
     c.resolve_fixups()?;
-    Ok(IrProg { code: c.code })
+    Ok(IrProg {
+        code: c.code,
+        var_types,
+    })
 }
 /// 预扫描：赋值目标 + PL 表达式中的 PlVariable 引用（不进入 SQL 语句内部）。
 /// 扩展点（M6）：例程参数与 DECLARE 声明同样入集（GaussDB 语义：声明即变量）。

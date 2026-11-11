@@ -8,7 +8,9 @@ use crate::error::EngineError;
 use crate::exec::{SqlExecutor, TraceSink};
 use crate::ir::{AssignTarget, IrProg, IrStmt, VarName};
 use crate::runtime::frame::Frame;
+use crate::types::SpinType;
 use crate::value::SpinValue;
+use std::collections::BTreeMap;
 
 mod binds;
 mod cursors;
@@ -109,6 +111,7 @@ pub fn run_with_catalog(
             None
         },
         current_error: None,
+        var_types: &prog.var_types,
     };
     loop {
         match run_inner(prog, &mut env, &mut traps, &mut pc, &mut steps) {
@@ -181,6 +184,8 @@ pub(super) struct Env<'a> {
     pub(super) wbuf: writebuf::WBufOpt,
     /// 进入异常处理器体时写入的当前错误——裸 `RAISE;` 的重抛源。
     pub current_error: Option<EngineError>,
+    /// 当前例程已映射的标量声明（写入 `VARCHAR` 槽时转换）。
+    pub var_types: &'a BTreeMap<String, SpinType>,
 }
 
 /// 内层执行驱动（traps/pc/steps 由外层持有，支持跨重试持久化）。
@@ -315,12 +320,21 @@ fn run_inner(
 }
 
 /// 写槽唯一入口（帧 `assign` 语义含 %ROWTYPE 字段与记录整体赋值）。
+/// 标量变量按声明类型转换；记录字段与无类型槽原样写入。
 pub(super) fn assign(
-    frame: &mut Frame,
+    env: &mut Env<'_>,
     target: &AssignTarget,
     v: SpinValue,
 ) -> Result<(), EngineError> {
-    frame.assign(target, v)
+    let v = match target {
+        AssignTarget::Var(name) => crate::value::coerce_for_slot(
+            &v,
+            env.var_types.get(&name.0),
+            env.cat.sql_rules().implicit_assignment_loose,
+        )?,
+        AssignTarget::Field { .. } => v,
+    };
+    env.frame.assign(target, v)
 }
 
 // 测试模块（随 §3 规模拆分搬出，断言一字未改）。

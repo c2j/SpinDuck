@@ -12,10 +12,10 @@
 //! - `[dates.formats]`：载入 `date_formats`，映射表本体仍在
 //!   `sql::oracle_format_to_strftime`，由
 //!   `should_keep_seed_date_formats_in_sync_with_strftime_mapper` 守护两侧不漂移。
-//! - `[implicit]` `[ddl]` `[rejects]` `version`：语料事实与探针期望的
-//!   数据登记，当前无改写器消费；`implicit_concat_numeric_to_varchar` 保留为
-//!   可读字段（种子值 false，用于黄金比对口径追溯）——数值拼接转串的实际口径
+//! - `[implicit] assignment_loose`：写入 `VARCHAR` 槽的宽松转换（`value::coerce_for_slot`）。
+//!   `concat_numeric_to_varchar` 仍只作登记（种子值 false）；数值拼接转串的实际口径
 //!   已由 `[patterns] concat_null_as_empty` 的 `concat(…)` 承担。
+//! - `[ddl]` `[rejects]` `version`：语料事实与探针期望的数据登记，当前无改写器消费。
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -29,6 +29,9 @@ pub struct RuleRegistry {
     pub functions: BTreeMap<String, String>,
     /// `[implicit]`：隐式转换开关
     pub implicit_concat_numeric_to_varchar: bool,
+    /// `[implicit] assignment_loose`：写入 `VARCHAR` 槽时数字/布尔收成字符串。
+    /// 种子为 true；关闭后变体不符返回 `BIZ-0111`。
+    pub implicit_assignment_loose: bool,
     /// `[patterns] rownum_first_row`：`rownum = 1` 首行谓词 → `LIMIT 1` 改写开关。
     /// DuckDB 无 rownum，不改写则语句必然内核报错，故默认 true（可经规则文件关闭）。
     pub patterns_rownum_first_row: bool,
@@ -74,6 +77,7 @@ impl RuleRegistry {
             types: BTreeMap::new(),
             functions: BTreeMap::new(),
             implicit_concat_numeric_to_varchar: false,
+            implicit_assignment_loose: true,
             patterns_rownum_first_row: true,
             patterns_update_strip_alias: true,
             patterns_sequence_nextval: true,
@@ -145,6 +149,9 @@ impl RuleRegistry {
                 .get("concat_numeric_to_varchar")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(false);
+            if let Some(b) = i.get("assignment_loose").and_then(|x| x.as_bool()) {
+                reg.implicit_assignment_loose = b;
+            }
         }
         if let Some(p) = v.get("patterns").and_then(|x| x.as_table()) {
             if let Some(b) = p.get("rownum_first_row").and_then(|x| x.as_bool()) {
@@ -192,6 +199,11 @@ impl RuleRegistry {
                 }
             }
         }
+        if let Some(i) = v.get("implicit").and_then(|x| x.as_table()) {
+            if let Some(b) = i.get("assignment_loose").and_then(|x| x.as_bool()) {
+                self.implicit_assignment_loose = b;
+            }
+        }
         if let Some(p) = v.get("patterns").and_then(|x| x.as_table()) {
             if let Some(b) = p.get("rownum_first_row").and_then(|x| x.as_bool()) {
                 self.patterns_rownum_first_row = b;
@@ -215,9 +227,8 @@ impl RuleRegistry {
         Ok(())
     }
 
-    /// 类型名 → SpinType（unknown 返回 None，由调用方报 ENG 域改写缺口）。
-    /// 现状：语料 DDL 的 DuckDB 建表由黄金 harness 按参照侧 schema 物化，本方法尚无
-    /// 生产调用点——接入点在 DDL 翻译（`docs/validation.md` V18 登记）。
+    /// 类型名 → SpinType。映射表没有的名字返回 None（调用方保持该槽无类型）。
+    /// 形参与局部变量登记使用本方法；DDL 翻译仍见 `docs/validation.md` V18。
     pub fn spin_type(&self, gauss_name: &str) -> Option<crate::types::SpinType> {
         crate::types::SpinType::from_gauss_name(gauss_name, &self.types)
     }
@@ -273,6 +284,16 @@ concat_numeric_to_varchar = false
         let mut d = RuleRegistry::default();
         d.overlay("[patterns]\nrownum_first_row = false").unwrap();
         assert!(!d.patterns_rownum_first_row, "overlay 可覆盖");
+    }
+
+    #[test]
+    fn should_load_assignment_loose_and_allow_overlay_to_close_it() {
+        assert!(RuleRegistry::default().implicit_assignment_loose);
+        let mut rules = RuleRegistry::default();
+        rules
+            .overlay("[implicit]\nassignment_loose = false")
+            .unwrap();
+        assert!(!rules.implicit_assignment_loose);
     }
 
     #[test]

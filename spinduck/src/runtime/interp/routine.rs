@@ -24,24 +24,13 @@ pub(super) fn call(
         .ok_or_else(|| EngineError::business(150, format!("routine {name} not registered")))?
         .clone();
     crate::catalog::check_arity(name, &routine.params, args.len())?;
+    let callee_args = eval_args(env, &routine.params, args)?;
     let mut callee = Frame::new();
-    for (i, p) in routine.params.iter().enumerate() {
-        let v = match args.get(i) {
-            Some(ir_a) => {
-                let mut env_ = EvalEnv {
-                    frame: env.frame,
-                    ex: env.ex,
-                    cat: env.cat,
-                    depth: env.depth,
-                    sink: &mut *env.sink,
-                };
-                crate::runtime::eval::eval(ir_a, &mut env_)?
-            }
-            // 省略的尾部实参取声明默认值（BIZ-0151 已在元数校验里排除其余形态）
-            None => p.default.clone().unwrap_or(SpinValue::Null),
-        };
-        callee.set(&VarName(p.name.to_ascii_lowercase()), v);
-    }
+    callee.install_params(
+        &routine.params,
+        &callee_args,
+        env.cat.sql_rules().implicit_assignment_loose,
+    )?;
     let out = run_with_catalog(
         &routine.prog,
         &mut callee,
@@ -61,13 +50,39 @@ pub(super) fn call(
         }
         if let Some(Some(t)) = out_targets.get(i) {
             if let Some(v) = callee.get(&VarName(p.name.to_ascii_lowercase())) {
-                crate::runtime::interp::assign(env.frame, t, v.clone())?;
+                crate::runtime::interp::assign(env, t, v.clone())?;
             }
         }
     }
     // 过程的 RETURN <expr> 在过程语境下不产生调用方值（v1）
     let _ = out;
     Ok(())
+}
+
+/// 位置实参求值。省略的尾部实参取声明默认值（元数校验已排除其余形态）。
+fn eval_args(
+    env: &mut Env<'_>,
+    params: &[crate::catalog::RoutineParam],
+    args: &[IrExpr],
+) -> Result<Vec<SpinValue>, EngineError> {
+    let mut out = Vec::with_capacity(params.len());
+    for (i, p) in params.iter().enumerate() {
+        let v = match args.get(i) {
+            Some(ir_a) => {
+                let mut env_ = EvalEnv {
+                    frame: env.frame,
+                    ex: env.ex,
+                    cat: env.cat,
+                    depth: env.depth,
+                    sink: &mut *env.sink,
+                };
+                crate::runtime::eval::eval(ir_a, &mut env_)?
+            }
+            None => p.default.clone().unwrap_or(SpinValue::Null),
+        };
+        out.push(v);
+    }
+    Ok(out)
 }
 
 /// 按值调用已注册函数（SQL 上下文下沉用；OUT 写回不适用）。
@@ -85,13 +100,11 @@ pub(super) fn call_routine_value(
         .clone();
     crate::catalog::check_arity(name, &routine.params, args.len())?;
     let mut callee = Frame::new();
-    for (i, p) in routine.params.iter().enumerate() {
-        let v = match args.get(i) {
-            Some(v) => v.clone(),
-            None => p.default.clone().unwrap_or(SpinValue::Null),
-        };
-        callee.set(&VarName(p.name.to_ascii_lowercase()), v);
-    }
+    callee.install_params(
+        &routine.params,
+        args,
+        env.cat.sql_rules().implicit_assignment_loose,
+    )?;
     let out = run_with_catalog(
         &routine.prog,
         &mut callee,

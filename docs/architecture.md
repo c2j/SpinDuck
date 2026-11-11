@@ -209,9 +209,14 @@ SQL 侧列引用。改写器与解释器必须共享同一判定，避免两套�
 | 游标 | `CursorState`（见 §7） |
 | 集合类型 TABLE OF / VARRAY | `Vec<SpinValue>`（本期不做 index-by 自定义类型） |
 
-**隐式转换**由规则文件 `[implicit]` 驱动，解释器与改写器共用同一实现：
-赋值/拼接/函数参数处的宽松转换统一走一个 `coerce(value, target_type)` 入口，
-并产出 lint 诊断；差异行为（如空串与 NULL）必须显式配置，禁止默认含糊。
+**隐式转换**由规则文件 `[implicit]` 驱动。第一阶段只覆盖声明为 `VARCHAR`
+（含 `VARCHAR2` / `CHAR` / `CLOB` 等映射到 `VARCHAR` 的名字）的标量槽：
+调用装帧与赋值、`SELECT INTO`、`FETCH` 写入时，`assignment_loose = true`
+把 `Int` / `Decimal` / `Bool` 收成 `Str`；关闭时这些变体返回 `BIZ-0111`。
+`NULL` 保持 `NULL`。`NUMBER` 等数字目标、`DATE` / `TIMESTAMP`、记录字段
+与映射表里没有的类型名保持写入前的变体。SQL 绑定只看帧里的 `SpinValue`，
+不在改写文本里插入 `CAST`。`coerce` 仍是数值字符串等转换的函数，成功路径
+不另打 lint。
 
 ### 3.4 存过内 SQL 改写（`sql/rewrite/`，机制层）
 

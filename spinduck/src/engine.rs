@@ -165,7 +165,7 @@ impl Engine {
                             pkg.to_ascii_lowercase(),
                             p.name.join(".").to_ascii_lowercase()
                         );
-                        let prog = match &p.block {
+                        let mut prog = match &p.block {
                             Some(b) => {
                                 let extra: Vec<String> = p
                                     .parameters
@@ -184,8 +184,9 @@ impl Engine {
                         let params = p
                             .parameters
                             .iter()
-                            .map(crate::catalog::map_param)
+                            .map(|pp| crate::catalog::map_param(pp, &self.rules))
                             .collect::<Result<Vec<_>, EngineError>>()?;
+                        crate::catalog::remember_param_types(&mut prog, &params);
                         names.push(full.clone());
                         self.catalog.register(crate::catalog::CompiledRoutine {
                             name: full,
@@ -200,7 +201,7 @@ impl Engine {
                             pkg.to_ascii_lowercase(),
                             f.name.join(".").to_ascii_lowercase()
                         );
-                        let prog = match &f.block {
+                        let mut prog = match &f.block {
                             Some(b) => {
                                 let extra: Vec<String> = f
                                     .parameters
@@ -219,8 +220,9 @@ impl Engine {
                         let params = f
                             .parameters
                             .iter()
-                            .map(crate::catalog::map_param)
+                            .map(|pp| crate::catalog::map_param(pp, &self.rules))
                             .collect::<Result<Vec<_>, EngineError>>()?;
+                        crate::catalog::remember_param_types(&mut prog, &params);
                         names.push(full.clone());
                         self.catalog.register(crate::catalog::CompiledRoutine {
                             name: full,
@@ -339,13 +341,11 @@ impl Engine {
             .clone();
         crate::catalog::check_arity(name, &routine.params, args.len())?;
         let mut frame = Frame::new();
-        for (i, p) in routine.params.iter().enumerate() {
-            let v = match args.get(i) {
-                Some(v) => v.clone(),
-                None => p.default.clone().unwrap_or(SpinValue::Null),
-            };
-            frame.set(&VarName(p.name.to_ascii_lowercase()), v);
-        }
+        frame.install_params(
+            &routine.params,
+            args,
+            self.catalog.sql_rules().implicit_assignment_loose,
+        )?;
         // 统一事务边界（§3.5）：最外层调用在显式事务内执行——过程内
         // TxCommit/TxRollback 即时提交/回滚当前事务并重开；正常完成统一
         // COMMIT；未处理异常统一 ROLLBACK（DuckDB ACID 提供原子性）
