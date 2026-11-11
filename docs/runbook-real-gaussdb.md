@@ -138,13 +138,14 @@ target/release/spinduck deploy "$PLAN" --db run/local.duckdb
 ```
 
 第二步：物化——按计划 `[sources].materialize` 清单把输入表从实例拉进本地库
-（只读实例，`SELECT` 进本地库）：
+（只读实例，`SELECT` 进本地库）。V27 起支持多表并行（`--table` 重复/逗号分隔，
+`--jobs` 默认 4；`--where` 仅限单表形态；单表失败不中断其余表，任一失败退出码 1）：
 
 ```bash
-for t in $(sed -n '/^\[sources\]/,/^\[/p' "$PLAN" | grep '^"' | tr -d '"'); do
-  # 或直接逐条手敲清单里的表名
-  target/release/spinduck materialize --db run/local.duckdb --table "$t"
-done
+TABLES=$(sed -n '/^\[sources\]/,/^\[/p' "$PLAN" | grep '^"' | tr -d '"' | paste -sd, -)
+target/release/spinduck materialize --db run/local.duckdb --table "$TABLES" --jobs 4
+# 或沿用逐表形态：
+# for t in …; do target/release/spinduck materialize --db run/local.duckdb --table "$t"; done
 ```
 
 第三步：执行（两条路等价，按需选）：

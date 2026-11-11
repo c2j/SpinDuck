@@ -5,4 +5,4 @@
 pub mod gauss;
 
 #[cfg(feature = "gauss")]
-pub use gauss::GaussConn;
+pub use gauss::{materialize_parallel, GaussConn, MaterializeMode, MaterializeOutcome};

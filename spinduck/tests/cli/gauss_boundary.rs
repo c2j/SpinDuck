@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use super::{cli, EXIT_FAIL};
+use super::{cli, EXIT_FAIL, EXIT_USAGE};
 
 /// `--db` 指向临时目录里的一个**不该被创建**的文件。
 fn contract_db(dir: &Path) -> String {
@@ -52,6 +52,53 @@ fn should_exit_1_with_env_0012_when_materialize_built_without_gauss() {
     assert!(
         !tmp.path().join("contract.duck").exists(),
         "被 feature 门禁挡住时不该打开本地库"
+    );
+}
+
+#[cfg(not(feature = "gauss"))]
+#[test]
+fn should_exit_1_with_env_0012_when_multi_table_built_without_gauss() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = contract_db(tmp.path());
+    let argv: Vec<String> = ["materialize", "--db", &db, "--table", "t1", "--table", "t2"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let (code, out, _) = run(&argv);
+    assert_eq!(code, EXIT_FAIL, "{out}");
+    assert!(out.starts_with("[ENV-0012] materialize "), "{out}");
+    assert!(out.contains("requires feature `gauss`"), "{out}");
+    assert!(
+        !tmp.path().join("contract.duck").exists(),
+        "被 feature 门禁挡住时不该打开本地库"
+    );
+}
+
+#[test]
+fn should_reject_where_with_multi_table_before_touching_db() {
+    // 语义歧义在 parse 层判用法错（feature 无关，exit 2）：不连源、不建库
+    let tmp = tempfile::tempdir().unwrap();
+    let db = contract_db(tmp.path());
+    let argv: Vec<String> = [
+        "materialize",
+        "--db",
+        &db,
+        "--table",
+        "t1",
+        "--table",
+        "t2",
+        "--where",
+        "bcrq='20240105'",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let (code, out, _) = run(&argv);
+    assert_eq!(code, EXIT_USAGE, "{out}");
+    assert!(out.contains("--where 仅限单表形态"), "{out}");
+    assert!(
+        !tmp.path().join("contract.duck").exists(),
+        "用法错不该打开本地库"
     );
 }
 

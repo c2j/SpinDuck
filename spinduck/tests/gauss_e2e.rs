@@ -12,7 +12,7 @@
 use spinduck_core::engine::Engine;
 use spinduck_core::error::EngineError;
 use spinduck_core::exec::{BindMap, Row, RowStream, SqlExecutor};
-use spinduck_core::io::GaussConn;
+use spinduck_core::io::{GaussConn, MaterializeMode};
 use spinduck_core::rules::RuleRegistry;
 use spinduck_core::sql::exec_native::DuckExecutor;
 use spinduck_core::value::SpinValue;
@@ -169,7 +169,10 @@ fn gauss_e2e_materialize_process_sync_back() {
     .unwrap();
 
     // 1b. 物化：GaussDB → DuckDB（按源端全量）
-    let mat = og.materialize(&ex, "sd_dat_in", None).unwrap();
+    let mat = og
+        .materialize(&ex, "sd_dat_in", None, std::env::temp_dir().as_path())
+        .unwrap()
+        .rows;
     assert_eq!(mat, 2, "全量物化两行");
 
     let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
@@ -226,8 +229,14 @@ fn gauss_e2e_materialize_with_where_clause() {
     )
     .unwrap();
     let n = og
-        .materialize(&ex, "sd_incr", Some("bcrq = '20240105'"))
-        .unwrap();
+        .materialize(
+            &ex,
+            "sd_incr",
+            Some("bcrq = '20240105'"),
+            std::env::temp_dir().as_path(),
+        )
+        .unwrap()
+        .rows;
     assert_eq!(n, 1, "按分区键增量物化");
     let mut s = ex
         .query("SELECT count(*) FROM sd_incr", &BindMap::new())
@@ -255,7 +264,12 @@ fn should_fail_materialize_when_local_table_missing() {
     // 本地库存在但**没有** sd_guard：守卫必须在拉取前红
     let ex = DuckExecutor::open_in_memory().unwrap();
     let err = og
-        .materialize(&ex, "sd_guard", Some("n = 1"))
+        .materialize(
+            &ex,
+            "sd_guard",
+            Some("n = 1"),
+            std::env::temp_dir().as_path(),
+        )
         .expect_err("本地缺表必须显式红");
     let text = err.to_string();
     assert!(text.starts_with("[ENV-0015]"), "{text}");
@@ -263,7 +277,197 @@ fn should_fail_materialize_when_local_table_missing() {
 
     // 零行路径同样红：守卫先于 fetch，`1=0` 不再有假绿
     let err0 = og
-        .materialize(&ex, "sd_guard", Some("1=0"))
+        .materialize(&ex, "sd_guard", Some("1=0"), std::env::temp_dir().as_path())
         .expect_err("零行路径也必须红（假绿禁止）");
     assert!(err0.to_string().starts_with("[ENV-0015]"), "{err0}");
+}
+
+/// PR-A 回归守护（V27）：COPY STREAM 快路径的单元格保真——NULL、空串、
+/// 含逗号/引号/换行的字符串、DECIMAL 精度四类逐值往返（D14 硬约束：
+/// 空串不得塌缩成 NULL）。同时锁定 outcome.mode = CopyStream 与行数。
+#[test]
+fn should_preserve_null_empty_and_special_cells_via_copystream() {
+    let Some(mut og) = og() else {
+        panic!(
+            "E2E 用例需要 A 模式容器（golden/gaussdb-docker）：\n\
+             docker compose -f golden/gaussdb-docker/docker-compose.yml up -d\n\
+             SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 SPINDUCK_OG_PASSWORD=… cargo test --features gauss"
+        );
+    };
+    let _ = og.exec("DROP TABLE IF EXISTS sd_fidelity");
+    og.exec("CREATE TABLE sd_fidelity(id INT, v VARCHAR(50), note VARCHAR(80), amt NUMERIC(15,3))")
+        .unwrap();
+    og.exec(
+        "INSERT INTO sd_fidelity VALUES \
+         (1, NULL, 'x', 1.500), \
+         (2, '', 'comma,quote\"' || chr(10) || 'next-line', 2.250), \
+         (3, 'plain', NULL, NULL)",
+    )
+    .unwrap();
+
+    let ex = DuckExecutor::open_in_memory().unwrap();
+    ex.execute(
+        "CREATE TABLE sd_fidelity(id INT, v VARCHAR, note VARCHAR, amt DECIMAL(15,3))",
+        &BindMap::new(),
+    )
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let out = og
+        .materialize(&ex, "sd_fidelity", None, tmp.path())
+        .expect("快路径物化");
+    assert_eq!(
+        out.mode,
+        MaterializeMode::CopyStream,
+        "默认应走 COPY STREAM"
+    );
+    assert_eq!(out.rows, 3);
+
+    let mut s = ex
+        .query(
+            "SELECT id, v, note, amt FROM sd_fidelity ORDER BY id",
+            &BindMap::new(),
+        )
+        .unwrap();
+    let rows = s.fetch_many(10);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    // id=1：NULL 保真
+    assert_eq!(rows[0][1], SpinValue::Null, "NULL 不得变空串");
+    assert_eq!(
+        rows[0][3],
+        SpinValue::Decimal(1500, 38, 3),
+        "DECIMAL(15,3) 类型化返回：1.500 = 未缩放 1500/scale 3"
+    );
+    assert_eq!(
+        rows[1][3],
+        SpinValue::Decimal(2250, 38, 3),
+        "2.250 精度保真"
+    );
+    // id=2：openGauss A 兼容模式下内核层 '' ≡ NULL（datcompatibility=A，Oracle 语义），
+    // 源端 CSV 即写 \N——空串保真（D14）只对 PG 类源端成立，A 模式无空串可保；
+    // 此处锁定的是"不因传输层塌缩产生额外差异"（与 INSERT 路径同形）
+    assert_eq!(
+        rows[1][1],
+        SpinValue::Null,
+        "A 模式源端 '' 即 NULL，传输层不得改变该语义"
+    );
+    assert_eq!(
+        rows[1][2],
+        SpinValue::Str("comma,quote\"\nnext-line".into())
+    );
+    // id=3：NULL 数值
+    assert_eq!(rows[2][2], SpinValue::Null);
+    assert_eq!(rows[2][3], SpinValue::Null);
+}
+
+/// PR-A 降级守护（V27）：快路径失败（临时目录不可创建）必须自动回落
+/// INSERT 路径且数据正确——降级可观测的 TraceSink 事件随 JSONL 契约评审
+/// 单独落地，本用例锁定行为面。
+#[test]
+fn should_fall_back_to_insert_batch_when_fast_path_fails() {
+    let Some(mut og) = og() else {
+        panic!(
+            "E2E 用例需要 A 模式容器（golden/gaussdb-docker）：\n\
+             docker compose -f golden/gaussdb-docker/docker-compose.yml up -d\n\
+             SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 SPINDUCK_OG_PASSWORD=… cargo test --features gauss"
+        );
+    };
+    let _ = og.exec("DROP TABLE IF EXISTS sd_fallback");
+    og.exec("CREATE TABLE sd_fallback(a VARCHAR(20), n INT)")
+        .unwrap();
+    og.exec("INSERT INTO sd_fallback VALUES ('x', 1), ('y', 2)")
+        .unwrap();
+
+    let ex = DuckExecutor::open_in_memory().unwrap();
+    ex.execute(
+        "CREATE TABLE sd_fallback(a VARCHAR, n INT)",
+        &BindMap::new(),
+    )
+    .unwrap();
+    // 不可创建的"目录"：一个已存在的普通文件
+    let blocker = tempfile::tempdir().unwrap();
+    let workdir = blocker.path().join("not-a-dir");
+    std::fs::write(&workdir, b"file").unwrap();
+    let out = og
+        .materialize(&ex, "sd_fallback", None, &workdir)
+        .expect("降级后应成功");
+    assert_eq!(out.mode, MaterializeMode::InsertBatch, "必须回落 INSERT");
+    assert_eq!(out.rows, 2);
+    let mut s = ex
+        .query("SELECT count(*) FROM sd_fallback", &BindMap::new())
+        .unwrap();
+    assert_eq!(s.fetch_many(1)[0][0], SpinValue::Int(2));
+}
+
+/// PR-A2 回归守护（V27 §3.6）：多表并行——结果按输入序、单表失败不中断
+/// 其余表（快照批次语义）、同库多连接并发写（MVCC）、快路径默认生效。
+#[test]
+fn should_materialize_multiple_tables_in_parallel_with_failure_isolation() {
+    let Some(_guard) = og() else {
+        panic!(
+            "E2E 用例需要 A 模式容器（golden/gaussdb-docker）：\n\
+             docker compose -f golden/gaussdb-docker/docker-compose.yml up -d\n\
+             SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 SPINDUCK_OG_PASSWORD=… cargo test --features gauss"
+        );
+    };
+    let mut og = og().unwrap();
+    for (t, rows) in [
+        ("sd_mt_a", "INSERT INTO sd_mt_a VALUES ('x',1),('y',2)"),
+        (
+            "sd_mt_b",
+            "INSERT INTO sd_mt_b VALUES ('p',10),('q',20),('r',30)",
+        ),
+    ] {
+        og.exec(&format!("DROP TABLE IF EXISTS {t}")).unwrap();
+        og.exec(&format!("CREATE TABLE {t}(a VARCHAR(20), n INT)"))
+            .unwrap();
+        og.exec(rows).unwrap();
+    }
+
+    // 同一落盘库 + 每表一个连接句柄（CLI 多表形态的同一装配方式）
+    let dir = tempfile::tempdir().unwrap();
+    let db_file = dir.path().join("mt.duckdb");
+    let ex = DuckExecutor::open(db_file.to_str().unwrap()).expect("落盘库");
+    for t in ["sd_mt_a", "sd_mt_b"] {
+        ex.execute(
+            &format!("CREATE TABLE {t}(a VARCHAR, n INT)"),
+            &BindMap::new(),
+        )
+        .unwrap();
+    }
+    let executors = (0..3)
+        .map(|_| DuckExecutor::from_connection(ex.connection().try_clone().unwrap()))
+        .collect::<Vec<_>>();
+
+    let workdir = db_file.parent().unwrap().to_path_buf();
+    let host = std::env::var("SPINDUCK_OG_HOST").unwrap();
+    let port: u16 = std::env::var("SPINDUCK_OG_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5432);
+    let password = std::env::var("SPINDUCK_OG_PASSWORD").unwrap();
+    let outcomes = spinduck_core::io::materialize_parallel(
+        2,
+        vec![
+            "sd_mt_a".to_string(),
+            "sd_mt_b".to_string(),
+            "sd_mt_c".to_string(), // 源端不存在：失败隔离样本
+        ],
+        &workdir,
+        || {
+            GaussConn::connect_parts(&host, port, "gaussdb", &password, "postgres")
+                .map_err(|e| spinduck_core::error::EngineError::env(20, format!("connect: {e}")))
+        },
+        executors,
+    );
+
+    // 输入序 + 成功两张 + 缺表一张 ENV-0015（不中断其余）
+    assert_eq!(outcomes.len(), 3);
+    assert_eq!(outcomes[0].0, "sd_mt_a");
+    let ok_a = outcomes[0].1.as_ref().expect("sd_mt_a 应成功");
+    assert_eq!(ok_a.rows, 2);
+    assert_eq!(ok_a.mode, MaterializeMode::CopyStream);
+    let ok_b = outcomes[1].1.as_ref().expect("sd_mt_b 应成功");
+    assert_eq!(ok_b.rows, 3);
+    let err_c = outcomes[2].1.as_ref().unwrap_err().to_string();
+    assert!(err_c.starts_with("[ENV-0015]"), "{err_c}");
 }

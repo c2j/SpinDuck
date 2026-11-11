@@ -21,8 +21,12 @@ pub enum Command {
     /// 物化：GaussDB 表 → 本地 DuckDB 表（feature `gauss`）。
     Materialize {
         db: PathBuf,
-        table: String,
+        /// 一张或多张表：`--table` 可重复，值内逗号分隔同义（V27 §3.6 多表并行）。
+        tables: Vec<String>,
+        /// 可选 WHERE 过滤（仅单表形态；多表形态拒绝，语义歧义）。
         where_clause: Option<String>,
+        /// 并发度（默认 4；0 视为用法错）。
+        jobs: Option<usize>,
     },
     /// 回写：本地 DuckDB 表 → GaussDB 追加（feature `gauss`）。
     Sync {
@@ -445,8 +449,10 @@ fn parse_explain(rest: &[String]) -> Result<Command, EngineError> {
 
 fn parse_materialize(rest: &[String]) -> Result<Command, EngineError> {
     let mut db = None;
-    let mut table = None;
+    // --table 可重复出现，值内逗号分隔同义（V27 §3.6 多表并行）
+    let mut tables: Vec<String> = Vec::new();
     let mut where_clause = None;
+    let mut jobs = None;
     let mut it = rest.iter();
     while let Some(tok) = it.next() {
         match tok.as_str() {
@@ -457,10 +463,13 @@ fn parse_materialize(rest: &[String]) -> Result<Command, EngineError> {
                 db = Some(PathBuf::from(next_arg(&mut it, "--db <path>")?));
             }
             "--table" => {
-                if table.is_some() {
-                    return Err(dup_flag_err("--table"));
-                }
-                table = Some(next_arg(&mut it, "--table <name>")?);
+                let v = next_arg(&mut it, "--table <name>[,name…]")?;
+                tables.extend(
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string),
+                );
             }
             "--where" => {
                 if where_clause.is_some() {
@@ -468,14 +477,37 @@ fn parse_materialize(rest: &[String]) -> Result<Command, EngineError> {
                 }
                 where_clause = Some(next_arg(&mut it, "--where <expr>")?);
             }
+            "--jobs" => {
+                if jobs.is_some() {
+                    return Err(dup_flag_err("--jobs"));
+                }
+                let v = next_arg(&mut it, "--jobs <n>")?;
+                let n: usize = v
+                    .parse()
+                    .map_err(|_| usage_err(format!("materialize --jobs 须为正整数：{v}")))?;
+                if n == 0 {
+                    return Err(usage_err("materialize --jobs 须 ≥ 1"));
+                }
+                jobs = Some(n);
+            }
             t if t.starts_with("--") => return Err(usage_err(format!("unknown flag {t}"))),
             t => return Err(usage_err(format!("unexpected argument {t}"))),
         }
     }
+    if tables.is_empty() {
+        return Err(usage_err("materialize --db <path> --table <name>[,name…]"));
+    }
+    // WHERE 与多表同用是语义歧义（过滤条件归属哪张表？）——用法错，绝不猜
+    if tables.len() > 1 && where_clause.is_some() {
+        return Err(usage_err(
+            "materialize --where 仅限单表形态；多表请逐表指定 --where 分次物化",
+        ));
+    }
     Ok(Command::Materialize {
-        db: db.ok_or_else(|| usage_err("materialize --db <path> --table <name>"))?,
-        table: table.ok_or_else(|| usage_err("materialize --db <path> --table <name>"))?,
+        db: db.ok_or_else(|| usage_err("materialize --db <path> --table <name>[,name…]"))?,
+        tables,
         where_clause,
+        jobs,
     })
 }
 
@@ -643,7 +675,6 @@ mod tests {
             v(&["compare", "a.json", "b.json", "--key", "k1", "--key", "k2"]),
             v(&["explain", "--file", "a.sql", "--file", "b.sql", "foo"]),
             v(&["materialize", "--db", "a", "--db", "b", "--table", "t"]),
-            v(&["materialize", "--db", "d", "--table", "t", "--table", "u"]),
             v(&[
                 "materialize",
                 "--db",
@@ -866,14 +897,77 @@ mod tests {
     }
 
     #[test]
+    fn should_parse_materialize_multi_table_via_repeated_and_comma_forms() {
+        // 重复 --table 与逗号分隔同义（V27 §3.6），两者混用取并集（顺序保留）
+        let c = parse(&v(&[
+            "materialize",
+            "--db",
+            "w.duckdb",
+            "--table",
+            "t1",
+            "--table",
+            "t2,t3",
+            "--jobs",
+            "2",
+        ]))
+        .unwrap();
+        match c {
+            Command::Materialize {
+                db: _,
+                tables,
+                where_clause,
+                jobs,
+            } => {
+                assert_eq!(tables, vec!["t1", "t2", "t3"]);
+                assert_eq!(where_clause, None);
+                assert_eq!(jobs, Some(2));
+            }
+            other => panic!("wrong command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_where_with_multi_table_as_usage_error() {
+        let err = parse(&v(&[
+            "materialize",
+            "--db",
+            "w.duckdb",
+            "--table",
+            "t1,t2",
+            "--where",
+            "bcrq='20240105'",
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("--where 仅限单表形态"), "{err}");
+    }
+
+    #[test]
+    fn should_reject_jobs_zero_and_non_numeric_as_usage_error() {
+        for bad in ["0", "x"] {
+            let err = parse(&v(&[
+                "materialize",
+                "--db",
+                "w.duckdb",
+                "--table",
+                "t1",
+                "--jobs",
+                bad,
+            ]))
+            .unwrap_err();
+            assert!(err.to_string().contains("--jobs"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn should_parse_materialize_with_optional_where() {
         let c = parse(&v(&["materialize", "--db", "w.duckdb", "--table", "t1"])).unwrap();
         assert_eq!(
             c,
             Command::Materialize {
                 db: PathBuf::from("w.duckdb"),
-                table: "t1".to_string(),
+                tables: vec!["t1".to_string()],
                 where_clause: None,
+                jobs: None,
             }
         );
         let c = parse(&v(&[
