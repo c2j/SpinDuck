@@ -166,6 +166,24 @@ target/release/spinduck call --db run/local.duckdb --plan "$PLAN" \
   --batch-commit --step-budget 200000 …
 ```
 
+排障面：这条调用到底跑了哪些 SQL、绑定值怎么变，加 `--trace`（stdout 契约不受影响；
+缺件即红时日志与 sidecar 都不产出，因为一条都没执行）：
+
+```bash
+target/release/spinduck call --db run/local.duckdb --plan "$PLAN" \
+  --batch-commit --step-budget 200000 --trace run/trace.log …
+tail -5 run/trace.log                       # 每条 SQL 一行：sqlid + 前 96 字符 + 绑定值
+grep '^sq-978f03531652' run/trace.log.sql   # 全文反查（sidecar 与日志同前缀 + .sql）
+# 日志 ↔ IR 对齐：哪条静态 SQL 一次都没跑（分支没走到 / 循环体没进）
+target/release/spinduck explain --file sql/routines/PKG_X.sql \
+  --trace run/trace.log <包>.<过程>
+```
+
+`--trace-format jsonl` 给机器消费（§11.2 字段契约），`--trace-level stmt|sql|bind|all`
+控制详细度，默认 `bind`。日志是**逐条全量**（同形语句不合并），体量与执行语句数同阶——
+游标循环每取一行就多至少一条，`all` 级还另加每条 IR 指令；请先按 `run/` 的磁盘余量选级别。
+落地口径与已知缺口见 `architecture.md` §11.2「落地口径」、`validation.md` V39。
+
 把裁决对象落成快照（一条 SQL；文件里多语句会被拒绝，红在发出内核之前）：
 
 ```bash

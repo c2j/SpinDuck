@@ -2,19 +2,88 @@
 //!
 //! 输出契约：每行一条指令 `<pc>\t<op>\t<detail>`，`detail` 只含稳定信息
 //! （变量名/标签/常量），不含地址或指针，便于 diff 与黄金比对。
+//!
+//! `--trace <日志>` 时在契约之外追加第四列（关联形态 A）：每条静态 SQL 行尾给出该文本在
+//! 真实运行里的命中次数与绑定跨度，动态语句标注"文本在运行期"，末尾反向报出"日志里跑了、
+//! 本 IR 里没有"的语句。不给 `--trace` 时输出逐字不变。
 
 use crate::error::EngineError;
 use crate::ir::{AssignTarget, BinOp, CursorSource, IrExpr, IrProg, IrStmt};
+use crate::trace::{annotation, flat, histogram, sql_id, unmatched, Hit};
 use crate::value::SpinValue;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 渲染程序为逐行文本。
 pub fn render(prog: &IrProg) -> Vec<String> {
-    let mut out = Vec::with_capacity(prog.code.len());
-    for (pc, st) in prog.code.iter().enumerate() {
-        let (op, detail) = describe(st);
-        out.push(format!("{pc}\t{op}\t{detail}"));
+    lines(prog).into_iter().map(|l| l.text).collect()
+}
+
+/// 一条指令：稳定行 + 对齐审计日志所需的指纹。
+struct IrLine {
+    text: String,
+    /// 编译期确定的 SQL 文本指纹（`None` = 该行没有静态 SQL）。
+    sql_id: Option<String>,
+    /// 文本要到运行期才知道（EXECUTE IMMEDIATE / OPEN FOR 的动态源）。
+    dynamic: bool,
+}
+
+fn lines(prog: &IrProg) -> Vec<IrLine> {
+    prog.code
+        .iter()
+        .enumerate()
+        .map(|(pc, st)| {
+            let (op, detail) = describe(st);
+            IrLine {
+                text: format!("{pc}\t{op}\t{detail}"),
+                sql_id: static_sql(st).map(sql_id),
+                dynamic: is_dynamic(st),
+            }
+        })
+        .collect()
+}
+
+/// 该指令携带的静态 SQL（`explain` ↔ `trace` 的关联面）。
+fn static_sql(st: &IrStmt) -> Option<&str> {
+    match st {
+        IrStmt::SqlQuery { sql, .. } => Some(sql),
+        IrStmt::SqlExec { sql, .. } => Some(sql),
+        IrStmt::OpenCursor {
+            source: CursorSource::Static { sql, .. },
+            ..
+        } => Some(sql),
+        IrStmt::SqlExecDynamic { .. }
+        | IrStmt::OpenCursor {
+            source: CursorSource::Dynamic { .. },
+            ..
+        }
+        | IrStmt::Nop
+        | IrStmt::Assign { .. }
+        | IrStmt::Jump(_)
+        | IrStmt::JumpIfNot { .. }
+        | IrStmt::JumpIf { .. }
+        | IrStmt::Raise { .. }
+        | IrStmt::Return { .. }
+        | IrStmt::TxCommit
+        | IrStmt::TxRollback
+        | IrStmt::Perform { .. }
+        | IrStmt::Fetch { .. }
+        | IrStmt::CloseCursor { .. }
+        | IrStmt::PushTrap { .. }
+        | IrStmt::PopTrap
+        | IrStmt::CallRoutine { .. } => None,
     }
-    out
+}
+
+/// 语句文本只在运行期存在的指令（动态 SQL）。
+fn is_dynamic(st: &IrStmt) -> bool {
+    matches!(
+        st,
+        IrStmt::SqlExecDynamic { .. }
+            | IrStmt::OpenCursor {
+                source: CursorSource::Dynamic { .. },
+                ..
+            }
+    )
 }
 
 fn describe(st: &IrStmt) -> (&'static str, String) {
@@ -174,12 +243,13 @@ fn const_text(v: &SpinValue) -> String {
     }
 }
 
+/// 与 trace 的 `sql_id` 同一归一口径（都走 [`flat`]）——explain ↔ trace 按指纹对齐的前提。
 fn one_line(sql: &str) -> String {
-    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    flat(sql)
 }
 
-/// 供 CLI 使用：读取 SQL 文件、注册例程、渲染指定例程的 IR。
-pub fn explain_routine(sql_text: &str, routine: &str) -> Result<Vec<String>, EngineError> {
+/// 编译例程（不执行）：`--file` 的源码文本 + 例程名 → IR 程序。
+fn compile_routine(sql_text: &str, routine: &str) -> Result<IrProg, EngineError> {
     let mut eng = crate::engine::Engine::new(
         Box::new(crate::cli::NoopExecutor),
         crate::rules::RuleRegistry::default(),
@@ -189,5 +259,53 @@ pub fn explain_routine(sql_text: &str, routine: &str) -> Result<Vec<String>, Eng
         .catalog
         .lookup(routine)
         .ok_or_else(|| EngineError::business(150, format!("routine {routine} not registered")))?;
-    Ok(render(&r.prog))
+    Ok(r.prog.clone())
+}
+
+/// 供 CLI 使用：读取 SQL 文件、注册例程、渲染指定例程的 IR。
+pub fn explain_routine(sql_text: &str, routine: &str) -> Result<Vec<String>, EngineError> {
+    Ok(render(&compile_routine(sql_text, routine)?))
+}
+
+/// 供 CLI 使用（`--trace`）：IR 行 + 该次真实运行的命中注记 + 反向报警。
+pub fn explain_traced(
+    sql_text: &str,
+    routine: &str,
+    log: &str,
+) -> Result<Vec<String>, EngineError> {
+    let hits = histogram(log);
+    Ok(align(&compile_routine(sql_text, routine)?, &hits))
+}
+
+/// 直方图贴到 IR 行上；`sqlid` 相同的多条指令共享同一命中数（静态文本口径）。
+fn align(prog: &IrProg, hits: &BTreeMap<String, Hit>) -> Vec<String> {
+    let mut ir_ids: BTreeSet<String> = BTreeSet::new();
+    let mut out: Vec<String> = Vec::with_capacity(prog.code.len() + 2);
+    for l in lines(prog) {
+        match (&l.sql_id, l.dynamic) {
+            (Some(id), _) => {
+                ir_ids.insert(id.clone());
+                out.push(format!("{}\t{}", l.text, annotation(id, hits)));
+            }
+            (None, true) => out.push(format!("{}\t[trace 动态：文本在运行期]", l.text)),
+            (None, false) => out.push(l.text),
+        }
+    }
+    let ran = ir_ids.iter().filter(|id| hits.contains_key(*id)).count();
+    out.push(format!(
+        "[trace] 对齐 {ran}/{} 条静态 SQL · 日志 {} 个 sqlid",
+        ir_ids.len(),
+        hits.len()
+    ));
+    let orphans = unmatched(hits, &ir_ids);
+    if !orphans.is_empty() {
+        out.push(format!(
+            "[trace] 未对齐 {} 条（动态 SQL / 攒批合并文本 / 被调例程自己的语句）:",
+            orphans.len()
+        ));
+        for (id, h) in orphans {
+            out.push(format!("[trace]   {id} ×{} :: {}", h.count, h.head));
+        }
+    }
+    out
 }

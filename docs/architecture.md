@@ -675,6 +675,50 @@ $SPINDUCK_HOME/                       # 根路径，配置项 home；默认 ./�
 | 关联性 | `sid/cid` 贯穿 engine→trace→audit→error，任一条日志可反查全链路 |
 | Win7 | 文件名仅用 ASCII/日期，无符号链接，路径大小写不敏感安全 |
 
+#### 11.2 落地口径（V39：`call --trace` 与 `explain --trace`）
+
+上面是目标态契约；V39 落地 `call` 一条入口的 trace 通道，与契约的差别必须逐条写明，
+否则"文档有 `step`、日志里没有"会变成排障时的误判：
+
+| 项 | 落地形态 |
+|---|---|
+| 入口 | `spinduck call … --trace <日志路径>`；`--trace-format text\|jsonl`（默认 text）、`--trace-level stmt\|sql\|bind\|all`（默认 bind）。形态/级别只描述汇，脱离 `--trace` 单独给出即用法错 |
+| 缺件顺序 | 日志文件在 D5 缺件门**之后**创建：拒绝执行 = 一条 SQL 都没跑，因此既不留日志也不留 sidecar |
+| `seq` | **契约新增字段**：本次调用内单调递增行号（首行 1），同毫秒事件排序的唯一依据 |
+| `sid` / `cid` | 真实值：`sid = s-<pid>-<进程启动 epoch 毫秒>`、`cid = c-<会话内第 N 次 CALL>`；一次 CLI 进程只有一条调用 ⇒ 恒 `c-000001` |
+| `event` | 落在**顶层**而非 `detail` 内（`{"ch":"trace","event":"SQL_EXEC","detail":{…}}`）；detail 只放该事件的专属字段 |
+| `step` | 未接入：步骤锚点在解释器里，尚未进入事件面 |
+| `elapsed_us` | 字段在、值恒 0：埋点未计耗时 |
+| 轮转/保留 | 未落地：写调用方给定的单个文件，逐行 flush（§11.1 at-least-once），无切割无压缩；日志通道的写失败上报为 ENV-0013，不静默少一份审计 |
+
+**语句全文不入日志行。** 每条 SQL 由 `sqlid` 标识：先归一（连续空白折叠为单空格，
+`src/trace/render.rs::flat`——与 `explain` 的 `one_line` 同源，同一个函数），再取 FNV-1a
+64bit 的低 48bit，渲染为 `sq-` + 12 位小写十六进制。日志行只给归一文本的前 96 字符，
+超出以 `…(+N chars)` 报出被削掉的字符数；全文落同前缀 sidecar `<日志路径>.sql`，每行
+`sqlid<TAB>归一全文`、按 id 升序去重，`grep '^sq-xxxx' <日志>.sql` 即反查。归一与哈希
+同口径 ⇒ 同一条语句在 IR、日志、sidecar 三处是同一个 id，且与源码缩进/换行无关。
+
+**级别阶梯**（`level_allows`，级别越高记越多；BATCH_SKIP 任何级别都不丢）：
+
+| 级别 | 记什么 |
+|---|---|
+| `stmt` | SQL_EXEC 的 sqlid 骨架（无文本无绑定） |
+| `sql` | 上述 + SQL 开头片段 + 游标开/取（`CURSOR_OPEN` 带查询文本、sqlid 与真实列名；`FETCH` 带行号） |
+| `bind` | 上述 + 绑定值原值（单值超 32 字符截断）——**默认档** |
+| `all` | 上述 + 每条 IR 指令（`IR_STMT`）与 UDF 调用（`UDF_CALL`） |
+
+**关联形态 A（`explain --trace`）**：`spinduck explain --file X.sql --trace <日志> <routine>`
+在既有 `<pc>\t<op>\t<detail>` 契约之外追加第四列——静态 SQL 行给 `[trace ×N …]`（绑定不变只报
+次数；首末不同报 `首 … 末 …`；日志里没有报 `[trace ×0]`），动态语句给 `[trace 动态：文本在运行期]`；
+末尾汇总 `[trace] 对齐 m/n 条静态 SQL · 日志 k 个 sqlid`，并逐条报出"日志里跑了、本 IR 里没有"的
+sqlid（三类来源：动态 SQL、攒批合并文本、被调例程自己的语句）。不给 `--trace` 时 explain 输出
+逐字不变，故黄金比对与既有契约不受影响。
+
+**覆盖面口径**（V39 已知缺口，排障时按此判读，不得当成完整序列）：`UDF_CALL` 变体尚无发射点；
+`FETCH` 的行号是 `Some(1)`/`None`（内核未提供真实游标位置）；SQL 上下文函数下沉后，缓存表自身的
+DDL/DML 与 `distinct_sql` 直连内核、不产生事件；`Engine::call` 与 `call_with_sink` 同一实现，
+不注入 sink 时事件面为空、既有行为逐字不变。
+
 ### 11.2.1 内核托管与 SpinDuck 托管的边界
 
 | 类别 | 文件/目录 | SpinDuck 职责边界 |

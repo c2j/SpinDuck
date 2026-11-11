@@ -2,7 +2,6 @@
 
 use crate::catalog::ParamMode;
 use crate::error::EngineError;
-use crate::exec::SqlExecutor;
 use crate::ir::{AssignTarget, IrExpr, VarName};
 use crate::runtime::eval::EvalEnv;
 use crate::runtime::frame::Frame;
@@ -29,25 +28,25 @@ pub(super) fn call(
     for (i, p) in routine.params.iter().enumerate() {
         let v = match args.get(i) {
             Some(ir_a) => {
-                let env_ = EvalEnv {
+                let mut env_ = EvalEnv {
                     frame: env.frame,
                     ex: env.ex,
                     cat: env.cat,
                     depth: env.depth,
+                    sink: &mut *env.sink,
                 };
-                crate::runtime::eval::eval(ir_a, &env_)?
+                crate::runtime::eval::eval(ir_a, &mut env_)?
             }
             // 省略的尾部实参取声明默认值（BIZ-0151 已在元数校验里排除其余形态）
             None => p.default.clone().unwrap_or(SpinValue::Null),
         };
         callee.set(&VarName(p.name.to_ascii_lowercase()), v);
     }
-    let mut noop = crate::exec::TraceNoopSink;
     let out = run_with_catalog(
         &routine.prog,
         &mut callee,
         env.ex,
-        &mut noop,
+        &mut *env.sink,
         env.cat,
         env.depth + 1,
         RunLimits {
@@ -72,14 +71,15 @@ pub(super) fn call(
 }
 
 /// 按值调用已注册函数（SQL 上下文下沉用；OUT 写回不适用）。
+///
+/// 环境整体传入而非拆成四个接缝参数：被下沉例程的埋点必须沿父链写回同一个汇。
 pub(super) fn call_routine_value(
-    cat: &crate::catalog::RoutineCatalog,
+    env: &mut Env<'_>,
     name: &str,
     args: &[SpinValue],
-    ex: &dyn SqlExecutor,
-    depth: usize,
 ) -> Result<SpinValue, EngineError> {
-    let routine = cat
+    let routine = env
+        .cat
         .lookup(name)
         .ok_or_else(|| EngineError::business(150, format!("routine {name} not registered")))?
         .clone();
@@ -92,14 +92,13 @@ pub(super) fn call_routine_value(
         };
         callee.set(&VarName(p.name.to_ascii_lowercase()), v);
     }
-    let mut noop = crate::exec::TraceNoopSink;
     let out = run_with_catalog(
         &routine.prog,
         &mut callee,
-        ex,
-        &mut noop,
-        cat,
-        depth + 1,
+        env.ex,
+        &mut *env.sink,
+        env.cat,
+        env.depth + 1,
         RunLimits::default(),
     )?;
     Ok(match out {

@@ -318,7 +318,19 @@ impl Engine {
     }
 
     /// 调用例程（§12 P5）：IN 按值、OUT/INOUT 按位取回、函数返回标量。
+    /// 默认静默（`TraceNoopSink`）；要观测埋点走 [`Self::call_with_sink`]。
     pub fn call(&mut self, name: &str, args: &[SpinValue]) -> Result<CallResult, EngineError> {
+        let mut sink = crate::exec::TraceNoopSink;
+        self.call_with_sink(name, args, &mut sink)
+    }
+
+    /// 调用例程并把埋点交给调用方的 sink（AGENTS §1 接缝：CLI 持汇，内核只发事件）。
+    pub fn call_with_sink(
+        &mut self,
+        name: &str,
+        args: &[SpinValue],
+        sink: &mut dyn crate::exec::TraceSink,
+    ) -> Result<CallResult, EngineError> {
         self.memo.clear();
         let routine = self
             .catalog
@@ -334,7 +346,6 @@ impl Engine {
             };
             frame.set(&VarName(p.name.to_ascii_lowercase()), v);
         }
-        let mut sink = crate::exec::TraceNoopSink;
         // 统一事务边界（§3.5）：最外层调用在显式事务内执行——过程内
         // TxCommit/TxRollback 即时提交/回滚当前事务并重开；正常完成统一
         // COMMIT；未处理异常统一 ROLLBACK（DuckDB ACID 提供原子性）
@@ -344,7 +355,7 @@ impl Engine {
             &routine.prog,
             &mut frame,
             self.ex.as_ref(),
-            &mut sink,
+            sink,
             &self.catalog,
             0,
             crate::runtime::RunLimits {

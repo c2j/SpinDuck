@@ -64,7 +64,11 @@ fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError> {
             })
         }
         Command::Compile { paths } => compile_cmd(&paths, out),
-        Command::Explain { file, routine } => explain_cmd(&file, &routine, out),
+        Command::Explain {
+            file,
+            routine,
+            trace,
+        } => explain_cmd(&file, &routine, trace.as_deref(), out),
         Command::Materialize { .. } => materialize_cmd(cmd_materialize(cmd), out),
         Command::Sync { .. } => sync_cmd(cmd_sync(cmd), out),
         Command::Call { .. } => call_cmd(cmd_call(cmd), out),
@@ -95,6 +99,9 @@ fn cmd_call(cmd: Command) -> CallParts {
             args,
             batch_commit,
             step_budget,
+            trace,
+            trace_format,
+            trace_level,
         } => CallParts {
             db,
             rules,
@@ -103,6 +110,9 @@ fn cmd_call(cmd: Command) -> CallParts {
             args,
             batch_commit,
             step_budget,
+            trace,
+            trace_format,
+            trace_level,
         },
         _ => unreachable!("cmd_call only for Call"),
     }
@@ -153,6 +163,9 @@ struct CallParts {
     args: Vec<String>,
     batch_commit: bool,
     step_budget: Option<u64>,
+    trace: Option<PathBuf>,
+    trace_format: crate::trace::TraceFormat,
+    trace_level: crate::trace::TraceLevel,
 }
 
 /// 对一组路径做项目规则发现：向上查找 `spinduck.toml` `[paths].rules` 并集（§6 只增不删）。
@@ -211,9 +224,23 @@ fn compile_cmd(paths: &[PathBuf], out: &mut dyn Write) -> Result<i32, EngineErro
     Ok(if s.failed == 0 { EXIT_OK } else { EXIT_FAIL })
 }
 
-fn explain_cmd(file: &Path, routine: &str, out: &mut dyn Write) -> Result<i32, EngineError> {
+fn explain_cmd(
+    file: &Path,
+    routine: &str,
+    trace: Option<&Path>,
+    out: &mut dyn Write,
+) -> Result<i32, EngineError> {
     let text = crate::cli::read_source_strict(file)?;
-    for line in crate::cli::explain::explain_routine(&text, routine)? {
+    let lines = match trace {
+        None => crate::cli::explain::explain_routine(&text, routine)?,
+        Some(log) => {
+            let log_text = std::fs::read_to_string(log).map_err(|e| {
+                EngineError::env(12, format!("read trace log {}: {e}", log.display()))
+            })?;
+            crate::cli::explain::explain_traced(&text, routine, &log_text)?
+        }
+    };
+    for line in lines {
         writeln!(out, "{line}").map_err(io_err)?;
     }
     Ok(EXIT_OK)
@@ -288,16 +315,33 @@ fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, EngineError> {
         return Ok(EXIT_FAIL);
     }
     let args: Vec<crate::value::SpinValue> = parts.args.iter().map(|a| parse_literal(a)).collect();
-    let res = eng.call(&target, &args)?;
+    // 审计日志的门禁顺序：缺件已拒 = 一条都没执行，此时不得留下日志文件，否则
+    // "有日志"会变成"跑过"的假象（§11.1）。stdout 契约与 --trace 无关，恒不变。
+    let mut traced = match &parts.trace {
+        Some(p) => Some(crate::cli::trace::TraceRun::open(
+            p,
+            parts.trace_format,
+            parts.trace_level,
+            &target,
+        )?),
+        None => None,
+    };
+    let res = match &mut traced {
+        Some(t) => eng.call_with_sink(&target, &args, t.sink())?,
+        None => eng.call(&target, &args)?,
+    };
     if res.outs.is_empty() && res.return_value.is_none() {
         writeln!(out, "CALL {target} OK").map_err(io_err)?;
-        return Ok(EXIT_OK);
+    } else {
+        for (k, v) in &res.outs {
+            writeln!(out, "OUT {} = {}", k, v.display()).map_err(io_err)?;
+        }
+        if let Some(v) = &res.return_value {
+            writeln!(out, "RETURN {}", v.display()).map_err(io_err)?;
+        }
     }
-    for (k, v) in &res.outs {
-        writeln!(out, "OUT {} = {}", k, v.display()).map_err(io_err)?;
-    }
-    if let Some(v) = &res.return_value {
-        writeln!(out, "RETURN {}", v.display()).map_err(io_err)?;
+    if let Some(t) = traced {
+        t.finish()?;
     }
     Ok(EXIT_OK)
 }

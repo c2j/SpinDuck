@@ -3,6 +3,7 @@
 //! 契约：解析失败返回 `ENG-0010`（用法错误），退出码 2；未知子命令同上。
 
 use crate::error::EngineError;
+use crate::trace::{TraceFormat, TraceLevel};
 use std::path::PathBuf;
 
 /// 子命令。
@@ -17,7 +18,12 @@ pub enum Command {
     /// 规则文件探针（版本锚定检查）。
     RulesProbe { path: PathBuf },
     /// 打印例程 IR（调试/回归，不执行）。
-    Explain { file: PathBuf, routine: String },
+    /// `trace` = 审计日志路径（关联形态 A）：给出时每条静态 SQL 行尾追加命中注记。
+    Explain {
+        file: PathBuf,
+        routine: String,
+        trace: Option<PathBuf>,
+    },
     /// 物化：GaussDB 表 → 本地 DuckDB 表（feature `gauss`）。
     Materialize {
         db: PathBuf,
@@ -68,6 +74,12 @@ pub enum Command {
         /// 步数预算覆盖（复核应修 C：默认预算跑不动 100k 级游标循环，
         /// 大业务经此入口放大；None = 用引擎默认值）。
         step_budget: Option<u64>,
+        /// 审计日志落盘路径：None = 不记（默认，stdout 契约因此逐字不变）。
+        trace: Option<PathBuf>,
+        /// 日志形态（`--trace-format`，默认 text）；只在 `--trace` 给出时有意义。
+        trace_format: TraceFormat,
+        /// 详细级别（`--trace-level`，默认 bind）；同上。
+        trace_level: TraceLevel,
     },
 }
 
@@ -322,6 +334,9 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
     let mut batch_commit = false;
     let mut step_budget: Option<u64> = None;
     let mut rules = None;
+    let mut trace = None;
+    let mut trace_format: Option<TraceFormat> = None;
+    let mut trace_level: Option<TraceLevel> = None;
     let mut files = Vec::new();
     let mut routine = None;
     let mut args = Vec::new();
@@ -366,6 +381,38 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
                 }
                 step_budget = Some(v);
             }
+            "--trace" => {
+                if trace.is_some() {
+                    return Err(dup_flag_err("--trace"));
+                }
+                trace = Some(PathBuf::from(
+                    it.next().ok_or_else(|| usage_err("--trace <path>"))?,
+                ));
+            }
+            "--trace-format" => {
+                if trace_format.is_some() {
+                    return Err(dup_flag_err("--trace-format"));
+                }
+                let v = it
+                    .next()
+                    .ok_or_else(|| usage_err("--trace-format <text|jsonl>"))?;
+                trace_format = Some(
+                    TraceFormat::from_flag(v)
+                        .ok_or_else(|| usage_err("--trace-format <text|jsonl>"))?,
+                );
+            }
+            "--trace-level" => {
+                if trace_level.is_some() {
+                    return Err(dup_flag_err("--trace-level"));
+                }
+                let v = it
+                    .next()
+                    .ok_or_else(|| usage_err("--trace-level <stmt|sql|bind|all>"))?;
+                trace_level = Some(
+                    TraceLevel::from_flag(v)
+                        .ok_or_else(|| usage_err("--trace-level <stmt|sql|bind|all>"))?,
+                );
+            }
             t if t.starts_with("--") => {
                 return Err(usage_err(format!("unknown flag {t}")));
             }
@@ -400,6 +447,12 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
             }
         }
     }
+    // 形态与级别是给汇用的：没有落盘路径就没有承接者，静默收下等于给出"有日志"的假象。
+    if trace.is_none() && (trace_format.is_some() || trace_level.is_some()) {
+        return Err(usage_err(
+            "--trace-format/--trace-level 需要 --trace <path>；单独给出无落盘处",
+        ));
+    }
     Ok(Command::Call {
         db,
         rules,
@@ -408,6 +461,9 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
         args,
         batch_commit,
         step_budget,
+        trace,
+        trace_format: trace_format.unwrap_or_default(),
+        trace_level: trace_level.unwrap_or_default(),
     })
 }
 
@@ -422,6 +478,7 @@ fn plan_target_if_readable(p: &std::path::Path) -> Option<String> {
 fn parse_explain(rest: &[String]) -> Result<Command, EngineError> {
     let mut file = None;
     let mut routine = None;
+    let mut trace = None;
     let mut it = rest.iter();
     while let Some(tok) = it.next() {
         match tok.as_str() {
@@ -430,6 +487,13 @@ fn parse_explain(rest: &[String]) -> Result<Command, EngineError> {
                     return Err(dup_flag_err("--file"));
                 }
                 file = Some(PathBuf::from(next_arg(&mut it, "--file <path>")?));
+            }
+            "--trace" => {
+                // 对齐视图的输入：一次真实运行的审计日志（text 或 jsonl 都可读）
+                if trace.is_some() {
+                    return Err(dup_flag_err("--trace"));
+                }
+                trace = Some(PathBuf::from(next_arg(&mut it, "--trace <path>")?));
             }
             t if t.starts_with("--") => return Err(usage_err(format!("unknown flag {t}"))),
             _ => {
@@ -444,6 +508,7 @@ fn parse_explain(rest: &[String]) -> Result<Command, EngineError> {
     Ok(Command::Explain {
         file: file.ok_or_else(|| usage_err("explain --file <sql> <routine>"))?,
         routine: routine.ok_or_else(|| usage_err("explain --file <sql> <routine>"))?,
+        trace,
     })
 }
 
@@ -603,7 +668,8 @@ pub fn usage() -> &'static str {
      \x20 version                         打印版本\n\
      \x20 compile <path>...               语料编译体检（递归 *.sql）\n\
      \x20 rules probe <rules.toml>        规则文件版本锚定检查\n\
-     \x20 explain --file <sql> <routine>   打印例程 IR（不执行）\n\
+     \x20 explain --file <sql> [--trace <审计日志>] <routine>\n\
+     \x20                                打印例程 IR（不执行）；给 --trace 则逐行标注该次真实运行的命中\n\
      \x20 verify [项目目录]               从 [[entry]] 出发核验链路对象与场景\n\
      \x20 plan [--dir <项目目录>] [--schema <名>] <routine>\n\
      \x20                                求目标例程闭包并落盘运行计划（缺件即判红）\n\
@@ -616,11 +682,15 @@ pub fn usage() -> &'static str {
      \x20                                从 GaussDB 物化到本地 DuckDB（需 feature gauss）\n\
      \x20 sync --db <f> --table <t> --cols a,b\n\
      \x20                                本地 DuckDB 回写追加到 GaussDB（需 feature gauss）\n\
-     \x20 call [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>] <routine> [args...]\n\
-     \x20 call --plan <计划.toml> [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>] [args...]\n\
+     \x20 call [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>]\n\
+     \x20      [--trace <f> [--trace-format <text|jsonl>] [--trace-level <stmt|sql|bind|all>]] <routine> [args...]\n\
+     \x20 call --plan <计划.toml> [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>]\n\
+     \x20      [--trace <f> [--trace-format <text|jsonl>] [--trace-level <stmt|sql|bind|all>]] [args...]\n\
      \x20                                注册例程并调用；计划面自带目标与源清单，缺件即红\n\
      \x20                                （args: 整数/小数/'串'/null；--plan 下位置参数全是实参；\n\
-     \x20                                  规则口径：内置种子 < 项目发现 < --rules）\n"
+     \x20                                  规则口径：内置种子 < 项目发现 < --rules；\n\
+     \x20                                  --trace 把审计日志逐行落盘（默认 text），sidecar <日志>.sql\n\
+     \x20                                  按行内 sqlid 存 SQL 全文，可 grep 反查）\n"
 }
 
 #[cfg(test)]
@@ -794,6 +864,9 @@ mod tests {
                 args: v(&["1", "2"]),
                 batch_commit: false,
                 step_budget: None,
+                trace: None,
+                trace_format: TraceFormat::Text,
+                trace_level: TraceLevel::Bind,
             }
         );
     }
@@ -840,6 +913,9 @@ mod tests {
                 args: v(&["'20250715'", "'0130000001'"]),
                 batch_commit: false,
                 step_budget: None,
+                trace: None,
+                trace_format: TraceFormat::Text,
+                trace_level: TraceLevel::Bind,
             }
         );
     }
@@ -858,6 +934,9 @@ mod tests {
                 args: vec![],
                 batch_commit: false,
                 step_budget: Some(20_000_000),
+                trace: None,
+                trace_format: TraceFormat::Text,
+                trace_level: TraceLevel::Bind,
             }
         );
         let bad = parse(&v(&["call", "--step-budget", "0", "prc_x"])).unwrap_err();
@@ -888,6 +967,7 @@ mod tests {
             Command::Explain {
                 file: PathBuf::from("p.sql"),
                 routine: "prc_x".to_string(),
+                trace: None,
             }
         );
         assert!(
@@ -956,6 +1036,30 @@ mod tests {
             .unwrap_err();
             assert!(err.to_string().contains("--jobs"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn should_parse_explain_with_a_trace_log_for_alignment() {
+        // 关联形态 A：`--trace` 让 explain 读一次真实运行的日志，把每条静态 SQL 的命中对上
+        let c = parse(&v(&[
+            "explain", "--file", "p.sql", "--trace", "run.log", "prc_x",
+        ]))
+        .unwrap();
+        assert_eq!(
+            c,
+            Command::Explain {
+                file: PathBuf::from("p.sql"),
+                routine: "prc_x".to_string(),
+                trace: Some(PathBuf::from("run.log")),
+            }
+        );
+        // 旗标要给路径；空手给出等于"要对齐但没有日志"
+        let bad = parse(&v(&["explain", "--file", "p.sql", "--trace", "prc_x"])).unwrap_err();
+        assert!(
+            bad.message.contains("explain --file <sql> <routine>"),
+            "{}",
+            bad.message
+        );
     }
 
     #[test]
@@ -1208,5 +1312,87 @@ mod tests {
         assert!(e.message.contains("至少要给一个列名"), "{e}");
         let e = parse(&v(&["compare", "a.json", "b.json", "--key"])).unwrap_err();
         assert!(e.message.contains("--key k1,k2"), "{e}");
+    }
+
+    #[test]
+    fn should_parse_trace_flags_into_the_call_command() {
+        // 只给 --trace 时是"默认形态"：文本 + bind 级（已确认的原型口径）
+        match parse(&v(&["call", "--trace", "run.log", "r", "1"])).unwrap() {
+            Command::Call {
+                trace,
+                trace_format,
+                trace_level,
+                args,
+                ..
+            } => {
+                assert_eq!(trace, Some(PathBuf::from("run.log")));
+                assert_eq!(trace_format, TraceFormat::Text);
+                assert_eq!(trace_level, TraceLevel::Bind);
+                assert_eq!(args, v(&["1"]));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&v(&[
+            "call",
+            "--trace",
+            "run.jsonl",
+            "--trace-format",
+            "jsonl",
+            "--trace-level",
+            "all",
+            "r",
+        ]))
+        .unwrap()
+        {
+            Command::Call {
+                trace,
+                trace_format,
+                trace_level,
+                ..
+            } => {
+                assert_eq!(trace, Some(PathBuf::from("run.jsonl")));
+                assert_eq!(trace_format, TraceFormat::Jsonl);
+                assert_eq!(trace_level, TraceLevel::All);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_invalid_trace_format_and_level() {
+        let e = parse(&v(&["call", "--trace", "x", "--trace-format", "yaml", "r"])).unwrap_err();
+        assert_eq!(e.code.to_string(), "ENG-0010");
+        assert!(
+            e.message.contains("--trace-format <text|jsonl>"),
+            "{}",
+            e.message
+        );
+        let e = parse(&v(&["call", "--trace", "x", "--trace-level", "loud", "r"])).unwrap_err();
+        assert_eq!(e.code.to_string(), "ENG-0010");
+        assert!(
+            e.message.contains("--trace-level <stmt|sql|bind|all>"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn should_reject_trace_shape_flags_without_a_trace_path() {
+        // 形态与级别是给汇用的：没有 --trace 就无处可写，静默收下等于给用户"有日志"的假象
+        for argv in [
+            v(&["call", "--trace-format", "jsonl", "r"]),
+            v(&["call", "--trace-level", "all", "r"]),
+        ] {
+            let e = parse(&argv).unwrap_err();
+            assert_eq!(e.code.to_string(), "ENG-0010", "{argv:?}");
+            assert!(e.message.contains("--trace"), "{}", e.message);
+        }
+    }
+
+    #[test]
+    fn should_reject_duplicated_trace_path_flag() {
+        let e = parse(&v(&["call", "--trace", "a", "--trace", "b", "r"])).unwrap_err();
+        assert_eq!(e.code.to_string(), "ENG-0010");
+        assert!(e.message.contains("重复旗标"), "{}", e.message);
     }
 }

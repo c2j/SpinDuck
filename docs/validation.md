@@ -4058,3 +4058,78 @@ exit 2、真实参 `100` → RETURN 0.08 exit 0；规则项目 `compile` 绿且 
   （3 表 2 并发，含源端缺表失败隔离样本，快路径 `CopyStream` 断言）。
   CLI 端到端：4 张夹具表 `--jobs 2` 全部成功 + 1 张源端缺表 FAIL 隔离，
   总耗时 0.092s（真实例吞吐收益随 PR-A 的 CPU 让出而放大，§1.1）。
+
+## V39. `--trace` 审计日志落地：sqlid 指纹 + sidecar 反查 + `explain --trace` 关联视图（2026-11-11）
+
+来源：`call --plan` 排障后的人工提问"我怎样查看运行日志呢？"→ 批复"同意按 --trace 方式实现
+审计日志，但默认按文本格式，可指定为 jsonl"→ 两轮原型确认（v1 全量内嵌文本 / v2 sqlid + 开头片段
++ sidecar）→ 关联形态选择。本轮依赖面零变更（`git diff Cargo.toml Cargo.lock` 为空，`cargo audit`
+仍是既登记的 4 条 `zip` 豁免）。工作树：`.worktrees/trace`（与主干 materialize COPY STREAM 改动隔离）。
+
+**批复口径**（决定实现形态的四条）：逐条全量（不合并同形语句）；JSONL 加 `seq` 与真实 `sid`/`cid`；
+binds 落原值 + 单值 32 字符上限；`sqlid` = 归一文本 FNV-1a 48bit（零新依赖）；全文反查走 sidecar +
+grep；两处隐形语句修复（嵌套例程继承父 sink、`CURSOR_OPEN` 携带查询文本与列名）归本轮；
+explain 联动选 **A 形态（直方图视图）与 trace 同期交付**。
+
+**行为面**（11 个 TDD 循环，测试名可检索）：
+
+| 循环 | 落地 | 测试 |
+|---|---|---|
+| 渲染 text | `[trace] <ts> <seq:06> <EVENT> <sqlid> [binds=…] [:: 前 96 字符…(+N chars)]`；多字节按字符不按字节截 | `trace::render::tests::should_render_sql_exec_as_text_line_with_id_binds_and_head` / `…_clip_a_long_sql_…` / `…_count_multibyte_sql_in_chars_not_bytes_when_clipping` / `…_prefix_text_lines_with_the_injected_timestamp` |
+| 渲染 jsonl | §11.2 公共头 + `event` 顶层 + `detail.{sql_id,sql_head,sql_chars,binds,columns,…}`；级别门槛之下的键整键缺席 | `…_should_render_sql_exec_as_jsonl_with_contract_fields` / `…_jsonl_omit_fields_below_their_level` / `…_render_cursor_and_fetch_jsonl_detail` |
+| 级别阶梯 | `stmt/sql/bind/all`（默认 bind）；BATCH_SKIP 任何级别不丢 | `…_should_gate_event_kinds_by_level` / `…_text_render_only_the_fields_allowed_by_level` / `trace::tests::should_parse_trace_flag_texts_case_insensitively` |
+| 汇 | 逐行 flush（at-least-once）、seq 递增、首因写失败留存、sqlid→全文索引去重 | `trace::sink::tests::should_flush_after_every_line_so_a_crash_loses_no_written_line` / `…_keep_the_first_write_failure_…` / `…_index_each_sql_text_once_by_its_id` |
+| 注入面 | `Engine::call` 委派 `call_with_sink`（默认 sink 不变 ⇒ 不注 sink 时行为逐字不变） | `tests/trace_events.rs` 全 6 条 |
+| 子树覆盖 | 三处硬编 noop 的调用点改为继承父 sink：`CALL` 语句、PL 表达式函数、SQL 上下文下沉 | `should_inherit_the_sink_into_a_nested_procedure_call` / `…_from_a_pl_expression` / `…_downshifted_into_sql` |
+| 游标可见 | `TraceEvent::CursorOpen` 新增 `sql` 字段并与真实 `schema` 一起发 | `should_carry_the_cursor_query_text_into_the_open_event` / `should_report_the_opened_cursor_columns` |
+| CLI 旗标 | `call --trace <f> [--trace-format text\|jsonl] [--trace-level stmt\|sql\|bind\|all]`；无 `--trace` 单给形态/级别 = 用法错 | `src/cli/args.rs` 4 条新单测 + `tests/cli/trace.rs::should_exit_usage_when_the_trace_level_is_not_a_known_name` |
+| 端到端 | 日志与 sidecar 落盘、stdout 契约逐字不变、缺件即红时两个文件都不留 | `should_write_a_text_audit_log_and_a_sql_sidecar_for_a_traced_call` / `…_jsonl_lines_with_the_contract_header_…` / `…_ir_stmt_lines_only_at_trace_level_all` / `should_not_create_the_trace_file_when_the_call_refuses_for_missing_relations` |
+| 对齐视图 | `explain --file X --trace <日志> <routine>` 第四列 `[trace ×N …]`/`[trace ×0]`/`[trace 动态：文本在运行期]` + `对齐 m/n` + 未对齐逐条报警 | `trace::align::tests` 8 条 + `should_annotate_explain_ir_lines_with_hits_from_the_trace_log` / `should_keep_explain_output_unchanged_without_a_trace_log` |
+
+**契约变更面**（Ask-first 已批复，登记在此）：① `TraceEvent::CursorOpen` 由 `{schema}` 变
+`{sql, schema}`——接缝签名变更，消费者只有 `src/trace/render.rs` 与两个测试汇；② `Command::Call`
+加 `trace/trace_format/trace_level`、`Command::Explain` 加 `trace`，故 `src/cli/args.rs` 里 3 条人工
+编写的穷举构造测试被同批 additive 补齐（`trace: None, trace_format: Text, trace_level: Bind`，断言
+意图未变）；③ JSONL 新增 `seq` 与顶层 `event`（`detail.event` 形态作废），architecture §11.2 的
+"落地口径"小节据此改写。
+
+**sqlid 交叉核对**（独立 Python 实现，同 FNV-1a/归一/低 48bit 口径）：`SELECT 1` = `sq-7bca63ea84f2`
+（`SELECT   1` 同值，证明与源码缩进无关）、`SELECT 1 AS qid, 7 AS js_days` = `sq-8cfb7e071ef0`、
+真语料 `delete from dat_trd_repurchase where purchase_date = $v_p_i_date and market_code = '001'` =
+`sq-e71a3b4fe9fc`——四条与二进制实测逐字一致。
+
+**真语料实证**（`golden/case_corpus_purchase`，本机 debug 二进制，2026-11-11）：
+
+```
+plan   routines=5 tables=1 missing=0        → deploy ddl_files=1 routine_files=5 db=/tmp/purchase.duckdb
+call --plan <计划> --db <库> --trace /tmp/pt.log '20260105' ''  → rc=0, stdout 仅 "OUT p_o_succeed = 0"
+  /tmp/pt.log      3 行（SQL_EXEC / CURSOR_OPEN / FETCH row=end）
+  /tmp/pt.log.sql  2 行（sidecar；游标那条 971 字符的 SELECT 全文在此，日志行只留 96 字符 + …(+875 chars)）
+explain --file … --trace /tmp/pt.log pkg_split_trade_step3_sh.prc_trd_deal_purchase
+  18 sql_exec   delete from dat_trd_repurchase …      [trace ×1 绑定 $v_p_i_date=20260105]
+  25 open_cursor c_get_purchase static[SELECT qs.gddm …] [trace ×1]
+  29/36/51/59/61/62/69 …                        [trace ×0]
+  [trace] 对齐 2/9 条静态 SQL · 日志 2 个 sqlid
+```
+
+本地库为空表 ⇒ 游标 `FETCH row=end`、循环体七条静态 SQL 全 ×0——这正是 A 形态要给的判读：
+"过程跑完了，但循环体一条没执行"，不解释器内部状态就能定位到数据面。
+
+**门禁证据**（本机，2026-11-11，rebase 到主干 `v0.1.18` 之后重取）：`cargo fmt --all -- --check`
+干净；`cargo clippy --all-features -- -D warnings` 干净；`cargo check --all-features --tests`
+零告警（含 `gauss` 侧 e2e 测试目标与本分支改动的同一批文件共存编译）；`cargo test --features cli`
+24 个 suite 全绿 0 failed（lib 371 + CLI 契约 89 + `tests/trace_events` 6；本轮新增面为 lib
+`trace::` 32、`tests/trace_events` 6、`tests/cli/trace` 7）。`cargo audit` 本轮重取时拉不动
+advisory-db（网络 IO 错，非漏洞结论），沿用 V38 登记的 4 条 `zip` 豁免口径；依赖侧只有上游
+`Cargo.toml`/`Cargo.lock` 的版本号 bump，本分支自身零新增依赖。
+
+**与 V27 的交界**：V27「遗留」条目里的 TraceSink 分时事件（`mode/unload_ms/load_ms/rows/shards`）
+本轮**未接**——埋点面只覆盖 `call` 的执行路径（SQL / 游标 / IR / 绑定），物化 COPY STREAM 快路径
+仍不产生事件，故 `materialize` 不带 `--trace`；该形态在分时事件落地时复用本节已定的字段契约。
+
+**已知缺口**（V39 口径，排障时按此判读）：`elapsed_us` 字段在、值恒 0（埋点未计耗时）；`step`
+未接入事件面；`UDF_CALL` 变体无发射点；`FETCH` 行号为 `Some(1)`/`None` 而非内核真实游标位置；
+SQL 上下文函数下沉后缓存表自身的 DDL/DML 与 `distinct_sql` 直连内核、不产生事件；`--trace`
+未接 §11.2 的轮转/保留策略（单文件、无切割）；`src/cli/args.rs`（rebase 后 1398 行）与
+`src/cli/run.rs`（848 行）与上游 PR-A2 同文件增长，均已越过 §3 的 500 行线，按"范围限于当前
+改动路径"未在本轮拆分。

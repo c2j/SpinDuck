@@ -13,15 +13,19 @@ use crate::value::SpinValue;
 use numeric::{arith, compare};
 
 /// 表达式求值环境：PL 上下文函数直调需要例程目录与执行器（§8 分派矩阵）。
+///
+/// `sink` 也在这里：表达式里直调的例程与 CALL 下去的例程共用同一条埋点链，
+/// 断在哪一环，审计日志就少哪一环（§11.1 禁止静默丢弃）。
 pub struct EvalEnv<'a> {
     pub frame: &'a Frame,
     pub ex: &'a dyn SqlExecutor,
     pub cat: &'a RoutineCatalog,
     pub depth: usize,
+    pub sink: &'a mut dyn crate::exec::TraceSink,
 }
 
 /// 三值逻辑条件求值：Some(bool) 确定性；None = UNKNOWN（EXIT WHEN 按 false）。
-pub fn eval_cond(e: &IrExpr, env: &EvalEnv<'_>) -> Result<Option<bool>, EngineError> {
+pub fn eval_cond(e: &IrExpr, env: &mut EvalEnv<'_>) -> Result<Option<bool>, EngineError> {
     let _f = env.frame;
     match eval(e, env)? {
         SpinValue::Null => Ok(None),
@@ -34,7 +38,7 @@ pub fn eval_cond(e: &IrExpr, env: &EvalEnv<'_>) -> Result<Option<bool>, EngineEr
 }
 
 /// PL 表达式求值（NULL 传播 + 三值逻辑 AND/OR）。
-pub fn eval(e: &IrExpr, env: &EvalEnv<'_>) -> Result<SpinValue, EngineError> {
+pub fn eval(e: &IrExpr, env: &mut EvalEnv<'_>) -> Result<SpinValue, EngineError> {
     let f = env.frame;
     match e {
         IrExpr::Const(v) => Ok(v.clone()),
@@ -55,7 +59,11 @@ pub fn eval(e: &IrExpr, env: &EvalEnv<'_>) -> Result<SpinValue, EngineError> {
                 format!("NOT requires boolean, got {}", other.display()),
             )),
         },
-        IrExpr::Bin { op, l, r } => eval_bin(*op, &eval(l, env)?, &eval(r, env)?),
+        IrExpr::Bin { op, l, r } => {
+            let l = eval(l, env)?;
+            let r = eval(r, env)?;
+            eval_bin(*op, &l, &r)
+        }
         IrExpr::CursorAttr { cursor, kind } => Ok(f.cursor_attr(cursor, *kind)),
         IrExpr::SqlFn { name, args } => eval_sqlfn(name, args, env),
         IrExpr::FuncCall { name, args } => eval_funccall(name, args, env),
@@ -63,7 +71,11 @@ pub fn eval(e: &IrExpr, env: &EvalEnv<'_>) -> Result<SpinValue, EngineError> {
 }
 
 /// §8.2 @变换标记：整体下沉单条 SQL（保留日期等中间类型，不经 SpinValue）。
-fn eval_sqlfn(name: &str, args: &[IrExpr], env: &EvalEnv<'_>) -> Result<SpinValue, EngineError> {
+fn eval_sqlfn(
+    name: &str,
+    args: &[IrExpr],
+    env: &mut EvalEnv<'_>,
+) -> Result<SpinValue, EngineError> {
     let Some((arg_sql, binds_vec)) = crate::sql::render::expr_to_sql_binds(&e_sqlfn_args(args))
     else {
         return Err(EngineError::invariant(
@@ -86,7 +98,11 @@ fn eval_sqlfn(name: &str, args: &[IrExpr], env: &EvalEnv<'_>) -> Result<SpinValu
 /// §8 分派矩阵：PL 上下文 → 例程目录直调；未命中视为内建/库函数，
 /// 下沉为 `SELECT f($p0,…)` 交给内核求值（内建函数语义由 DuckDB 提供，
 /// Gauss 方言差异由编译期规则改名 + 解析级变换承担）。
-fn eval_funccall(name: &str, args: &[IrExpr], env: &EvalEnv<'_>) -> Result<SpinValue, EngineError> {
+fn eval_funccall(
+    name: &str,
+    args: &[IrExpr],
+    env: &mut EvalEnv<'_>,
+) -> Result<SpinValue, EngineError> {
     let Some(routine) = env.cat.lookup(name).cloned() else {
         return eval_builtin(env, name, args);
     };
@@ -112,7 +128,7 @@ fn eval_funccall(name: &str, args: &[IrExpr], env: &EvalEnv<'_>) -> Result<SpinV
         &routine.prog,
         &mut callee,
         env.ex,
-        &mut crate::exec::TraceNoopSink,
+        &mut *env.sink,
         env.cat,
         env.depth + 1,
         crate::runtime::interp::RunLimits::default(),
@@ -131,7 +147,11 @@ fn e_sqlfn_args(args: &[IrExpr]) -> IrExpr {
     }
 }
 
-fn eval_builtin(env: &EvalEnv, name: &str, args: &[IrExpr]) -> Result<SpinValue, EngineError> {
+fn eval_builtin(
+    env: &mut EvalEnv<'_>,
+    name: &str,
+    args: &[IrExpr],
+) -> Result<SpinValue, EngineError> {
     let mut binds = crate::exec::BindMap::new();
     let mut ph = Vec::with_capacity(args.len());
     for (i, a) in args.iter().enumerate() {
