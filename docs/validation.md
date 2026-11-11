@@ -4238,3 +4238,8 @@ lib 的 `#[cfg(test)]` 代码**，因此 args 拆分留下的一条未用导入�
 - `--trace` 的轮转/保留仍未落地（§11.2 既有缺口）；"按时间戳自动命名"仍是**待评审的备选**，
   不是实现。
 - CI clippy 是否补 `--all-targets`：见 V40.3 末段，未决。
+- `cargo check --no-default-features`（关 `native`）本轮实测**仍红**，且与本 PR 无关：报错点在
+  `src/verify.rs:17`（`no verify_project in verify::deploy`），该行出自上游 `1bcec83`（2026-11-10），
+  本 PR 未触碰 `src/verify*`。副作用：`run/call.rs` 的 `#[cfg(not(feature = "native"))]` 拒绝桩
+  与其新增的 `#[cfg]` 导入闸门无法在该配置下自证编译——AGENTS §8 未把 `--no-default-features`
+  列为支持面，故记为观察项，不在本轮修。
