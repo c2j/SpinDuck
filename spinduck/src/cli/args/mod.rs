@@ -49,11 +49,20 @@ pub enum Command {
         /// 并发度（默认 4；0 视为用法错）。
         jobs: Option<usize>,
     },
-    /// 回写：本地 DuckDB 表 → GaussDB 追加（feature `gauss`）。
+    /// 回写：本地 DuckDB 表 → GaussDB（feature `gauss`）。
+    /// 默认（无 mode/where）保持 V26 append 全表契约逐字不变。
     Sync {
         db: PathBuf,
         table: String,
         cols: Vec<String>,
+        /// 读取过滤（仅 append 语义；slice/upsert 模式拒绝）。
+        where_clause: Option<String>,
+        /// 回写模式：append（缺省）/ slice / upsert（原始串，engine 侧解析）。
+        mode: Option<String>,
+        /// mode=slice 的结构化谓词 `k=v,k=v`（值支持 `$ENV` / `${ENV}` 引用）。
+        slice: Option<String>,
+        /// mode=upsert 的键列 `a,b`。
+        key: Option<String>,
     },
     /// 链路校验（§12.1 入口声明）：从 `[[entry]]` 出发逐对象核验。
     Verify { path: Option<PathBuf> },
@@ -231,8 +240,11 @@ pub fn usage() -> &'static str {
      \x20                                两份结果快照逐值比对（归一后判值；红 = 退出码 1 + DIFF）\n\
      \x20 materialize --db <f> --table <t> [--where <expr>]\n\
      \x20                                从 GaussDB 物化到本地 DuckDB（需 feature gauss）\n\
-     \x20 sync --db <f> --table <t> --cols a,b\n\
-     \x20                                本地 DuckDB 回写追加到 GaussDB（需 feature gauss）\n\
+     \x20 sync --db <f> --table <t> --cols a,b [--where <expr>]\n\
+     \x20      [--mode append|slice|upsert] [--slice k=$ENV,...] [--key a,b]\n\
+     \x20                                本地 DuckDB 回写 GaussDB（需 feature gauss；\n\
+     \x20                                  缺省 append；slice=同事务先删后灌幂等，\n\
+     \x20                                  upsert=键控合并；--slice 值支持 $ENV 引用）\n\
      \x20 call [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>]\n\
      \x20      [--trace <f> [--trace-format <text|jsonl>] [--trace-level <stmt|sql|bind|all>]] <routine> [args...]\n\
      \x20 call --plan <计划.toml> [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>]\n\

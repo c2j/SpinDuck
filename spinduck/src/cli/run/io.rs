@@ -39,11 +39,31 @@ pub(super) struct SyncParts {
     db: PathBuf,
     table: String,
     cols: Vec<String>,
+    where_clause: Option<String>,
+    mode: Option<String>,
+    slice: Option<String>,
+    key: Option<String>,
 }
 
 pub(super) fn cmd_sync(cmd: Command) -> SyncParts {
     match cmd {
-        Command::Sync { db, table, cols } => SyncParts { db, table, cols },
+        Command::Sync {
+            db,
+            table,
+            cols,
+            where_clause,
+            mode,
+            slice,
+            key,
+        } => SyncParts {
+            db,
+            table,
+            cols,
+            where_clause,
+            mode,
+            slice,
+            key,
+        },
         _ => unreachable!("cmd_sync only for Sync"),
     }
 }
@@ -139,10 +159,32 @@ pub(super) fn materialize_cmd(
 
 #[cfg(feature = "gauss")]
 pub(super) fn sync_cmd(parts: SyncParts, out: &mut dyn Write) -> Result<i32, EngineError> {
+    let mode = crate::io::sync::resolve_mode(
+        parts.mode.as_deref(),
+        parts.slice.as_deref(),
+        parts.key.as_deref(),
+        parts.where_clause.as_deref(),
+    )?;
+    // 临时 CSV 与目标库同目录（失败诊断现场自包含；成功即删，设计 §4.1）
+    let workdir = parts
+        .db
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
     let mut og = open_gauss()?;
     let duck = crate::sql::DuckExecutor::open(&parts.db.to_string_lossy())?;
-    let n = og.sync_append(&duck, &parts.table, &parts.cols)?;
-    writeln!(out, "SYNC {} rows={}", parts.table, n).map_err(io_err)?;
+    let oc = og.sync_write(&duck, &parts.table, &parts.cols, &mode, &workdir)?;
+    // 缺省形态（无 mode/where）保持 V26 契约逐字不变
+    if parts.mode.is_none() && parts.where_clause.is_none() {
+        writeln!(out, "SYNC {} rows={}", parts.table, oc.rows).map_err(io_err)?;
+    } else {
+        writeln!(
+            out,
+            "SYNC {} mode={} rows={}",
+            parts.table, oc.mode_label, oc.rows
+        )
+        .map_err(io_err)?;
+    }
     Ok(EXIT_OK)
 }
 

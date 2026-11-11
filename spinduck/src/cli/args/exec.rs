@@ -113,6 +113,10 @@ pub(super) fn parse_sync(rest: &[String]) -> Result<Command, EngineError> {
     let mut db = None;
     let mut table = None;
     let mut cols = Vec::new();
+    let mut where_clause = None;
+    let mut mode = None;
+    let mut slice = None;
+    let mut key = None;
     let mut it = rest.iter();
     while let Some(tok) = it.next() {
         match tok.as_str() {
@@ -139,10 +143,40 @@ pub(super) fn parse_sync(rest: &[String]) -> Result<Command, EngineError> {
                     .filter(|c| !c.is_empty())
                     .collect();
             }
+            "--where" => {
+                if where_clause.is_some() {
+                    return Err(dup_flag_err("--where"));
+                }
+                where_clause = Some(next_arg(&mut it, "--where <expr>")?);
+            }
+            "--mode" => {
+                if mode.is_some() {
+                    return Err(dup_flag_err("--mode"));
+                }
+                mode = Some(next_arg(&mut it, "--mode append|slice|upsert")?);
+            }
+            "--slice" => {
+                if slice.is_some() {
+                    return Err(dup_flag_err("--slice"));
+                }
+                slice = Some(next_arg(&mut it, "--slice k=v[,k=v]")?);
+            }
+            "--key" => {
+                if key.is_some() {
+                    return Err(dup_flag_err("--key"));
+                }
+                key = Some(next_arg(&mut it, "--key a,b")?);
+            }
             t if t.starts_with("--") => return Err(usage_err(format!("unknown flag {t}"))),
             t => return Err(usage_err(format!("unexpected argument {t}"))),
         }
     }
+    validate_sync_flags(
+        mode.as_deref(),
+        slice.as_deref(),
+        key.is_some(),
+        where_clause.as_ref(),
+    )?;
     let table = table.ok_or_else(|| usage_err("sync --db <path> --table <name> --cols a,b"))?;
     if cols.is_empty() {
         return Err(usage_err("sync requires --cols a,b,..."));
@@ -151,7 +185,74 @@ pub(super) fn parse_sync(rest: &[String]) -> Result<Command, EngineError> {
         db: db.ok_or_else(|| usage_err("sync --db <path> --table <name> --cols a,b"))?,
         table,
         cols,
+        where_clause,
+        mode,
+        slice,
+        key,
     })
+}
+
+/// sync 旗标组合校验（用法错，ENG-0010）：模式与配套旗标必须成对、
+/// `--where` 仅限 append（缺省）语义、`--mode` 值枚举封闭、slice 谓词 `k=v` 形态。
+fn validate_sync_flags(
+    mode: Option<&str>,
+    slice_raw: Option<&str>,
+    has_key: bool,
+    where_clause: Option<&String>,
+) -> Result<(), EngineError> {
+    let has_slice = slice_raw.is_some();
+    match mode {
+        None | Some("append") => {
+            if has_slice {
+                return Err(usage_err("--slice 需要 --mode slice"));
+            }
+            if has_key {
+                return Err(usage_err("--key 需要 --mode upsert"));
+            }
+        }
+        Some("slice") => {
+            if has_key {
+                return Err(usage_err("--key 需要 --mode upsert"));
+            }
+            if !has_slice {
+                return Err(usage_err("--mode slice 需要 --slice k=v[,k=v]"));
+            }
+            if where_clause.is_some() {
+                return Err(usage_err(
+                    "--where 仅限 append 语义（缺省模式）；slice 模式下过滤条件就是 slice 谓词本身",
+                ));
+            }
+        }
+        Some("upsert") => {
+            if has_slice {
+                return Err(usage_err("--slice 需要 --mode slice"));
+            }
+            if !has_key {
+                return Err(usage_err("--mode upsert 需要 --key a,b"));
+            }
+            if where_clause.is_some() {
+                return Err(usage_err(
+                    "--where 仅限 append 语义（缺省模式）；upsert 模式不接受读取过滤",
+                ));
+            }
+        }
+        Some(other) => {
+            return Err(usage_err(format!(
+                "--mode 取值须为 append|slice|upsert，得到 {other}"
+            )));
+        }
+    }
+    if let Some(raw) = slice_raw {
+        if raw
+            .split(',')
+            .any(|seg| !seg.trim().is_empty() && !seg.contains('='))
+        {
+            return Err(usage_err(
+                "--slice 谓词必须是 k=v 形态（逗号分隔；值支持 $ENV / ${ENV} 引用）",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -306,6 +407,10 @@ mod tests {
                 db: PathBuf::from("w"),
                 table: "t".to_string(),
                 cols: vec!["a".into(), "b".into(), "c".into()],
+                where_clause: None,
+                mode: None,
+                slice: None,
+                key: None,
             }
         );
     }
