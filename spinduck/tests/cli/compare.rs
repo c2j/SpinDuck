@@ -216,6 +216,7 @@ fn should_compare_two_snapshots_written_by_query_on_the_same_database() {
         let out_file = tmp.path().join(name);
         let (code, out, _) = cli(&[
             "query",
+            "--db",
             &db.to_string_lossy(),
             "--sql-file",
             &tmp.path().join("sql").join(sql).to_string_lossy(),

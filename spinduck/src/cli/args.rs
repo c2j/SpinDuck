@@ -92,7 +92,17 @@ pub fn parse(argv: &[String]) -> Result<Command, EngineError> {
         "version" | "--version" | "-V" => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
         "compile" => {
-            let paths: Vec<PathBuf> = argv[1..].iter().map(PathBuf::from).collect();
+            // F4：与其余子命令同一旗标纪律——`--` 前缀一律拒，绝不当路径静默读
+            let paths: Vec<PathBuf> = argv[1..]
+                .iter()
+                .map(|t| {
+                    if t.starts_with("--") {
+                        Err(usage_err(format!("compile 不接受旗标，未知参数: {t}")))
+                    } else {
+                        Ok(PathBuf::from(t))
+                    }
+                })
+                .collect::<Result<_, _>>()?;
             if paths.is_empty() {
                 return Err(usage_err("compile <path>..."));
             }
@@ -139,8 +149,20 @@ fn parse_plan(rest: &[String]) -> Result<Command, EngineError> {
     let mut it = rest.iter();
     while let Some(tok) = it.next() {
         match tok.as_str() {
-            "--dir" => dir = Some(PathBuf::from(next_arg(&mut it, "--dir <项目目录>")?)),
-            "--schema" => schema = Some(next_arg(&mut it, "--schema <名>")?),
+            "--dir" => {
+                // F3 取舍：plan 的位置参数已被目标例程占用，项目目录只能走旗标；
+                // verify/compile 的目录是主操作数才用位置参数——同概念不同形态是刻意的
+                if dir.is_some() {
+                    return Err(dup_flag_err("--dir"));
+                }
+                dir = Some(PathBuf::from(next_arg(&mut it, "--dir <项目目录>")?));
+            }
+            "--schema" => {
+                if schema.is_some() {
+                    return Err(dup_flag_err("--schema"));
+                }
+                schema = Some(next_arg(&mut it, "--schema <名>")?);
+            }
             t if t.starts_with("--") => return Err(usage_err(format!("unknown flag {t}"))),
             _ if routine.is_none() => routine = Some(tok.clone()),
             t => return Err(usage_err(format!("plan 只接受一个目标例程，多余参数: {t}"))),
@@ -163,7 +185,12 @@ fn parse_deploy(rest: &[String]) -> Result<Command, EngineError> {
     let mut it = rest.iter();
     while let Some(tok) = it.next() {
         match tok.as_str() {
-            "--db" => db = Some(PathBuf::from(next_arg(&mut it, "--db <path>")?)),
+            "--db" => {
+                if db.is_some() {
+                    return Err(dup_flag_err("--db"));
+                }
+                db = Some(PathBuf::from(next_arg(&mut it, "--db <path>")?));
+            }
             t if t.starts_with("--") => return Err(usage_err(format!("unknown flag {t}"))),
             _ if plan.is_none() => plan = Some(PathBuf::from(tok)),
             t => {
@@ -179,29 +206,42 @@ fn parse_deploy(rest: &[String]) -> Result<Command, EngineError> {
     })
 }
 
-/// `query <库文件> --sql-file F --out F.json`：三个输入都必填（design §6.2 A5）。
+/// `query --db <f> --sql-file F --out F.json`：三件输入全旗标、必填（design §6.2 A5）。
 ///
-/// 库文件是位置参数而不是 `--db`，与 `deploy` 同形：`query` 只有一个落盘目标，
-/// 没有"可选的库"这种形态（缺库就没有执行面）。
+/// F2-A：库文件改为 `--db` 旗标，与 deploy/materialize/sync/call 统一——此前位置参数形态
+/// 与注释里"与 deploy 同形"的说法不符（deploy 的位置参数是计划、db 用旗标）。
 fn parse_query(rest: &[String]) -> Result<Command, EngineError> {
-    let usage = "query <本地 DuckDB 文件> --sql-file <F.sql> --out <F.json>";
+    let usage = "query --db <本地 DuckDB 文件> --sql-file <F.sql> --out <F.json>";
     let mut db = None;
     let mut sql_file = None;
     let mut out = None;
     let mut it = rest.iter();
     while let Some(tok) = it.next() {
         match tok.as_str() {
-            "--sql-file" => {
-                sql_file = Some(PathBuf::from(next_arg(&mut it, "--sql-file <F.sql>")?))
+            "--db" => {
+                if db.is_some() {
+                    return Err(dup_flag_err("--db"));
+                }
+                db = Some(PathBuf::from(next_arg(&mut it, "--db <path>")?));
             }
-            "--out" => out = Some(PathBuf::from(next_arg(&mut it, "--out <F.json>")?)),
+            "--sql-file" => {
+                if sql_file.is_some() {
+                    return Err(dup_flag_err("--sql-file"));
+                }
+                sql_file = Some(PathBuf::from(next_arg(&mut it, "--sql-file <F.sql>")?));
+            }
+            "--out" => {
+                if out.is_some() {
+                    return Err(dup_flag_err("--out"));
+                }
+                out = Some(PathBuf::from(next_arg(&mut it, "--out <F.json>")?));
+            }
             t if t.starts_with("--") => return Err(usage_err(format!("unknown flag {t}"))),
-            _ if db.is_none() => db = Some(PathBuf::from(tok)),
-            t => return Err(usage_err(format!("query 只接受一个库文件，多余参数: {t}"))),
+            t => return Err(usage_err(format!("query 不接受位置参数: {t}"))),
         }
     }
     Ok(Command::Query {
-        db: db.ok_or_else(|| usage_err(usage))?,
+        db: db.ok_or_else(|| usage_err(format!("{usage}（缺 --db）")))?,
         sql_file: sql_file.ok_or_else(|| usage_err(format!("{usage}（缺 --sql-file）")))?,
         out: out.ok_or_else(|| usage_err(format!("{usage}（缺 --out）")))?,
     })
@@ -220,6 +260,9 @@ fn parse_compare(rest: &[String]) -> Result<Command, EngineError> {
     while let Some(tok) = it.next() {
         match tok.as_str() {
             "--key" => {
+                if key_given {
+                    return Err(dup_flag_err("--key"));
+                }
                 key_given = true;
                 let raw = next_arg(&mut it, "--key k1,k2")?;
                 key = raw
@@ -260,6 +303,9 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
     let mut it = rest.iter();
     while let Some(tok) = it.next() {
         if tok == "--plan" {
+            if plan.is_some() {
+                return Err(dup_flag_err("--plan"));
+            }
             plan = Some(PathBuf::from(
                 it.next().ok_or_else(|| usage_err("--plan <plan.toml>"))?,
             ));
@@ -279,11 +325,17 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
     while let Some(tok) = it.next() {
         match tok.as_str() {
             "--db" => {
+                if db.is_some() {
+                    return Err(dup_flag_err("--db"));
+                }
                 db = Some(PathBuf::from(
                     it.next().ok_or_else(|| usage_err("--db <path>"))?,
                 ));
             }
             "--rules" => {
+                if rules.is_some() {
+                    return Err(dup_flag_err("--rules"));
+                }
                 rules = Some(PathBuf::from(
                     it.next().ok_or_else(|| usage_err("--rules <path>"))?,
                 ));
@@ -297,6 +349,9 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
                 batch_commit = true;
             }
             "--step-budget" => {
+                if step_budget.is_some() {
+                    return Err(dup_flag_err("--step-budget"));
+                }
                 let v = it
                     .next()
                     .ok_or_else(|| usage_err("--step-budget <n>"))?
@@ -326,6 +381,21 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
             routine.ok_or_else(|| usage_err("call [--plan <plan.toml> | <routine>] [args...]"))?,
         ),
     };
+    // F6：--plan 下位置参数全是实参。首位置参数恰为计划 target 时，几乎必是"忘了删例程名"，
+    // 静默当实参会把根因盖成 BIZ-0112 之类的值错误——此处直接用法错。计划读不到则跳过本检查
+    // （parse 不产生 I/O 错误面，错误仍由执行层按 BIZ/ENV 域给出）。
+    if let CallTarget::Plan(p) = &target {
+        if let Some(first) = args.first() {
+            if let Some(t) = plan_target_if_readable(p) {
+                if first == &t {
+                    return Err(usage_err(format!(
+                        "call --plan 下位置参数全是实参；目标例程来自计划（{t}），\
+                         请去掉位置参数或改用无计划形态"
+                    )));
+                }
+            }
+        }
+    }
     Ok(Command::Call {
         db,
         rules,
@@ -337,13 +407,26 @@ fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
     })
 }
 
+/// F6 辅助：读取计划文件的 `target`（不可读/不可解析即 None，不在 parse 阶段报 I/O 错）。
+fn plan_target_if_readable(p: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(p).ok()?;
+    crate::plan::RunPlan::from_toml_str(&text)
+        .ok()
+        .map(|x| x.target)
+}
+
 fn parse_explain(rest: &[String]) -> Result<Command, EngineError> {
     let mut file = None;
     let mut routine = None;
     let mut it = rest.iter();
     while let Some(tok) = it.next() {
         match tok.as_str() {
-            "--file" => file = Some(PathBuf::from(next_arg(&mut it, "--file <path>")?)),
+            "--file" => {
+                if file.is_some() {
+                    return Err(dup_flag_err("--file"));
+                }
+                file = Some(PathBuf::from(next_arg(&mut it, "--file <path>")?));
+            }
             t if t.starts_with("--") => return Err(usage_err(format!("unknown flag {t}"))),
             _ => {
                 if routine.is_none() {
@@ -367,9 +450,24 @@ fn parse_materialize(rest: &[String]) -> Result<Command, EngineError> {
     let mut it = rest.iter();
     while let Some(tok) = it.next() {
         match tok.as_str() {
-            "--db" => db = Some(PathBuf::from(next_arg(&mut it, "--db <path>")?)),
-            "--table" => table = Some(next_arg(&mut it, "--table <name>")?),
-            "--where" => where_clause = Some(next_arg(&mut it, "--where <expr>")?),
+            "--db" => {
+                if db.is_some() {
+                    return Err(dup_flag_err("--db"));
+                }
+                db = Some(PathBuf::from(next_arg(&mut it, "--db <path>")?));
+            }
+            "--table" => {
+                if table.is_some() {
+                    return Err(dup_flag_err("--table"));
+                }
+                table = Some(next_arg(&mut it, "--table <name>")?);
+            }
+            "--where" => {
+                if where_clause.is_some() {
+                    return Err(dup_flag_err("--where"));
+                }
+                where_clause = Some(next_arg(&mut it, "--where <expr>")?);
+            }
             t if t.starts_with("--") => return Err(usage_err(format!("unknown flag {t}"))),
             t => return Err(usage_err(format!("unexpected argument {t}"))),
         }
@@ -388,9 +486,22 @@ fn parse_sync(rest: &[String]) -> Result<Command, EngineError> {
     let mut it = rest.iter();
     while let Some(tok) = it.next() {
         match tok.as_str() {
-            "--db" => db = Some(PathBuf::from(next_arg(&mut it, "--db <path>")?)),
-            "--table" => table = Some(next_arg(&mut it, "--table <name>")?),
+            "--db" => {
+                if db.is_some() {
+                    return Err(dup_flag_err("--db"));
+                }
+                db = Some(PathBuf::from(next_arg(&mut it, "--db <path>")?));
+            }
+            "--table" => {
+                if table.is_some() {
+                    return Err(dup_flag_err("--table"));
+                }
+                table = Some(next_arg(&mut it, "--table <name>")?);
+            }
             "--cols" => {
+                if !cols.is_empty() {
+                    return Err(dup_flag_err("--cols"));
+                }
                 let raw = next_arg(&mut it, "--cols a,b")?;
                 cols = raw
                     .split(',')
@@ -415,6 +526,11 @@ fn parse_sync(rest: &[String]) -> Result<Command, EngineError> {
 
 fn next_arg(it: &mut std::slice::Iter<'_, String>, usage: &str) -> Result<String, EngineError> {
     it.next().cloned().ok_or_else(|| usage_err(usage))
+}
+
+/// F5：语义单值的旗标重复给 = 用法错（与位置参数重复即报错同一纪律）。
+fn dup_flag_err(flag: &str) -> EngineError {
+    usage_err(format!("重复旗标 {flag}"))
 }
 
 /// 字面量 → SpinValue 推断（CLI 入参）：整数 / 小数 / 带引号串 / 其余按串。
@@ -460,7 +576,7 @@ pub fn usage() -> &'static str {
      \x20 plan [--dir <项目目录>] [--schema <名>] <routine>\n\
      \x20                                求目标例程闭包并落盘运行计划（缺件即判红）\n\
      \x20 deploy <计划.toml> --db <f>    按运行计划把资产装进落盘的本地 DuckDB（缺件即拒）\n\
-     \x20 query <本地 DuckDB 文件> --sql-file <F.sql> --out <F.json>\n\
+     \x20 query --db <f> --sql-file <F.sql> --out <F.json>\n\
      \x20                                跑一条 SQL，把结果集落成快照文件（内核文本，未归一）\n\
      \x20 compare <a.json> <b.json> [--key k1,k2]\n\
      \x20                                两份结果快照逐值比对（归一后判值；红 = 退出码 1 + DIFF）\n\
@@ -469,9 +585,10 @@ pub fn usage() -> &'static str {
      \x20 sync --db <f> --table <t> --cols a,b\n\
      \x20                                本地 DuckDB 回写追加到 GaussDB（需 feature gauss）\n\
      \x20 call [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>] <routine> [args...]\n\
-     \x20 call --plan <计划.toml> [--db <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>] [args...]\n\
+     \x20 call --plan <计划.toml> [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>] [args...]\n\
      \x20                                注册例程并调用；计划面自带目标与源清单，缺件即红\n\
-     \x20                                （args: 整数/小数/'串'/null；--plan 下位置参数全是实参）\n"
+     \x20                                （args: 整数/小数/'串'/null；--plan 下位置参数全是实参；\n\
+     \x20                                  规则口径：内置种子 < 项目发现 < --rules）\n"
 }
 
 #[cfg(test)]
@@ -492,6 +609,129 @@ mod tests {
                 paths: vec![PathBuf::from("a"), PathBuf::from("b")]
             }
         );
+    }
+
+    #[test]
+    fn should_reject_duplicate_single_value_flag() {
+        // F5：语义单值的旗标重复给 = 手误，不得静默 last-wins（与位置参数重复即报错同纪律）
+        for argv in [
+            v(&["plan", "--dir", "a", "--dir", "b", "r"]),
+            v(&["plan", "--schema", "a", "--schema", "b", "r"]),
+            v(&["deploy", "--db", "a", "--db", "b", "p.toml"]),
+            v(&[
+                "query",
+                "--db",
+                "w",
+                "--sql-file",
+                "s1",
+                "--sql-file",
+                "s2",
+                "--out",
+                "o",
+            ]),
+            v(&[
+                "query",
+                "--db",
+                "w",
+                "--sql-file",
+                "q",
+                "--out",
+                "o1",
+                "--out",
+                "o2",
+            ]),
+            v(&["compare", "a.json", "b.json", "--key", "k1", "--key", "k2"]),
+            v(&["explain", "--file", "a.sql", "--file", "b.sql", "foo"]),
+            v(&["materialize", "--db", "a", "--db", "b", "--table", "t"]),
+            v(&["materialize", "--db", "d", "--table", "t", "--table", "u"]),
+            v(&[
+                "materialize",
+                "--db",
+                "d",
+                "--table",
+                "t",
+                "--where",
+                "a",
+                "--where",
+                "b",
+            ]),
+            v(&[
+                "sync", "--db", "a", "--db", "b", "--table", "t", "--cols", "c",
+            ]),
+            v(&[
+                "sync", "--db", "d", "--table", "t", "--table", "u", "--cols", "c",
+            ]),
+            v(&[
+                "sync", "--db", "d", "--table", "t", "--cols", "a", "--cols", "b",
+            ]),
+            v(&["call", "--db", "a", "--db", "b", "r"]),
+            v(&["call", "--rules", "a", "--rules", "b", "r"]),
+            v(&["call", "--plan", "a", "--plan", "b"]),
+            v(&["call", "--step-budget", "1", "--step-budget", "2", "r"]),
+        ] {
+            let e = parse(&argv).unwrap_err();
+            assert!(e.message.contains("重复旗标"), "{argv:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn should_accept_repeated_file_flag_for_call() {
+        // F5 边界：--file 有意可多次，保持合法
+        let c = parse(&v(&["call", "--file", "a.sql", "--file", "b.sql", "r"])).unwrap();
+        match c {
+            Command::Call { files, .. } => {
+                assert_eq!(files.len(), 2);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_call_plan_with_target_as_first_positional() {
+        // F6：--plan 下位置参数全是实参，例程名误入无防护会把 BIZ-0112 当根因——
+        // 首位置参数 == 计划 target 时直接用法错（exit 2）
+        let dir = std::env::temp_dir().join(format!("spinduck-f6-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan = dir.join("p.toml");
+        std::fs::write(
+            &plan,
+            "[plan]\nschema_version = 1\ntarget = \"fnc_fee\"\n\
+             generator = \"test\"\nproject_dir = \".\"\n[sources]\n",
+        )
+        .unwrap();
+        let e = parse(&v(&["call", "--plan", &plan.to_string_lossy(), "fnc_fee"])).unwrap_err();
+        assert_eq!(e.code.to_string(), "ENG-0010");
+        assert!(e.message.contains("fnc_fee"), "{}", e.message);
+        // 非目标名的位置参数仍是实参（守护既有行为）
+        let c = parse(&v(&["call", "--plan", &plan.to_string_lossy(), "20250715"])).unwrap();
+        match c {
+            Command::Call { args, .. } => assert_eq!(args, v(&["20250715"])),
+            other => panic!("{other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn should_skip_target_check_when_plan_unreadable() {
+        // F6 折衷：parse 不因计划读不到而报错（I/O 错误留给执行层，保持解析零 I/O 错误面）
+        let c = parse(&v(&[
+            "call",
+            "--plan",
+            "/nonexistent/p.toml",
+            "whatever",
+            "1",
+        ]));
+        assert!(c.is_ok(), "计划不可读时 parse 不得抢判: {c:?}");
+    }
+
+    #[test]
+    fn should_reject_compile_with_flag_argument() {
+        // F4：compile 是唯一不拒 `--` 前缀的分支会把旗标当路径读——统一为用法错
+        let e = parse(&v(&["compile", "--help"])).unwrap_err();
+        assert_eq!(e.code.to_string(), "ENG-0010");
+        assert!(e.message.contains("compile 不接受旗标"), "{}", e.message);
+        let e = parse(&v(&["compile", "--rules", "x", "dir"])).unwrap_err();
+        assert!(e.message.contains("--rules"), "{}", e.message);
     }
 
     #[test]
@@ -524,6 +764,24 @@ mod tests {
                 batch_commit: false,
                 step_budget: None,
             }
+        );
+    }
+
+    #[test]
+    fn usage_snapshot_should_mention_rules_in_plan_form() {
+        // F8：usage 与解析器能力对齐（--plan 形态本就接受 --rules），并写明规则三通道口径
+        let u = usage();
+        let plan_line = u
+            .lines()
+            .find(|l| l.contains("call --plan"))
+            .expect("usage 必含 call --plan 行");
+        assert!(
+            plan_line.contains("--rules"),
+            "call --plan 行须列 --rules: {plan_line}"
+        );
+        assert!(
+            u.contains("内置种子 < 项目发现 < --rules"),
+            "规则口径说明缺失: {u}"
         );
     }
 
@@ -764,10 +1022,12 @@ mod tests {
     }
 
     #[test]
-    fn should_parse_query_with_db_and_both_flags() {
+    fn should_parse_query_with_all_three_flags_in_any_order() {
+        // F2-A：三件输入全旗标、顺序自由（与 deploy/materialize/sync/call 的 --db 同形）
         assert_eq!(
             parse(&v(&[
                 "query",
+                "--db",
                 "w.duckdb",
                 "--sql-file",
                 "q.sql",
@@ -781,11 +1041,11 @@ mod tests {
                 out: PathBuf::from("snap.json"),
             }
         );
-        // 库文件是位置参数，旗标在前后都成立（与 deploy 同形）
         assert!(parse(&v(&[
             "query",
             "--sql-file",
             "q.sql",
+            "--db",
             "w.duckdb",
             "--out",
             "snap.json"
@@ -794,28 +1054,27 @@ mod tests {
     }
 
     #[test]
-    fn should_reject_query_with_a_missing_flag_or_a_second_db() {
-        let e = parse(&v(&["query", "w.duckdb"])).unwrap_err();
-        assert_eq!(e.code.to_string(), "ENG-0010");
-        assert!(
-            e.message.contains("--sql-file"),
-            "缺件面要指认缺哪个旗标：{}",
-            e.message
-        );
+    fn should_reject_query_with_a_missing_flag_or_a_positional() {
+        // 缺件面逐旗标指认
         let e = parse(&v(&["query", "--sql-file", "q.sql", "--out", "s.json"])).unwrap_err();
-        assert!(e.message.contains("query <本地 DuckDB 文件>"), "{e}");
+        assert_eq!(e.code.to_string(), "ENG-0010");
+        assert!(e.message.contains("--db"), "{e}");
+        let e = parse(&v(&["query", "--db", "w.duckdb", "--out", "s.json"])).unwrap_err();
+        assert!(e.message.contains("--sql-file"), "{e}");
+        let e = parse(&v(&["query", "--db", "w.duckdb", "--sql-file", "q.sql"])).unwrap_err();
+        assert!(e.message.contains("--out"), "{e}");
+        // 位置参数一律拒（旧形态迁移点）
         let e = parse(&v(&[
             "query",
             "w.duckdb",
-            "v.duckdb",
             "--sql-file",
             "q.sql",
             "--out",
             "s.json",
         ]))
         .unwrap_err();
-        assert!(e.message.contains("只接受一个库文件"), "{e}");
-        let e = parse(&v(&["query", "w", "--sql-file"])).unwrap_err();
+        assert!(e.message.contains("不接受位置参数"), "{e}");
+        let e = parse(&v(&["query", "--db", "w", "--sql-file"])).unwrap_err();
         assert!(e.message.contains("--sql-file <F.sql>"), "{e}");
     }
 

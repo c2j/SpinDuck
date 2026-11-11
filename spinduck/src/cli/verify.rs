@@ -51,10 +51,11 @@ pub(crate) fn locate(start: &Path) -> Result<ProjectConfig, EngineError> {
         return ProjectConfig::load(start);
     }
     ProjectConfig::discover(start).ok_or_else(|| {
+        // F7：verify/plan 共用本入口，消息不绑定子命令名（各自 usage 已说明起点语义）
         EngineError::env(
             30,
             format!(
-                "未在 {} 及其上级目录找到项目声明（spinduck.toml 或 conf/spinduck.toml；verify 以项目声明为起点）",
+                "未在 {} 及其上级目录找到项目声明（spinduck.toml 或 conf/spinduck.toml）",
                 start.display()
             ),
         )
@@ -110,4 +111,31 @@ fn render(reports: &[EntryReport], out: &mut dyn Write) -> Result<i32, EngineErr
 
 fn io_err(e: std::io::Error) -> EngineError {
     EngineError::env(13, format!("stdout: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::locate;
+    use crate::cli::run::run;
+
+    #[test]
+    fn should_locate_error_mention_only_project_declaration() {
+        // F7：locate 为 verify/plan 共用，错误消息不得绑定具体子命令名
+        let e = locate(std::path::Path::new("/nonexistent/spinduck-f7")).unwrap_err();
+        let msg = e.message;
+        assert!(msg.contains("项目声明"), "{msg}");
+        assert!(!msg.contains("verify"), "消息不得带 verify 字样: {msg}");
+    }
+
+    #[test]
+    fn should_plan_error_reuse_neutral_locate_message() {
+        // F7：plan 无项目声明时走同一消息（全链路经 run()，退出码 1）
+        let mut buf: Vec<u8> = Vec::new();
+        let argv = vec!["plan".to_string(), "fnc_x".to_string()];
+        let code = run(&argv, &mut buf);
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(code, 1, "{out}");
+        assert!(out.contains("项目声明"), "{out}");
+        assert!(!out.contains("verify 以项目声明为起点"), "{out}");
+    }
 }

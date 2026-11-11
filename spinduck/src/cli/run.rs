@@ -152,21 +152,27 @@ struct CallParts {
     step_budget: Option<u64>,
 }
 
-/// 语料目录的规则口径：内置种子为基座 + 各路径向上发现的 `spinduck.toml`
-/// `[paths].rules` 叠加（§6 只增不删）。compile/explain 与 golden 用例同一基座，
-/// 避免"体检绿、运行红"的口径分裂。
-fn rules_for_corpus(paths: &[PathBuf]) -> Result<RuleRegistry, EngineError> {
-    let mut files: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+/// 对一组路径做项目规则发现：向上查找 `spinduck.toml` `[paths].rules` 并集（§6 只增不删）。
+fn discover_rules_files(paths: &[PathBuf]) -> std::collections::BTreeSet<PathBuf> {
+    let mut files = std::collections::BTreeSet::new();
     for p in paths {
         if let Some(proj) = crate::project::ProjectConfig::discover(p) {
             files.extend(proj.rules_files);
         }
     }
+    files
+}
+
+/// 语料目录的规则口径：内置种子为基座 + 各路径向上发现的 `spinduck.toml`
+/// `[paths].rules` 叠加（§6 只增不删）。compile/explain 与 golden 用例同一基座，
+/// 避免"体检绿、运行红"的口径分裂。
+fn rules_for_paths(paths: &[PathBuf]) -> Result<RuleRegistry, EngineError> {
+    let files = discover_rules_files(paths);
     RuleRegistry::default().with_project_rules(&files.iter().cloned().collect::<Vec<_>>())
 }
 
 fn compile_cmd(paths: &[PathBuf], out: &mut dyn Write) -> Result<i32, EngineError> {
-    let rules = rules_for_corpus(paths)?;
+    let rules = rules_for_paths(paths)?;
     let mut all: Vec<FileReport> = Vec::new();
     for p in paths {
         if p.is_dir() {
@@ -246,16 +252,19 @@ fn failure_histogram(reports: &[FileReport]) -> Vec<(String, usize)> {
 fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, EngineError> {
     use crate::cli::args::parse_literal;
     use crate::engine::Engine;
-    // 内置种子规则恒为基座；--rules 为项目覆盖（叠加语义，§6 只增不删）
-    let mut rules = RuleRegistry::default();
+    let Some(t) = call_target_and_sources(&parts, out)? else {
+        return Ok(EXIT_FAIL);
+    };
+    // 规则优先级链（F1，与 compile 同口径）：内置种子 < 项目发现 < --rules 手动覆盖。
+    // 缺件门排在开库之前不动：先取目标与源清单，再建规则表。
+    let rules_files: Vec<PathBuf> = t.rules_files.into_iter().collect();
+    let mut rules = RuleRegistry::default().with_project_rules(&rules_files)?;
+    let (target, sources) = (t.target, t.sources);
     if let Some(p) = &parts.rules {
         let raw = std::fs::read_to_string(p)
             .map_err(|e| EngineError::env(12, format!("read rules: {e}")))?;
         rules.overlay(&raw)?;
     }
-    let Some((target, sources)) = call_target_and_sources(&parts, out)? else {
-        return Ok(EXIT_FAIL);
-    };
     let ex = match &parts.db {
         Some(p) => crate::sql::DuckExecutor::open(&p.to_string_lossy())?,
         None => crate::sql::DuckExecutor::open_in_memory()?,
@@ -320,20 +329,36 @@ fn refuse_on_kernel_gaps(
     Ok(true)
 }
 
-/// `call` 的目标例程与例程源清单（design D5/R3）。
+/// `call` 的目标例程、例程源清单与项目规则文件集（design D5/R3 / F1）。
 ///
 /// 返回 `None` = 计划带缺件、已打印拒绝行，调用方直接退出 1。缺件检查排在开库之前：
 /// DuckDB 的 `open` 即建文件，晚一步核对就留下半成品库（口径与 `deploy` 逐字相同——
 /// 同一份计划，两个入口必须先拒在同一件事上）。`--file` 在两种形态下都有效：计划给的是
 /// 闭包内的源，计划外临时补一个桩包仍要允许。
+///
+/// 规则文件集（第三返回值）：Routine 形态对各 `--file` 路径向上发现项目声明取并集；
+/// Plan 形态直接取计划定位到的项目 `rules_files`（计划就在项目内，精确且不受计划文件
+/// 本身软链等影响）。无项目声明时为空集 = 纯种子规则。
+/// `call` 目标解析产物（F1）：目标例程 + 例程源清单 + 项目规则文件集。
+#[cfg(feature = "native")]
+struct CallTargeting {
+    target: String,
+    sources: Vec<PathBuf>,
+    rules_files: std::collections::BTreeSet<PathBuf>,
+}
+
 #[cfg(feature = "native")]
 fn call_target_and_sources(
     parts: &CallParts,
     out: &mut dyn Write,
-) -> Result<Option<(String, Vec<std::path::PathBuf>)>, EngineError> {
+) -> Result<Option<CallTargeting>, EngineError> {
     use crate::cli::args::CallTarget;
     match &parts.target {
-        CallTarget::Routine(r) => Ok(Some((r.clone(), parts.files.clone()))),
+        CallTarget::Routine(r) => Ok(Some(CallTargeting {
+            target: r.clone(),
+            sources: parts.files.clone(),
+            rules_files: discover_rules_files(&parts.files),
+        })),
         CallTarget::Plan(p) => {
             let text = crate::cli::read_source_strict(p)?;
             let plan = crate::plan::RunPlan::from_toml_str(&text)?;
@@ -354,7 +379,11 @@ fn call_target_and_sources(
             let deployment = crate::plan::deploy::resolve(&project, &plan)?;
             let mut files = deployment.routines;
             files.extend(parts.files.iter().cloned());
-            Ok(Some((plan.target.clone(), files)))
+            Ok(Some(CallTargeting {
+                target: plan.target.clone(),
+                sources: files,
+                rules_files: project.rules_files.iter().cloned().collect(),
+            }))
         }
     }
 }
@@ -502,17 +531,17 @@ mod tests {
         let corpus = root.join("sql/routines");
         std::fs::create_dir_all(&corpus).unwrap();
 
-        let r = rules_for_corpus(std::slice::from_ref(&corpus)).expect("项目规则叠加");
+        let r = rules_for_paths(std::slice::from_ref(&corpus)).expect("项目规则叠加");
         assert_eq!(r.functions["MYNVL"], "coalesce");
         assert_eq!(r.functions["NVL"], "coalesce", "内置种子仍为基座");
         // 项目声明对其下所有语料目录生效（子目录继承，无需重复声明）
         let nested = root.join("sql/routines/pkg");
         std::fs::create_dir_all(&nested).unwrap();
-        let r2 = rules_for_corpus(&[nested]).expect("子目录继承项目规则");
+        let r2 = rules_for_paths(&[nested]).expect("子目录继承项目规则");
         assert_eq!(r2.functions["MYNVL"], "coalesce");
         // 无项目声明的目录回落内置种子（compile 与 call 同口径的基座）
         let outside = tempfile::tempdir().unwrap();
-        let plain = rules_for_corpus(&[outside.path().to_path_buf()]).expect("无项目声明也可编译");
+        let plain = rules_for_paths(&[outside.path().to_path_buf()]).expect("无项目声明也可编译");
         assert_eq!(plain.functions.get("MYNVL"), None);
     }
 
@@ -555,6 +584,145 @@ mod tests {
     #[cfg(feature = "native")]
     #[test]
     fn should_register_file_and_call_routine_with_out_param() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("pkg.sql");
+        std::fs::write(
+            &f,
+            "CREATE OR REPLACE PROCEDURE prc_calc(p_i IN NUMBER, p_o OUT NUMBER) IS \
+             BEGIN p_o := p_i * 3; END;",
+        )
+        .unwrap();
+        let (code, out) = run_str(&[
+            "call",
+            "--file",
+            &f.to_string_lossy(),
+            "prc_calc",
+            "14",
+            "null",
+        ]);
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("OUT p_o = 42"), "{out}");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn should_load_project_rules_for_call_routine_form() {
+        // F1（验证报告/修复设计 docs/spinduck-cli-修复设计.md）：call 必须与 compile 同口径
+        // 发现项目规则——不传 --rules 也不得"体检绿、运行红"（修复前此测试必红）
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("spinduck.toml"),
+            "[project]\nname = \"demo\"\n[paths]\nrules = [\"rules/custom.toml\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("rules")).unwrap();
+        std::fs::write(
+            root.join("rules/custom.toml"),
+            "[functions]\nMYNVL = \"coalesce\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("sql")).unwrap();
+        let f = root.join("sql/pkg.sql");
+        std::fs::write(
+            &f,
+            "CREATE OR REPLACE FUNCTION fnc_nv(x IN NUMBER, y IN NUMBER) RETURN NUMBER IS \
+             BEGIN RETURN MYNVL(x, y); END;",
+        )
+        .unwrap();
+        let (code, out) = run_str(&[
+            "call",
+            "--file",
+            &f.to_string_lossy(),
+            "fnc_nv",
+            "5",
+            "null",
+        ]);
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("RETURN 5"), "{out}");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn should_load_project_rules_for_call_plan_form() {
+        // F1：--plan 形态同样发现项目规则（规则文件取计划定位到的 project.rules_files）
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("spinduck.toml"),
+            "[project]\nname = \"demo\"\n[paths]\nrules = [\"rules/custom.toml\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("rules")).unwrap();
+        std::fs::write(
+            root.join("rules/custom.toml"),
+            "[functions]\nMYNVL = \"coalesce\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("sql/routines")).unwrap();
+        std::fs::write(
+            root.join("sql/routines/r.sql"),
+            "CREATE OR REPLACE FUNCTION fnc_nv(x IN NUMBER, y IN NUMBER) RETURN NUMBER IS \
+             BEGIN RETURN MYNVL(x, y); END;",
+        )
+        .unwrap();
+        // plan 会把计划落到项目 .spinduck/plan 下，call --plan 直接消费它
+        let (plan_code, plan_out) = run_str(&["plan", "--dir", &root.to_string_lossy(), "fnc_nv"]);
+        assert_eq!(plan_code, EXIT_OK, "{plan_out}");
+        let plan_path = root.join(".spinduck/plan/fnc_nv.toml");
+        assert!(plan_path.is_file(), "plan 落盘缺失");
+        let (code, out) = run_str(&["call", "--plan", &plan_path.to_string_lossy(), "5", "null"]);
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(out.contains("RETURN 5"), "{out}");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn should_apply_rules_flag_after_project_rules_for_call() {
+        // D1 优先级锁定：项目规则与 --rules 对同一函数名都给映射时，--rules 生效
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("spinduck.toml"),
+            "[project]\nname = \"demo\"\n[paths]\nrules = [\"rules/custom.toml\"]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("rules")).unwrap();
+        std::fs::write(
+            root.join("rules/custom.toml"),
+            "[functions]\nMYX = \"least\"\n",
+        )
+        .unwrap();
+        let override_rules = tmp.path().join("override.toml");
+        std::fs::write(&override_rules, "[functions]\nMYX = \"greatest\"\n").unwrap();
+        let f = root.join("pkg.sql");
+        std::fs::write(
+            &f,
+            "CREATE OR REPLACE FUNCTION fnc_x(a IN NUMBER, b IN NUMBER) RETURN NUMBER IS \
+             BEGIN RETURN MYX(a, b); END;",
+        )
+        .unwrap();
+        let (code, out) = run_str(&[
+            "call",
+            "--file",
+            &f.to_string_lossy(),
+            "--rules",
+            &override_rules.to_string_lossy(),
+            "fnc_x",
+            "2",
+            "7",
+        ]);
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(
+            out.contains("RETURN 7"),
+            "greatest 生效即 --rules 为链顶: {out}"
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn should_call_with_seed_rules_when_no_project_declared() {
+        // F1 守护：项目外 --file 保持纯种子规则，发现逻辑不得扩大化
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("pkg.sql");
         std::fs::write(

@@ -65,6 +65,7 @@ fn should_dump_the_result_set_of_one_sql_file_as_a_snapshot() {
 
     let (code, out, err) = cli(&[
         "query",
+        "--db",
         &db.to_string_lossy(),
         "--sql-file",
         &tmp.path().join("sql/count.sql").to_string_lossy(),
@@ -104,6 +105,7 @@ fn should_snapshot_an_empty_result_set_as_zero_rows() {
     let out_file = tmp.path().join("empty.json");
     let (code, out, _) = cli(&[
         "query",
+        "--db",
         &db.to_string_lossy(),
         "--sql-file",
         &tmp.path().join("sql/none.sql").to_string_lossy(),
@@ -131,6 +133,7 @@ fn should_leave_no_snapshot_file_when_the_statement_fails() {
     let out_file = tmp.path().join("bad.json");
     let (code, out, err) = cli(&[
         "query",
+        "--db",
         &db.to_string_lossy(),
         "--sql-file",
         &tmp.path().join("sql/bad.sql").to_string_lossy(),
@@ -157,6 +160,7 @@ fn should_reject_a_file_that_holds_more_than_one_statement() {
     let out_file = tmp.path().join("two.json");
     let (code, out, _) = cli(&[
         "query",
+        "--db",
         &db.to_string_lossy(),
         "--sql-file",
         &tmp.path().join("sql/two.sql").to_string_lossy(),
@@ -177,6 +181,7 @@ fn should_read_the_sql_file_before_opening_the_database() {
     let out_file = tmp.path().join("snap.json");
     let (code, out, err) = cli(&[
         "query",
+        "--db",
         &db.to_string_lossy(),
         "--sql-file",
         &tmp.path().join("sql/absent.sql").to_string_lossy(),
@@ -206,6 +211,7 @@ fn should_refuse_a_gbk_sql_file_because_the_statement_must_be_decoded() {
     let out_file = tmp.path().join("gbk.json");
     let (code, out, _) = cli(&[
         "query",
+        "--db",
         &db.to_string_lossy(),
         "--sql-file",
         &sql.to_string_lossy(),
@@ -223,35 +229,39 @@ fn should_refuse_a_gbk_sql_file_because_the_statement_must_be_decoded() {
 fn should_exit_2_when_query_is_missing_the_out_or_sql_file_flag() {
     let tmp = tempfile::tempdir().unwrap();
     let db = seeded_db(tmp.path());
-    let (code, out, _) = cli(&["query", &db.to_string_lossy()]);
+    let (code, out, _) = cli(&["query", "--db", &db.to_string_lossy()]);
     assert_eq!(code, EXIT_USAGE, "{out}");
     assert!(out.starts_with("[ENG-0010] usage: query"), "{out}");
     assert!(out.contains("--sql-file"), "缺件面要指认缺哪个旗标: {out}");
 
     let (code, out, _) = cli(&[
         "query",
+        "--db",
         &db.to_string_lossy(),
         "--sql-file",
         &tmp.path().join("sql/x.sql").to_string_lossy(),
     ]);
     assert_eq!(code, EXIT_USAGE, "{out}");
     assert!(out.contains("--out"), "{out}");
+
+    let (code, out, _) = cli(&["query"]);
+    assert_eq!(code, EXIT_USAGE, "{out}");
+    assert!(out.contains("--db"), "缺件面要指认 --db: {out}");
 }
 
 #[test]
-fn should_exit_2_when_a_second_database_file_is_given() {
-    // query 只有一个落盘库目标；多给位置参数一律判用法错，绝不猜"以哪个为准"
+fn should_exit_2_when_a_positional_is_given() {
+    // F2-A：query 三件输入全旗标，不再收位置参数（旧 <db> 位置形态一并拒绝）
     let tmp = tempfile::tempdir().unwrap();
     let db = seeded_db(tmp.path());
     let (code, out, _) = cli(&[
         "query",
         &db.to_string_lossy(),
-        "other.duckdb",
         "--sql-file",
         "s.sql",
         "--out",
         "o.json",
     ]);
     assert_eq!(code, EXIT_USAGE, "{out}");
-    assert!(out.contains("只接受一个库文件"), "{out}");
+    assert!(out.contains("不接受位置参数"), "{out}");
 }

@@ -3988,3 +3988,35 @@ golden job 下一轮预期 406，若不等必须现场解释，不接受"数字�
 `src/cli/args.rs` 859 行 / `src/cli/run.rs` 588 行的 §3 拆分轮，以及顺带补
 `Snapshot::from_json_str` 的行宽 == schema 长度形态校验。本轮 `compare.rs` 自身规模
 = 代码 225 行 / 含 `#[cfg(test)]` 总 537 行，在"含测试总行 ≤700"限内，不构成新增越限。
+
+## V38. CLI 一致性修复轮：F1–F8 按 docs/spinduck-cli-修复设计.md 全量落地（2026-11-11）
+
+来源：`docs/spinduck-cli-一致性验证报告.md`（实测 13 子命令 + 边界用例）→ 修复设计经人工批复
+（D1=种子<项目发现<--rules；D2=A query 改 --db；D3 不加别名；D4 不做逐命令 --help；D5 不去重
+--file；D6=parse 层读计划 target）。本轮依赖面零变更（`Cargo.toml`/`Cargo.lock` 无 diff）。
+
+**行为面**（全部先 Red 后 Green，测试名可检索）：
+
+| 项 | 修复 | 守护/行为测试 |
+|---|---|---|
+| F1 | `call` 两形态叠加项目规则发现（`rules_for_corpus`→`rules_for_paths`；计划形态取 `project.rules_files`）；优先级 seed < 项目发现 < `--rules` | `should_load_project_rules_for_call_routine_form`（修复前实测红：KERNEL-0010 mynvl missing）/ `…_call_plan_form` / `should_apply_rules_flag_after_project_rules_for_call` / `should_call_with_seed_rules_when_no_project_declared` |
+| F4 | `compile` 拒绝 `--` 前缀（原把 `--help` 当路径读，ENV-0010 exit 1） | `should_reject_compile_with_flag_argument` |
+| F5 | 8 解析器的单值旗标重复 → `重复旗标 <f>` 用法错；`call --file` 有意多次不纳管 | `should_reject_duplicate_single_value_flag`（17 例表驱动）/ `should_accept_repeated_file_flag_for_call` |
+| F6 | `call --plan` 首位置参数 == 计划 target → 用法错（原静默当实参报 BIZ-0112）；计划不可读时 parse 跳过检查（I/O 面留给执行层） | `should_reject_call_plan_with_target_as_first_positional` / `should_skip_target_check_when_plan_unreadable` |
+| F2-A | `query` 库文件改 `--db` 旗标，位置参数一律拒；契约测试同批更新（tests/cli/query.rs、compare.rs 夹具） | `should_parse_query_with_all_three_flags_in_any_order` / `should_reject_query_with_a_missing_flag_or_a_positional` / `should_exit_2_when_a_positional_is_given` |
+| F7 | `locate()` 消息去"verify 以项目声明为起点"从句（verify/plan 共用） | `should_locate_error_mention_only_project_declaration` / `should_plan_error_reuse_neutral_locate_message` |
+| F8 | usage：`call --plan` 形态补 `--rules` + 规则三通道口径一行；`read_source_strict` 注释修正（I/O=ENV-0010 / 编码=ENV-0030） | `usage_snapshot_should_mention_rules_in_plan_form` |
+| F3 | `plan --dir` 取舍注释（位置参数被 routine 占用，不改接口） | 无行为面 |
+
+**门禁证据**（本机，2026-11-11）：`cargo fmt --all -- --check` 干净；`cargo clippy
+--all-features -- -D warnings` 干净（F1 返回三元组触发 `type_complexity`，按规范不用
+`#[allow]`，收口为 `CallTargeting` 结构体）；`cargo test --features cli` 全绿（lib 331 +
+cli 契约 80，0 failed）；`cargo audit` 4 条 = 既登记的 `zip` 豁免清单
+（RUSTSEC-2026-0367/0368/0369/0429，与 ci.yml §audit 逐条一致），依赖零变更非本轮引入。
+
+**二进制实证复核**（`target/debug/spinduck`，重建后）：`compile --help` → ENG-0010 exit 2；
+`deploy --db a --db b` → `重复旗标 --db` exit 2；`query --db …` 三旗标任意顺序 exit 0、旧
+位置形态 → `不接受位置参数` exit 2；`call --plan p.toml fnc_fee`（=target）→ 指认式用法错
+exit 2、真实参 `100` → RETURN 0.08 exit 0；规则项目 `compile` 绿且 `call --file`（不带
+--rules）同绿（RETURN 5）——报告 F1 的"体检绿、运行红"路径关闭；`plan`/`verify` 定位失败
+消息不再含 verify 字样；usage `call --plan` 行含 `--rules` 与规则口径说明。

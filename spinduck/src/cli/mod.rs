@@ -59,8 +59,8 @@ pub fn read_source(path: &std::path::Path) -> Result<(String, bool), EngineError
 ///
 /// 与 [`read_source`] 的分工：`compile` 是语料体检面，保留有损解码 + `(non-utf8)` 标记；
 /// `call`/`explain`/`plan`/`deploy`/`query`/`compare` 是执行与比对面，同一份源码只可能因
-/// 编码不同**报错**或被**正确还原**，不可能返回不同的值。实现收口在 [`crate::source`]，
-/// 诊断仍是 `ENV-0030` 形状。
+/// 编码不同**报错**或被**正确还原**，不可能返回不同的值。实现收口在 [`crate::source`]：
+/// 缺文件等 I/O 失败为 `ENV-0010`（`source.rs` env(10)），编码双判失败为 `ENV-0030`（D9①②）。
 pub fn read_source_strict(path: &std::path::Path) -> Result<String, EngineError> {
     crate::source::read_text(path)
 }
