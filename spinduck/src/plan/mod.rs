@@ -5,6 +5,7 @@
 //! 排序去重、段序与字段序固定、不写日期、不写绝对路径。
 
 pub mod closure;
+pub mod codeweb;
 pub mod deploy;
 
 #[cfg(test)]
