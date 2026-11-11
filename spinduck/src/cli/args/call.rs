@@ -177,7 +177,6 @@ fn plan_target_if_readable(p: &std::path::Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::cli::args::{parse, v};
-    use crate::value::SpinValue;
 
     #[test]
     fn should_accept_repeated_file_flag_for_call() {
