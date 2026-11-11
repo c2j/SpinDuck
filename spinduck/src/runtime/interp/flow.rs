@@ -47,12 +47,16 @@ pub(super) fn perform(env: &mut Env<'_>, expr: &IrExpr) -> Result<(), EngineErro
 }
 
 /// 三值逻辑条件求值（JumpIf / JumpIfNot 共用）。
-pub(super) fn cond(env: &Env<'_>, expr: &IrExpr) -> Result<Option<bool>, EngineError> {
-    eval_cond(expr, &eval_env(env))
+pub(super) fn cond(env: &mut Env<'_>, expr: &IrExpr) -> Result<Option<bool>, EngineError> {
+    let mut e = eval_env(env);
+    eval_cond(expr, &mut e)
 }
 
 /// `RAISE <message>`：构造业务错误（BIZ-0200）交回主循环的 trap 展开。
-pub(super) fn raise(env: &Env<'_>, message: &Option<IrExpr>) -> Result<EngineError, EngineError> {
+pub(super) fn raise(
+    env: &mut Env<'_>,
+    message: &Option<IrExpr>,
+) -> Result<EngineError, EngineError> {
     match message {
         Some(m) => Ok(EngineError::business(
             200,
@@ -69,7 +73,7 @@ pub(super) fn raise(env: &Env<'_>, message: &Option<IrExpr>) -> Result<EngineErr
 
 /// `RETURN [<expr>]`。
 pub(super) fn return_step(
-    env: &Env<'_>,
+    env: &mut Env<'_>,
     value: &Option<IrExpr>,
 ) -> Result<RunOutcome, EngineError> {
     let v = match value {
@@ -80,16 +84,18 @@ pub(super) fn return_step(
 }
 
 /// 表达式求值（帧的不可变借用与写槽的可变借用分离，故收敛为单一入口）。
-fn eval_expr(env: &Env<'_>, expr: &IrExpr) -> Result<SpinValue, EngineError> {
-    eval(expr, &eval_env(env))
+fn eval_expr(env: &mut Env<'_>, expr: &IrExpr) -> Result<SpinValue, EngineError> {
+    let mut e = eval_env(env);
+    eval(expr, &mut e)
 }
 
 /// 求值环境（帧 + 接缝 + 目录 + 深度）。
-fn eval_env<'e>(env: &'e Env<'_>) -> EvalEnv<'e> {
+fn eval_env<'e>(env: &'e mut Env<'_>) -> EvalEnv<'e> {
     EvalEnv {
         frame: env.frame,
         ex: env.ex,
         cat: env.cat,
         depth: env.depth,
+        sink: &mut *env.sink,
     }
 }

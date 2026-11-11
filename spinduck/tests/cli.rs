@@ -21,7 +21,8 @@
 //! `usage`（版本/用法/输出通道）、`compile`、`rules_explain`、`call`（含编码两代判定与
 //! 三形态）、`verify`、`plan`（运行计划落盘与缺件红）、`deploy`（按计划建落盘库、
 //! 缺件即拒）、`query`（一条 SQL → 结果快照落盘）、`compare`（两份快照逐值裁决）、
-//! `gauss_boundary`（`materialize`/`sync` 的门禁）。
+//! `gauss_boundary`（`materialize`/`sync` 的门禁）、`trace`（`call --trace` 的审计
+//! 落盘：text/jsonl 两形态、级别阶梯、缺件即不产文件、日志已存在即拒绝覆盖）。
 //!
 //! 零网络与实例依赖：每个用例自带临时目录，且子进程环境里所有 `SPINDUCK_*` 变量一律
 //! 剥离——否则 `materialize`/`sync` 的契约会从"报错"变成"真的去连实例"。唯一的库级
@@ -48,6 +49,8 @@ mod plan;
 mod query;
 #[path = "cli/rules_explain.rs"]
 mod rules_explain;
+#[path = "cli/trace.rs"]
+mod trace;
 #[path = "cli/usage.rs"]
 mod usage;
 #[path = "cli/verify.rs"]

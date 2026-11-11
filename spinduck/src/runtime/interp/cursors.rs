@@ -22,22 +22,21 @@ pub(super) fn open(
             binds,
             fn_sites,
         } => {
-            materialize_fn_sites(fn_sites, env.frame, env.ex, env.cat, env.depth)?;
+            materialize_fn_sites(fn_sites, env)?;
             let m = resolve_binds(binds, env.frame)?;
             (sql.clone(), m)
         }
         CursorSource::Dynamic { query_expr } => {
             // 动态 OPEN FOR：与 EXECUTE IMMEDIATE 同一条管线（统一收口）
             let v = eval_text(env, query_expr)?;
-            let (sql, _) =
-                prepare_dynamic_sql(&v.as_str_loose(), env.frame, env.ex, env.cat, env.depth)?;
+            let (sql, _) = prepare_dynamic_sql(&v.as_str_loose(), env)?;
             (sql, BindMap::new())
         }
     };
     let stream = env.ex.query(&sql, &binds)?;
     env.frame.open_cursor(cursor, CursorState::open(stream));
-    env.sink
-        .on_event(TraceEvent::CursorOpen { schema: Vec::new() });
+    let schema = env.frame.cursor_schema(cursor);
+    env.sink.on_event(TraceEvent::CursorOpen { sql, schema });
     Ok(())
 }
 
@@ -101,12 +100,13 @@ pub(super) fn close(env: &mut Env<'_>, cursor: &VarName) -> Result<(), EngineErr
 }
 
 /// 表达式求值（游标动态文本用）。
-fn eval_text(env: &Env<'_>, expr: &IrExpr) -> Result<SpinValue, EngineError> {
-    let env_ = EvalEnv {
+fn eval_text(env: &mut Env<'_>, expr: &IrExpr) -> Result<SpinValue, EngineError> {
+    let mut env_ = EvalEnv {
         frame: env.frame,
         ex: env.ex,
         cat: env.cat,
         depth: env.depth,
+        sink: &mut *env.sink,
     };
-    eval(expr, &env_)
+    eval(expr, &mut env_)
 }

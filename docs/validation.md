@@ -4058,3 +4058,188 @@ exit 2、真实参 `100` → RETURN 0.08 exit 0；规则项目 `compile` 绿且 
   （3 表 2 并发，含源端缺表失败隔离样本，快路径 `CopyStream` 断言）。
   CLI 端到端：4 张夹具表 `--jobs 2` 全部成功 + 1 张源端缺表 FAIL 隔离，
   总耗时 0.092s（真实例吞吐收益随 PR-A 的 CPU 让出而放大，§1.1）。
+
+## V39. `--trace` 审计日志落地：sqlid 指纹 + sidecar 反查 + `explain --trace` 关联视图（2026-11-11）
+
+来源：`call --plan` 排障后的人工提问"我怎样查看运行日志呢？"→ 批复"同意按 --trace 方式实现
+审计日志，但默认按文本格式，可指定为 jsonl"→ 两轮原型确认（v1 全量内嵌文本 / v2 sqlid + 开头片段
++ sidecar）→ 关联形态选择。本轮依赖面零变更（`git diff Cargo.toml Cargo.lock` 为空，`cargo audit`
+仍是既登记的 4 条 `zip` 豁免）。工作树：`.worktrees/trace`（与主干 materialize COPY STREAM 改动隔离）。
+
+**批复口径**（决定实现形态的四条）：逐条全量（不合并同形语句）；JSONL 加 `seq` 与真实 `sid`/`cid`；
+binds 落原值 + 单值 32 字符上限；`sqlid` = 归一文本 FNV-1a 48bit（零新依赖）；全文反查走 sidecar +
+grep；两处隐形语句修复（嵌套例程继承父 sink、`CURSOR_OPEN` 携带查询文本与列名）归本轮；
+explain 联动选 **A 形态（直方图视图）与 trace 同期交付**。
+
+**行为面**（11 个 TDD 循环，测试名可检索）：
+
+| 循环 | 落地 | 测试 |
+|---|---|---|
+| 渲染 text | `[trace] <ts> <seq:06> <EVENT> <sqlid> [binds=…] [:: 前 96 字符…(+N chars)]`；多字节按字符不按字节截 | `trace::render::tests::should_render_sql_exec_as_text_line_with_id_binds_and_head` / `…_clip_a_long_sql_…` / `…_count_multibyte_sql_in_chars_not_bytes_when_clipping` / `…_prefix_text_lines_with_the_injected_timestamp` |
+| 渲染 jsonl | §11.2 公共头 + `event` 顶层 + `detail.{sql_id,sql_head,sql_chars,binds,columns,…}`；级别门槛之下的键整键缺席 | `…_should_render_sql_exec_as_jsonl_with_contract_fields` / `…_jsonl_omit_fields_below_their_level` / `…_render_cursor_and_fetch_jsonl_detail` |
+| 级别阶梯 | `stmt/sql/bind/all`（默认 bind）；BATCH_SKIP 任何级别不丢 | `…_should_gate_event_kinds_by_level` / `…_text_render_only_the_fields_allowed_by_level` / `trace::tests::should_parse_trace_flag_texts_case_insensitively` |
+| 汇 | 逐行 flush（at-least-once）、seq 递增、首因写失败留存、sqlid→全文索引去重 | `trace::sink::tests::should_flush_after_every_line_so_a_crash_loses_no_written_line` / `…_keep_the_first_write_failure_…` / `…_index_each_sql_text_once_by_its_id` |
+| 注入面 | `Engine::call` 委派 `call_with_sink`（默认 sink 不变 ⇒ 不注 sink 时行为逐字不变） | `tests/trace_events.rs` 全 6 条 |
+| 子树覆盖 | 三处硬编 noop 的调用点改为继承父 sink：`CALL` 语句、PL 表达式函数、SQL 上下文下沉 | `should_inherit_the_sink_into_a_nested_procedure_call` / `…_from_a_pl_expression` / `…_downshifted_into_sql` |
+| 游标可见 | `TraceEvent::CursorOpen` 新增 `sql` 字段并与真实 `schema` 一起发 | `should_carry_the_cursor_query_text_into_the_open_event` / `should_report_the_opened_cursor_columns` |
+| CLI 旗标 | `call --trace <f> [--trace-format text\|jsonl] [--trace-level stmt\|sql\|bind\|all]`；无 `--trace` 单给形态/级别 = 用法错 | `src/cli/args.rs` 4 条新单测 + `tests/cli/trace.rs::should_exit_usage_when_the_trace_level_is_not_a_known_name` |
+| 端到端 | 日志与 sidecar 落盘、stdout 契约逐字不变、缺件即红时两个文件都不留 | `should_write_a_text_audit_log_and_a_sql_sidecar_for_a_traced_call` / `…_jsonl_lines_with_the_contract_header_…` / `…_ir_stmt_lines_only_at_trace_level_all` / `should_not_create_the_trace_file_when_the_call_refuses_for_missing_relations` |
+| 对齐视图 | `explain --file X --trace <日志> <routine>` 第四列 `[trace ×N …]`/`[trace ×0]`/`[trace 动态：文本在运行期]` + `对齐 m/n` + 未对齐逐条报警 | `trace::align::tests` 8 条 + `should_annotate_explain_ir_lines_with_hits_from_the_trace_log` / `should_keep_explain_output_unchanged_without_a_trace_log` |
+
+**契约变更面**（Ask-first 已批复，登记在此）：① `TraceEvent::CursorOpen` 由 `{schema}` 变
+`{sql, schema}`——接缝签名变更，消费者只有 `src/trace/render.rs` 与两个测试汇；② `Command::Call`
+加 `trace/trace_format/trace_level`、`Command::Explain` 加 `trace`，故 `src/cli/args.rs` 里 3 条人工
+编写的穷举构造测试被同批 additive 补齐（`trace: None, trace_format: Text, trace_level: Bind`，断言
+意图未变）；③ JSONL 新增 `seq` 与顶层 `event`（`detail.event` 形态作废），architecture §11.2 的
+"落地口径"小节据此改写。
+
+**sqlid 交叉核对**（独立 Python 实现，同 FNV-1a/归一/低 48bit 口径）：`SELECT 1` = `sq-7bca63ea84f2`
+（`SELECT   1` 同值，证明与源码缩进无关）、`SELECT 1 AS qid, 7 AS js_days` = `sq-8cfb7e071ef0`、
+真语料 `delete from dat_trd_repurchase where purchase_date = $v_p_i_date and market_code = '001'` =
+`sq-e71a3b4fe9fc`——四条与二进制实测逐字一致。
+
+**真语料实证**（`golden/case_corpus_purchase`，本机 debug 二进制，2026-11-11）：
+
+```
+plan   routines=5 tables=1 missing=0        → deploy ddl_files=1 routine_files=5 db=/tmp/purchase.duckdb
+call --plan <计划> --db <库> --trace /tmp/pt.log '20260105' ''  → rc=0, stdout 仅 "OUT p_o_succeed = 0"
+  /tmp/pt.log      3 行（SQL_EXEC / CURSOR_OPEN / FETCH row=end）
+  /tmp/pt.log.sql  2 行（sidecar；游标那条 971 字符的 SELECT 全文在此，日志行只留 96 字符 + …(+875 chars)）
+explain --file … --trace /tmp/pt.log pkg_split_trade_step3_sh.prc_trd_deal_purchase
+  18 sql_exec   delete from dat_trd_repurchase …      [trace ×1 绑定 $v_p_i_date=20260105]
+  25 open_cursor c_get_purchase static[SELECT qs.gddm …] [trace ×1]
+  29/36/51/59/61/62/69 …                        [trace ×0]
+  [trace] 对齐 2/9 条静态 SQL · 日志 2 个 sqlid
+```
+
+本地库为空表 ⇒ 游标 `FETCH row=end`、循环体七条静态 SQL 全 ×0——这正是 A 形态要给的判读：
+"过程跑完了，但循环体一条没执行"，不解释器内部状态就能定位到数据面。
+
+**门禁证据**（本机，2026-11-11，rebase 到主干 `v0.1.18` 之后重取）：`cargo fmt --all -- --check`
+干净；`cargo clippy --all-features -- -D warnings` 干净；`cargo check --all-features --tests`
+零告警（含 `gauss` 侧 e2e 测试目标与本分支改动的同一批文件共存编译）；`cargo test --features cli`
+24 个 suite 全绿 0 failed（lib 371 + CLI 契约 89 + `tests/trace_events` 6；本轮新增面为 lib
+`trace::` 32、`tests/trace_events` 6、`tests/cli/trace` 7）。`cargo audit` 本轮重取时拉不动
+advisory-db（网络 IO 错，非漏洞结论），沿用 V38 登记的 4 条 `zip` 豁免口径；依赖侧只有上游
+`Cargo.toml`/`Cargo.lock` 的版本号 bump，本分支自身零新增依赖。
+
+**与 V27 的交界**：V27「遗留」条目里的 TraceSink 分时事件（`mode/unload_ms/load_ms/rows/shards`）
+本轮**未接**——埋点面只覆盖 `call` 的执行路径（SQL / 游标 / IR / 绑定），物化 COPY STREAM 快路径
+仍不产生事件，故 `materialize` 不带 `--trace`；该形态在分时事件落地时复用本节已定的字段契约。
+
+**已知缺口**（V39 口径，排障时按此判读）：`elapsed_us` 字段在、值恒 0（埋点未计耗时）；`step`
+未接入事件面；`UDF_CALL` 变体无发射点；`FETCH` 行号为 `Some(1)`/`None` 而非内核真实游标位置；
+SQL 上下文函数下沉后缓存表自身的 DDL/DML 与 `distinct_sql` 直连内核、不产生事件；`--trace`
+未接 §11.2 的轮转/保留策略（单文件、无切割）；`src/cli/args.rs`（rebase 后 1398 行）与
+`src/cli/run.rs`（848 行）与上游 PR-A2 同文件增长，均已越过 §3 的 500 行线——这一条**已被 V40
+关闭**（同 PR 内按职责拆成 `src/cli/args/` 与 `src/cli/run/` 两个目录），V39 原文写"未在本轮拆分"
+是当时的口径，不作为现状。
+
+---
+
+## V40. 审计轮：`--trace` 拒绝覆盖（ENV-0016）+ `args.rs`/`run.rs` 按 §3 拆分（2026-11-11）
+
+**评审意见原文两条**（PR #22）：
+
+1. `src/cli/args.rs`（1398 行）与 `src/cli/run.rs`（848 行）**第三次**越 §3 线。§3 明文
+   "同一文件的规模问题连续两次评审豁免 = 必须拆分"——PR-A2 豁免一次、V39 豁免一次，本轮起
+   不得再登记为"范围外"。
+2. `--trace` 以 `File::create` 打开日志 ⇒ 重跑同名路径**静默截断**上一轮审计证据；runbook
+   只提示磁盘余量，没写"重跑会清空"。审计语义下这是危险默认。
+
+### V40.1 意见 2：独占创建 + 新错误码 `ENV-0016`
+
+Red→Green 锁定行为：`tests/cli/trace.rs::should_refuse_to_overwrite_an_existing_trace_log`——
+先跑一次 `call --trace` 落日志，再用**同一路径**重跑，断言退出码 1、stdout 含 `[ENV-0016]` 与
+"拒绝覆盖"、stderr 恒空、**不含** `OUT p_o` 行（拒绝必须排在 `eng.call` 之前，否则等于"跑完再
+报错"）、旧文件字节逐字不变、`<日志>.sql` 不产出。修复前该测试实测 `rc=0` 并打出
+`OUT p_o = 42`——即静默截断的现场复现；修复后转绿。
+
+| 面 | 落地 | 判据 |
+|---|---|---|
+| 打开方式 | `src/cli/trace.rs` 的 `open_exclusive`：`OpenOptions::write().create_new(true)`，"已存在"由 **OS** 判定，不留 `exists()` → `create()` 的 TOCTOU 窗口 | 非 AlreadyExists 的 IO 错仍归 `ENV-0012`（原口径不变） |
+| 拒绝语义 | `ENV-0016`（故障域 ENV，产生点在打开日志文件处，不事后改判）+ rc=1 | 与缺件门同一条纪律：**拒绝执行不留"跑过什么"的痕迹**（§11.1） |
+| sidecar | 仍允许覆盖 | 它只在主日志独占打开成功之后才写；届时旧 `<日志>.sql` 只可能来自被人为删掉的主日志，不是可比对的上一轮 |
+| 备选方案 | "引擎按时间戳自动命名"**未采用** | 会改掉"日志路径由调用方给定"这条既有语义（轮转/保留属另一议题），需另行评审；本轮先在 runbook 给出 `trace-$(date +%Y%m%dT%H%M%S).log` 的手工命名口径 |
+
+文档同步四处（口径不得只活在注释里）：`docs/architecture.md` §11.2 落地口径新增「覆盖语义」行、
+`docs/runbook-real-gaussdb.md` §4（换路径重跑 + 不建议轮转）与 §7 排障表（ENV-0016 / ENV-0012
+两行，写明"别先删后跑——删掉的那份正是可比对的两轮证据"）、`README.md` §2.1、
+`spinduck/src/cli/args/mod.rs` 的 `usage()`（由
+`args::tests::usage_snapshot_should_mention_the_trace_overwrite_refusal` 断言 usage 文本含
+`ENV-0016`，防止只在源码里可查）。
+
+### V40.2 意见 1：两个超限文件按职责拆分
+
+先例是仓库里已有的形态（`tests/cli.rs` 用 `#[path = "cli/<x>.rs"] mod <x>;`，`src/plan/`、
+`src/verify/` 用目录模块），本轮沿用同一机制，不改任何行为。
+
+```
+spinduck/src/cli/args.rs (1398)  →  args/mod.rs 398  派发/usage/字面量/公共错误件
+                                      args/call.rs 389  call（含 --trace 三旗标、--plan 形态）
+                                      args/exec.rs 312  explain / materialize / sync
+                                      args/project.rs 192  verify / plan / deploy
+                                      args/snapshot.rs 197  query / compare
+spinduck/src/cli/run.rs  (848)   →  run/mod.rs  158  run/exec 派发、退出码、io_err
+                                      run/compile.rs 197  compile / explain 渲染与规则口径
+                                      run/call.rs 398  call 执行面（目标解析→规则链→两道门→审计）
+                                      run/io.rs 160  materialize / sync（GaussDB 数据面）
+```
+
+拆分只做三类机械改动，逐类可核对：① 归属重排；② 跨文件可见的项加 `pub(super)`
+（`Command`/`CallTarget`/`*Parts`/`cmd_*`/各 `*_cmd`/`io_err`/`discover_rules_files`），文件内部
+仍是私有；③ 只在某 feature 路径使用的导入逐条 `#[cfg]` gate——不用 `#[allow]` 压 lint（§Never）。
+
+**完整性证据（两条独立机械比对，不靠人眼）**：
+
+- 测试名集合逐字相同：`src/cli/args/` 36 条（34 条 `should_*` + 2 条 `usage_snapshot_*`）、
+  `src/cli/run/` 12 条，与拆分前
+  `git show <pre-split>:spinduck/src/cli/{args,run}.rs` 的测试名排序后 `diff` 为空——
+  无删除、无跳过、无改名（§4.3 守护测试面完整迁移）。
+- 逐行覆盖比对：把拆分前后各自"去空行 + 去缩进 + 排序"的行做 `diff`，落选行只剩三类
+  可解释项——被 `pub(super)`/`pub(crate)` 改写掉的旧签名行、新增的 `#[cfg(...)]`/`mod`/
+  `use` 接线、新增的模块头 `//!`。`run.rs` 侧比对结果另含 2 处 rustfmt 对长签名的换行，语义不变。
+
+### V40.3 门禁证据（本机，2026-11-11，最终树）
+
+- `cargo fmt --all -- --check` 干净。
+- `cargo clippy --all-features -- -D warnings` 干净。
+- `cargo check --all-features --tests` **零告警**。
+- `cargo test --features cli`：24 个 suite 全绿，549 passed / 0 failed。
+- `cargo audit` 本机重取成功（advisory-db 可读，与 V39 那次的网络 IO 错不同）：裸跑报 4 条
+  `zip` 漏洞（RUSTSEC-2026-0367/0368/0369/0429），与 `ci.yml` audit job 的 `--ignore` 清单**逐条
+  同一组**；按 CI 同口径带这四条 `--ignore` 重跑即零报告。依赖侧本轮零新增，本分支自身不动
+  `Cargo.toml`/`Cargo.lock`。
+
+**门禁面的一条实测发现**：`cargo clippy --all-features`（不带 `--tests`/`--all-targets`）**不编译
+lib 的 `#[cfg(test)]` 代码**，因此 args 拆分留下的一条未用导入（`src/cli/args/call.rs` 测试模块里的
+`use crate::value::SpinValue;`）当场不可见，只有 `cargo check --all-features --tests` 抓到。本轮把
+后者列入门禁证据；是否把 `--all-targets` 加进 `ci.yml` 的 clippy job 属 CI 变更，未在本 PR 动，
+留作待评审项。
+
+### V40.4 变更面登记
+
+- **新增错误码**：`ENV-0016`（审计日志目标已存在，拒绝覆盖既有审计）。按 §5 挂测试：
+  `tests/cli/trace.rs::should_refuse_to_overwrite_an_existing_trace_log`（端到端契约）+
+  `src/cli/args/mod.rs` 的 usage 快照断言。故障域 ENV，退出码 1，与 ENV-0012/0013 分工不重叠。
+- **零接缝变更**：`TraceSink`/`SqlExecutor` 签名未动；`src/cli/run.rs` → `src/cli/run/` 与
+  `src/cli/args.rs` → `src/cli/args/` 不改 `pub` 面（外部只见 `cli::run::run` 与 `EXIT_*`，
+  二者路径与可见性逐字不变，见 `src/bin/spinduck.rs`、`tests/verify_chain.rs`、`src/cli/verify.rs`
+  等消费者的既有 `use crate::cli::run::{EXIT_FAIL, EXIT_OK}`）。
+- **行为不变**：默认面（不带 `--trace`）、stdout 契约、退出码语义、缺件门顺序全部未动；
+  本轮唯一新增的可观察行为是"日志目标已存在 ⇒ `ENV-0016` + rc=1 + 不执行 + 不写文件"。
+
+### V40.5 已知缺口（本轮口径）
+
+- §3 债务只关闭了评审点名的两个文件。仓库内仍有超长文件，最大 `src/engine.rs` 711 行（无内联
+  `mod tests`，纯代码即越线），另有 `src/sql/patterns.rs` 609、`src/verify/run.rs` 607、
+  `src/trace/render.rs` 573、`src/exec.rs` 545——本轮按"范围限于当前改动路径"未触碰，需在各自
+  路径被实际改动时拆分。
+- `--trace` 的轮转/保留仍未落地（§11.2 既有缺口）；"按时间戳自动命名"仍是**待评审的备选**，
+  不是实现。
+- CI clippy 是否补 `--all-targets`：见 V40.3 末段，未决。
+- `cargo check --no-default-features`（关 `native`）本轮实测**仍红**，且与本 PR 无关：报错点在
+  `src/verify.rs:17`（`no verify_project in verify::deploy`），该行出自上游 `1bcec83`（2026-11-10），
+  本 PR 未触碰 `src/verify*`。副作用：`run/call.rs` 的 `#[cfg(not(feature = "native"))]` 拒绝桩
+  与其新增的 `#[cfg]` 导入闸门无法在该配置下自证编译——AGENTS §8 未把 `--no-default-features`
+  列为支持面，故记为观察项，不在本轮修。
