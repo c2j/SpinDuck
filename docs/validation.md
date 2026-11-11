@@ -4206,8 +4206,10 @@ spinduck/src/cli/run.rs  (848)   →  run/mod.rs  158  run/exec 派发、退出�
 - `cargo clippy --all-features -- -D warnings` 干净。
 - `cargo check --all-features --tests` **零告警**。
 - `cargo test --features cli`：24 个 suite 全绿，549 passed / 0 failed。
-- `cargo audit`：本机重取仍拉不动 advisory-db（网络 IO 错，不构成结论），沿用 V38 的 4 条 `zip`
-  豁免口径；CI audit job 为准。
+- `cargo audit` 本机重取成功（advisory-db 可读，与 V39 那次的网络 IO 错不同）：裸跑报 4 条
+  `zip` 漏洞（RUSTSEC-2026-0367/0368/0369/0429），与 `ci.yml` audit job 的 `--ignore` 清单**逐条
+  同一组**；按 CI 同口径带这四条 `--ignore` 重跑即零报告。依赖侧本轮零新增，本分支自身不动
+  `Cargo.toml`/`Cargo.lock`。
 
 **门禁面的一条实测发现**：`cargo clippy --all-features`（不带 `--tests`/`--all-targets`）**不编译
 lib 的 `#[cfg(test)]` 代码**，因此 args 拆分留下的一条未用导入（`src/cli/args/call.rs` 测试模块里的
