@@ -20,7 +20,7 @@ pub(super) fn query(
     into: &[AssignTarget],
     sites: &[crate::sql::FnSite],
 ) -> Result<(), EngineError> {
-    materialize_fn_sites(sites, env.frame, env.ex, env.cat, env.depth)?;
+    materialize_fn_sites(sites, env)?;
     let bound = resolve_binds(binds, env.frame)?;
     env.sink.on_event(TraceEvent::SqlExec {
         sql: sql.to_string(),
@@ -39,7 +39,7 @@ pub(super) fn exec(
     binds: &[(String, BindSrc)],
     sites: &[crate::sql::FnSite],
 ) -> Result<(), EngineError> {
-    materialize_fn_sites(sites, env.frame, env.ex, env.cat, env.depth)?;
+    materialize_fn_sites(sites, env)?;
     let bound = resolve_binds(binds, env.frame)?;
     env.sink.on_event(TraceEvent::SqlExec {
         sql: sql.to_string(),
@@ -57,7 +57,7 @@ pub(super) fn exec_dynamic(
     into_targets: &[AssignTarget],
 ) -> Result<(), EngineError> {
     let v = eval_expr(env, text_expr)?;
-    let (sql, _) = prepare_dynamic_sql(&v.as_str_loose(), env.frame, env.ex, env.cat, env.depth)?;
+    let (sql, _) = prepare_dynamic_sql(&v.as_str_loose(), env)?;
     env.sink.on_event(TraceEvent::SqlExec {
         sql: sql.clone(),
         binds: BindMap::new(),
@@ -107,12 +107,13 @@ fn write_into(
     Ok(())
 }
 
-fn eval_expr(env: &Env<'_>, expr: &IrExpr) -> Result<SpinValue, EngineError> {
-    let env_ = EvalEnv {
+fn eval_expr(env: &mut Env<'_>, expr: &IrExpr) -> Result<SpinValue, EngineError> {
+    let mut env_ = EvalEnv {
         frame: env.frame,
         ex: env.ex,
         cat: env.cat,
         depth: env.depth,
+        sink: &mut *env.sink,
     };
-    eval(expr, &env_)
+    eval(expr, &mut env_)
 }

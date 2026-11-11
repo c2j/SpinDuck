@@ -9,6 +9,7 @@ pub mod explain;
 mod plan;
 mod query;
 pub mod run;
+mod trace;
 mod verify;
 
 use crate::engine::Engine;
