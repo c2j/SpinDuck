@@ -4287,3 +4287,73 @@ lib 的 `#[cfg(test)]` 代码**，因此 args 拆分留下的一条未用导入�
   本 PR 未触碰 `src/verify*`。副作用：`run/call.rs` 的 `#[cfg(not(feature = "native"))]` 拒绝桩
   与其新增的 `#[cfg]` 导入闸门无法在该配置下自证编译——AGENTS §8 未把 `--no-default-features`
   列为支持面，故记为观察项，不在本轮修。
+
+## V41. 项目态 compile 以 codeweb 0.9.7 为闭包真源（2026-11-12）
+
+本轮只补实证。`plan` / `verify` 仍是项目态 `compile` 的别名，子命令没有删除。
+临时目录、`.codeweb/` 和计划文件都没有进仓库，`golden/case_corpus_purchase` 未改。
+
+### V41.1 被测面
+
+- 二进制：本分支 `f696339` 上 `cargo build --features cli` 的 debug `spinduck`。
+- codeweb：本机安装，`--version` 标准输出为 `codeweb 0.9.7`，退出码 0。产品解析顺序仍是
+  `--codeweb-bin`、`SPINDUCK_CODEWEB`、`PATH`；下面的绝对路径只是这次调用传给旗标的值。
+- 夹具：把 `golden/case_corpus_purchase` 复制到 `/tmp/spinduck-purchase-ev`。`compile` 自己不跑
+  `analyze`。复制件上先在命令外做了一次 `codeweb init` 与一次 `codeweb analyze`，然后：
+
+```text
+$ codeweb diff --project /tmp/spinduck-purchase-ev
+（stdout 空；stderr 恰好为 "Up to date. No changes detected." 加一个换行；退出码 0）
+```
+
+唯一 `[[entry]]` 仍是 `pkg_split_trade_step3_sh.prc_trd_deal_purchase`。
+
+### V41.2 默认入口到不了样本函数
+
+`golden/case_corpus_purchase/sql/routines/PKG_SPLIT_TRADE_STEP3_SH.sql` 里，
+`fnc_get_fund_data_mode` 出现在第 104 行，位于 `PROCEDURE prc_trd_hz_byfund` 的游标查询中。
+同文件对 `prc_trd_hz_byfund` 只有过程声明（第 6、13 行）和 `v_proc_name` 赋值（第 138 行），
+没有从 `prc_trd_deal_purchase` 发出的调用。因此默认入口的闭包不包含这个函数。这是夹具源码的形状，
+不是把一条已有调用边漏掉。
+
+```text
+$ spinduck compile --dir /tmp/spinduck-purchase-ev \
+    --codeweb-bin <本机 codeweb 0.9.7> \
+    --codeweb-project /tmp/spinduck-purchase-ev
+plan: target=pkg_split_trade_step3_sh.prc_trd_deal_purchase routines=5 tables=1 missing=1
+MISS routine:fnc_com_get_seat_para <- pkg_split_trade_step3_sh.prc_trd_deal_purchase
+compile: entries=1 missing=1 failed=0 dynamic=0
+```
+
+退出码 1，stderr 为空。计划 `generator = "codeweb 0.9.7"`，`schema_version = 1`，
+`ddl_routines` 5 个文件，`ddl_tables` 只有 `sql/ddl/tables.sql`。`sys_dummy` 出现为
+`REF table:sys_dummy read`，不是 `MISS`。`MISS` 行里没有 `par_oper_close_date`、
+`par_sys_marketrate`、`split_log_info`、`sys_dummy`。
+
+### V41.3 显式入口报出样本名
+
+把入口改成定义该标量子查询的过程之后，样本名从调用方报出：
+
+```text
+$ spinduck compile --dir /tmp/spinduck-purchase-ev \
+    --entry pkg_split_trade_step3_sh.prc_trd_hz_byfund \
+    --codeweb-bin <本机 codeweb 0.9.7> \
+    --codeweb-project /tmp/spinduck-purchase-ev
+plan: target=pkg_split_trade_step3_sh.prc_trd_hz_byfund routines=2 tables=2 missing=11
+MISS routine:fnc_get_fund_data_mode <- pkg_split_trade_step3_sh.prc_trd_hz_byfund
+compile: entries=1 missing=11 failed=0 dynamic=0
+```
+
+退出码 1，stderr 为空。同一次还有另外 10 行 `MISS`（4 个 `relation:`、6 个其余 `routine:`），
+调用方都是 `pkg_split_trade_step3_sh.prc_trd_hz_byfund`。其中 `relation:par_oper_venture`
+与 V31.5 否掉的 `par_oper_close_date` 不是同一个名字。`sys_dummy` 仍是
+`REF table:sys_dummy read`。计划头同样是 `generator = "codeweb 0.9.7"`、`schema_version = 1`；
+`ddl_tables` 为 `sql/ddl/tables.sql` 与 `sql/ddl/views/view_check_para.sql`。
+
+### V41.4 本轮不声称的事
+
+- 不把默认入口 `prc_trd_deal_purchase` 写成“因 `fnc_get_fund_data_mode` 失败”。那次失败的缺件是
+  `routine:fnc_com_get_seat_para`。
+- 不把 `par_oper_close_date`、`par_sys_marketrate`、`split_log_info`、`sys_dummy` 写回缺件。
+  V31.5 的改判继续成立。
+- 不删除 `plan` / `verify`，也不去掉裸 `call` 的词法门。别名周期是否结束仍要人确认。
