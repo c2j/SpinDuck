@@ -5,4 +5,13 @@
 pub mod gauss;
 
 #[cfg(feature = "gauss")]
+pub mod sync;
+
+#[cfg(feature = "gauss")]
+pub mod sync_tx;
+
+#[cfg(feature = "gauss")]
 pub use gauss::{materialize_parallel, GaussConn, MaterializeMode, MaterializeOutcome};
+
+#[cfg(feature = "gauss")]
+pub use sync::{resolve_mode, SyncMode, SyncOutcome};

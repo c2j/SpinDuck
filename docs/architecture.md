@@ -997,6 +997,20 @@ SQL 侧对象名取自改写前的静态扫描（`FROM`/`JOIN`/`UPDATE`/`INSERT 
 | 幂等与校验 | 回写前校验本地待写行数 vs 上次回写水位；回写后行数/校验和双向核对；失败重跑按模式幂等（append 需业务键去重或 replace_partition） |
 | 失败语义 | 回写失败 = 该表回滚（GaussDB 事务保证），本地结果保留 → 修复后 `sync --retry` 单表重试；多表回写顺序按依赖拓扑（被业务链引用的先写） |
 
+> **落地实态（feat/sync-writeback，机制规格见 `docs/sync-writeback-design.md`）**：
+> `sync` 当前落地的模式集为 **append / slice / upsert**（`--mode`，缺省 append 与
+> V26 契约逐字一致；append 无 mode/where 时输出不变）。上表的
+> `replace_partition`（对应 slice 的分区整段替换语义）由 `--mode slice
+> --slice k=v` 承接——结构化等值谓词、同事务先 DELETE 后 COPY、幂等重跑；
+> `--slice` 值支持 `$ENV` / `${ENV}` 引用（缺失即 ENV-0016 红）。upsert 未用
+> GaussDB MERGE，改为 **staging 临时表 + join 式 UPDATE + INSERT NOT EXISTS**
+> （A 模式无 `ON CONFLICT`；语句数与行数无关）。通道为 DuckDB 内核 `COPY TO`
+> CSV 中转 → `copy_in` 流式灌入（快路径失败自动回落 V26 逐行通道）。
+> 前置守卫族（触碰目标数据之前执行，全部 fail-closed）：G1 目标 schema 漂移
+> （ENV-0021）/ G2 slice 越界（BIZ-0102）/ G3 staging key 完整性（BIZ-0103）/
+> G4 目标 key 唯一索引覆盖（ENV-0022）。实现位于 `src/io/sync.rs`（纯逻辑）与
+> `src/io/sync_tx.rs`（事务骨架与通道）。
+
 ### 13.3 运行时序（单次批处理）
 
 ```

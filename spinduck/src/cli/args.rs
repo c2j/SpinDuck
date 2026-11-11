@@ -28,11 +28,20 @@ pub enum Command {
         /// 并发度（默认 4；0 视为用法错）。
         jobs: Option<usize>,
     },
-    /// 回写：本地 DuckDB 表 → GaussDB 追加（feature `gauss`）。
+    /// 回写：本地 DuckDB 表 → GaussDB（feature `gauss`）。
+    /// 默认（无 mode/where）保持 V26 append 全表契约逐字不变。
     Sync {
         db: PathBuf,
         table: String,
         cols: Vec<String>,
+        /// 读取过滤（仅 append 语义；slice/upsert 模式拒绝）。
+        where_clause: Option<String>,
+        /// 回写模式：append（缺省）/ slice / upsert（原始串，engine 侧解析）。
+        mode: Option<String>,
+        /// mode=slice 的结构化谓词 `k=v,k=v`（值支持 `$ENV` / `${ENV}` 引用）。
+        slice: Option<String>,
+        /// mode=upsert 的键列 `a,b`。
+        key: Option<String>,
     },
     /// 链路校验（§12.1 入口声明）：从 `[[entry]]` 出发逐对象核验。
     Verify { path: Option<PathBuf> },
@@ -515,6 +524,10 @@ fn parse_sync(rest: &[String]) -> Result<Command, EngineError> {
     let mut db = None;
     let mut table = None;
     let mut cols = Vec::new();
+    let mut where_clause = None;
+    let mut mode = None;
+    let mut slice = None;
+    let mut key = None;
     let mut it = rest.iter();
     while let Some(tok) = it.next() {
         match tok.as_str() {
@@ -541,10 +554,40 @@ fn parse_sync(rest: &[String]) -> Result<Command, EngineError> {
                     .filter(|c| !c.is_empty())
                     .collect();
             }
+            "--where" => {
+                if where_clause.is_some() {
+                    return Err(dup_flag_err("--where"));
+                }
+                where_clause = Some(next_arg(&mut it, "--where <expr>")?);
+            }
+            "--mode" => {
+                if mode.is_some() {
+                    return Err(dup_flag_err("--mode"));
+                }
+                mode = Some(next_arg(&mut it, "--mode append|slice|upsert")?);
+            }
+            "--slice" => {
+                if slice.is_some() {
+                    return Err(dup_flag_err("--slice"));
+                }
+                slice = Some(next_arg(&mut it, "--slice k=v[,k=v]")?);
+            }
+            "--key" => {
+                if key.is_some() {
+                    return Err(dup_flag_err("--key"));
+                }
+                key = Some(next_arg(&mut it, "--key a,b")?);
+            }
             t if t.starts_with("--") => return Err(usage_err(format!("unknown flag {t}"))),
             t => return Err(usage_err(format!("unexpected argument {t}"))),
         }
     }
+    validate_sync_flags(
+        mode.as_deref(),
+        slice.as_deref(),
+        key.is_some(),
+        where_clause.as_ref(),
+    )?;
     let table = table.ok_or_else(|| usage_err("sync --db <path> --table <name> --cols a,b"))?;
     if cols.is_empty() {
         return Err(usage_err("sync requires --cols a,b,..."));
@@ -553,7 +596,74 @@ fn parse_sync(rest: &[String]) -> Result<Command, EngineError> {
         db: db.ok_or_else(|| usage_err("sync --db <path> --table <name> --cols a,b"))?,
         table,
         cols,
+        where_clause,
+        mode,
+        slice,
+        key,
     })
+}
+
+/// sync 旗标组合校验（用法错，ENG-0010）：模式与配套旗标必须成对、
+/// `--where` 仅限 append（缺省）语义、`--mode` 值枚举封闭、slice 谓词 `k=v` 形态。
+fn validate_sync_flags(
+    mode: Option<&str>,
+    slice_raw: Option<&str>,
+    has_key: bool,
+    where_clause: Option<&String>,
+) -> Result<(), EngineError> {
+    let has_slice = slice_raw.is_some();
+    match mode {
+        None | Some("append") => {
+            if has_slice {
+                return Err(usage_err("--slice 需要 --mode slice"));
+            }
+            if has_key {
+                return Err(usage_err("--key 需要 --mode upsert"));
+            }
+        }
+        Some("slice") => {
+            if has_key {
+                return Err(usage_err("--key 需要 --mode upsert"));
+            }
+            if !has_slice {
+                return Err(usage_err("--mode slice 需要 --slice k=v[,k=v]"));
+            }
+            if where_clause.is_some() {
+                return Err(usage_err(
+                    "--where 仅限 append 语义（缺省模式）；slice 模式下过滤条件就是 slice 谓词本身",
+                ));
+            }
+        }
+        Some("upsert") => {
+            if has_slice {
+                return Err(usage_err("--slice 需要 --mode slice"));
+            }
+            if !has_key {
+                return Err(usage_err("--mode upsert 需要 --key a,b"));
+            }
+            if where_clause.is_some() {
+                return Err(usage_err(
+                    "--where 仅限 append 语义（缺省模式）；upsert 模式不接受读取过滤",
+                ));
+            }
+        }
+        Some(other) => {
+            return Err(usage_err(format!(
+                "--mode 取值须为 append|slice|upsert，得到 {other}"
+            )));
+        }
+    }
+    if let Some(raw) = slice_raw {
+        if raw
+            .split(',')
+            .any(|seg| !seg.trim().is_empty() && !seg.contains('='))
+        {
+            return Err(usage_err(
+                "--slice 谓词必须是 k=v 形态（逗号分隔；值支持 $ENV / ${ENV} 引用）",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn next_arg(it: &mut std::slice::Iter<'_, String>, usage: &str) -> Result<String, EngineError> {
@@ -614,8 +724,11 @@ pub fn usage() -> &'static str {
      \x20                                两份结果快照逐值比对（归一后判值；红 = 退出码 1 + DIFF）\n\
      \x20 materialize --db <f> --table <t> [--where <expr>]\n\
      \x20                                从 GaussDB 物化到本地 DuckDB（需 feature gauss）\n\
-     \x20 sync --db <f> --table <t> --cols a,b\n\
-     \x20                                本地 DuckDB 回写追加到 GaussDB（需 feature gauss）\n\
+     \x20 sync --db <f> --table <t> --cols a,b [--where <expr>]\n\
+     \x20      [--mode append|slice|upsert] [--slice k=$ENV,...] [--key a,b]\n\
+     \x20                                本地 DuckDB 回写 GaussDB（需 feature gauss；\n\
+     \x20                                  缺省 append；slice=同事务先删后灌幂等，\n\
+     \x20                                  upsert=键控合并；--slice 值支持 $ENV 引用）\n\
      \x20 call [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>] <routine> [args...]\n\
      \x20 call --plan <计划.toml> [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>] [args...]\n\
      \x20                                注册例程并调用；计划面自带目标与源清单，缺件即红\n\
@@ -1002,8 +1115,147 @@ mod tests {
                 db: PathBuf::from("w"),
                 table: "t".to_string(),
                 cols: vec!["a".into(), "b".into(), "c".into()],
+                where_clause: None,
+                mode: None,
+                slice: None,
+                key: None,
             }
         );
+    }
+
+    #[test]
+    fn should_parse_sync_where_and_mode_flags() {
+        let c = parse(&v(&[
+            "sync", "--db", "w", "--table", "t", "--cols", "a,b", "--where", "n > 1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            c,
+            Command::Sync {
+                db: PathBuf::from("w"),
+                table: "t".to_string(),
+                cols: vec!["a".into(), "b".into()],
+                where_clause: Some("n > 1".into()),
+                mode: None,
+                slice: None,
+                key: None,
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_sync_slice_mode_with_env_ref_value() {
+        let c = parse(&v(&[
+            "sync",
+            "--db",
+            "w",
+            "--table",
+            "t",
+            "--cols",
+            "a,b",
+            "--mode",
+            "slice",
+            "--slice",
+            "biz_date=$SYNC_BIZ_DATE,split_src=BUY",
+        ]))
+        .unwrap();
+        assert_eq!(
+            c,
+            Command::Sync {
+                db: PathBuf::from("w"),
+                table: "t".to_string(),
+                cols: vec!["a".into(), "b".into()],
+                where_clause: None,
+                mode: Some("slice".into()),
+                slice: Some("biz_date=$SYNC_BIZ_DATE,split_src=BUY".into()),
+                key: None,
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_sync_upsert_mode_with_key() {
+        let c = parse(&v(&[
+            "sync", "--db", "w", "--table", "t", "--cols", "a,b", "--mode", "upsert", "--key", "a",
+        ]))
+        .unwrap();
+        assert_eq!(
+            c,
+            Command::Sync {
+                db: PathBuf::from("w"),
+                table: "t".to_string(),
+                cols: vec!["a".into(), "b".into()],
+                where_clause: None,
+                mode: Some("upsert".into()),
+                slice: None,
+                key: Some("a".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn should_require_slice_flag_for_slice_mode() {
+        let e = parse(&v(&[
+            "sync", "--db", "w", "--table", "t", "--cols", "a", "--mode", "slice",
+        ]))
+        .unwrap_err();
+        assert!(e.message.contains("--slice"), "{}", e.message);
+    }
+
+    #[test]
+    fn should_reject_slice_flag_without_slice_mode() {
+        let e = parse(&v(&[
+            "sync", "--db", "w", "--table", "t", "--cols", "a", "--slice", "k=v",
+        ]))
+        .unwrap_err();
+        assert!(e.message.contains("--mode slice"), "{}", e.message);
+    }
+
+    #[test]
+    fn should_require_key_flag_for_upsert_mode() {
+        let e = parse(&v(&[
+            "sync", "--db", "w", "--table", "t", "--cols", "a", "--mode", "upsert",
+        ]))
+        .unwrap_err();
+        assert!(e.message.contains("--key"), "{}", e.message);
+    }
+
+    #[test]
+    fn should_reject_key_flag_without_upsert_mode() {
+        let e = parse(&v(&[
+            "sync", "--db", "w", "--table", "t", "--cols", "a", "--key", "a",
+        ]))
+        .unwrap_err();
+        assert!(e.message.contains("--mode upsert"), "{}", e.message);
+    }
+
+    #[test]
+    fn should_reject_unknown_sync_mode() {
+        let e = parse(&v(&[
+            "sync", "--db", "w", "--table", "t", "--cols", "a", "--mode", "merge",
+        ]))
+        .unwrap_err();
+        assert!(e.message.contains("append|slice|upsert"), "{}", e.message);
+    }
+
+    #[test]
+    fn should_reject_where_clause_with_non_append_mode() {
+        let e = parse(&v(&[
+            "sync", "--db", "w", "--table", "t", "--cols", "a", "--mode", "slice", "--slice",
+            "k=v", "--where", "n > 1",
+        ]))
+        .unwrap_err();
+        assert!(e.message.contains("--where"), "{}", e.message);
+    }
+
+    #[test]
+    fn should_reject_malformed_slice_predicate() {
+        let e = parse(&v(&[
+            "sync", "--db", "w", "--table", "t", "--cols", "a", "--mode", "slice", "--slice",
+            "biz_date",
+        ]))
+        .unwrap_err();
+        assert!(e.message.contains("k=v"), "{}", e.message);
     }
 
     #[test]
