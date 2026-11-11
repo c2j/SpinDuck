@@ -78,11 +78,14 @@ pub fn parse_slice(raw: &str) -> Result<Vec<SlicePredicate>, EngineError> {
             continue;
         }
         let (col, value) = seg.split_once('=').ok_or_else(|| {
-            crate::error::EngineError::env(10, format!("--slice 谓词必须是 k=v 形态，得到 {seg:?}"))
+            crate::error::EngineError::invariant(
+                10,
+                format!("--slice 谓词必须是 k=v 形态，得到 {seg:?}"),
+            )
         })?;
         let col = col.trim();
         if col.is_empty() {
-            return Err(crate::error::EngineError::env(
+            return Err(crate::error::EngineError::invariant(
                 10,
                 format!("--slice 谓词列名不能为空，得到 {seg:?}"),
             ));
@@ -93,7 +96,7 @@ pub fn parse_slice(raw: &str) -> Result<Vec<SlicePredicate>, EngineError> {
         });
     }
     if out.is_empty() {
-        return Err(crate::error::EngineError::env(
+        return Err(crate::error::EngineError::invariant(
             10,
             "--slice 至少需要一个 k=v 谓词",
         ));
@@ -139,25 +142,22 @@ pub fn expand_env_refs(text: &str) -> Result<String, EngineError> {
             )
         })?;
         out.push_str(&val);
-        for _ in 0..consumed.saturating_sub(1) {
+        // '$' 已由外层 next() 消费；此处需再跳过 consumed 个字符（"{name}" 整体）
+        for _ in 0..consumed {
             chars.next();
         }
     }
     Ok(out)
 }
 
-/// 解析 slice 原始串为谓词列表（语法 + 环境变量展开）。
+/// 解析 slice 原始串为谓词列表：**先解析语法、后只展开 value**——
+/// 环境变量值里的 `,` / `=` 不得改变谓词结构，value 内引用也不做二次展开。
 pub fn resolve_slice(raw: &str) -> Result<Vec<SlicePredicate>, EngineError> {
-    let raw = expand_env_refs(raw)?;
-    let parsed = parse_slice(&raw)?;
-    parsed
-        .iter()
+    parse_slice(raw)?
+        .into_iter()
         .map(|p| {
             let value = expand_env_refs(&p.value)?;
-            Ok(SlicePredicate {
-                col: p.col.clone(),
-                value,
-            })
+            Ok(SlicePredicate { col: p.col, value })
         })
         .collect()
 }
@@ -177,24 +177,26 @@ pub fn resolve_mode(
             where_clause: where_raw.map(str::to_string),
         }),
         Some("slice") => {
-            let raw = slice_raw.ok_or_else(|| EngineError::env(10, "--mode slice 需要 --slice"))?;
+            let raw =
+                slice_raw.ok_or_else(|| EngineError::invariant(10, "--mode slice 需要 --slice"))?;
             Ok(SyncMode::Slice {
                 predicates: resolve_slice(raw)?,
             })
         }
         Some("upsert") => {
-            let raw = key_raw.ok_or_else(|| EngineError::env(10, "--mode upsert 需要 --key"))?;
+            let raw =
+                key_raw.ok_or_else(|| EngineError::invariant(10, "--mode upsert 需要 --key"))?;
             let keys = raw
                 .split(',')
                 .map(|k| k.trim().to_string())
                 .filter(|k| !k.is_empty())
                 .collect::<Vec<_>>();
             if keys.is_empty() {
-                return Err(EngineError::env(10, "--key 至少需要一列"));
+                return Err(EngineError::invariant(10, "--key 至少需要一列"));
             }
             Ok(SyncMode::Upsert { keys })
         }
-        Some(other) => Err(EngineError::env(
+        Some(other) => Err(EngineError::invariant(
             10,
             format!("--mode 取值须为 append|slice|upsert，得到 {other}"),
         )),
@@ -373,7 +375,7 @@ pub fn assert_staging_keys(
 }
 
 /// 标量计数取值（count(*) → SpinValue::Int）。
-fn scalar_count(s: &mut RowStream) -> Result<i64, EngineError> {
+pub(crate) fn scalar_count(s: &mut RowStream) -> Result<i64, EngineError> {
     match s.fetch_many(1).first().and_then(|r| r.first()) {
         Some(SpinValue::Int(c)) => Ok(*c),
         other => Err(EngineError::env(
@@ -388,6 +390,33 @@ pub(crate) fn read_select(table: &str, cols: &[String], where_clause: Option<&st
     match where_clause {
         Some(w) => format!("SELECT {} FROM {table} WHERE {w}", cols.join(", ")),
         None => format!("SELECT {} FROM {table}", cols.join(", ")),
+    }
+}
+
+/// 表名拆分：`schema.table` → (Some(schema), table)，裸表名 → (None, table)。
+/// G1/G4 共用同一口径（评审建议 5：两守卫此前不一致）。
+pub(crate) fn split_schema(table: &str) -> (Option<&str>, &str) {
+    // 仅处理恰好一段 schema 限定（`schema.table`）；其余形态不猜，交目标端判红
+    let parts: Vec<&str> = table.split('.').collect();
+    if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+        (Some(parts[0]), parts[1])
+    } else {
+        (None, table)
+    }
+}
+
+/// 按模式构造读取端 SELECT（纯函数；执行层唯一消费点）。
+/// slice 的读取过滤就是 slice 谓词本身；upsert 读全量进 staging。
+pub(crate) fn mode_select_sql(table: &str, cols: &[String], mode: &SyncMode) -> String {
+    match mode {
+        SyncMode::Append { where_clause } => read_select(table, cols, where_clause.as_deref()),
+        SyncMode::Slice { predicates } => format!(
+            "SELECT {} FROM {} WHERE {}",
+            cols.join(", "),
+            table,
+            slice_where(predicates)
+        ),
+        SyncMode::Upsert { .. } => read_select(table, cols, None),
     }
 }
 
@@ -459,8 +488,50 @@ mod tests {
     #[test]
     fn should_reject_malformed_slice_predicate() {
         let e = parse_slice("biz_date").unwrap_err();
-        assert_eq!(e.code.to_string(), "ENV-0010");
+        assert_eq!(e.code.to_string(), "ENG-0010");
         assert!(e.message.contains("k=v"));
+    }
+
+    #[test]
+    fn should_expand_braced_env_ref_exactly() {
+        std::env::set_var("SPINDUCK_TEST_BRACED", "20261111");
+        let preds = resolve_slice("biz_date=${SPINDUCK_TEST_BRACED}").unwrap();
+        assert_eq!(preds.len(), 1);
+        assert_eq!(preds[0].value, "20261111", "braced 展开不得残留右花括号");
+    }
+
+    #[test]
+    fn should_expand_env_value_containing_delimiters_as_single_predicate() {
+        // 评审遗留①：先解析后只展开 value——env 值里的 , / = 不得改变谓词结构
+        std::env::set_var("SPINDUCK_TEST_COMMA", "a,b=c");
+        let preds = resolve_slice("d=$SPINDUCK_TEST_COMMA").unwrap();
+        assert_eq!(preds.len(), 1);
+        assert_eq!(preds[0].col, "d");
+        assert_eq!(preds[0].value, "a,b=c");
+    }
+
+    #[test]
+    fn should_split_schema_qualified_and_bare_table_names() {
+        assert_eq!(split_schema("bigfund.t_out"), (Some("bigfund"), "t_out"));
+        assert_eq!(split_schema("t_out"), (None, "t_out"));
+        assert_eq!(
+            split_schema("a.b.c"),
+            (None, "a.b.c"),
+            "多于一段不猜，交给目标端判红"
+        );
+    }
+
+    #[test]
+    fn should_filter_append_read_by_where_clause() {
+        // 评审必修①：--where 必须进入读取 SELECT（此前被静默丢弃 = fail-open）
+        let sql = mode_select_sql(
+            "t_out",
+            &["a".to_string(), "b".to_string()],
+            &SyncMode::Append {
+                where_clause: Some("biz_date = '20261111'".into()),
+            },
+        );
+        assert_eq!(sql, "SELECT a, b FROM t_out WHERE biz_date = '20261111'");
     }
 
     #[test]

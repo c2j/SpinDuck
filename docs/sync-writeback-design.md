@@ -1,6 +1,6 @@
 # sync 回写改进设计（部分回写 + 模式化 + 快路径）
 
-> 状态：**设计提案，实现未开始**。参照实现：fastaas `prototype-1.7/dota-scheduler/
+> 状态：**已实现（feat/sync-writeback），GaussDB 容器 E2E 待补**。参照实现：fastaas `prototype-1.7/dota-scheduler/
 > dota-adapter/src/main/java/com/dota/commit`（回写框架五层拆解见 §2）。
 > 本文只承载机制设计：实证数字落地后更新 `docs/validation.md`，机制描述在实现
 > 合入时同步 `docs/architecture.md` §13.2——三者不互相越界（AGENTS §3）。
@@ -137,7 +137,7 @@ GaussDB A 模式无 `ON CONFLICT`；参照实现的逐行 UPDATE-then-INSERT 不
 5. DROP TABLE sd_sync_tmp; commit
 ```
 
-- CLI：`--mode upsert --key a,b`（key 必须是 `--cols` 的子集）。
+- CLI：`--mode upsert --key a,b`（key 必须是 `--cols` 的**真子集**——全键列无更新目标，直接红）。
 - 无 unique 索引时步骤 3/4 在并发下可能双写；**fail-closed 前置**（§5.4），
   而不是运行时竞态重试。
 - 每语句影响行数交叉校验（updated + inserted == staging 行数），不一致即红。
@@ -202,3 +202,26 @@ sync --db <path> --table <name> --cols a,b[,c…]
   依赖 CLI 多表语法与补偿语义评审。
 - **回写并行**：表级 jobs（对齐 `materialize_parallel`）或单表分片；需先定义
   分片键与 slice 语义的交互。
+
+## 9. 评审遗留登记（2026-11-11 评审，#23）
+
+已修（必修 1–3 + 建议 4–6）：`--where` 执行层消费（`mode_select_sql` 唯一消费点
++ 回落路径同口径）；`${ENV}` 展开 off-by-one；BIZ-0102 域标签与用法错域统一
+（ENG-0010）；`WritePlan` 纯函数测试三态；G1 schema 限定名/跨 schema 过滤、
+G4 `conkey` 经 `string_to_array::int[]` 可移植 unnest；快路径本地行数核对 +
+upsert `UPDATE+INSERT == staging` 交叉校验（DROP 移出计数）。
+
+登记待后续（不阻断合入）：
+
+1. G1/G4 元数据 SQL 未对真实 openGauss 执行过——E2E 守护补齐前，G4 若因
+   `string_to_array` 口径不支持而恒红，属 fail-closed 方向，修 SQL 即可。
+2. 回滚失败（`let _ = self.exec("ROLLBACK")`）吞错后仍继续回落——应终止回落。
+3. 回落与快路径读取同一张本地表，两次尝试可能读到不同快照——可复用快路径
+   保留的 CSV 作为回落数据源。
+4. `RunCtx { workdir, fast }` 两字段同义——改 `enum Channel { Fast(PathBuf), Rows }`。
+5. `--slice` 语法预检在 `args.rs` 与 `parse_slice` 两处（同形真值来源）；slice
+   谓词**列名**裸拼进 DELETE，建议加标识符白名单（破坏性语句，成本极低）。
+6. 临时 CSV 命名用 mode 标签而非设计 §4.1 的 `{table}`；失败保留的 CSV（含
+   业务数据）落在库文件同目录——runbook 需写清理口径。
+7. 规模：`args.rs`（1464 行）/ `run.rs`（846 行）继续超 §3 上限（本 PR
+   sync.rs / sync_tx.rs 合规），按 §3 纪律评审已指出，拆分另行 PR。

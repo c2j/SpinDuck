@@ -30,6 +30,8 @@ struct WritePlan {
     pre_sql: Vec<String>,
     /// COPY 后执行（同事务；upsert 的 UPDATE/INSERT 行数计入结果）。
     post_sql: Vec<String>,
+    /// 收尾 SQL（同事务，行数不计入结果；upsert 的 DROP staging 表）。
+    finalize_sql: Option<String>,
 }
 
 impl WritePlan {
@@ -40,6 +42,7 @@ impl WritePlan {
                 copy_target: table.to_string(),
                 pre_sql: Vec::new(),
                 post_sql: Vec::new(),
+                finalize_sql: None,
             },
             SyncMode::Slice { predicates } => Self {
                 tx: true,
@@ -49,6 +52,7 @@ impl WritePlan {
                     slice_where(predicates)
                 )],
                 post_sql: Vec::new(),
+                finalize_sql: None,
             },
             SyncMode::Upsert { keys } => {
                 let collist = cols.join(", ");
@@ -60,7 +64,8 @@ impl WritePlan {
                     pre_sql: vec![format!(
                         "CREATE TEMP TABLE {TMP_TABLE} AS SELECT {collist} FROM {table} LIMIT 0"
                     )],
-                    post_sql: vec![update, insert, format!("DROP TABLE {TMP_TABLE}")],
+                    post_sql: vec![update, insert],
+                    finalize_sql: Some(format!("DROP TABLE {TMP_TABLE}")),
                 }
             }
         }
@@ -79,30 +84,21 @@ impl GaussConn {
         workdir: &Path,
     ) -> Result<SyncOutcome, EngineError> {
         self.guard_target_schema(table, cols)?;
-        let select_sql = match mode {
-            SyncMode::Append { .. } => crate::io::sync::read_select(table, cols, None),
-            SyncMode::Slice { predicates } => {
-                let n = staging_slice_violations(duck, table, predicates)?;
-                if n > 0 {
-                    return Err(EngineError::env(
-                        BIZ_SLICE_VIOLATION,
-                        format!("staging 有 {n} 行不满足 --slice 谓词（NULL 同判越界）"),
-                    ));
-                }
-                format!(
-                    "SELECT {} FROM {} WHERE {}",
-                    cols.join(", "),
-                    table,
-                    slice_where(predicates)
-                )
+        if let SyncMode::Slice { predicates } = mode {
+            let n = staging_slice_violations(duck, table, predicates)?;
+            if n > 0 {
+                return Err(EngineError::business(
+                    BIZ_SLICE_VIOLATION,
+                    format!("staging 有 {n} 行不满足 --slice 谓词（NULL 同判越界）"),
+                ));
             }
-            SyncMode::Upsert { keys } => {
-                validate_keys_subset(keys, cols)?;
-                assert_staging_keys(duck, table, keys)?;
-                self.guard_unique_index(table, keys)?;
-                crate::io::sync::read_select(table, cols, None)
-            }
-        };
+        }
+        if let SyncMode::Upsert { keys } = mode {
+            validate_keys_subset(keys, cols)?;
+            assert_staging_keys(duck, table, keys)?;
+            self.guard_unique_index(table, keys)?;
+        }
+        let select_sql = crate::io::sync::mode_select_sql(table, cols, mode);
         let fast_ctx = RunCtx {
             select_sql: select_sql.clone(),
             workdir: Some(workdir.to_path_buf()),
@@ -129,10 +125,18 @@ impl GaussConn {
 
     /// G1：目标 schema 漂移守卫（information_schema 元数据，零行读取）。
     fn guard_target_schema(&mut self, table: &str, cols: &[String]) -> Result<(), EngineError> {
-        let t = table.replace('\'', "''");
+        let (schema, bare) = crate::io::sync::split_schema(table);
+        let mut cond = format!("lower(table_name) = lower('{}')", bare.replace('\'', "''"));
+        if let Some(sc) = schema {
+            // schema 限定名必须同时约束 table_schema，防跨 schema 同名表串列
+            cond.push_str(&format!(
+                " AND lower(table_schema) = lower('{}')",
+                sc.replace('\'', "''")
+            ));
+        }
         let sql = format!(
             "SELECT column_name, is_nullable, coalesce(column_default, '') \
-             FROM information_schema.columns WHERE lower(table_name) = lower('{t}')"
+             FROM information_schema.columns WHERE {cond}"
         );
         let (_, rows) = self.fetch_rows(&sql)?;
         let target: Vec<TargetCol> = rows
@@ -176,7 +180,7 @@ impl GaussConn {
             "SELECT coalesce(string_agg(a.attname, ',' ORDER BY a.attnum), '') \
              FROM pg_constraint con \
              JOIN pg_class rel ON rel.oid = con.conrelid \
-             CROSS JOIN unnest(con.conkey) k \
+             CROSS JOIN unnest(string_to_array(con.conkey::text, ' ')::int[]) k \
              JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k \
              WHERE con.contype IN ('p', 'u') AND lower(rel.relname) = lower('{t}') \
              GROUP BY con.oid"
@@ -228,7 +232,7 @@ impl GaussConn {
                 mode,
             )
         } else {
-            self.run_rows(duck, table, &ctx.select_sql, &plan, cols, mode)
+            self.run_rows(duck, &ctx.select_sql, &plan, cols, mode)
         };
         match result {
             Ok(n) => {
@@ -258,6 +262,9 @@ impl GaussConn {
         mode: &SyncMode,
     ) -> Result<usize, EngineError> {
         let workdir = workdir.ok_or_else(|| EngineError::env(20, "快路径缺工作目录"))?;
+        // V26 同款纪律：服务端 copied 必须与本地行数相等（快路径不豁免）
+        let count_sql = format!("SELECT count(*) FROM ({select_sql})");
+        let local_n = crate::io::sync::scalar_count(&mut duck.query(&count_sql, &BindMap::new())?)?;
         let csv = self.export_csv(duck, select_sql, workdir, mode)?;
         for sql in &plan.pre_sql {
             self.exec(sql)?;
@@ -267,13 +274,32 @@ impl GaussConn {
         for sql in &plan.post_sql {
             post_rows += self.exec(sql)?;
         }
+        if let Some(fin) = &plan.finalize_sql {
+            self.exec(fin)?;
+        }
         std::fs::remove_file(&csv)
             .map_err(|e| EngineError::env(20, format!("清理临时 CSV {}: {e}", csv.display())))?;
-        let rows = match mode {
-            SyncMode::Upsert { .. } => post_rows as usize,
-            _ => copied as usize,
-        };
-        Ok(rows)
+        match mode {
+            SyncMode::Upsert { .. } => {
+                if post_rows as i64 != copied as i64 {
+                    return Err(EngineError::env(
+                        20,
+                        format!(
+                            "upsert 行数不一致：staging {copied} 行，UPDATE+INSERT {post_rows} 行"
+                        ),
+                    ));
+                }
+            }
+            _ => {
+                if copied as i64 != local_n {
+                    return Err(EngineError::env(
+                        20,
+                        format!("快路径行数不一致：本地 {local_n} 行，服务端 {copied} 行"),
+                    ));
+                }
+            }
+        }
+        Ok(copied as usize)
     }
 
     /// DuckDB 内核 COPY TO：导出列序/转义/NULL 口径由内核保证（设计 §4.1）。
@@ -327,15 +353,12 @@ impl GaussConn {
     fn run_rows(
         &mut self,
         duck: &dyn SqlExecutor,
-        table: &str,
         select_sql: &str,
         plan: &WritePlan,
         cols: &[String],
         mode: &SyncMode,
     ) -> Result<usize, EngineError> {
-        if let SyncMode::Append { .. } = mode {
-            return self.sync_append(duck, table, cols);
-        }
+        // 回落同样以 select_sql 为准（append 带 --where 时不得退化为全表）
         let mut s = duck.query(select_sql, &BindMap::new())?;
         for sql in &plan.pre_sql {
             self.exec(sql)?;
@@ -396,5 +419,65 @@ impl GaussConn {
             ));
         }
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_plan_slice_as_delete_then_copy_in_tx() {
+        let preds = crate::io::sync::resolve_slice("biz_date=20261111").unwrap();
+        let plan = WritePlan::new(
+            "t_out",
+            &["a".to_string()],
+            &SyncMode::Slice { predicates: preds },
+        );
+        assert!(plan.tx, "slice 必须显式事务（DELETE+COPY 原子）");
+        assert_eq!(plan.copy_target, "t_out");
+        assert_eq!(
+            plan.pre_sql,
+            vec!["DELETE FROM t_out WHERE biz_date = '20261111'"]
+        );
+        assert!(plan.post_sql.is_empty());
+        assert!(plan.finalize_sql.is_none());
+    }
+
+    #[test]
+    fn should_plan_upsert_with_staging_tmp_and_finalize_drop() {
+        let cols = vec!["a".to_string(), "b".to_string()];
+        let plan = WritePlan::new(
+            "t_out",
+            &cols,
+            &SyncMode::Upsert {
+                keys: vec!["a".into()],
+            },
+        );
+        assert!(plan.tx);
+        assert_eq!(plan.copy_target, TMP_TABLE);
+        assert_eq!(
+            plan.pre_sql,
+            vec!["CREATE TEMP TABLE sd_sync_tmp AS SELECT a, b FROM t_out LIMIT 0"]
+        );
+        assert_eq!(
+            plan.post_sql.len(),
+            2,
+            "post 仅 UPDATE+INSERT，DROP 不得计入行数"
+        );
+        assert!(plan.post_sql[0].starts_with("UPDATE t_out SET b = tmp.b"));
+        assert!(plan.post_sql[1].starts_with("INSERT INTO t_out"));
+        assert_eq!(plan.finalize_sql.as_deref(), Some("DROP TABLE sd_sync_tmp"));
+    }
+
+    #[test]
+    fn should_plan_append_without_tx() {
+        let plan = WritePlan::new(
+            "t_out",
+            &["a".to_string()],
+            &SyncMode::Append { where_clause: None },
+        );
+        assert!(!plan.tx, "append 单语句天然原子，不加 BEGIN");
+        assert!(plan.pre_sql.is_empty() && plan.post_sql.is_empty() && plan.finalize_sql.is_none());
     }
 }
