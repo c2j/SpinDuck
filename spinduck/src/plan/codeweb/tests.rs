@@ -401,12 +401,10 @@ fn should_miss_non_entry_outside_root_and_still_walk_its_out_edges() {
             && m.at == "sql/A.sql:3"
             && !m.at.starts_with('/')
     }));
-    assert!(got.missing.iter().any(|m| {
-        m.object == "routine:fnc_missing"
-            && m.from == "outer"
-            && m.at.ends_with(":0")
-            && !m.at.starts_with('/')
-    }));
+    assert!(got
+        .missing
+        .iter()
+        .any(|m| { m.object == "routine:fnc_missing" && m.from == "outer" && m.at == "B.sql:0" }));
     assert!(got.refs.iter().any(|r| {
         r.object == "outer" && r.kind == "routine" && r.role == "call" && r.from == "caller"
     }));
@@ -419,6 +417,20 @@ fn should_miss_non_entry_outside_root_and_still_walk_its_out_edges() {
         .any(|m| m.object == "relation:t_out" && m.from == "outer"));
     assert!(got.refs.iter().all(|r| !r.at.starts_with('/')));
     assert!(got.ddl_routines.iter().all(|p| !p.starts_with('/')));
+}
+
+#[test]
+fn should_keep_an_already_relative_edge_file_without_parent_segments() {
+    let json = doc(
+        r#"{"id":1,"type":"procedure","name":"caller","file":"/work/sql/routines/A.sql","line":1},
+           {"id":2,"type":"unresolved","raw_expr":"fnc_x","context":"call"}"#,
+        r#"{"source":1,"target":2,"type":"direct","scope":"sql","file":"sql/routines/B.sql","line":12}"#,
+    );
+    let got = close(&json, "caller", "/work", &[]).unwrap();
+    assert_eq!(got.missing.len(), 1, "{:?}", got.missing);
+    assert_eq!(got.missing[0].object, "routine:fnc_x");
+    assert_eq!(got.missing[0].from, "caller");
+    assert_eq!(got.missing[0].at, "sql/routines/B.sql:12");
 }
 
 #[test]

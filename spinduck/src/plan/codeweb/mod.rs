@@ -90,10 +90,33 @@ pub(super) fn project_rel(root: &Path, file: &str) -> Option<String> {
     Some(rest.to_string())
 }
 
-/// 边的 `at`。剥不出项目根时只留文件名，避免把绝对路径写进计划。
+/// 边的 `at`。根下的绝对路径剥成相对路径；已是相对路径且没有 `..` 段时原样保留。
+/// 只有绝对路径且不在项目根下时才退回文件名，避免把绝对路径写进计划。
 pub(super) fn at_text(root: &Path, file: &str, line: u64) -> String {
-    let rel = project_rel(root, file).unwrap_or_else(|| file_only(file));
+    let rel = project_rel(root, file)
+        .or_else(|| relative_without_parent(file))
+        .unwrap_or_else(|| file_only(file));
     format!("{rel}:{line}")
+}
+
+/// 没有绝对前缀、也没有 `..` 段。反斜杠先收成 `/`。
+fn relative_without_parent(file: &str) -> Option<String> {
+    let norm = file.replace('\\', "/");
+    if norm.is_empty() || is_absolute_path(&norm) {
+        return None;
+    }
+    if norm.split('/').any(|seg| seg == "..") {
+        return None;
+    }
+    Some(norm)
+}
+
+fn is_absolute_path(file: &str) -> bool {
+    if file.starts_with('/') {
+        return true;
+    }
+    let bytes = file.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
 }
 
 fn file_only(file: &str) -> String {
