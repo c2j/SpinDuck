@@ -102,6 +102,8 @@ pub fn coerce_for_slot(
         SpinValue::Int(_) | SpinValue::Decimal(..) | SpinValue::Bool(_) if assignment_loose => {
             Ok(SpinValue::Str(v.as_str_loose()))
         }
+        // 码 111 与下方 coerce() 兜底共用。本路径的消息固定为赋值句，
+        // 探针 should_reject_numeric_varchar_argument_when_assignment_loose_is_off 锁住它。
         SpinValue::Int(_) | SpinValue::Decimal(..) | SpinValue::Bool(_) => Err(
             EngineError::business(111, format!("cannot assign {} to VARCHAR", v.display())),
         ),
@@ -282,7 +284,41 @@ mod tests {
         let e = coerce_for_slot(&SpinValue::Int(20260106), Some(&SpinType::Varchar), false)
             .unwrap_err();
         assert_eq!(e.code.to_string(), "BIZ-0111");
-        assert!(e.message.contains("VARCHAR"));
+        assert!(
+            e.message.contains("cannot assign") && e.message.contains("VARCHAR"),
+            "实际: {}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn should_stringify_decimal_and_bool_into_varchar_when_assignment_is_loose() {
+        let d = coerce_for_slot(
+            &SpinValue::Decimal(12, 38, 1),
+            Some(&SpinType::Varchar),
+            true,
+        )
+        .unwrap();
+        assert_eq!(d, SpinValue::Str("1.2".into()));
+        let b = coerce_for_slot(&SpinValue::Bool(true), Some(&SpinType::Varchar), true).unwrap();
+        assert_eq!(b, SpinValue::Str("true".into()));
+    }
+
+    #[test]
+    fn should_keep_str_null_and_untyped_slots_unchanged() {
+        let s = SpinValue::Str("20260106".into());
+        assert_eq!(
+            coerce_for_slot(&s, Some(&SpinType::Varchar), false).unwrap(),
+            s
+        );
+        assert_eq!(
+            coerce_for_slot(&SpinValue::Null, Some(&SpinType::Varchar), false).unwrap(),
+            SpinValue::Null
+        );
+        assert_eq!(
+            coerce_for_slot(&SpinValue::Int(7), None, false).unwrap(),
+            SpinValue::Int(7)
+        );
     }
 
     #[test]

@@ -443,10 +443,14 @@ mod tests {
 
     #[test]
     fn should_reject_numeric_varchar_argument_when_assignment_loose_is_off() {
+        // 错误码 BIZ-0111 探针：assignment_loose 关闭时，数字写入 VARCHAR 槽。
+        // 与 coerce() 兜底共用码 111；消息必须是赋值句，不能落成 "cannot coerce"。
         use crate::engine::Engine;
         use crate::exec::FakeExecutor;
-        let mut rules = RuleRegistry::default();
-        rules.implicit_assignment_loose = false;
+        let rules = RuleRegistry {
+            implicit_assignment_loose: false,
+            ..Default::default()
+        };
         let mut eng = Engine::new(Box::new(FakeExecutor::default()), rules);
         eng.register(
             "CREATE OR REPLACE PROCEDURE prc_v(p_i IN VARCHAR2) IS BEGIN p_i := p_i; END;",
@@ -454,7 +458,11 @@ mod tests {
         .unwrap();
         let e = eng.call("prc_v", &[SpinValue::Int(20260106)]).unwrap_err();
         assert_eq!(e.code.to_string(), "BIZ-0111");
-        assert!(e.message.contains("VARCHAR"));
+        assert!(
+            e.message.contains("cannot assign") && e.message.contains("VARCHAR"),
+            "赋值失败须与 coerce 兜底的 cannot coerce 区分，实际: {}",
+            e.message
+        );
     }
 
     #[test]
