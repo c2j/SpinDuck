@@ -297,6 +297,19 @@ PopFrame）。语义要点：
   语义跳过、不进入 PL 异常处理器（inst_log 缺失）。机制细节见
   `runtime/interp/writebuf.rs` 头注释，实证见 validation V26.3/V26.7。
 
+### 3.5.1 参数表点查缓存
+
+循环里的点查（等值、日期 `BETWEEN`、`IN` 列表、同一列上的 `OR`、单列 `IN`
+子查询、带 `ORDER BY` 的 `LIMIT`）第一次执行时，由 DuckDB 按不变谓词扫一遍，
+结果按等值键放进进程内哈希表，随后的行只做探测。`SELECT INTO` 的 0 行 / 多行
+语义不变，结果列名跟 SELECT 列表走。投影里的 `coalesce` 留在构建 SQL 中，由内核计算。
+
+刷新点只有两处：写入都走当前连接的 `SqlExecutor::execute`，调用内没有第二写者。
+顶层 `call` 入口清空；`execute` 的标识符命中已缓存表名时丢掉该表的索引，下一次
+查询重建，因此能看见本事务刚写入的行。认不出的语句（`CASE`、不等谓词、连接）、
+构建失败、排序键并列，或排序值无法在进程内比较，都原样下发。机制见 `src/lookup_cache/`，
+实证见 validation V42。
+
 ### 3.6 目录与持久化
 
 例程定义存 DuckDB 内部表 `spinduck_routines(name, kind, source, registered_at)`。

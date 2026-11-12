@@ -11,6 +11,7 @@ pub mod error;
 pub mod exec;
 pub mod io;
 pub mod ir;
+pub(crate) mod lookup_cache;
 pub mod norm;
 pub mod plan;
 pub mod project;

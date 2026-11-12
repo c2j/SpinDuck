@@ -4301,3 +4301,83 @@ lib 的 `#[cfg(test)]` 代码**，因此 args 拆分留下的一条未用导入�
 同时含 `cannot assign` 与 `VARCHAR`。值级直接断言在 `value.rs` 的
 `should_reject_int_into_varchar_when_assignment_loose_is_off`。成功路径不打 lint，
 种子注释 `config/rewrite-rules.toml` 的 `[implicit].assignment_loose` 与此同口径。
+
+## V42. 参数表点查缓存：生产体量参数表上的墙钟与 CPU（2026-11-13）
+
+机制见 architecture §3.5.1 与 `spinduck/src/lookup_cache/`。本节只记实测。
+
+**结论**：同一份库、同一次 `prc_trd_deal_purchase` 调用，热状态下墙钟
+3.62 s → 1.50 s（约 2.4 倍），CPU 11.4 s → 1.47 s（约 7.8 倍）。两侧
+`OUT p_o_succeed = 0`，`dat_trd_repurchase` 的 490 行有序导出逐字节相同。
+
+### 环境
+
+- 机器：本机 apple silicon，2026-11-13。release，`cargo build --release --locked --features cli`。
+- 库：`/tmp/spinduck-perf/volidx.duckdb` 的副本 `/tmp/spinduck-perf/bench.duckdb`
+  （137 MiB）。参数表行数当时为 `par_fund_partner` 47,095、`par_fund_seat`
+  620,630、`par_sys_purchase` 427,436、`par_fund_seat_para` 364,409、
+  `swh_all_kind` 7,026。游标日 `20250715` 且 `scdm = '001'` 的
+  `mid_yjqs_detail` 为 500 行，过程写入 490 行。
+- 入口：`golden/case_corpus_purchase/.spinduck/plan/pkg_split_trade_step3_sh.prc_trd_deal_purchase.toml`，
+  `spinduck call --plan <计划> --db <副本> '20250715' null`。未加
+  `--batch-commit`，计时跑未加 `--trace`。`call --plan` 不重放表 DDL，
+  两侧用的是同一库文件。
+- 对照二进制：重建前的 release 副本 `/tmp/spinduck-perf/spinduck-nocache`
+  （`strings` 中 `lookup_cache` 出现 0 次）。被测二进制为同日重建的
+  `spinduck/target/release/spinduck`（`lookup_cache` 出现 2 次）。
+
+### 计时
+
+`/usr/bin/time -p`，热页缓存下各跑预热一次再计时两次。下表是计时两次的
+`real` / `user`。预热与计时两次同量级（无缓存 3.60 s，有缓存 1.51 s）。
+
+| 侧 | 计时 1 | 计时 2 | 两次均值 |
+|---|---:|---:|---:|
+| 无缓存 | 3.64 s / 11.44 s | 3.61 s / 11.39 s | 3.62 s / 11.42 s |
+| 有缓存 | 1.51 s / 1.48 s | 1.48 s / 1.46 s | 1.50 s / 1.47 s |
+
+同日更早一次无缓存冷跑是 11.37 s 与 11.44 s 墙钟、user 约 21 s。页缓存稳定后
+回到 3.6 s / 11.4 s，与此前同文件名上 3.54 s 墙钟 / 10.81 s CPU 的量级一致。
+稳态对照用热跑，不用那次冷跑。
+
+无缓存的 user 约为墙钟的 3 倍，顺序扫描在并行。有缓存后墙钟与 user 几乎重合，
+重复扫描不再占热路径。
+
+### 产物
+
+查询：
+
+```sql
+SELECT fund_code, seat_code, security_id, purchase_no,
+       cast(purchase_yj AS VARCHAR), cast(purchase_days AS VARCHAR),
+       cast(purchase_money AS VARCHAR)
+FROM dat_trd_repurchase
+WHERE purchase_date = '20250715' AND market_code = '001'
+ORDER BY 1, 2, 3, 4
+```
+
+无缓存导出、有缓存导出、紧接着再跑一遍有缓存的导出，都是 490 行、7 列，
+文件 sha256 都是 `28157fdc973fbea350cc239bfeb2fb09f672b683007212311edde77b534e26d6`。
+
+### 测试
+
+- `lookup_cache::tests::should_keep_select_list_names_on_the_probed_stream`：
+  `SELECT n FROM dat ORDER BY n` 的探测流列名是 `n`，`AS num` 是 `num`。
+  修前该形态被收成 `c0`，真实内核的
+  `should_run_for_loop_over_query_on_real_kernel` 报 `record r has no field n`。
+- `lookup_cache::tests::should_fall_back_when_the_probe_bind_type_differs_from_the_column`：
+  整数列对上字符串绑定 `'1'` 时回退原语句。修前按 Rust 类型比键，
+  `SELECT s INTO v FROM t_form WHERE id = p` 被收成 0 行并抛 `NO_DATA_FOUND`。
+- `cargo test --features cli lookup_cache`：点查缓存用例通过（含两条真实
+  DuckDB 日期区间）。
+- `cargo clippy --offline --all-features -- -D warnings`：通过。
+
+### 不声称
+
+- trace-0105（2,816 行、89.835 s）的文件库不在本机，没有重跑。SQL_EXEC
+  条数也不会下降：构建扫描发生在第一次 `query` 内部，trace 的 `elapsed_us`
+  仍是 0。
+- 剩余约 1.5 s 含逐行 INSERT、默认逐行 COMMIT，以及认不出的
+  `CASE FROM sys_dummy`。`--batch-commit` 仍默认关闭，本轮没有把它打开。
+- 黄金建表脚本里的四条点查索引不在本提交。`call --plan` 不会把它们装进
+  这份已有库，因此它们不是本次数的差异来源。
