@@ -41,11 +41,11 @@ pub fn compare(a: &Snapshot, b: &Snapshot) -> Vec<Diff> {
     for i in 0..common {
         out.extend(compare_pair(a, &a.rows[i], &b.rows[i], i + 1));
     }
-    for i in common..a.rows.len() {
-        out.push(only_in(DiffKind::OnlyInA, i, &a.rows[i]));
+    for (i, row) in a.rows.iter().enumerate().skip(common) {
+        out.push(only_in(DiffKind::OnlyInA, i, row));
     }
-    for i in common..b.rows.len() {
-        out.push(only_in(DiffKind::OnlyInB, i, &b.rows[i]));
+    for (i, row) in b.rows.iter().enumerate().skip(common) {
+        out.push(only_in(DiffKind::OnlyInB, i, row));
     }
     out
 }

@@ -117,10 +117,10 @@ fn eval_funccall(
         return Err(EngineError::invariant(63, "call depth exceeded (100)"));
     }
     let mut callee_args = Vec::with_capacity(routine.params.len());
-    for i in 0..routine.params.len() {
+    for (i, param) in routine.params.iter().enumerate() {
         let v = match args.get(i) {
             Some(ir_a) => eval(ir_a, env)?,
-            None => routine.params[i].default.clone().unwrap_or(SpinValue::Null),
+            None => param.default.clone().unwrap_or(SpinValue::Null),
         };
         callee_args.push(v);
     }
