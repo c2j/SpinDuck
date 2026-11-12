@@ -215,6 +215,8 @@ fn creates_view(unit: &str) -> bool {
 ///
 /// 只认默认值表达式本身以 `(` 开头。列类型上的括号（`character varying(12)`、
 /// `numeric(15,3)`）不算，字面量默认值（`DEFAULT 0`、`DEFAULT '000000'::character varying`）保留。
+/// 一行只看第一处 ` DEFAULT`。`a INT DEFAULT 0, b INT DEFAULT (1)` 这种同行多列
+/// 不会裁掉后面的括号默认值。语料 DDL 是一列一行，这里不拆列。
 pub fn strip_defaults(ddl: &str) -> String {
     let mut out = String::with_capacity(ddl.len());
     for line in ddl.lines() {

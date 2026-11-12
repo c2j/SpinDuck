@@ -2,14 +2,14 @@
 
 | 项 | 值 |
 |---|---|
-| 作者 | （待填） |
+| 作者 | Jianjun Chen |
 | 日期 | 2026-11-12 |
 | 状态 | Draft |
-| 基线代码 | 本工作树 `tuning/deploy-with-ddl` @ `663e182`（尚无 PR #29–#33） |
-| compile 栈尖 | `FETCH_HEAD` = `a77e504`（`execute-plan/db74071b-pr-5-docs-record-codeweb-as-the-only-project-closure-so`） |
-| 取代范围 | 取代 `FETCH_HEAD:docs/design-compile.md` 里四句 deploy 契约，不改 codeweb 闭包正文：Goals 的「`deploy` 下发顺序不改」（约第 85 行）；Non-Goals 的「不改 `deploy` 的装配语义」（约第 94 行）；IR 节「失败仍会装到 `register_routine_files` 再失败」（约第 389 行）；衔接节「判定顺序不改、视图仍靠 `views/` 目录分流」（约第 393 行）。`[[ref]]` / `[[dynamic]]` 的生成和 `call` 的产品边界不重做 |
+| 基线代码 | 本工作树 `tuning/deploy-with-ddl` 的父提交 `663e182`（尚无 PR #29–#33） |
+| compile 栈尖 | `ef3127d`（PR #33，`execute-plan/db74071b-pr-5-docs-record-codeweb-as-the-only-project-closure-so`）。下文 `git show ef3127d:<path>` 即此提交 |
+| 取代范围 | 取代 `ef3127d:docs/design-compile.md` 里的 deploy 契约，不改 codeweb 闭包正文。2026-11-12 对照该提交复核过行号：Goals「`deploy` 下发顺序不改」第 85 行；Non-Goals「不改 `deploy` 的装配语义」第 94 行；IR 节「失败仍会装到 `register_routine_files` 再失败」第 389 行；衔接节「判定顺序不改、视图仍靠 `views/` 目录分流」第 393 行；决策记录 9 第 674 行再次写了「`deploy` 下发顺序不改」，一并指向本文。`[[ref]]` / `[[dynamic]]` 的生成和 `call` 的产品边界不重做 |
 
-本文是设计，不是机制说明，也不是实证。落地后机制写入 `docs/architecture.md` §13.6（同一 PR），实证进 `docs/validation.md` 的新小节。行号以本工作树为准；compile 栈上的文件以 `git show FETCH_HEAD:<path>` 为准，工作树里还没有 `compile_project.rs`。
+本文是设计，不是机制说明，也不是实证。落地后机制写入 `docs/architecture.md` §13.6（同一 PR），实证进 `docs/validation.md` 的新小节。行号以本工作树为准；compile 栈上的文件以 `git show ef3127d:<path>` 为准，工作树里还没有 `compile_project.rs`。
 
 ---
 
@@ -48,7 +48,7 @@
 
 ### compile 栈尖（工作树里还没有）
 
-`FETCH_HEAD:spinduck/src/cli/run/compile_project.rs` 的 `compile_with_export`：
+`ef3127d:spinduck/src/cli/run/compile_project.rs` 的 `compile_with_export`：
 
 1. `plans_from_export` 造内存中的 `RunPlan`（`plan/codeweb/plans.rs` 的 `GENERATOR = "codeweb 0.9.7"`）。
 2. `write_plans` → `cli/plan.rs::write_plan`，落 `<home>/plan/<target>.toml`。
@@ -873,7 +873,7 @@ copy-and-swap 只在探针于本地失败时写进仓库，并且和「锁住内
 11. **`sources.materialize` 必须被本载荷的 table 语句覆盖。** 不扫 `sql/ddl`。`[[dynamic]]` 不建表。不调用 `verify::chain::normalize`。trim、剥一层双引号、ASCII 小写、只取最后一段，再与无限定的 `kind = table` 名比较。`bigfund.t_a` 与 `"T_A"` 覆盖 `t_a`。同尾段的视图或序列不覆盖。
 12. **物化仍不建表。** 本地 `ENV-0015` 文案不动。远端探针在 `ensure_local_table` 之后、`materialize_copystream` 之前，用 `split_schema` 分限定名与无限定名。零行是 `ENV-0019` `remote table missing:`，不 `prepare`，不回落 INSERT。驱动错误保持 `ENV-0020`。列不一致不改码。
 13. **新码只用 0017 / 0018 / 0019。** 0016、0020、0021、0022、0030 都已有主人。`ENG-0010` 仍只是用法。单表 CLI 打印 `[{code}] {message}`，没有域名称，所以前缀写在 `message` 里。多表物化的 `FAIL` 行仍走 `Display`，域名称留在行内，不改打印机。
-14. **stdout 在旧子串后面追加计数。** `ddl_files` 与 `routine_files` 相邻且含义仍是文件数。`created` 含第一次安装的视图，`replaced` 只计已存在且文本不同的 `CREATE OR REPLACE` 视图，`skipped` 是任何 kind 的 Skip，`sys_dummy` 三个都不进。真正要 Ask first 的是 `FETCH_HEAD:tests/cli/deploy.rs` 里把 `deployed_plan` 和两处视图夹具的 `plan_in_process` 封印，以及删活 DDL 那条断言的含义反转。红的是 `unmarked plan:`，不是 `generator:`。
+14. **stdout 在旧子串后面追加计数。** `ddl_files` 与 `routine_files` 相邻且含义仍是文件数。`created` 含第一次安装的视图，`replaced` 只计已存在且文本不同的 `CREATE OR REPLACE` 视图，`skipped` 是任何 kind 的 Skip，`sys_dummy` 三个都不进。真正要 Ask first 的是 `ef3127d:tests/cli/deploy.rs` 里把 `deployed_plan` 和两处视图夹具的 `plan_in_process` 封印，以及删活 DDL 那条断言的含义反转。红的是 `unmarked plan:`，不是 `generator:`。
 15. **无新依赖，无新旗标，无 `SqlExecutor` / `TraceSink` 变更。** SHA-256 写在树内。DuckDB API 仍只在 `sql/exec_native.rs`。
 
 ---
@@ -894,19 +894,19 @@ copy-and-swap 只在探针于本地失败时写进仓库，并且和「锁住内
 | Windows 上删除刚关闭的 db 文件失败 | 中 | 先 drop 连接再删。删失败时保留原始安装错误，并把 `io::Error` 附上。不把退出码改成 0 |
 | 事务 `COMMIT` 一个空操作仍改文件字节 | 低 | 不承诺字节相同。承诺行、定义、退出码 |
 | 分类漏掉一种语料 DDL（例如 `CREATE GLOBAL TEMPORARY TABLE`） | 中 | 认不出就 `unsupported ddl`，整单拒绝，不部分安装。补分类是后续小 PR，带一条红→绿的单元测试 |
-| 栈上 `compile_project.rs` 与本工作树分叉，补丁打错基线 | 高 | 写盘行为的 PR 以 `a77e504` 为基线，不在 `663e182` 上新造一份 `compile_project.rs` |
+| 栈上 `compile_project.rs` 与本工作树分叉，补丁打错基线 | 高 | 写盘行为的 PR 以 `ef3127d` 为基线，不在 `663e182` 上新造一份 `compile_project.rs` |
 
 ---
 
 ## References
 
 - `docs/architecture.md` §13.5、§13.6、§13.7（本工作树）。§13.6 是落地时要改的机制段。
-- `docs/design-compile.md`（`FETCH_HEAD`）：本文取代四句，不改 codeweb 闭包正文。Goals「`deploy` 下发顺序不改」（约第 85 行）；Non-Goals「不改 `deploy` 的装配语义」（约第 94 行）；IR 节「失败仍会装到 `register_routine_files`」（约第 389 行）；衔接节「判定顺序不改、视图仍靠 `views/` 目录分流」（约第 393 行）。决策 9（不升 `schema_version`）继续有效。
+- `docs/design-compile.md`（`ef3127d`）：本文取代文首表里点名的五处 deploy 契约，不改 codeweb 闭包正文。决策 9 里「不升 `schema_version`」继续有效；同一条里的「`deploy` 下发顺序不改」指向本文。
 - `docs/design-production-gaussdb.md` §6.2 / 差距表里 V31 的三条限制（非幂等、例程不落盘、`plan.schema` 不下发）。例程不落盘与 schema 不下发继续成立；非幂等被本文取消。
 - `docs/runbook-real-gaussdb.md` §4：先 deploy 后 materialize。落地时改一段，说明 deploy 读的是载荷，以及远端缺表是 `ENV-0019`。
 - `docs/materialize-copystream-design.md`：目标表必须已存在，`ENV-0015` 不变。本文只加远端对称的一道门。
 - 代码：`spinduck/src/cli/deploy.rs`、`spinduck/src/plan/deploy.rs`、`spinduck/src/verify/deploy.rs`、`spinduck/src/engine.rs`（`register_persistent` / `CATALOG_DDL`）、`spinduck/src/sql/exec_native.rs`、`spinduck/src/io/gauss/mod.rs`（`ensure_local_table`）、`spinduck/src/io/gauss/materialize.rs`、`spinduck/src/error.rs`、`spinduck/src/io/sync.rs`（已占用的 ENV 号）。
-- 栈尖：`git show FETCH_HEAD:spinduck/src/cli/run/compile_project.rs`、`git show FETCH_HEAD:spinduck/src/plan/codeweb/plans.rs`（`GENERATOR`）、`git show FETCH_HEAD:spinduck/src/plan/mod.rs`。
+- 栈尖 `ef3127d`：`git show ef3127d:spinduck/src/cli/run/compile_project.rs`、`git show ef3127d:spinduck/src/plan/codeweb/plans.rs`（`GENERATOR`）、`git show ef3127d:spinduck/src/plan/mod.rs`。
 - 人类测试：`spinduck/tests/cli/deploy.rs`。物化入口门禁：`spinduck/tests/cli/gauss_boundary.rs`。本地缺表单测：`GaussConn` 的 `should_err_env_0015_with_deploy_hint_when_table_missing`。
 - duckdb crate `=1.10505.0`：`Connection::open_with_flags`，`AccessMode::ReadOnly`。
 
@@ -919,7 +919,7 @@ copy-and-swap 只在探针于本地失败时写进仓库，并且和「锁住内
 ### PR 1 — 载荷格式与「只在 compile 退出 0 时封印」
 
 - 标题：`compile: seal a payload sidecar only when the project compile exits 0`
-- 基线：`a77e504`（PR #29–#33 栈尖）。本工作树 `663e182` 没有 `compile_project.rs`，不要在旧树上平行造一份。
+- 基线：`ef3127d`（PR #33 head，含 #29–#32）。本工作树 `663e182` 没有 `compile_project.rs`，不要在旧树上平行造一份。
 - 文件：`spinduck/src/plan/sha256.rs`（新）、`spinduck/src/plan/payload.rs`（新）、`spinduck/src/plan/mod.rs`（`PlanArtifact`，空则不写出；`quoted` 改为 `pub(crate) fn quoted`，`payload.rs` 只调用这一个函数，不另写 match）、`spinduck/src/verify/deploy.rs`（抽出 `canonical_ddl_unit` / `canonical_view_unit`，`deploy_ddl_file` 改为先整文件 `strip_defaults` 再切句，`deploy_view` 占位分支不动）、`spinduck/src/cli/run/compile_project.rs`（读一次、IR、再按成败写盘）、`spinduck/src/plan/classify.rs`（新，供 compile 产生 `[[statement]]`）。
 - 依赖：PR #29–#33。不依赖本文其它 PR。不改 `plan/deploy.rs` 的行为。
 - 红→绿：
@@ -970,7 +970,7 @@ copy-and-swap 只在探针于本地失败时写进仓库，并且和「锁住内
 ### PR 4 — 预检、事务安装、deploy 路径禁止占位、文档
 
 - 标题：`deploy: install a sealed payload transactionally and refuse definition drift`
-- 基线测试文件是 `FETCH_HEAD:spinduck/tests/cli/deploy.rs`，不是本工作树里 `cli(&["plan", ...])` 那一版。`deployed_plan`（约第 24 行）调用 `plan_in_process(..., cw_graph(...))`。`plan/codeweb/plans.rs` 的 `GENERATOR` 已经是 `codeweb 0.9.7`。切到载荷之后，这些测试红在 `ENV-0017` `unmarked plan:`，不是 `generator:`。不要按 `spinduck … (plan schema 1)` 去改断言，栈上的 `plan` 不写那一串。
+- 基线测试文件是 `ef3127d:spinduck/tests/cli/deploy.rs`，不是本工作树里 `cli(&["plan", ...])` 那一版。`deployed_plan`（约第 24 行）调用 `plan_in_process(..., cw_graph(...))`。`plan/codeweb/plans.rs` 的 `GENERATOR` 已经是 `codeweb 0.9.7`。切到载荷之后，这些测试红在 `ENV-0017` `unmarked plan:`，不是 `generator:`。不要按 `spinduck … (plan schema 1)` 去改断言，栈上的 `plan` 不写那一串。
 - 文件：`spinduck/src/cli/deploy.rs`、`spinduck/src/plan/deploy/mod.rs`、`spinduck/src/plan/deploy/apply.rs`（仅探针绿；探针红则调用 PR 2 的 `swap.rs`，不在本 PR 再实现一套）、`spinduck/src/plan/deploy.rs`（变目录或变薄门面）、`docs/architecture.md` §13.6、`docs/runbook-real-gaussdb.md` §4 里 deploy 那一段、`docs/design-compile.md` 的四句（见下）。不重写 codeweb 闭包。
 - 依赖：PR 1、PR 2（探针结论已经是绿测试）、PR 3。
 - 内部顺序（一个 PR，避免主干停在红上）：
