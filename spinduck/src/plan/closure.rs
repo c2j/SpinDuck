@@ -71,6 +71,8 @@ pub fn build(
         ddl_tables: ddl_tables.into_iter().collect(),
         materialize: Vec::new(),
         writeback: Vec::new(),
+        refs: Vec::new(),
+        dynamic: Vec::new(),
         missing: missing.into_iter().collect(),
     })
 }

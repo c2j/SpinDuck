@@ -4,7 +4,7 @@ use super::*;
 use crate::plan::MissingObject;
 use std::path::Path;
 
-fn plan_with_two_routines_and_a_gap() -> RunPlan {
+pub(super) fn plan_with_two_routines_and_a_gap() -> RunPlan {
     RunPlan {
         // 故意乱序：字节可复现要求渲染前排序
         ddl_routines: vec![
@@ -14,6 +14,8 @@ fn plan_with_two_routines_and_a_gap() -> RunPlan {
         ddl_tables: vec!["sql/ddl/tables.sql".into()],
         materialize: vec![],
         writeback: vec![],
+        refs: vec![],
+        dynamic: vec![],
         missing: vec![
             MissingObject {
                 object: "relation:par_oper_close_date".into(),
@@ -82,7 +84,30 @@ fn should_render_identical_bytes_for_the_same_plan_twice() {
     let a = plan_with_two_routines_and_a_gap().to_toml_string();
     let b = plan_with_two_routines_and_a_gap().to_toml_string();
     assert_eq!(a, b);
+    assert_eq!(a, LEGACY_GAP_PLAN);
 }
+
+const LEGACY_GAP_PLAN: &str = "[plan]
+schema_version = 1
+target = \"pkg_a.prc_main\"
+generator = \"spinduck test (plan schema 1)\"
+project_dir = \"../..\"
+schema = \"bigfund\"
+
+[sources]
+ddl_routines = [\"sql/routines/a_first.sql\", \"sql/routines/b_second.sql\"]
+ddl_tables = [\"sql/ddl/tables.sql\"]
+materialize = []
+writeback = []
+
+[[missing]]
+object = \"relation:par_oper_close_date\"
+from = \"pkg_a.fnc_x\"
+
+[[missing]]
+object = \"sequence:s_order\"
+from = \"pkg_a.prc_main\"
+";
 
 #[test]
 fn should_read_back_every_field_it_rendered() {
