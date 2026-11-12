@@ -15,6 +15,7 @@ mod fs;
 mod tests;
 
 pub use case::{AssertKind, CaseAssert, CaseConfig, CaseKind, Scenario};
+pub(crate) use entry::qualified_routine;
 pub use entry::EntryConfig;
 
 use crate::error::EngineError;
@@ -39,6 +40,8 @@ pub struct ProjectConfig {
     pub case_includes: Vec<String>,
     /// `[[entry]]` 声明：本项目可被调用的存过全名（可多个；链路校验起点）
     pub entries: Vec<EntryConfig>,
+    /// `[paths].codeweb`（可选）：codeweb 项目根。缺省时向上查找 `codeweb.toml`。
+    pub codeweb_dir: Option<PathBuf>,
     /// 项目根（相对路径基准）
     pub root: PathBuf,
 }
@@ -119,6 +122,11 @@ impl ProjectConfig {
             Some(toml::Value::String(s)) => vec![root.join(s)],
             _ => Vec::new(),
         };
+        // 只认这一个可选键；其它未知键保持忽略，旧 spinduck.toml 仍然合法。
+        let codeweb_dir = paths
+            .get("codeweb")
+            .and_then(|x| x.as_str())
+            .map(|s| root.join(s));
         let cases = v
             .get("cases")
             .cloned()
@@ -154,6 +162,7 @@ impl ProjectConfig {
             home_dir: get_path("home", ".spinduck"),
             case_includes,
             entries,
+            codeweb_dir,
             root: root.to_path_buf(),
         })
     }

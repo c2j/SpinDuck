@@ -242,7 +242,7 @@ fn generator() -> String {
 ///
 /// 层数由 [`plan_dir`] 相对项目根的分量数推出，不写死字面量——落盘位置变了，
 /// 清单里的相对路径必须跟着变，否则换机即失效。
-fn project_dir_text(project: &ProjectConfig) -> String {
+pub(crate) fn project_dir_text(project: &ProjectConfig) -> String {
     let dir = plan_dir(project);
     let rel = dir.strip_prefix(&project.root).unwrap_or(dir.as_path());
     let depth = rel.components().count();
@@ -345,6 +345,27 @@ fn ddl_index(project: &ProjectConfig) -> Result<BTreeMap<String, String>, Engine
         let rel = rel_text(&project.root, &f);
         for (kind, name) in ddl_declared(&text) {
             out.insert(object_identity(kind, &name), rel.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// 归一名（无 `relation:` / `sequence:` 前缀）→ 相对 DDL 路径。
+///
+/// codeweb 闭包按这个键核对项目文件，不复用上面带前缀的词法索引。
+pub(crate) fn ddl_name_index(
+    project: &ProjectConfig,
+) -> Result<BTreeMap<String, String>, EngineError> {
+    let mut out = BTreeMap::new();
+    let files = project
+        .ddl_files()?
+        .into_iter()
+        .chain(project.view_files()?);
+    for f in files {
+        let text = read_source_strict(&f)?;
+        let rel = rel_text(&project.root, &f);
+        for (_kind, name) in ddl_declared(&text) {
+            out.entry(name).or_insert_with(|| rel.clone());
         }
     }
     Ok(out)

@@ -39,6 +39,8 @@ mod call;
 mod compare;
 #[path = "cli/compile.rs"]
 mod compile;
+#[path = "cli/compile_project.rs"]
+mod compile_project;
 #[path = "cli/deploy.rs"]
 mod deploy;
 #[path = "cli/gauss_boundary.rs"]

@@ -12,9 +12,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// 落盘结果（路径 + 是否改写），标注口径同运行态快照。
-struct PlanWrite {
-    path: PathBuf,
-    changed: bool,
+pub(crate) struct PlanWrite {
+    pub(crate) path: PathBuf,
+    pub(crate) changed: bool,
 }
 
 /// `spinduck plan [--dir <项目目录>] [--schema <名>] <routine>`。
@@ -35,7 +35,10 @@ pub fn plan_cmd(
     render(&plan, &written, out)
 }
 
-fn write_plan(project: &ProjectConfig, plan: &RunPlan) -> Result<PlanWrite, EngineError> {
+pub(crate) fn write_plan(
+    project: &ProjectConfig,
+    plan: &RunPlan,
+) -> Result<PlanWrite, EngineError> {
     let path = plan::plan_dir(project).join(format!("{}.toml", plan.target));
     let text = plan.to_toml_string();
     let dir = path

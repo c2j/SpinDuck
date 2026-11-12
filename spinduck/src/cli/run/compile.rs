@@ -22,7 +22,7 @@ pub(super) fn discover_rules_files(paths: &[PathBuf]) -> std::collections::BTree
 /// 语料目录的规则口径：内置种子为基座 + 各路径向上发现的 `spinduck.toml`
 /// `[paths].rules` 叠加（§6 只增不删）。compile/explain 与 golden 用例同一基座，
 /// 避免"体检绿、运行红"的口径分裂。
-fn rules_for_paths(paths: &[PathBuf]) -> Result<RuleRegistry, EngineError> {
+pub(super) fn rules_for_paths(paths: &[PathBuf]) -> Result<RuleRegistry, EngineError> {
     let files = discover_rules_files(paths);
     RuleRegistry::default().with_project_rules(&files.iter().cloned().collect::<Vec<_>>())
 }
