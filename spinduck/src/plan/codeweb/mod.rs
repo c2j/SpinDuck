@@ -84,10 +84,15 @@ pub(super) fn project_rel(root: &Path, file: &str) -> Option<String> {
     let file = file.replace('\\', "/");
     let prefix = format!("{root}/");
     let rest = file.strip_prefix(&prefix)?;
-    if rest.is_empty() || rest.starts_with('/') {
+    // 前缀命中不等于落在根下：`/proj/../etc/x.sql` 剥出来仍是 `../etc/x.sql`。
+    if rest.is_empty() || rest.starts_with('/') || has_parent_segment(rest) {
         return None;
     }
     Some(rest.to_string())
+}
+
+fn has_parent_segment(path: &str) -> bool {
+    path.split('/').any(|seg| seg == "..")
 }
 
 /// 边的 `at`。根下的绝对路径剥成相对路径；已是相对路径且没有 `..` 段时原样保留。

@@ -138,7 +138,14 @@ impl Walk<'_> {
                     .insert(miss(&format!("routine:{name}"), &from, &at));
             }
             Some(Node::Builtin) | None => {}
-            Some(_) => {}
+            // direct 只记调用。表、视图、序列走各自的边类型，不在这里当缺件。
+            Some(
+                Node::Package { .. }
+                | Node::Table { .. }
+                | Node::View { .. }
+                | Node::MView { .. }
+                | Node::Sequence { .. },
+            ) => {}
         }
     }
 
@@ -207,7 +214,16 @@ impl Walk<'_> {
     fn routine_rel(&self, id: usize) -> Option<String> {
         match self.graph.nodes.get(&id) {
             Some(Node::Routine { file, .. }) => project_rel(self.ctx.project_root, file),
-            _ => None,
+            Some(
+                Node::Package { .. }
+                | Node::Table { .. }
+                | Node::View { .. }
+                | Node::MView { .. }
+                | Node::Sequence { .. }
+                | Node::Unresolved { .. }
+                | Node::Builtin,
+            )
+            | None => None,
         }
     }
 
@@ -220,7 +236,13 @@ impl Walk<'_> {
             | Some(Node::View { schema, name, .. })
             | Some(Node::MView { schema, name })
             | Some(Node::Sequence { schema, name }) => qualified(schema, name),
-            _ => String::new(),
+            Some(
+                Node::Routine { .. }
+                | Node::Package { .. }
+                | Node::Unresolved { .. }
+                | Node::Builtin,
+            )
+            | None => String::new(),
         }
     }
 }
@@ -276,7 +298,11 @@ fn relation(graph: &CodewebGraph, id: usize) -> Option<RelInfo> {
             system: false,
             walk: true,
         },
-        _ => return None,
+        Node::Routine { .. }
+        | Node::Package { .. }
+        | Node::Sequence { .. }
+        | Node::Unresolved { .. }
+        | Node::Builtin => return None,
     })
 }
 
@@ -414,7 +440,16 @@ fn package_endpoints(graph: &CodewebGraph) -> Result<BTreeMap<usize, Pkg>, Engin
 fn routine_name(graph: &CodewebGraph, id: usize) -> String {
     match graph.nodes.get(&id) {
         Some(Node::Routine { name, .. }) => name.clone(),
-        _ => id.to_string(),
+        Some(
+            Node::Package { .. }
+            | Node::Table { .. }
+            | Node::View { .. }
+            | Node::MView { .. }
+            | Node::Sequence { .. }
+            | Node::Unresolved { .. }
+            | Node::Builtin,
+        )
+        | None => id.to_string(),
     }
 }
 

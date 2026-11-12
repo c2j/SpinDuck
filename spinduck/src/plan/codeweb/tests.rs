@@ -434,6 +434,34 @@ fn should_keep_an_already_relative_edge_file_without_parent_segments() {
 }
 
 #[test]
+fn should_basename_an_edge_whose_file_escapes_the_root_with_parent_segments() {
+    let json = doc(
+        r#"{"id":1,"type":"procedure","name":"caller","file":"/proj/sql/A.sql","line":1},
+           {"id":2,"type":"unresolved","raw_expr":"fnc_x","context":"call"}"#,
+        r#"{"source":1,"target":2,"type":"direct","scope":"sql","file":"/proj/../etc/x.sql","line":0}"#,
+    );
+    let got = close(&json, "caller", "/proj", &[]).unwrap();
+    assert_eq!(got.missing.len(), 1, "{:?}", got.missing);
+    assert_eq!(got.missing[0].at, "x.sql:0");
+    assert!(!got.missing[0].at.contains(".."));
+}
+
+#[test]
+fn should_reject_entry_whose_file_escapes_the_root_with_parent_segments() {
+    let json = doc(
+        r#"{"id":1,"type":"procedure","name":"caller","file":"/proj/../etc/x.sql","line":1}"#,
+        "",
+    );
+    let err = close(&json, "caller", "/proj", &[]).expect_err("dotdot entry");
+    assert_eq!(err.code.to_string(), "ENV-0030");
+    assert!(
+        err.message.starts_with("入口源文件不在项目根下:"),
+        "{}",
+        err.message
+    );
+}
+
+#[test]
 fn should_reject_entry_whose_file_is_outside_the_project_root() {
     let json = doc(
         r#"{"id":1,"type":"procedure","name":"caller","file":"/other/A.sql","line":1}"#,
