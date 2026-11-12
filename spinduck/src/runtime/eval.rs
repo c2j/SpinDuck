@@ -6,7 +6,7 @@ mod numeric;
 use crate::catalog::RoutineCatalog;
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
-use crate::ir::{BinOp, IrExpr, VarName};
+use crate::ir::{BinOp, IrExpr};
 use crate::runtime::frame::Frame;
 use crate::runtime::RunOutcome;
 use crate::value::SpinValue;
@@ -116,14 +116,20 @@ fn eval_funccall(
     if env.depth > 100 {
         return Err(EngineError::invariant(63, "call depth exceeded (100)"));
     }
-    let mut callee = Frame::new();
-    for (i, p) in routine.params.iter().enumerate() {
+    let mut callee_args = Vec::with_capacity(routine.params.len());
+    for i in 0..routine.params.len() {
         let v = match args.get(i) {
             Some(ir_a) => eval(ir_a, env)?,
-            None => p.default.clone().unwrap_or(SpinValue::Null),
+            None => routine.params[i].default.clone().unwrap_or(SpinValue::Null),
         };
-        callee.set(&VarName(p.name.to_ascii_lowercase()), v);
+        callee_args.push(v);
     }
+    let mut callee = Frame::new();
+    callee.install_params(
+        &routine.params,
+        &callee_args,
+        env.cat.sql_rules().implicit_assignment_loose,
+    )?;
     let out = crate::runtime::run_with_catalog(
         &routine.prog,
         &mut callee,

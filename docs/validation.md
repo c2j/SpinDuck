@@ -4287,3 +4287,17 @@ lib 的 `#[cfg(test)]` 代码**，因此 args 拆分留下的一条未用导入�
   本 PR 未触碰 `src/verify*`。副作用：`run/call.rs` 的 `#[cfg(not(feature = "native"))]` 拒绝桩
   与其新增的 `#[cfg]` 导入闸门无法在该配置下自证编译——AGENTS §8 未把 `--no-default-features`
   列为支持面，故记为观察项，不在本轮修。
+
+## V41. VARCHAR 赋值失败复用 BIZ-0111（PR #28 审核）
+
+`main` 上 `coerce()` 的兜底已经返回 `business(111)`，消息是 `cannot coerce …`，
+且没有生产调用方。第一阶段的槽写入在 `assignment_loose = false` 时复用同一码，
+消息固定为 `cannot assign {值} to VARCHAR`。不另开新码：architecture §3.3 与
+调用方已经按 BIZ-0111 发布。
+
+探针是引擎路径
+`catalog::tests::should_reject_numeric_varchar_argument_when_assignment_loose_is_off`：
+`Engine::call` 把 `Int(20260106)` 送进 `VARCHAR2` 形参，断言码为 `BIZ-0111` 且消息
+同时含 `cannot assign` 与 `VARCHAR`。值级直接断言在 `value.rs` 的
+`should_reject_int_into_varchar_when_assignment_loose_is_off`。成功路径不打 lint，
+种子注释 `config/rewrite-rules.toml` 的 `[implicit].assignment_loose` 与此同口径。

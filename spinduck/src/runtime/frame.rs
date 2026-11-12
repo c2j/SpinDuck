@@ -25,6 +25,24 @@ impl Frame {
     pub fn set(&mut self, name: &VarName, v: SpinValue) {
         self.vars.insert(name.0.clone(), v);
     }
+
+    /// 按形参声明把实参写入帧。省略的尾部实参取已转换的默认值。
+    pub fn install_params(
+        &mut self,
+        params: &[crate::catalog::RoutineParam],
+        args: &[SpinValue],
+        assignment_loose: bool,
+    ) -> Result<(), EngineError> {
+        for (i, p) in params.iter().enumerate() {
+            let raw = match args.get(i) {
+                Some(v) => v.clone(),
+                None => p.default.clone().unwrap_or(SpinValue::Null),
+            };
+            let v = crate::value::coerce_for_slot(&raw, p.ty.as_ref(), assignment_loose)?;
+            self.set(&VarName(p.name.to_ascii_lowercase()), v);
+        }
+        Ok(())
+    }
     pub fn record_field(&self, rec: &VarName, field: &str) -> Result<&SpinValue, EngineError> {
         match self.vars.get(&rec.0) {
             Some(SpinValue::Record(fields)) => fields

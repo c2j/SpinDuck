@@ -4,7 +4,8 @@
 use crate::error::EngineError;
 use crate::ir::{compile_routine_with_names, IrProg};
 use crate::rules::RuleRegistry;
-use crate::value::SpinValue;
+use crate::types::SpinType;
+use crate::value::{coerce_for_slot, SpinValue};
 use ogsql_parser::ast::Statement;
 use std::collections::BTreeMap;
 
@@ -21,21 +22,43 @@ pub enum ParamMode {
 pub struct RoutineParam {
     pub name: String,
     pub mode: ParamMode,
-    /// 声明的 `DEFAULT <字面量>`（登记期编译；无默认值 = 必传）
+    /// 声明的 `DEFAULT <字面量>`（登记期编译；无默认值 = 必传）。
+    /// 能映射的声明类型上，默认值已按 `[implicit].assignment_loose` 转换。
     pub default: Option<SpinValue>,
+    /// `[types]` 能映射的声明类型。映射表没有的名字（如 `INTEGER`）为 None。
+    pub ty: Option<SpinType>,
 }
 
-/// 形参声明 → [`RoutineParam`]（模式 + DEFAULT 字面量；包体与独立例程同口径）。
-pub fn map_param(p: &ogsql_parser::ast::RoutineParam) -> Result<RoutineParam, EngineError> {
+/// 形参声明 → [`RoutineParam`]（模式 + 类型 + DEFAULT 字面量；包体与独立例程同口径）。
+pub fn map_param(
+    p: &ogsql_parser::ast::RoutineParam,
+    rules: &RuleRegistry,
+) -> Result<RoutineParam, EngineError> {
+    let ty = rules.spin_type(&p.data_type);
+    let default = match p.default_value.as_deref() {
+        Some(raw) => Some(coerce_for_slot(
+            &default_literal(raw)?,
+            ty.as_ref(),
+            rules.implicit_assignment_loose,
+        )?),
+        None => None,
+    };
     Ok(RoutineParam {
         name: p.name.clone(),
         mode: map_mode(&p.mode)?,
-        default: p
-            .default_value
-            .as_deref()
-            .map(default_literal)
-            .transpose()?,
+        default,
+        ty,
     })
+}
+
+/// 把形参声明类型并进程序的槽位表，使过程体内对形参的赋值走同一写入转换。
+pub fn remember_param_types(prog: &mut IrProg, params: &[RoutineParam]) {
+    for p in params {
+        if let Some(ty) = &p.ty {
+            prog.var_types
+                .insert(p.name.to_ascii_lowercase(), ty.clone());
+        }
+    }
 }
 
 /// 形参 `DEFAULT` 的字面量口径（语料实测只有 NULL / 数值 / 引号串）：
@@ -203,15 +226,16 @@ pub fn compile_statement_routine_with_names(
                 .iter()
                 .map(|p| p.name.to_ascii_lowercase())
                 .collect();
-            let prog = match &cs.block {
+            let mut prog = match &cs.block {
                 Some(b) => compile_routine_with_names(b, &extra, rules, routine_names)?,
                 None => IrProg::default(),
             };
             let params = cs
                 .parameters
                 .iter()
-                .map(map_param)
+                .map(|p| map_param(p, rules))
                 .collect::<Result<Vec<_>, EngineError>>()?;
+            remember_param_types(&mut prog, &params);
             out.push(CompiledRoutine {
                 name: cs
                     .name
@@ -230,15 +254,16 @@ pub fn compile_statement_routine_with_names(
                 .iter()
                 .map(|p| p.name.to_ascii_lowercase())
                 .collect();
-            let prog = match &cf.block {
+            let mut prog = match &cf.block {
                 Some(b) => compile_routine_with_names(b, &extra, rules, routine_names)?,
                 None => IrProg::default(),
             };
             let params = cf
                 .parameters
                 .iter()
-                .map(map_param)
+                .map(|p| map_param(p, rules))
                 .collect::<Result<Vec<_>, EngineError>>()?;
+            remember_param_types(&mut prog, &params);
             out.push(CompiledRoutine {
                 name: cf
                     .name
@@ -299,6 +324,145 @@ mod tests {
         cat.set_sql_rules(rules);
         assert_eq!(cat.sql_functions()["NVL"], "coalesce");
         assert_eq!(cat.sql_functions(), &cat.sql_rules().functions);
+    }
+
+    #[test]
+    fn should_map_varchar2_and_coerce_numeric_default() {
+        let rules = RuleRegistry::default();
+        let p = ogsql_parser::ast::RoutineParam {
+            name: "p_i_date".into(),
+            mode: Some("IN".into()),
+            data_type: "VARCHAR2".into(),
+            default_value: Some("20260106".into()),
+        };
+        let got = map_param(&p, &rules).unwrap();
+        assert_eq!(got.ty, Some(crate::types::SpinType::Varchar));
+        assert_eq!(got.default, Some(SpinValue::Str("20260106".into())));
+    }
+
+    #[test]
+    fn should_leave_unmapped_integer_param_untyped() {
+        let rules = RuleRegistry::default();
+        let p = ogsql_parser::ast::RoutineParam {
+            name: "p_n".into(),
+            mode: Some("IN".into()),
+            data_type: "INTEGER".into(),
+            default_value: Some("7".into()),
+        };
+        let got = map_param(&p, &rules).unwrap();
+        assert_eq!(got.ty, None);
+        assert_eq!(got.default, Some(SpinValue::Int(7)));
+    }
+
+    #[test]
+    fn should_bind_varchar2_argument_as_string_and_keep_number_as_int() {
+        use crate::engine::Engine;
+        use crate::exec::FakeExecutor;
+        let ex = FakeExecutor::default();
+        let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_v(p_i IN VARCHAR2, p_o OUT VARCHAR2) IS \
+             BEGIN p_o := p_i; END;",
+        )
+        .unwrap();
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_set(p_o OUT VARCHAR2) IS BEGIN p_o := 20260106; END;",
+        )
+        .unwrap();
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_loc(p_o OUT VARCHAR2) IS \
+             DECLARE v VARCHAR2(8); BEGIN v := 20260106; p_o := v; END;",
+        )
+        .unwrap();
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_n(p_i IN NUMBER, p_o OUT NUMBER) IS \
+             BEGIN p_o := p_i; END;",
+        )
+        .unwrap();
+        let v = eng
+            .call("prc_v", &[SpinValue::Int(20260106), SpinValue::Null])
+            .unwrap();
+        assert_eq!(v.outs.get("p_o"), Some(&SpinValue::Str("20260106".into())));
+        let set = eng.call("prc_set", &[SpinValue::Null]).unwrap();
+        assert_eq!(
+            set.outs.get("p_o"),
+            Some(&SpinValue::Str("20260106".into()))
+        );
+        let loc = eng.call("prc_loc", &[SpinValue::Null]).unwrap();
+        assert_eq!(
+            loc.outs.get("p_o"),
+            Some(&SpinValue::Str("20260106".into()))
+        );
+        let n = eng
+            .call("prc_n", &[SpinValue::Int(42), SpinValue::Null])
+            .unwrap();
+        assert_eq!(n.outs.get("p_o"), Some(&SpinValue::Int(42)));
+    }
+
+    #[test]
+    fn should_bind_varchar2_parameter_as_text_in_sql() {
+        use crate::exec::{FakeExecutor, TraceNoopSink};
+        use crate::runtime::frame::Frame;
+        use crate::runtime::{run_with_catalog, RunLimits};
+        use ogsql_parser::parser::Parser;
+        use ogsql_parser::token::tokenizer::Tokenizer;
+        let sql = "CREATE PROCEDURE prc_bind(p_i_date IN VARCHAR2) IS \
+                   BEGIN DELETE FROM t WHERE d = p_i_date; END;";
+        let stmt = Parser::new(Tokenizer::new(sql).tokenize().unwrap())
+            .parse()
+            .remove(0);
+        let rules = RuleRegistry::default();
+        let routine = compile_statement_routine(&stmt, &rules).unwrap().remove(0);
+        let ex = FakeExecutor::default();
+        let mut frame = Frame::new();
+        frame
+            .install_params(
+                &routine.params,
+                &[SpinValue::Int(20260106)],
+                rules.implicit_assignment_loose,
+            )
+            .unwrap();
+        let mut sink = TraceNoopSink;
+        let cat = RoutineCatalog::new();
+        run_with_catalog(
+            &routine.prog,
+            &mut frame,
+            &ex,
+            &mut sink,
+            &cat,
+            0,
+            RunLimits::default(),
+        )
+        .unwrap();
+        let binds = &ex.calls()[0].1;
+        assert_eq!(
+            binds.get("$v_p_i_date"),
+            Some(&SpinValue::Str("20260106".into()))
+        );
+    }
+
+    #[test]
+    fn should_reject_numeric_varchar_argument_when_assignment_loose_is_off() {
+        // 错误码 BIZ-0111 探针：assignment_loose 关闭时，数字写入 VARCHAR 槽。
+        // 与 coerce() 兜底共用码 111；消息必须是赋值句，不能落成 "cannot coerce"。
+        use crate::engine::Engine;
+        use crate::exec::FakeExecutor;
+        let rules = RuleRegistry {
+            implicit_assignment_loose: false,
+            ..Default::default()
+        };
+        let mut eng = Engine::new(Box::new(FakeExecutor::default()), rules);
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_v(p_i IN VARCHAR2) IS BEGIN p_i := p_i; END;",
+        )
+        .unwrap();
+        let e = eng.call("prc_v", &[SpinValue::Int(20260106)]).unwrap_err();
+        assert_eq!(e.code.to_string(), "BIZ-0111");
+        assert!(
+            e.message.contains("cannot assign") && e.message.contains("VARCHAR"),
+            "赋值失败须与 coerce 兜底的 cannot coerce 区分，实际: {}",
+            e.message
+        );
     }
 
     #[test]
