@@ -34,8 +34,7 @@ pub(crate) fn resolve_codeweb_bin(
     }
     if let Some(path_var) = path_var {
         for dir in std::env::split_paths(path_var) {
-            let candidate = dir.join("codeweb");
-            if candidate.is_file() {
+            if let Some(candidate) = first_named_file(&dir, path_bin_names(cfg!(windows))) {
                 return Ok(candidate);
             }
         }
@@ -70,6 +69,22 @@ fn existing_bin(path: &Path) -> Result<PathBuf, EngineError> {
     } else {
         Err(missing_bin(path.display()))
     }
+}
+
+/// Windows 的 PATH 上是 `codeweb.exe`。先找它，再找无后缀的 `codeweb`。
+pub(crate) fn path_bin_names(windows: bool) -> &'static [&'static str] {
+    if windows {
+        &["codeweb.exe", "codeweb"]
+    } else {
+        &["codeweb"]
+    }
+}
+
+fn first_named_file(dir: &Path, names: &[&str]) -> Option<PathBuf> {
+    names
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.is_file())
 }
 
 fn missing_bin(detail: impl std::fmt::Display) -> EngineError {
@@ -325,5 +340,20 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    #[test]
+    fn should_prefer_codeweb_exe_when_resolving_a_windows_path() {
+        assert_eq!(path_bin_names(false), ["codeweb"]);
+        assert_eq!(path_bin_names(true), ["codeweb.exe", "codeweb"]);
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("codeweb.exe"), b"").unwrap();
+        let hit = first_named_file(tmp.path(), path_bin_names(true)).unwrap();
+        assert_eq!(hit, tmp.path().join("codeweb.exe"));
+        std::fs::write(tmp.path().join("codeweb"), b"").unwrap();
+        let hit = first_named_file(tmp.path(), path_bin_names(true)).unwrap();
+        assert_eq!(hit, tmp.path().join("codeweb.exe"));
+        let hit = first_named_file(tmp.path(), path_bin_names(false)).unwrap();
+        assert_eq!(hit, tmp.path().join("codeweb"));
     }
 }

@@ -97,7 +97,7 @@ pub fn parse_codeweb_json(text: &str) -> Result<CodewebGraph, EngineError> {
 
 /// 从导出管道解析瘦图。生产路径不要先把整份文档读成 `Vec<u8>`。
 pub fn parse_codeweb_reader(reader: impl std::io::Read) -> Result<CodewebGraph, EngineError> {
-    let raw: RawGraph = serde_json::from_reader(reader)
+    let raw: RawGraph = serde_json::from_reader(std::io::BufReader::new(reader))
         .map_err(|e| EngineError::env(30, format!("codeweb JSON 解析失败: {e}")))?;
     Ok(graph_from_raw(raw))
 }

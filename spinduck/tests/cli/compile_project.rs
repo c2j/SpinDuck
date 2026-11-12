@@ -1,4 +1,8 @@
 //! 项目态 `compile` 的真子进程契约：一次 codeweb argv 序列、缺二进制不退回词法 `build`。
+//!
+//! 桩是 `/bin/sh`。Windows 开发机不编译这组测试；二进制名本身由 `path_bin_names` 覆盖。
+
+#![cfg(unix)]
 
 use super::{cli, write, EXIT_FAIL, EXIT_OK, EXIT_USAGE};
 use std::path::{Path, PathBuf};
@@ -17,7 +21,13 @@ here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 case "${1:-}" in
   --version) cat "$here/version.txt" ;;
   diff) cat "$here/diff.stderr" >&2 ;;
-  export) cat "$here/export.json" ;;
+  export)
+    if [ -f "$here/export.exit" ]; then
+      cat "$here/export.stderr" >&2
+      exit "$(cat "$here/export.exit")"
+    fi
+    cat "$here/export.json"
+    ;;
   *) printf '%s\n' "unexpected: ${1:-}" >&2; exit 9 ;;
 esac
 "#;
@@ -165,6 +175,60 @@ fn should_reject_diff_stderr_that_is_not_the_sentinel() {
     assert!(log.contains("diff\n"), "{log}");
     assert!(!log.contains("export\n"), "{log}");
     assert!(plan_text(root).is_empty());
+}
+
+#[test]
+fn should_reject_export_nonzero_without_writing_a_plan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let _file = project_sql(root, "pkg_a.prc_x");
+    let bin = stub(
+        root,
+        "codeweb 0.9.7\n",
+        "Up to date. No changes detected.\n",
+    );
+    std::fs::write(root.join("export.exit"), "3\n").unwrap();
+    std::fs::write(root.join("export.stderr"), "export broke\n").unwrap();
+    let (code, out, err) = cli(&[
+        "compile",
+        "--dir",
+        &root.to_string_lossy(),
+        "--codeweb-bin",
+        &bin.to_string_lossy(),
+    ]);
+    assert_eq!(err, "");
+    assert_eq!(code, EXIT_FAIL, "{out}");
+    assert!(out.contains("[ENV-0030]"), "{out}");
+    assert!(out.contains("codeweb export 失败:"), "{out}");
+    assert!(out.contains("exit 3"), "{out}");
+    let log = std::fs::read_to_string(root.join("argv.log")).unwrap();
+    assert!(log.contains("export\n"), "{log}");
+    assert!(plan_text(root).is_empty(), "{out}");
+}
+
+#[test]
+fn should_reject_export_json_that_does_not_parse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let _file = project_sql(root, "pkg_a.prc_x");
+    let bin = stub(
+        root,
+        "codeweb 0.9.7\n",
+        "Up to date. No changes detected.\n",
+    );
+    std::fs::write(root.join("export.json"), "{\n").unwrap();
+    let (code, out, err) = cli(&[
+        "compile",
+        "--dir",
+        &root.to_string_lossy(),
+        "--codeweb-bin",
+        &bin.to_string_lossy(),
+    ]);
+    assert_eq!(err, "");
+    assert_eq!(code, EXIT_FAIL, "{out}");
+    assert!(out.contains("[ENV-0030]"), "{out}");
+    assert!(out.contains("codeweb JSON 解析失败:"), "{out}");
+    assert!(plan_text(root).is_empty(), "{out}");
 }
 
 #[test]
