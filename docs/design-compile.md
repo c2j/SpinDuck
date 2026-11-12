@@ -2,11 +2,11 @@
 
 | 项 | 值 |
 |---|---|
-| 作者 | placeholder |
+| 作者 | c2j |
 | 日期 | 2026-11-11 |
-| 状态 | Draft |
+| 状态 | 已批准 |
 | 读者 | 熟悉 SpinDuck 与 codeweb 的工程师 |
-| 取代关系 | 不改写 `docs/design-production-gaussdb.md`。本文只细化静态闭包这一条，落地路径是将来的 `docs/design-compile.md` |
+| 取代关系 | 不改写 `docs/design-production-gaussdb.md`。本文是静态闭包的规格，文件即 `docs/design-compile.md` |
 
 本文里的行号都按工作区与本机 codeweb 源码当场读到的版本，不是提示里的约数。SpinDuck 工作区：`/Users/c2j/Projects/Desktop_Projects/DOTA/SpinDuck__worktrees/tuning-subcommand-integrate`。codeweb 源码：`/Users/c2j/Projects/Desktop_Projects/CODE/codeweb`，`Cargo.toml` 的 `version = "0.9.7"`。已核对的二进制位置是 `/Users/c2j/dev/tools_bin/codeweb`；产品代码不把这条绝对路径写死。
 
@@ -565,7 +565,7 @@ codeweb 的图不入库、不进 git、不进 `RunPlan`。`[[ref]].at` 只留相
 
 `call` 的裸名门不在这个周期里删除。`--plan` 的第二道门改为读 `[[ref]]` 与切换 PR 同一批，且只在该 PR 获准时落地。旧计划文件没有 `[[ref]]`：`--plan` 的内核门保持今天的 `kernel_gaps` → `walk_chain`，直到该计划被项目态 `compile` 重写（文件里出现至少评估过的 ref 段；完全没有 `[[ref]]` 键视为旧计划）。这样旧计划不会在重写前突然变成「没有对象可核对 → 假绿」。新计划即使一行 ref 都没有，也写出 `refs_from = "codeweb"` 这样的标记吗？不写新键。改用：`generator` 以 `codeweb ` 开头即新计划，内核门只读 `[[ref]]`（空则内核门不再发现额外对象，缺件只来自 `[[missing]]`）。`generator` 仍是 `spinduck …` 或测试里的 `test` 时，`--plan` 内核门保持今天的实现。这一分支只活到别名周期结束；周期结束时裸 `call` 与旧 generator 的去留另起 Ask-first PR。它不让项目态 `compile` 与词法各写一份 missing。
 
-文档登记（architecture §13.5「闭包来源」那一行、design §6.1 的 generator 说明）放在切换 PR 获准之后，与行为同 PR。本设计现在只写在 scratch，不改仓库。
+文档登记（architecture §13.5「闭包来源」那一行、design §6.1 的 generator 说明）放在切换 PR 获准之后，与行为同 PR。本设计已写入 `docs/design-compile.md`。
 
 ---
 
