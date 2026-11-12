@@ -318,6 +318,14 @@ fn word(toks: &[Tok], i: usize) -> Option<&str> {
     }
 }
 
+/// 相对项目根的路径文本（`/` 分隔，跨平台可比；口径同 `compile` 报告）。
+fn rel_text(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::kernel_gaps_from_refs;
@@ -370,12 +378,4 @@ mod tests {
         assert!(gaps.iter().all(|g| g.from == "prc_main"));
         assert!(kernel_gaps_from_refs(&eng, "prc_missing", &objects, &refs).is_none());
     }
-}
-
-/// 相对项目根的路径文本（`/` 分隔，跨平台可比；口径同 `compile` 报告）。
-fn rel_text(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
 }

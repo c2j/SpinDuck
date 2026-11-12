@@ -248,6 +248,25 @@ mod tests {
     use crate::cli::run::{run_str, EXIT_OK};
 
     #[cfg(feature = "native")]
+    use crate::error::EngineError;
+    #[cfg(feature = "native")]
+    use crate::plan::codeweb::CodewebExport;
+    #[cfg(feature = "native")]
+    use std::io::Read;
+    #[cfg(feature = "native")]
+    use std::path::Path;
+
+    #[cfg(feature = "native")]
+    struct JsonExport(Vec<u8>);
+
+    #[cfg(feature = "native")]
+    impl CodewebExport for JsonExport {
+        fn export_json(&self, _project: &Path) -> Result<Box<dyn Read + Send>, EngineError> {
+            Ok(Box::new(std::io::Cursor::new(self.0.clone())))
+        }
+    }
+
+    #[cfg(feature = "native")]
     #[test]
     fn should_register_file_and_call_routine_with_out_param() {
         let tmp = tempfile::tempdir().unwrap();
@@ -332,17 +351,23 @@ mod tests {
              BEGIN RETURN MYNVL(x, y); END;",
         )
         .unwrap();
-        // 旧 generator：这条测的是规则链，不经过 codeweb 闭包。
+        // 计划由 plan_cmd 写出（generator 为 codeweb）。规则仍从项目声明带进 call。
+        std::fs::write(root.join("codeweb.toml"), b"").unwrap();
+        let file = root.join("sql/routines/r.sql");
+        let file_s = file.to_string_lossy().replace('\\', "/");
+        let export = JsonExport(
+            serde_json::to_vec(&serde_json::json!({
+                "nodes": [{"id": 1, "type": "function", "name": "fnc_nv", "file": file_s}],
+                "edges": []
+            }))
+            .unwrap(),
+        );
+        let mut plan_buf = Vec::new();
+        let plan_code = crate::cli::plan_cmd(Some(root), "fnc_nv", None, &export, &mut plan_buf)
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        let plan_out = String::from_utf8(plan_buf).unwrap();
+        assert_eq!(plan_code, EXIT_OK, "{plan_out}");
         let plan_path = root.join(".spinduck/plan/fnc_nv.toml");
-        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &plan_path,
-            "[plan]\nschema_version = 1\ntarget = \"fnc_nv\"\n\
-             generator = \"spinduck test (plan schema 1)\"\nproject_dir = \"../..\"\n\
-             \n[sources]\nddl_routines = [\"sql/routines/r.sql\"]\n\
-             ddl_tables = []\nmaterialize = []\nwriteback = []\n",
-        )
-        .unwrap();
         let (code, out) = run_str(&["call", "--plan", &plan_path.to_string_lossy(), "5", "null"]);
         assert_eq!(code, EXIT_OK, "{out}");
         assert!(out.contains("RETURN 5"), "{out}");

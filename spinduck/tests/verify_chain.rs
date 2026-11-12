@@ -114,6 +114,96 @@ fn fixture(root: &Path) -> ProjectConfig {
     ProjectConfig::load(root).unwrap()
 }
 
+const CLEAN_ONLY: &str = r#"
+CREATE OR REPLACE PACKAGE pkg_a AS
+  PROCEDURE prc_clean(p_dt IN VARCHAR2, p_n OUT NUMBER);
+END;
+/
+CREATE OR REPLACE PACKAGE BODY pkg_a AS
+  PROCEDURE prc_clean(p_dt IN VARCHAR2, p_n OUT NUMBER) IS
+  BEGIN
+    SELECT count(*) INTO p_n FROM t_ok WHERE a > 0;
+  END;
+END;
+/
+"#;
+
+struct FixtureExport(Vec<u8>);
+
+impl spinduck_core::plan::codeweb::CodewebExport for FixtureExport {
+    fn export_json(
+        &self,
+        _project: &Path,
+    ) -> Result<Box<dyn std::io::Read + Send>, spinduck_core::EngineError> {
+        Ok(Box::new(std::io::Cursor::new(self.0.clone())))
+    }
+}
+
+fn verify_export(root: &Path, json: serde_json::Value) -> (i32, String) {
+    std::fs::write(root.join("codeweb.toml"), b"").unwrap();
+    let export = FixtureExport(serde_json::to_vec(&json).unwrap());
+    let mut buf = Vec::new();
+    let result = spinduck_core::cli::verify_cmd(Some(root), &export, &mut buf);
+    match result {
+        Ok(code) => (code, String::from_utf8(buf).unwrap()),
+        Err(e) => {
+            use std::io::Write;
+            let _ = writeln!(buf, "[{}] {}", e.code, e.message);
+            (1, String::from_utf8(buf).unwrap())
+        }
+    }
+}
+
+fn forward(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+enum ChainShape {
+    Clean,
+    WithGaps,
+}
+
+fn chain_graph(file: &str, shape: ChainShape) -> serde_json::Value {
+    let mut nodes = vec![
+        serde_json::json!({"id": 1, "type": "package", "name": "pkg_a", "file": file}),
+        serde_json::json!({"id": 2, "type": "procedure", "name": "prc_clean", "file": file, "line": 1}),
+        serde_json::json!({"id": 5, "type": "table", "name": "t_ok"}),
+    ];
+    let mut edges = vec![
+        serde_json::json!({"source": 1, "target": 2, "type": "contains_routine"}),
+        serde_json::json!({
+            "source": 2, "target": 5, "type": "table_access",
+            "modes": ["read"], "file": file, "line": 4
+        }),
+    ];
+    if matches!(shape, ChainShape::WithGaps) {
+        push_gap(&mut nodes, &mut edges, file);
+    }
+    serde_json::json!({"nodes": nodes, "edges": edges})
+}
+
+fn push_gap(nodes: &mut Vec<serde_json::Value>, edges: &mut Vec<serde_json::Value>, file: &str) {
+    nodes.push(serde_json::json!({
+        "id": 3, "type": "procedure", "name": "prc_gap", "file": file, "line": 8
+    }));
+    nodes.push(serde_json::json!({"id": 6, "type": "table", "name": "t_missing"}));
+    nodes.push(serde_json::json!({
+        "id": 7, "type": "unresolved", "raw_expr": "pkg_a.prc_gone", "context": "call"
+    }));
+    nodes.push(serde_json::json!({
+        "id": 4, "type": "procedure", "name": "prc_typo", "file": file, "line": 1
+    }));
+    edges.push(serde_json::json!({"source": 1, "target": 3, "type": "contains_routine"}));
+    edges.push(serde_json::json!({"source": 1, "target": 4, "type": "contains_routine"}));
+    edges.push(serde_json::json!({
+        "source": 3, "target": 6, "type": "table_access",
+        "modes": ["write"], "file": file, "line": 9
+    }));
+    edges.push(serde_json::json!({
+        "source": 3, "target": 7, "type": "direct", "file": file, "line": 10
+    }));
+}
+
 fn report<'a>(reports: &'a [EntryReport], entry: &str) -> &'a EntryReport {
     reports
         .iter()
@@ -244,24 +334,23 @@ fn should_credit_assert_layer_when_no_scenario_declares_the_entry() {
 #[test]
 fn should_render_reports_and_exit_1_when_chain_has_gaps() {
     let tmp = tempfile::tempdir().unwrap();
-    fixture(tmp.path());
-    let mut buf: Vec<u8> = Vec::new();
-    let code = spinduck_core::cli::run::run(
-        &[
-            "verify".to_string(),
-            tmp.path().to_string_lossy().to_string(),
-        ],
-        &mut buf,
-    );
-    let text = String::from_utf8(buf).unwrap();
+    let root = tmp.path();
+    fixture(root);
+    let file = forward(&root.join("sql/routines/pkg_a.sql"));
+    let (code, text) = verify_export(root, chain_graph(&file, ChainShape::WithGaps));
     assert_eq!(code, 1, "有链路缺口必须非零退出：{text}");
-    assert!(text.contains("== entry pkg_a.prc_clean"), "{text}");
-    assert!(text.contains("FAIL Relation t_missing"), "{text}");
-    assert!(text.contains("PASS Scenario clean#1"), "{text}");
+    assert!(text.contains("manifest: "), "{text}");
     assert!(
-        text.contains("verify: entries=3 checks=") && text.contains("failed=3"),
-        "汇总行需给出条目数与失败数：{text}"
+        text.contains("MISS relation:t_missing <- pkg_a.prc_gap"),
+        "{text}"
     );
+    assert!(
+        text.contains("MISS routine:pkg_a.prc_gone <- pkg_a.prc_gap"),
+        "{text}"
+    );
+    assert!(text.contains("compile: entries=3"), "{text}");
+    assert!(!text.contains("PASS Scenario"), "{text}");
+    assert!(!text.contains("== entry"), "{text}");
 }
 
 #[test]
@@ -274,18 +363,17 @@ fn should_exit_0_when_every_entry_is_clean() {
         "[project]\nname = \"clean\"\nkernel = \"1.5.5\"\n\n[[entry]]\nroutine = \"pkg_a.prc_clean\"\n",
     );
     write(root, "sql/ddl/tables.sql", DDL);
-    let body = ROUTINES.replace("  PROCEDURE prc_gap(p_dt IN VARCHAR2) IS\n  BEGIN\n    INSERT INTO t_missing (a) VALUES (1);\n    pkg_a.prc_gone();\n  END;\n", "");
-    write(root, "sql/routines/pkg_a.sql", &body);
+    write(root, "sql/routines/pkg_a.sql", CLEAN_ONLY);
     write(root, "cases/x.case.toml", CASE);
     write(root, "cases/datasets/seed.sql", SEED);
-    let mut buf: Vec<u8> = Vec::new();
-    let code = spinduck_core::cli::run::run(
-        &["verify".to_string(), root.to_string_lossy().to_string()],
-        &mut buf,
-    );
-    let text = String::from_utf8(buf).unwrap();
+    let file = forward(&root.join("sql/routines/pkg_a.sql"));
+    let (code, text) = verify_export(root, chain_graph(&file, ChainShape::Clean));
     assert_eq!(code, 0, "干净链路应零退出：{text}");
-    assert!(text.contains("failed=0"), "{text}");
+    assert!(
+        text.contains("compile: entries=1 missing=0 failed=0 dynamic=0"),
+        "{text}"
+    );
+    assert!(text.contains("(updated)"), "{text}");
 }
 
 #[test]
@@ -336,13 +424,10 @@ fn should_snapshot_manifest_in_home_conf_and_verify_runtime_dir_alone() {
     fixture(root);
     let home = root.join(".spinduck");
     let snap = home.join("conf/spinduck.toml");
+    let file = forward(&root.join("sql/routines/pkg_a.sql"));
+    let graph = chain_graph(&file, ChainShape::WithGaps);
 
-    let mut buf: Vec<u8> = Vec::new();
-    spinduck_core::cli::run::run(
-        &["verify".to_string(), root.to_string_lossy().to_string()],
-        &mut buf,
-    );
-    let first = String::from_utf8(buf).unwrap();
+    let (_, first) = verify_export(root, graph.clone());
     assert!(
         first.contains(&format!("manifest: {}", snap.display())) && first.contains("(updated)"),
         "研发态 verify 必须落运行态快照并报告路径与变化：{first}"
@@ -359,16 +444,11 @@ fn should_snapshot_manifest_in_home_conf_and_verify_runtime_dir_alone() {
         "快照标注来源为研发态根：{text}"
     );
 
-    // 运行态目录独立核验：同一结论，且不回写快照（真源仍 = 研发态 spinduck.toml）
-    let mut buf2: Vec<u8> = Vec::new();
-    let code2 = spinduck_core::cli::run::run(
-        &["verify".to_string(), home.to_string_lossy().to_string()],
-        &mut buf2,
-    );
-    let second = String::from_utf8(buf2).unwrap();
+    // 运行态目录独立核验：同一缺件，且不回写快照（真源仍 = 研发态 spinduck.toml）
+    let (code2, second) = verify_export(&home, graph);
     assert!(
-        second.contains("verify: entries=3") && second.contains("failed=3"),
-        "运行态目录必须复现同一核验结论：{second}"
+        second.contains("MISS relation:t_missing <- pkg_a.prc_gap"),
+        "运行态目录必须复现同一缺件：{second}"
     );
     assert!(
         second.contains("(未改写"),

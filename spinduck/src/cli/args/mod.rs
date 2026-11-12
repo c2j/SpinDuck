@@ -227,7 +227,7 @@ pub fn usage() -> &'static str {
      \x20 rules probe <rules.toml>        规则文件版本锚定检查\n\
      \x20 explain --file <sql> [--trace <审计日志>] <routine>\n\
      \x20                                打印例程 IR（不执行）；给 --trace 则逐行标注该次真实运行的命中\n\
-     \x20 verify [项目目录]               从 [[entry]] 出发核验链路对象与场景（本发布周期的兼容入口，由项目态 compile 替换）\n\
+     \x20 verify [项目目录]               同步清单并对全部 [[entry]] 做项目态 compile（本发布周期的兼容入口，由项目态 compile 替换）\n\
      \x20 plan [--dir <项目目录>] [--schema <名>] <routine>\n\
      \x20                                求目标例程闭包并落盘运行计划（缺件即判红；本发布周期的兼容入口，由项目态 compile 替换）\n\
      \x20 deploy <计划.toml> --db <f>    按运行计划把资产装进落盘的本地 DuckDB（缺件即拒）\n\

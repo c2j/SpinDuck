@@ -352,3 +352,35 @@ fn should_exit_1_with_biz_0150_when_target_routine_is_not_declared() {
         "判红不得留下计划文件"
     );
 }
+
+fn project_without_codeweb(dir: &std::path::Path) {
+    write(
+        dir,
+        "spinduck.toml",
+        "[project]\nname = \"p\"\nkernel = \"1.5.5\"\n\n[[entry]]\nroutine = \"pkg_a.prc_x\"\n",
+    );
+}
+
+#[test]
+fn should_exit_1_when_the_real_binary_verify_cannot_find_a_codeweb_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    project_without_codeweb(root);
+    let (code, out, err) = cli(&["verify", &root.to_string_lossy()]);
+    assert_eq!(code, EXIT_FAIL, "{out}");
+    assert_eq!(err, "", "诊断走 stdout: {err}");
+    assert!(out.contains("[ENV-0030]"), "{out}");
+    assert!(out.contains("未找到 codeweb 项目"), "{out}");
+}
+
+#[test]
+fn should_exit_1_when_the_real_binary_plan_cannot_find_a_codeweb_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    project_without_codeweb(root);
+    let (code, out, err) = cli(&["plan", "--dir", &root.to_string_lossy(), "pkg_a.prc_x"]);
+    assert_eq!(code, EXIT_FAIL, "{out}");
+    assert_eq!(err, "", "诊断走 stdout: {err}");
+    assert!(out.contains("[ENV-0030]"), "{out}");
+    assert!(out.contains("未找到 codeweb 项目"), "{out}");
+}

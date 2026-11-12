@@ -32,6 +32,16 @@ pub fn verify_cmd(
 /// 只在研发态目录（含手写 `spinduck.toml`）写入：从运行态目录执行时不回写，
 /// 快照的来源标注因此始终指向真源，"漂移由下一次 verify 判读"的口径才不会断。
 fn sync_manifest(project: &ProjectConfig, out: &mut dyn Write) -> Result<(), EngineError> {
+    if project.loaded_as_runtime {
+        let path = project.home_dir.join("conf").join("spinduck.toml");
+        writeln!(
+            out,
+            "manifest: {} (未改写：本目录即运行态快照)",
+            path.display()
+        )
+        .map_err(io_err)?;
+        return Ok(());
+    }
     let line = if project.root.join("spinduck.toml").is_file() {
         let s = crate::verify::sync_runtime_manifest(project)?;
         format!(

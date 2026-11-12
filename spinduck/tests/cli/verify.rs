@@ -44,6 +44,14 @@ fn should_verify_a_gbk_package_without_complaining_about_encoding() {
         !out.contains("ENV-0030"),
         "GBK 已在读入时解码，核验面不得再报编码: {out}"
     );
+    assert!(
+        out.contains("plan: target=pkg_a.prc_gbk"),
+        "GBK 包体解码后应进入项目态 compile: {out}"
+    );
+    assert!(
+        out.contains("compile: entries=1 missing=0 failed=0 dynamic=0"),
+        "{out}"
+    );
     assert!(out.contains("manifest: "), "{out}");
     assert!(
         !out.contains("PASS "),
@@ -80,7 +88,10 @@ fn should_exit_1_with_env_0030_when_corpus_is_valid_in_neither_encoding() {
         ),
     );
     assert_eq!(code, EXIT_FAIL, "{out}");
-    assert!(out.contains("[ENV-0030]"), "{out}");
+    assert!(
+        out.contains("[ENV-0030] 读取 "),
+        "编码失败仍须带读取路径前缀: {out}"
+    );
     assert!(out.contains("valid UTF-8"), "{out}");
     assert!(out.contains("valid GBK"), "{out}");
 }

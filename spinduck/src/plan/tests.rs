@@ -186,13 +186,13 @@ fn should_reject_a_plan_missing_a_required_field() {
 
 // —— 闭包求值（§6.1 / R3）：项目夹具走真实文件系统，例程只编译不执行（NoopExecutor）。
 
-fn write_rel(root: &Path, rel: &str, body: &str) {
+pub(super) fn write_rel(root: &Path, rel: &str, body: &str) {
     let p = root.join(rel);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     std::fs::write(&p, body).unwrap();
 }
 
-const PROJECT_TOML: &str = "[project]\nname = \"plan_fixture\"\nkernel = \"1.5.5\"\n\n[paths]\nddl = \"sql/ddl\"\nroutines = \"sql/routines\"\n";
+pub(super) const PROJECT_TOML: &str = "[project]\nname = \"plan_fixture\"\nkernel = \"1.5.5\"\n\n[paths]\nddl = \"sql/ddl\"\nroutines = \"sql/routines\"\n";
 
 const MAIN_ROUTINE: &str = "CREATE OR REPLACE PROCEDURE prc_main IS
   v_n INT;
@@ -244,11 +244,11 @@ impl CodewebExport for JsonExport {
     }
 }
 
-fn abs_file(path: &Path) -> String {
+pub(super) fn abs_file(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn cw(nodes: serde_json::Value, edges: serde_json::Value) -> serde_json::Value {
+pub(super) fn cw(nodes: serde_json::Value, edges: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"nodes": nodes, "edges": edges})
 }
 
@@ -263,7 +263,7 @@ fn plan_from(root: &Path, target: &str, json: serde_json::Value) -> Result<RunPl
     )
 }
 
-fn plan_for(root: &Path, target: &str, json: serde_json::Value) -> RunPlan {
+pub(super) fn plan_for(root: &Path, target: &str, json: serde_json::Value) -> RunPlan {
     plan_from(root, target, json).unwrap()
 }
 
@@ -655,97 +655,4 @@ END;
         "视图体的基表要随视图一起进清单（下发顺序才可能表先于视图）"
     );
     assert!(plan.missing.is_empty(), "{:?}", plan.missing);
-}
-
-#[test]
-fn should_not_report_an_engine_provided_table_as_missing() {
-    // `sys_dummy` 由 `deploy_schema` 无条件建（`verify/deploy.rs`），项目里没有它的 DDL 文件。
-    // 静态闭包若按"无声明即缺件"处理，每个用它做常量取数的过程都会报假缺件；
-    // 它也没有源文件，所以既不进 ddl_tables 也不进 missing。
-    let tmp = tempfile::tempdir().unwrap();
-    write_rel(tmp.path(), "spinduck.toml", PROJECT_TOML);
-    write_rel(
-        tmp.path(),
-        "sql/routines/10_main.sql",
-        "CREATE OR REPLACE PROCEDURE prc_main IS
-  v_n INT;
-BEGIN
-  SELECT COUNT(*) INTO v_n FROM sys_dummy;
-END;
-/
-",
-    );
-    write_rel(
-        tmp.path(),
-        "sql/ddl/tables.sql",
-        "CREATE TABLE t_a (id INT);\n",
-    );
-    let root = tmp.path();
-    let file = abs_file(&root.join("sql/routines/10_main.sql"));
-    let plan = plan_for(
-        root,
-        "prc_main",
-        cw(
-            serde_json::json!([
-                {"id": 1, "type": "procedure", "name": "prc_main", "file": file},
-                {"id": 2, "type": "table", "name": "sys_dummy"}
-            ]),
-            serde_json::json!([
-                {"source": 1, "target": 2, "type": "table_access", "modes": ["read"], "file": file, "line": 1}
-            ]),
-        ),
-    );
-    assert!(
-        plan.missing.is_empty(),
-        "内核自建对象不该落缺件: {:?}",
-        plan.missing
-    );
-    assert!(
-        plan.ddl_tables.is_empty(),
-        "没有源文件的对象不该进部署清单: {:?}",
-        plan.ddl_tables
-    );
-}
-
-#[test]
-fn should_match_a_schema_qualified_reference_against_a_bare_ddl_name() {
-    // 语料写 `bigfund.t_a`、DDL 声明裸名 `t_a`：与 verify 的 present() 同口径（先全名后尾段）。
-    let tmp = tempfile::tempdir().unwrap();
-    write_rel(tmp.path(), "spinduck.toml", PROJECT_TOML);
-    write_rel(
-        tmp.path(),
-        "sql/routines/10_main.sql",
-        "CREATE OR REPLACE PROCEDURE prc_main IS
-BEGIN
-  DELETE FROM bigfund.t_a WHERE id = 1;
-END;
-/
-",
-    );
-    write_rel(
-        tmp.path(),
-        "sql/ddl/tables.sql",
-        "CREATE TABLE t_a (id INT);\n",
-    );
-    let root = tmp.path();
-    let file = abs_file(&root.join("sql/routines/10_main.sql"));
-    let plan = plan_for(
-        root,
-        "prc_main",
-        cw(
-            serde_json::json!([
-                {"id": 1, "type": "procedure", "name": "prc_main", "file": file},
-                {"id": 2, "type": "table", "schema": "bigfund", "name": "t_a"}
-            ]),
-            serde_json::json!([
-                {"source": 1, "target": 2, "type": "table_access", "modes": ["write"], "file": file, "line": 1}
-            ]),
-        ),
-    );
-    assert!(
-        plan.missing.is_empty(),
-        "尾段命中即不是缺件: {:?}",
-        plan.missing
-    );
-    assert_eq!(plan.ddl_tables, vec!["sql/ddl/tables.sql".to_string()]);
 }
