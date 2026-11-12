@@ -212,12 +212,18 @@ fn creates_view(unit: &str) -> bool {
 }
 
 /// 去 `DEFAULT (…)` 子句（与黄金 harness 同口径：DuckDB 对带括号默认值 + 逗号解析不稳）。
+///
+/// 只认默认值表达式本身以 `(` 开头。列类型上的括号（`character varying(12)`、
+/// `numeric(15,3)`）不算，字面量默认值（`DEFAULT 0`、`DEFAULT '000000'::character varying`）保留。
+/// 一行只看第一处 ` DEFAULT`。`a INT DEFAULT 0, b INT DEFAULT (1)` 这种同行多列
+/// 不会裁掉后面的括号默认值。语料 DDL 是一列一行，这里不拆列。
 pub fn strip_defaults(ddl: &str) -> String {
     let mut out = String::with_capacity(ddl.len());
     for line in ddl.lines() {
         let up = line.to_ascii_uppercase();
-        if up.contains("DEFAULT") && line.contains('(') {
-            if let Some(pos) = up.find(" DEFAULT") {
+        if let Some(pos) = up.find(" DEFAULT") {
+            let rest = line[pos + " DEFAULT".len()..].trim_start();
+            if rest.starts_with('(') {
                 out.push_str(line[..pos].trim_end());
                 out.push_str(",\n");
                 continue;
@@ -452,6 +458,7 @@ fn literal_end(b: &[u8], start: usize, quote: char) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::SqlExecutor;
 
     #[test]
     fn should_split_oracle_chunks_and_top_level_semicolons() {
@@ -490,6 +497,137 @@ mod tests {
             clamp_sequence_bounds("CREATE TABLE t (a BIGINT);"),
             "CREATE TABLE t (a BIGINT);",
             "非序列语句一字不改"
+        );
+    }
+
+    /// 与 `deploy_ddl_file` 同一条文本口径，停在 `execute` 之前。
+    fn ddl_as_deployed(text: &str) -> String {
+        let mut out = String::new();
+        for unit in sql_units(&strip_defaults(text)) {
+            let unit = drop_cache_option(&clamp_sequence_bounds(&unit));
+            let rewritten = crate::sql::rewrite_tokens_with_rules(
+                &unit,
+                &Default::default(),
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+            let sql = crate::sql::apply_ast_transforms(&rewritten.text).unwrap();
+            out.push_str(&sql);
+            out.push(';');
+        }
+        out
+    }
+
+    #[test]
+    fn should_keep_primary_key_clauses_through_the_deploy_ddl_pipeline() {
+        let ddl = "\
+CREATE TABLE dat_trd_repurchase (
+    fund_code character varying(8) NOT NULL,
+    security_id character varying(19) NOT NULL,
+    gddmzm character varying(12) DEFAULT '000000'::character varying,
+    mom_fund character varying(8) DEFAULT '0'::character varying NOT NULL,
+    CONSTRAINT pk_dat_trd_repurchase PRIMARY KEY (fund_code, security_id)
+);
+CREATE TABLE t_col (id INT PRIMARY KEY, name VARCHAR(8) DEFAULT 'x');
+CREATE TABLE t_paren (
+    id INT DEFAULT (1),
+    PRIMARY KEY (id)
+);
+";
+        let out = ddl_as_deployed(ddl);
+        assert!(
+            out.contains("CONSTRAINT pk_dat_trd_repurchase PRIMARY KEY (fund_code, security_id)"),
+            "表级主键必须原样留下：{out}"
+        );
+        assert!(
+            out.contains("gddmzm character varying(12) DEFAULT '000000'::character varying"),
+            "字面量默认值不得为了留主键而被改写：{out}"
+        );
+        assert!(
+            out.contains("id INT PRIMARY KEY"),
+            "列级主键必须留下：{out}"
+        );
+        assert!(
+            out.contains("PRIMARY KEY (id)"),
+            "括号默认值被裁掉后，下一行的主键子句必须还在：{out}"
+        );
+        assert!(!out.contains("DEFAULT (1)"), "括号默认值仍须剔除：{out}");
+
+        let ex = crate::sql::DuckExecutor::open_in_memory().unwrap();
+        for stmt in sql_units(&out) {
+            ex.execute(&stmt, &BindMap::new()).unwrap();
+        }
+        let mut s = ex
+            .query(
+                "SELECT table_name, string_agg(constraint_column_names::VARCHAR, '|') \
+                 FROM duckdb_constraints() \
+                 WHERE constraint_type = 'PRIMARY KEY' \
+                 GROUP BY table_name ORDER BY table_name",
+                &BindMap::new(),
+            )
+            .unwrap();
+        let rows = s.fetch_many(10);
+        let rendered: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{}:{}", r[0].as_str_loose(), r[1].as_str_loose()))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "dat_trd_repurchase:[fund_code, security_id]".to_string(),
+                "t_col:[id]".to_string(),
+                "t_paren:[id]".to_string(),
+            ],
+            "内核目录里的主键列：{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn should_keep_literal_column_defaults_and_strip_only_parenthesized_defaults() {
+        let ddl = "\
+CREATE TABLE dat_trd_repurchase (
+    accrual_added numeric(15,3) DEFAULT 0 NOT NULL,
+    gddmzm character varying(12) DEFAULT '000000'::character varying,
+    mom_fund character varying(8) DEFAULT '0'::character varying NOT NULL
+);
+CREATE TABLE t_d (id INT DEFAULT (1));
+CREATE TABLE par_sys_marketrate (
+    max_value numeric(20,4) DEFAULT (9999999999::bigint)::numeric NOT NULL,
+    par_value numeric(19,10) DEFAULT 0 NOT NULL
+);
+";
+        let out = strip_defaults(ddl);
+        assert!(
+            out.contains("accrual_added numeric(15,3) DEFAULT 0 NOT NULL"),
+            "类型括号不得带走字面量默认值：{out}"
+        );
+        assert!(
+            out.contains("gddmzm character varying(12) DEFAULT '000000'::character varying"),
+            "gddmzm 的字符串默认值必须留下：{out}"
+        );
+        assert!(
+            out.contains("mom_fund character varying(8) DEFAULT '0'::character varying NOT NULL"),
+            "mom_fund 的字符串默认值与 NOT NULL 必须留下：{out}"
+        );
+        assert!(
+            out.contains("par_value numeric(19,10) DEFAULT 0 NOT NULL"),
+            "数值字面量默认值必须留下：{out}"
+        );
+        assert!(
+            !out.contains("DEFAULT (1)"),
+            "DEFAULT ( 开头的括号默认值仍须整段剔除：{out}"
+        );
+        assert!(
+            out.contains("CREATE TABLE t_d (id INT,"),
+            "括号默认值与同行分号一起换成逗号：{out}"
+        );
+        assert!(
+            !out.contains("DEFAULT (9999999999"),
+            "语料里的括号默认值仍须剔除：{out}"
+        );
+        assert!(
+            out.contains("max_value numeric(20,4),"),
+            "括号默认值从 DEFAULT 起换成逗号：{out}"
         );
     }
 
