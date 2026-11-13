@@ -37,7 +37,7 @@ pub(super) fn assign_step(
     expr: &IrExpr,
 ) -> Result<(), EngineError> {
     let v = eval_expr(env, expr)?;
-    assign(env.frame, target, v)
+    assign(env, target, v)
 }
 
 /// `PERFORM <expr>`：求值并丢弃。

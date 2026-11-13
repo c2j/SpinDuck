@@ -27,6 +27,8 @@ pub struct Engine {
     /// 纯标量语句记忆化缓存（`ex` 内的 MemoizingExecutor 与本句柄共享），
     /// 每次顶层调用入口清空，给缓存一个确定的内存上界。
     memo: std::rc::Rc<crate::exec::MemoCache>,
+    /// 参数表点查缓存。与 memo 一样在顶层调用入口清空。
+    lookup: std::rc::Rc<crate::lookup_cache::LookupState>,
 }
 
 pub struct CallResultExt {
@@ -38,7 +40,9 @@ impl Engine {
         let mut catalog = RoutineCatalog::new();
         catalog.set_sql_rules(rules.clone());
         let memo = std::rc::Rc::new(crate::exec::MemoCache::default());
+        let lookup = std::rc::Rc::new(crate::lookup_cache::LookupState::default());
         let ex = Box::new(crate::exec::MemoizingExecutor::with_cache(ex, memo.clone()));
+        let ex = Box::new(crate::lookup_cache::LookupExecutor::new(ex, lookup.clone()));
         Self {
             ex,
             rules,
@@ -47,6 +51,7 @@ impl Engine {
             step_budget: crate::runtime::interp::DEFAULT_STEP_BUDGET,
             batch_commit: false,
             memo,
+            lookup,
         }
     }
 
@@ -165,7 +170,7 @@ impl Engine {
                             pkg.to_ascii_lowercase(),
                             p.name.join(".").to_ascii_lowercase()
                         );
-                        let prog = match &p.block {
+                        let mut prog = match &p.block {
                             Some(b) => {
                                 let extra: Vec<String> = p
                                     .parameters
@@ -184,8 +189,9 @@ impl Engine {
                         let params = p
                             .parameters
                             .iter()
-                            .map(crate::catalog::map_param)
+                            .map(|pp| crate::catalog::map_param(pp, &self.rules))
                             .collect::<Result<Vec<_>, EngineError>>()?;
+                        crate::catalog::remember_param_types(&mut prog, &params);
                         names.push(full.clone());
                         self.catalog.register(crate::catalog::CompiledRoutine {
                             name: full,
@@ -200,7 +206,7 @@ impl Engine {
                             pkg.to_ascii_lowercase(),
                             f.name.join(".").to_ascii_lowercase()
                         );
-                        let prog = match &f.block {
+                        let mut prog = match &f.block {
                             Some(b) => {
                                 let extra: Vec<String> = f
                                     .parameters
@@ -219,8 +225,9 @@ impl Engine {
                         let params = f
                             .parameters
                             .iter()
-                            .map(crate::catalog::map_param)
+                            .map(|pp| crate::catalog::map_param(pp, &self.rules))
                             .collect::<Result<Vec<_>, EngineError>>()?;
+                        crate::catalog::remember_param_types(&mut prog, &params);
                         names.push(full.clone());
                         self.catalog.register(crate::catalog::CompiledRoutine {
                             name: full,
@@ -332,6 +339,7 @@ impl Engine {
         sink: &mut dyn crate::exec::TraceSink,
     ) -> Result<CallResult, EngineError> {
         self.memo.clear();
+        self.lookup.clear();
         let routine = self
             .catalog
             .lookup(name)
@@ -339,13 +347,11 @@ impl Engine {
             .clone();
         crate::catalog::check_arity(name, &routine.params, args.len())?;
         let mut frame = Frame::new();
-        for (i, p) in routine.params.iter().enumerate() {
-            let v = match args.get(i) {
-                Some(v) => v.clone(),
-                None => p.default.clone().unwrap_or(SpinValue::Null),
-            };
-            frame.set(&VarName(p.name.to_ascii_lowercase()), v);
-        }
+        frame.install_params(
+            &routine.params,
+            args,
+            self.catalog.sql_rules().implicit_assignment_loose,
+        )?;
         // 统一事务边界（§3.5）：最外层调用在显式事务内执行——过程内
         // TxCommit/TxRollback 即时提交/回滚当前事务并重开；正常完成统一
         // COMMIT；未处理异常统一 ROLLBACK（DuckDB ACID 提供原子性）

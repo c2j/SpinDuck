@@ -30,6 +30,19 @@ pub struct MaterializeOutcome {
     pub degraded: Option<String>,
 }
 
+/// 本地行数查询的时点。
+///
+/// DuckDB 1.5.5 对已 checkpoint 的非空表把 `count(*)` 规划成
+/// `COLUMN_DATA_SCAN`（读落盘行组基数）。prepared 计划只在 catalog 身份变化时
+/// 重绑，追加行不会作废它。`SqlExecutor::query` 走 `prepare_cached`，物化后的
+/// 计数若与物化前同文，会复用旧计划，差值恒为 0，交叉核对误报 `ENV-0020`
+/// （数据已入库）。两代 SQL 文本不同，迫使追加之后重新 prepare。
+#[derive(Clone, Copy)]
+enum CountAt {
+    BeforeLoad,
+    AfterLoad,
+}
+
 /// 快路径失败分类（#16）：`loaded = true` 表示 `COPY FROM` **已成功入库**——
 /// 此时自动回落 INSERT 会把本地表灌成两倍行数，必须直接上抛，绝不回落。
 #[derive(Debug)]
@@ -110,8 +123,8 @@ impl GaussConn {
         select_sql: &str,
         workdir: &Path,
     ) -> Result<MaterializeOutcome, FastPathFailure> {
-        let before =
-            Self::local_count(duck, table).map_err(|err| FastPathFailure { err, loaded: false })?;
+        let before = Self::local_count(duck, table, CountAt::BeforeLoad)
+            .map_err(|err| FastPathFailure { err, loaded: false })?;
         // 列名经 prepare 取语句元数据（0 行查询在简单协议下无 Row 消息、
         // fetch_rows 的 schema 会是空的），COPY 的列清单按名对齐，
         // 与 INSERT 路径同一口径
@@ -161,7 +174,7 @@ impl GaussConn {
         csv_rows: usize,
     ) -> Result<MaterializeOutcome, FastPathFailure> {
         let loaded = |err: EngineError| FastPathFailure { err, loaded: true };
-        let after = Self::local_count(duck, table).map_err(loaded)?;
+        let after = Self::local_count(duck, table, CountAt::AfterLoad).map_err(loaded)?;
         // 差值保持 i64 直呈（评审 nit）：after < before 时负数如实进错误消息，
         // 不做 usize 环绕伪装；核对通过后差值必然非负，再收敛成 usize
         let rows = after - before;
@@ -219,8 +232,16 @@ impl GaussConn {
     }
 
     /// 本地表当前行数（物化行数差值统计的基准）。
-    fn local_count(duck: &dyn crate::exec::SqlExecutor, table: &str) -> Result<i64, EngineError> {
-        let mut s = duck.query(&format!("SELECT count(*) FROM {table}"), &BindMap::new())?;
+    fn local_count(
+        duck: &dyn crate::exec::SqlExecutor,
+        table: &str,
+        at: CountAt,
+    ) -> Result<i64, EngineError> {
+        let sql = match at {
+            CountAt::BeforeLoad => format!("SELECT count(*) FROM {table}"),
+            CountAt::AfterLoad => format!("SELECT count(*) AS spinduck_n FROM {table}"),
+        };
+        let mut s = duck.query(&sql, &BindMap::new())?;
         match s.fetch_many(1).first().and_then(|r| r.first()) {
             Some(SpinValue::Int(c)) => Ok(*c),
             other => Err(EngineError::env(
@@ -475,6 +496,50 @@ mod tests {
         assert!(out.is_err(), "loaded 失败不得走 INSERT 回落：{out:?}");
         assert!(!insert_ran.into_inner(), "INSERT 路径不得被执行");
         let _ = dirs.iter().try_for_each(std::fs::remove_dir_all);
+    }
+
+    #[test]
+    fn should_match_appended_row_delta_on_checkpointed_table() {
+        // DuckDB 1.5.5：已 checkpoint 的非空表上 `count(*)` 规划为
+        // COLUMN_DATA_SCAN（读落盘行组基数）。`prepare_cached` 复用物化前的
+        // 计划时，追加后的 count 仍是旧基数，差值 0，交叉核对误报 ENV-0020。
+        // 数据已经入库。空表第一次装入不走这条计划，所以只有第二次追加暴露。
+        let dir = tempfile::tempdir().expect("临时库目录");
+        let db = dir.path().join("appended.duckdb");
+        {
+            let ex =
+                crate::sql::DuckExecutor::open(db.to_str().expect("路径 utf-8")).expect("建库");
+            ex.execute("CREATE TABLE mid_t(bcrq VARCHAR)", &BindMap::new())
+                .expect("建表");
+            ex.execute(
+                "INSERT INTO mid_t SELECT '20260105' FROM range(20)",
+                &BindMap::new(),
+            )
+            .expect("灌入已落盘的基线行");
+        }
+        let ex = crate::sql::DuckExecutor::open(db.to_str().expect("路径 utf-8")).expect("重开库");
+        let before = GaussConn::local_count(&ex, "mid_t", CountAt::BeforeLoad).expect("物化前行数");
+        assert_eq!(before, 20, "checkpoint 后的基线行数");
+        let csv = dir.path().join("append.csv");
+        let mut body = String::from("bcrq\n");
+        for _ in 0..7 {
+            body.push_str("20260106\n");
+        }
+        std::fs::write(&csv, &body).expect("写追加 CSV");
+        let path = csv.display().to_string().replace('\'', "''");
+        ex.execute(
+            &format!(
+                "COPY mid_t FROM '{path}' (FORMAT CSV, HEADER true, DELIMITER ',', \
+                 QUOTE '\"', ESCAPE '\"', NULLSTR '\\N')"
+            ),
+            &BindMap::new(),
+        )
+        .expect("COPY 追加");
+        let out = GaussConn::finalize_copystream(&ex, "mid_t", before, &csv, 7)
+            .unwrap_or_else(|fast| panic!("追加后行数差必须等于 CSV 行数：{}", fast.err));
+        assert_eq!(out.rows, 7);
+        assert_eq!(out.mode, MaterializeMode::CopyStream);
+        assert!(out.degraded.is_none());
     }
 
     #[test]

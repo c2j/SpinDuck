@@ -129,7 +129,7 @@ concat_null_as_empty = true
 [implicit]
 concat_numeric_to_varchar = false  # verified@1.5.5：'x'||DECIMAL 原生可用，无需 CAST（V6 修订 R12）
 lpad_numeric_cast = true           # verified@1.5.5：lpad(DECIMAL,..) 仍无隐式转换，必须 CAST（V6）
-assignment_loose = true            # 赋值宽松转换（数字↔字符串），产生 lint 提示
+assignment_loose = true            # 写入 VARCHAR 槽时 Int/Decimal/Bool 收成字符串；关闭则 BIZ-0111。成功路径不打 lint
 empty_string_as_null = false       # 默认关闭；开启时改写层显式处理（见设计 §5 风险表）
 
 # ── 不可降级特性（遇之明确报错，禁止静默错误翻译）───────────────
