@@ -454,6 +454,10 @@ fn should_snapshot_manifest_in_home_conf_and_verify_runtime_dir_alone() {
         "运行态目录必须复现同一缺件：{second}"
     );
     assert!(
+        second.contains("compile: entries=3 missing=2 failed=0 dynamic=0"),
+        "运行态目录须复现同一份完整结论，不能只钉一条缺件：{second}"
+    );
+    assert!(
         second.contains("(未改写"),
         "快照不得被运行态反向覆盖：{second}"
     );
