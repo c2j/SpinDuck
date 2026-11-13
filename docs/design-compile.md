@@ -17,6 +17,8 @@
 
 行号基线：本文的行号与文件位置按 `663e182`（PR #32 合并前）核对。`2653c68` 起已有漂移：`closure.rs` 的 `build` / `walk_chain` / `kernel_gaps` 行号移动，`expand_view_bodies`、`register_routines`、`ddl_file_for` 已删除；阅读代码请以当前树为准。
 
+实现偏差（PR #1–#4 已落地；与本文设计口径的差异在此列出，读代码时以此为准）：`expand_view_bodies`、`register_routines`、`ddl_file_for` 已删除；`CodewebExport::export_json` 返回 `Box<dyn std::io::Read + Send>`；`closure_from_graph` 多一个 `&ClosureContext<'_>` 参数；`plan/codeweb.rs` 实际拆成 `plan/codeweb/` 目录；计划里的相对路径保留 codeweb `file` 的 `./` 段（如 `./sql/routines/...`）。
+
 ---
 
 ## Overview
