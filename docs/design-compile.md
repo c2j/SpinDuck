@@ -6,14 +6,16 @@
 | 日期 | 2026-11-11 |
 | 状态 | 已批准 |
 | 读者 | 熟悉 SpinDuck 与 codeweb 的工程师 |
-| 取代关系 | 不改写 `docs/design-production-gaussdb.md`。本文是静态闭包的规格，文件即 `docs/design-compile.md` |
-| 被取代部分 | 本文五处 deploy 契约已由 `docs/design-deploy.md` 取代：Goals「`deploy` 下发顺序不改」、Non-Goals「不改 `deploy` 的装配语义」、IR 节「失败仍会装到 `register_routine_files` 再失败」、衔接节「判定顺序不改、视图仍靠 `views/` 目录分流」、决策记录 9 里重复的「`deploy` 下发顺序不改」。各处已就地标注。codeweb 闭包正文、`[[ref]]` / `[[dynamic]]` 的生成与 `call` 的产品边界不受影响；决策 9 的「不升 `schema_version`」继续有效 |
+| 取代关系 | 不改写 `docs/design-production-gaussdb.md` 的结论；本文是静态闭包的规格，文件即 `docs/design-compile.md`。该文档 §6.1 的 generator 与闭包来源两句已随 PR 4 行为更新（PR #32） |
+| 被取代部分 | 本文五处 deploy 契约改由 `docs/design-deploy.md`（Draft，尚未落地）规定：Goals「`deploy` 下发顺序不改」、Non-Goals「不改 `deploy` 的装配语义」、IR 节「失败仍会装到 `register_routine_files` 再失败」、衔接节「判定顺序不改、视图仍靠 `views/` 目录分流」、决策记录 9 里重复的「`deploy` 下发顺序不改」。各处已就地标注；该文落地前 deploy 的当前行为仍以本文为准。codeweb 闭包正文、`[[ref]]` / `[[dynamic]]` 的生成与 `call` 的产品边界不受影响；决策 9 的「不升 `schema_version`」继续有效 |
 
 > 环境快照已过期：下文写作时核对的 codeweb 二进制 `/Users/c2j/dev/tools_bin/codeweb` 现为断链，
 > codeweb 仓库头也已到 0.9.8。产品仍硬校验 `0.9.7`（`plan/codeweb/export.rs` 的 `VERSION_WORD`）。
 > 当前可用的二进制来源与等价性论证见 `docs/validation.md` V43.1。
 
 本文里的行号都按工作区与本机 codeweb 源码当场读到的版本，不是提示里的约数。SpinDuck 工作区：`/Users/c2j/Projects/Desktop_Projects/DOTA/SpinDuck__worktrees/tuning-subcommand-integrate`。codeweb 源码：`/Users/c2j/Projects/Desktop_Projects/CODE/codeweb`，`Cargo.toml` 的 `version = "0.9.7"`。已核对的二进制位置是 `/Users/c2j/dev/tools_bin/codeweb`；产品代码不把这条绝对路径写死。
+
+行号基线：本文的行号与文件位置按 `663e182`（PR #32 合并前）核对。`2653c68` 起已有漂移：`closure.rs` 的 `build` / `walk_chain` / `kernel_gaps` 行号移动，`expand_view_bodies`、`register_routines`、`ddl_file_for` 已删除；阅读代码请以当前树为准。
 
 ---
 
@@ -47,13 +49,13 @@ SpinDuck 今天用三套静态入口描述同一件事：`compile` 逐文件做 
 pkg_split_trade_step3_sh.prc_trd_deal_purchase
 ```
 
-它调用同包过程 `prc_trd_hz_byfund`（声明在 `golden/case_corpus_purchase/sql/routines/PKG_SPLIT_TRADE_STEP3_SH.sql` 第 6 与第 13 行）。该过程的游标 `c_get_data` 从第 51 行开始，第 104 行是：
+同包过程 `prc_trd_hz_byfund`（声明在 `golden/case_corpus_purchase/sql/routines/PKG_SPLIT_TRADE_STEP3_SH.sql` 第 6 与第 13 行）的游标 `c_get_data` 从第 51 行开始，第 104 行是：
 
 ```sql
 AND (select fnc_get_fund_data_mode(a.bcrq, a.gddm, a.sub_gddm, a.xwdm)) = '1'
 ```
 
-项目内没有这个函数。`OPEN c_get_data` 在第 180 行，不在第 149 行和第 175 行那两个 `WHEN OTHERS` 里面。循环体第 372 行的 `WHEN OTHERS` 把本行错误交给 `pkg_split_trade_log.inst_log(..., p_o_succeed)`，不 `RAISE`。同文件还有多处同样把错误写进 `p_o_succeed` 或日志桩的处理器（149、175、205、251、274、294、428、452、581 行）。`call` 成功时只打印 `OUT` / `RETURN`（`cli/run/call.rs` 113–122 行）。函数不存在若被处理器收进 OUT，终端上看不到 Catalog Error。
+入口过程 `prc_trd_deal_purchase` 没有静态调用 `prc_trd_hz_byfund`：全文件只有第 6、13 行的声明和第 138 行它自己的 `v_proc_name` 赋值（见 V43.2）。因此默认入口的闭包到不了这段游标，本次调用只有在把入口改成该过程时才出现（V43.3）。项目内没有这个函数。`OPEN c_get_data` 在第 180 行，不在第 149 行和第 175 行那两个 `WHEN OTHERS` 里面。循环体第 372 行的 `WHEN OTHERS` 把本行错误交给 `pkg_split_trade_log.inst_log(..., p_o_succeed)`，不 `RAISE`。同文件还有多处同样把错误写进 `p_o_succeed` 或日志桩的处理器（149、175、205、251、274、294、428、452、581 行）。`call` 成功时只打印 `OUT` / `RETURN`（`cli/run/call.rs` 113–122 行）。函数不存在若被处理器收进 OUT，终端上看不到 Catalog Error。
 
 现有管线在四个点上丢掉这次调用：
 
@@ -87,7 +89,7 @@ codeweb 已经用解析器的 `Expr::FunctionCall.builtin` / `BuiltinFuncMeta` �
 
 - 项目模式的一条命令完成：按入口取闭包、写 `RunPlan`、对闭包内例程源做 SpinDuck IR 编译、缺件则退出码 1。
 - 关系只来自 codeweb 0.9.7 的导出图。`plan::closure::walk_chain` 与 `verify::run::walk_chain` 在切换之后不再是项目命令的关系真源。
-- 保留 `ddl_routines` / `ddl_tables`，`deploy` 下发顺序不改。**〔deploy 侧已取代〕** 下发顺序与装配语义改由 `docs/design-deploy.md` 规定；本条只保留「`ddl_routines` / `ddl_tables` 两个键仍在」这半句。
+- 保留 `ddl_routines` / `ddl_tables`，`deploy` 下发顺序不改。**〔deploy 侧已改判〕** 下发顺序与装配语义改由 `docs/design-deploy.md`（Draft，尚未落地）规定；落地前仍以本条为准，只保留「`ddl_routines` / `ddl_tables` 两个键仍在」这半句。
 - 计划字节可复现：排序、无绝对路径、无日期。`schema_version` 保持 1。
 - 无项目、只给路径的 `compile <path>...` 行为与 stdout 形状保持今天的逐文件体检。
 - `plan` 与 `verify` 先变成这条管线的别名，用法里写明替换关系，保留一个发布周期。
@@ -96,7 +98,7 @@ codeweb 已经用解析器的 `Expr::FunctionCall.builtin` / `BuiltinFuncMeta` �
 ### Non-Goals
 
 - 不把 `verify` 的「整库装进内存 DuckDB」和「按场景真的 call」并进 `compile`。这两件事继续不属于静态命令。别名切换之后它们不再由 `verify` 触发；要执行仍走 `call`。
-- 不改 `deploy` 的装配语义（非幂等、例程不落盘、`plan.schema` 不下发、不跑种子）。见 architecture §13.6。**〔deploy 侧已取代〕** `docs/design-deploy.md` 改了装配语义：无标记计划在 deploy 预检就被拒绝，IR 失败不再指望 `register_routine_files` 再失败一次。本条括号里的四项描述不再是 deploy 的当前行为。
+- 不改 `deploy` 的装配语义（非幂等、例程不落盘、`plan.schema` 不下发、不跑种子）。见 architecture §13.6。**〔deploy 侧已改判〕** `docs/design-deploy.md`（Draft，尚未落地）会改装配语义：无标记计划在 deploy 预检就被拒绝，IR 失败不再指望 `register_routine_files` 再失败一次。落地前本条括号里的四项仍是 deploy 的当前行为。
 - 不改 `call` 的产品边界。`kernel_gaps` 这个门还在。裸 `call --file` 在切换 PR 里仍走现有门；它不是项目关系真源，见 Rollout。
 - 不改循环内 `COMMIT` 语义，不改 sqlfn 物化，不把包函数放进宏。交付件上的运行时慢不在本设计范围内。范围内的加速只是：关系扫描交给已经跑完的 codeweb 图，SpinDuck 只对闭包内源文件做 IR 编译。
 - 不新增 runtime 依赖、不新增 Cargo feature、不新增 `[[bin]]`、不改 `SqlExecutor` / `TraceSink` 签名。
@@ -393,16 +395,17 @@ FAIL sql/routines/PKG_SPLIT_TRADE_STEP3_SH.sql  [ENG-0022] …
 
 IR 失败不阻止计划落盘：关系清单仍然成立，`deploy` 会在 `register_routine_files` 上用同一个错误再失败一次，不会装出一个「注册已成功」的库。不把 IR 失败塞进 `[[missing]]`，避免 `deploy` 的 `MISS` 行冒充缺对象。任一入口有缺件或有 IR 失败，进程退出码都是 1。
 
-> **〔deploy 侧已取代〕** 「`deploy` 会在 `register_routine_files` 上再失败一次」这半句已被
-> `docs/design-deploy.md` 修正：计划仍落盘，但无标记计划在 deploy 预检就被拒绝，库文件不会出现，
-> 不再走到注册那一步。本段其余部分（IR 失败不进 `[[missing]]`、退出码 1）继续有效。
+> **〔deploy 侧已改判〕** 「`deploy` 会在 `register_routine_files` 上再失败一次」这半句由
+> `docs/design-deploy.md`（Draft，尚未落地）改判：落地后计划仍落盘，但无标记计划在 deploy 预检
+> 就被拒绝，库文件不会出现，不再走到注册那一步。落地前本段描述仍是 deploy 的当前行为；本段其余部分
+> （IR 失败不进 `[[missing]]`、退出码 1）继续有效。
 
 ### 与 `deploy`、`call` 的衔接
 
 `deploy` 不改判定顺序：`[[missing]]` 非空 → 退出码 1，打印 `MISS`，不开库。它不读 `[[ref]]`、不读 `[[dynamic]]`、不调用 codeweb。文件清单仍是 `sources.ddl_routines` 与 `sources.ddl_tables`。视图文件继续靠现有的「路径落在 views 目录 / `creates_view()`」分流，不靠 `[[ref]].kind` 重排下发顺序。
 
-> **〔deploy 侧已取代〕** 本段的判定顺序与视图分流口径由 `docs/design-deploy.md` 接管。
-> 「不读 `[[ref]]` / `[[dynamic]]`、不调用 codeweb」这半句仍是 deploy 的边界。
+> **〔deploy 侧已改判〕** 本段的判定顺序与视图分流口径改由 `docs/design-deploy.md`（Draft，尚未落地）
+> 接管；落地前仍以本段为准。「不读 `[[ref]]` / `[[dynamic]]`、不调用 codeweb」这半句仍是 deploy 的边界。
 
 `call --plan` 保持两道门：
 
@@ -530,7 +533,7 @@ codeweb 的图不入库、不进 git、不进 `RunPlan`。`[[ref]].at` 只留相
 
 ### 3. `export --filter <入口>` 或 `query --spec` 按入口取子图
 
-否，作为**主路径**。`--filter` 只有 1-hop（`build_filtered_subgraph`）。`query` 不返回边载荷，`CollectMode::Subgraph` 没有实现成子图。两者都会漏掉 `fnc_get_fund_data_mode` 或拿不到 `explicit`。一次全量 JSON 导出、进程内再按入口裁闭包，是 v0.9.7 CLI 上能拿到完整字段的唯一命令。
+否，作为**主路径**。`--filter` 只有 1-hop（`build_filtered_subgraph`），表达不了多跳闭包；`query` 不返回边载荷，`CollectMode::Subgraph` 没有实现成子图，拿不到 `explicit`。本夹具的样本只能从显式入口命中（V43.3），不单独证明多层链；但 1-hop 与缺载荷这两条限制与入口无关。一次全量 JSON 导出、进程内再按入口裁闭包，是 v0.9.7 CLI 上能拿到完整字段的唯一命令。
 
 ### 4. 读 `store.bincode` 或解析 `trace --exact`
 
@@ -681,10 +684,10 @@ pub fn build(
 3. **入口是可重复的 `--entry`，缺省为全部 `[[entry]]`。** 每个入口一份计划。没有项目声明、只给路径时，保持今天的逐文件体检，包括 README 里的 `spinduck compile ../lib/fastaas/exam/...`。零参数 `compile` 仍是用法错，以免改掉 `usage: compile <path>...` 这条已锁契约。显式 `--entry` 不要求名字已经写在 `[[entry]]` 里。
 4. **关系抽取不在 SpinDuck 再写一套 AST 遍历。** 消费本机 codeweb 0.9.7 进程。不把 codeweb 当 crate。D4 的四条阻塞维持不变：无 lib 目标、无 LICENSE、解析器 pin 在 v0.10.0 而 SpinDuck 锁 path 上的 v0.11.x、默认 feature 切不干净。
 5. **机器契约在 `export` 的 json/ndjson 之内，本设计选定 JSON。** v0.9.7 的 ndjson（`NdjsonNodeRecord` / `NdjsonEdgeRecord`）丢掉 `explicit`、`system`、`modes`、`write_kinds`、`file`、`line`。用它就会在 SpinDuck 里重推这些事实。不使用 `trace` 文本，不使用 `store.bincode`。`generator` 写成 `codeweb 0.9.7`。
-6. **实际命令是一次 `codeweb diff --project <root>`，通过后再一次 `codeweb export --format json --project <root>`，stdout 管道，无 `--filter`。** `--filter` 只到 1-hop，盖不住「入口过程 → 被调过程 → 游标标量子查询」这三层。`query` 不返回边载荷。多入口共享这一次导出。不自动 `analyze`。`export` 退出码 0 只表示 store 能加载。`diff` 的退出码在「已同步」和「有变化」时都是 0；失败关闭看 stderr 是否恰好为 `Up to date. No changes detected.`。不加 mtime。
+6. **实际命令是一次 `codeweb diff --project <root>`，通过后再一次 `codeweb export --format json --project <root>`，stdout 管道，无 `--filter`。** `--filter` 只到 1-hop，表达不了「入口过程 → 被调过程 → 其游标里的用户函数」这类多跳闭包；本夹具的样本要从显式入口才命中（V43.2 / V43.3），不单独证明这条链，但 1-hop 不足以表达闭包本身。`query` 不返回边载荷。多入口共享这一次导出。不自动 `analyze`。`export` 退出码 0 只表示 store 能加载。`diff` 的退出码在「已同步」和「有变化」时都是 0；失败关闭看 stderr 是否恰好为 `Up to date. No changes detected.`。不加 mtime。
 7. **缺件规则以图上的标记为准，再用项目 DDL 文件核对。** `direct` 的目标是 `unresolved` 且不是 `builtin_function` → `MISS routine`。`uses_builtin_function` 不报缺。表/视图 `explicit:false` 且 `system:false`，并且项目里没有对应 DDL、又不是 `ENGINE_PROVIDED_TABLES` → 缺 DDL。`system:true` 不报缺。序列没有 `system` 字段，只看 `explicit` 与项目文件。`dynamic` 单独列入 `[[dynamic]]`，不判死。`explicit:false` 但项目文件里有这个名字 → 不报缺。
 8. **闭包内源文件仍由 SpinDuck 做 IR 编译。** codeweb 绿不等于 SpinDuck 可编译。语法/IR 错误沿用 `EngineError`，不新造码，不写成 `MISS routine`。规则口径与路径模式 `compile` 相同，不用 `register_routines` 今天那份 `RuleRegistry::default()`。
-9. **扩展 `RunPlan`，不升 `SCHEMA_VERSION`。** 保留 `ddl_routines` / `ddl_tables`，`deploy` 下发顺序不改**〔deploy 侧已取代：下发顺序见 `docs/design-deploy.md`；本条「不升 `SCHEMA_VERSION`」继续有效〕**。追加 `[[ref]]`（`object`、`kind`、`role`、`from`、`at`）与 `[[dynamic]]`。`[[missing]]` 非空则退出码 1，`deploy` 不打开库。`at` 与清单都是相对路径，排序后字节稳定。`at` 的行号原样抄 JSON `line`，包括 0。调用边、内建边、动态边在 v0.9.7 上就是 0；表/序列/锚/`depends_on` 是包围语句的 `info.start_line`。`[[dynamic]].raw` 是 Debug 文本。`quoted()` 额外转义换行、回车、制表符，使这种 `raw` 能往返；不含这些字符的旧计划字节不变。不扫描 SQL 补行号。
+9. **扩展 `RunPlan`，不升 `SCHEMA_VERSION`。** 保留 `ddl_routines` / `ddl_tables`，`deploy` 下发顺序不改**〔deploy 侧已改判：下发顺序改由 `docs/design-deploy.md`（Draft）规定；本条「不升 `SCHEMA_VERSION`」继续有效〕**。追加 `[[ref]]`（`object`、`kind`、`role`、`from`、`at`）与 `[[dynamic]]`。`[[missing]]` 非空则退出码 1，`deploy` 不打开库。`at` 与清单都是相对路径，排序后字节稳定。`at` 的行号原样抄 JSON `line`，包括 0。调用边、内建边、动态边在 v0.9.7 上就是 0；表/序列/锚/`depends_on` 是包围语句的 `info.start_line`。`[[dynamic]].raw` 是 Debug 文本。`quoted()` 额外转义换行、回车、制表符，使这种 `raw` 能往返；不含这些字符的旧计划字节不变。不扫描 SQL 补行号。
 10. **角色：`table_access` → `read` 或 `write`（同时则两行）；`anchors_on` → `type`；`depends_on` → 目标的 `read`；`uses_sequence` → `kind=sequence`、`role=read`；`direct` → `kind=routine`、`role=call`。** `role=write` 只在 `modes` 含 `write` 或 `write_kinds` 非空时出现。`share` 以及其它锁位在没有这两条时是 `read`。`call` 是因为三角色里没有调用。`materialized_view` 记成 `view`。
 11. **V31.5 的四张表不是缺件事实。** 不把 `par_oper_close_date`、`par_sys_marketrate`、`split_log_info`、`sys_dummy` 写进新期望。`sys_dummy` 继续走 `ENGINE_PROVIDED_TABLES`。验收缺口是样本里的 `fnc_get_fund_data_mode`。
 12. **项目模式找不到 codeweb 二进制、版本不是 0.9.7、或导出失败，都是 `ENV-0030`，不回退词法闭包。** 不新造错误类。消息用固定前缀区分。切换之后 `build` 不再调用 `plan::closure::walk_chain`；`verify` 不再调用 `verify::run::walk_chain`。`verify/chain/` 留下做名字归一和测试夹具，不得再产出一份项目缺件。

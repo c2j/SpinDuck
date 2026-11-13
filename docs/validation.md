@@ -4394,14 +4394,17 @@ ORDER BY 1, 2, 3, 4
 
 - spinduck：PR #32 合并后的 `main` `2653c68` 上 `cargo build --features cli` 的 debug
   二进制。原稿写的 `f696339` 是 PR 4 提交的早期孤儿版本，已不在任何分支上、也不是
-  `main` 的祖先；它到 `2653c68` 的 compile 路径 delta 有 463 行（`codeweb/walk.rs` +45、
-  `codeweb/export.rs` +34、`project/mod.rs` +41），正是产出下面这些 MISS 行与计数的代码，
-  所以旧输出不能假定仍成立。本节全部输出是 2026-11-13 在 `2653c68` 上重跑所得。
+  `main` 的祖先；它到 `2653c68` 的 compile 路径（`spinduck/src/plan`、`spinduck/src/project`、
+  `spinduck/src/cli/verify.rs`）新增 463 行；其中 `codeweb/walk.rs`、`codeweb/export.rs`、
+  `project/mod.rs` 三个文件的 `--stat` 变更量分别是 45、34、41（增+删，与 463 不同口径）。
+  这些文件正是产出下面这些 MISS 行与计数的代码，所以旧输出不能假定仍成立。
+  本节全部输出是 2026-11-13 在 `2653c68` 上重跑所得。
 - codeweb：`--version` 标准输出为 `codeweb 0.9.7`，退出码 0。本机原安装位置
   `/Users/c2j/dev/tools_bin/codeweb` 已是断链（`target/` 被清），这次用的是
   `codeweb__worktrees/fix-duplicate-entry` 的 debug 构建，源码为 `v0.9.7` tag 加一个提交
-  `5f49620`（`fix(graph): collapse duplicate detail and trace callees`）。该提交只改
-  `graph/traverse.rs`、`tui/app.rs` 与 `main.rs` 里 `print_node_detail` 的两行注释；
+  `5f49620`（`fix(graph): collapse duplicate detail and trace callees`）。该提交改了
+  `graph/traverse.rs`、`tui/app.rs` 与 `main.rs` 里 `print_node_detail` 的两行注释，并新增
+  只覆盖 detail 的回归测试 `tests/regress_detail_callee_collapse.rs`（不进二进制）；
   `cmd_export` 在不带 `--filter` 时直接走 `store.graph()` → `export::json::to_json`，
   不经过 traverse，`export/json.rs` 与 `graph/store.rs` 一行未动，`diff` 命令同样未动。
   SpinDuck 正是不带 `--filter` 调用（Key Decision 6），故本次 export/diff 面与 v0.9.7 等价。
@@ -4481,4 +4484,4 @@ compile: entries=1 missing=11 failed=0 dynamic=0
   限于 SpinDuck 实际调用的 `export --format json`（不带 `--filter`）与 `diff` 两个面，
   不覆盖 `detail` / `trace` / TUI。
 - 不声称原稿 `f696339` 上的输出与本轮逐字节相同。本轮是在 `2653c68` 上重跑后逐项核对，
-  结论一致；但两次之间 compile 路径有 463 行 delta，一致是实测结果而非推定。
+  结论一致；但两次之间 compile 路径新增 463 行（同一口径），一致是实测结果而非推定。
