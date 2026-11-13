@@ -449,6 +449,7 @@ mod tests {
                     out_targets: vec![],
                 })
                 .collect(),
+            ..IrProg::default()
         }
     }
 
@@ -530,6 +531,7 @@ mod tests {
                     fn_sites: vec![],
                 })
                 .collect(),
+            ..IrProg::default()
         }
     }
 

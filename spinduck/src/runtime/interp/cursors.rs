@@ -60,7 +60,7 @@ pub(super) fn fetch(
             let target = targets.first().ok_or_else(|| {
                 EngineError::invariant(47, "FOR-record fetch requires one INTO target")
             })?;
-            assign(env.frame, target, SpinValue::Record(fields))?;
+            assign(env, target, SpinValue::Record(fields))?;
             env.sink.on_event(TraceEvent::Fetch { row: Some(1) });
         }
         Some(r) => {
@@ -82,7 +82,7 @@ pub(super) fn fetch(
                 }
             }
             for (i, target) in targets.iter().enumerate() {
-                assign(env.frame, target, r[i].clone())?;
+                assign(env, target, r[i].clone())?;
             }
             env.sink.on_event(TraceEvent::Fetch { row: Some(1) });
         }

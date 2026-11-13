@@ -348,7 +348,10 @@ fn should_render_reports_and_exit_1_when_chain_has_gaps() {
         text.contains("MISS routine:pkg_a.prc_gone <- pkg_a.prc_gap"),
         "{text}"
     );
-    assert!(text.contains("compile: entries=3"), "{text}");
+    assert!(
+        text.contains("compile: entries=3 missing=2 failed=0 dynamic=0"),
+        "缺件总数须钉死，不能只钉入口数：{text}"
+    );
     assert!(!text.contains("PASS Scenario"), "{text}");
     assert!(!text.contains("== entry"), "{text}");
 }
@@ -449,6 +452,10 @@ fn should_snapshot_manifest_in_home_conf_and_verify_runtime_dir_alone() {
     assert!(
         second.contains("MISS relation:t_missing <- pkg_a.prc_gap"),
         "运行态目录必须复现同一缺件：{second}"
+    );
+    assert!(
+        second.contains("compile: entries=3 missing=2 failed=0 dynamic=0"),
+        "运行态目录须复现同一份完整结论，不能只钉一条缺件：{second}"
     );
     assert!(
         second.contains("(未改写"),

@@ -207,6 +207,8 @@ pub(crate) type CompiledCursorSql = (String, Vec<(String, BindSrc)>, Vec<crate::
 #[derive(Debug, Clone, Default)]
 pub struct IrProg {
     pub code: Vec<IrStmt>,
+    /// 已映射的标量声明（小写变量名 → 类型）。`%ROWTYPE` 与映射表外的类型名不在此。
+    pub var_types: std::collections::BTreeMap<String, crate::types::SpinType>,
 }
 
 impl IrProg {

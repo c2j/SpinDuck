@@ -175,6 +175,7 @@ fn should_collect_routine_refs_from_ir_and_skip_bare_builtins() {
                 }],
             },
         ],
+        ..IrProg::default()
     };
     let got: Vec<String> = routine_refs(&prog).into_iter().collect();
     assert_eq!(got, vec!["pkg_a.fn_c", "pkg_a.prc_b", "pkg_d.fn_e"]);
@@ -190,6 +191,7 @@ fn should_report_bare_expression_calls_as_candidates_not_as_routine_refs() {
             name: "trunc".into(),
             args: vec![],
         })],
+        ..IrProg::default()
     };
     assert!(routine_refs(&prog).is_empty(), "裸名不是例程引用");
     let got: Vec<String> = expr_func_names(&prog).into_iter().collect();
@@ -204,6 +206,7 @@ fn should_report_bare_expression_calls_as_candidates_not_as_routine_refs() {
                 args: vec![],
             }],
         })],
+        ..IrProg::default()
     };
     let got: Vec<String> = expr_func_names(&nested).into_iter().collect();
     assert_eq!(got, vec!["fnc_hidden", "pkg_a.fn_c"], "名字一律小写归一");
@@ -239,6 +242,7 @@ fn should_collect_sql_texts_from_statements_cursors_and_fn_sites() {
                 }],
             },
         ],
+        ..IrProg::default()
     };
     assert_eq!(
         walk(&prog).texts,
@@ -278,6 +282,7 @@ fn should_walk_exception_handler_bodies() {
                 fn_sites: vec![],
             },
         ],
+        ..IrProg::default()
     };
     assert_eq!(
         walk(&prog).texts,
@@ -311,7 +316,7 @@ fn should_exclude_lowering_plan_tables_from_object_refs() {
                     binds: vec![],
                 }],
             }],
-        };
+        ..IrProg::default()};
     let got: Vec<String> = chain_object_refs(&prog)
         .into_iter()
         .map(|r| format!("{:?}:{}", r.kind, r.name))

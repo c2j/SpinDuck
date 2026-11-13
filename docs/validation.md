@@ -4288,27 +4288,141 @@ lib 的 `#[cfg(test)]` 代码**，因此 args 拆分留下的一条未用导入�
   与其新增的 `#[cfg]` 导入闸门无法在该配置下自证编译——AGENTS §8 未把 `--no-default-features`
   列为支持面，故记为观察项，不在本轮修。
 
-## V41. 项目态 compile 以 codeweb 0.9.7 为闭包真源（2026-11-12）
+## V41. VARCHAR 赋值失败复用 BIZ-0111（PR #28 审核）
+
+`main` 上 `coerce()` 的兜底已经返回 `business(111)`，消息是 `cannot coerce …`，
+且没有生产调用方。第一阶段的槽写入在 `assignment_loose = false` 时复用同一码，
+消息固定为 `cannot assign {值} to VARCHAR`。不另开新码：architecture §3.3 与
+调用方已经按 BIZ-0111 发布。
+
+探针是引擎路径
+`catalog::tests::should_reject_numeric_varchar_argument_when_assignment_loose_is_off`：
+`Engine::call` 把 `Int(20260106)` 送进 `VARCHAR2` 形参，断言码为 `BIZ-0111` 且消息
+同时含 `cannot assign` 与 `VARCHAR`。值级直接断言在 `value.rs` 的
+`should_reject_int_into_varchar_when_assignment_loose_is_off`。成功路径不打 lint，
+种子注释 `config/rewrite-rules.toml` 的 `[implicit].assignment_loose` 与此同口径。
+
+## V42. 参数表点查缓存：生产体量参数表上的墙钟与 CPU（2026-11-13）
+
+机制见 architecture §3.5.1 与 `spinduck/src/lookup_cache/`。本节只记实测。
+
+**结论**：同一份库、同一次 `prc_trd_deal_purchase` 调用，热状态下墙钟
+3.62 s → 1.50 s（约 2.4 倍），CPU 11.4 s → 1.47 s（约 7.8 倍）。两侧
+`OUT p_o_succeed = 0`，`dat_trd_repurchase` 的 490 行有序导出逐字节相同。
+
+### 环境
+
+- 机器：本机 apple silicon，2026-11-13。release，`cargo build --release --locked --features cli`。
+- 库：`/tmp/spinduck-perf/volidx.duckdb` 的副本 `/tmp/spinduck-perf/bench.duckdb`
+  （137 MiB）。参数表行数当时为 `par_fund_partner` 47,095、`par_fund_seat`
+  620,630、`par_sys_purchase` 427,436、`par_fund_seat_para` 364,409、
+  `swh_all_kind` 7,026。游标日 `20250715` 且 `scdm = '001'` 的
+  `mid_yjqs_detail` 为 500 行，过程写入 490 行。
+- 入口：`golden/case_corpus_purchase/.spinduck/plan/pkg_split_trade_step3_sh.prc_trd_deal_purchase.toml`，
+  `spinduck call --plan <计划> --db <副本> '20250715' null`。未加
+  `--batch-commit`，计时跑未加 `--trace`。`call --plan` 不重放表 DDL，
+  两侧用的是同一库文件。
+- 对照二进制：重建前的 release 副本 `/tmp/spinduck-perf/spinduck-nocache`
+  （`strings` 中 `lookup_cache` 出现 0 次）。被测二进制为同日重建的
+  `spinduck/target/release/spinduck`（`lookup_cache` 出现 2 次）。
+
+### 计时
+
+`/usr/bin/time -p`，热页缓存下各跑预热一次再计时两次。下表是计时两次的
+`real` / `user`。预热与计时两次同量级（无缓存 3.60 s，有缓存 1.51 s）。
+
+| 侧 | 计时 1 | 计时 2 | 两次均值 |
+|---|---:|---:|---:|
+| 无缓存 | 3.64 s / 11.44 s | 3.61 s / 11.39 s | 3.62 s / 11.42 s |
+| 有缓存 | 1.51 s / 1.48 s | 1.48 s / 1.46 s | 1.50 s / 1.47 s |
+
+同日更早一次无缓存冷跑是 11.37 s 与 11.44 s 墙钟、user 约 21 s。页缓存稳定后
+回到 3.6 s / 11.4 s，与此前同文件名上 3.54 s 墙钟 / 10.81 s CPU 的量级一致。
+稳态对照用热跑，不用那次冷跑。
+
+无缓存的 user 约为墙钟的 3 倍，顺序扫描在并行。有缓存后墙钟与 user 几乎重合，
+重复扫描不再占热路径。
+
+### 产物
+
+查询：
+
+```sql
+SELECT fund_code, seat_code, security_id, purchase_no,
+       cast(purchase_yj AS VARCHAR), cast(purchase_days AS VARCHAR),
+       cast(purchase_money AS VARCHAR)
+FROM dat_trd_repurchase
+WHERE purchase_date = '20250715' AND market_code = '001'
+ORDER BY 1, 2, 3, 4
+```
+
+无缓存导出、有缓存导出、紧接着再跑一遍有缓存的导出，都是 490 行、7 列，
+文件 sha256 都是 `28157fdc973fbea350cc239bfeb2fb09f672b683007212311edde77b534e26d6`。
+
+### 测试
+
+- `lookup_cache::tests::should_keep_select_list_names_on_the_probed_stream`：
+  `SELECT n FROM dat ORDER BY n` 的探测流列名是 `n`，`AS num` 是 `num`。
+  修前该形态被收成 `c0`，真实内核的
+  `should_run_for_loop_over_query_on_real_kernel` 报 `record r has no field n`。
+- `lookup_cache::tests::should_fall_back_when_the_probe_bind_type_differs_from_the_column`：
+  整数列对上字符串绑定 `'1'` 时回退原语句。修前按 Rust 类型比键，
+  `SELECT s INTO v FROM t_form WHERE id = p` 被收成 0 行并抛 `NO_DATA_FOUND`。
+- `cargo test --features cli lookup_cache`：点查缓存用例通过（含两条真实
+  DuckDB 日期区间）。
+- `cargo clippy --offline --all-features -- -D warnings`：通过。
+
+### 不声称
+
+- trace-0105（2,816 行、89.835 s）的文件库不在本机，没有重跑。SQL_EXEC
+  条数也不会下降：构建扫描发生在第一次 `query` 内部，trace 的 `elapsed_us`
+  仍是 0。
+- 剩余约 1.5 s 含逐行 INSERT、默认逐行 COMMIT，以及认不出的
+  `CASE FROM sys_dummy`。`--batch-commit` 仍默认关闭，本轮没有把它打开。
+- 黄金建表脚本里的四条点查索引不在本提交。`call --plan` 不会把它们装进
+  这份已有库，因此它们不是本次数的差异来源。
+
+## V43. 项目态 compile 以 codeweb 0.9.7 为闭包真源（2026-11-12，2026-11-13 在合并头复验）
 
 本轮只补实证。`plan` / `verify` 仍是项目态 `compile` 的别名，子命令没有删除。
 临时目录、`.codeweb/` 和计划文件都没有进仓库，`golden/case_corpus_purchase` 未改。
 
-### V41.1 被测面
+编号说明：本节原稿编为 V41，与 main 上已有的 `V41. VARCHAR 赋值失败复用 BIZ-0111`
+（PR #28）撞号，故改 V43；V42 是参数表点查缓存。全仓对旧编号无交叉引用。
 
-- 二进制：本分支 `f696339` 上 `cargo build --features cli` 的 debug `spinduck`。
-- codeweb：本机安装，`--version` 标准输出为 `codeweb 0.9.7`，退出码 0。产品解析顺序仍是
-  `--codeweb-bin`、`SPINDUCK_CODEWEB`、`PATH`；下面的绝对路径只是这次调用传给旗标的值。
-- 夹具：把 `golden/case_corpus_purchase` 复制到 `/tmp/spinduck-purchase-ev`。`compile` 自己不跑
-  `analyze`。复制件上先在命令外做了一次 `codeweb init` 与一次 `codeweb analyze`，然后：
+### V43.1 被测面
+
+- spinduck：PR #32 合并后的 `main` `2653c68` 上 `cargo build --features cli` 的 debug
+  二进制。原稿写的 `f696339` 是 PR 4 提交的早期孤儿版本，已不在任何分支上、也不是
+  `main` 的祖先；它到 `2653c68` 的 compile 路径 delta 有 463 行（`codeweb/walk.rs` +45、
+  `codeweb/export.rs` +34、`project/mod.rs` +41），正是产出下面这些 MISS 行与计数的代码，
+  所以旧输出不能假定仍成立。本节全部输出是 2026-11-13 在 `2653c68` 上重跑所得。
+- codeweb：`--version` 标准输出为 `codeweb 0.9.7`，退出码 0。本机原安装位置
+  `/Users/c2j/dev/tools_bin/codeweb` 已是断链（`target/` 被清），这次用的是
+  `codeweb__worktrees/fix-duplicate-entry` 的 debug 构建，源码为 `v0.9.7` tag 加一个提交
+  `5f49620`（`fix(graph): collapse duplicate detail and trace callees`）。该提交只改
+  `graph/traverse.rs`、`tui/app.rs` 与 `main.rs` 里 `print_node_detail` 的两行注释；
+  `cmd_export` 在不带 `--filter` 时直接走 `store.graph()` → `export::json::to_json`，
+  不经过 traverse，`export/json.rs` 与 `graph/store.rs` 一行未动，`diff` 命令同样未动。
+  SpinDuck 正是不带 `--filter` 调用（Key Decision 6），故本次 export/diff 面与 v0.9.7 等价。
+  产品解析顺序仍是 `--codeweb-bin`、`SPINDUCK_CODEWEB`、`PATH`；下面的绝对路径只是这次
+  调用传给旗标的值。
+- 夹具：把 `golden/case_corpus_purchase` 复制到 `/tmp/spinduck-purchase-v43`。`compile`
+  自己不跑 `analyze`。复制件上先在命令外做了一次 `codeweb init case_corpus_purchase`
+  （full build：8 文件 → 51 节点、95 边）与一次 `codeweb analyze`（`Up to date. 8 files.`）。
+- **路径必须规范化**：macOS 上 `/tmp` 是 `/private/tmp` 的符号链接。store 里记的是
+  `/private/tmp/...`，若用 `--project /tmp/...` 调 `diff`，8 个文件会被判成
+  `0 modified, 8 added, 8 deleted`，stderr 1232 字节，不满足下面这条契约。改用
+  `/private/tmp/...` 后：
 
 ```text
-$ codeweb diff --project /tmp/spinduck-purchase-ev
-（stdout 空；stderr 恰好为 "Up to date. No changes detected." 加一个换行；退出码 0）
+$ codeweb diff --project /private/tmp/spinduck-purchase-v43
+（stdout 0 字节；stderr 恰好 33 字节 = "Up to date. No changes detected." 加一个换行；退出码 0）
 ```
 
 唯一 `[[entry]]` 仍是 `pkg_split_trade_step3_sh.prc_trd_deal_purchase`。
 
-### V41.2 默认入口到不了样本函数
+### V43.2 默认入口到不了样本函数
 
 `golden/case_corpus_purchase/sql/routines/PKG_SPLIT_TRADE_STEP3_SH.sql` 里，
 `fnc_get_fund_data_mode` 出现在第 104 行，位于 `PROCEDURE prc_trd_hz_byfund` 的游标查询中。
@@ -4317,43 +4431,54 @@ $ codeweb diff --project /tmp/spinduck-purchase-ev
 不是把一条已有调用边漏掉。
 
 ```text
-$ spinduck compile --dir /tmp/spinduck-purchase-ev \
-    --codeweb-bin <本机 codeweb 0.9.7> \
-    --codeweb-project /tmp/spinduck-purchase-ev
+$ spinduck compile --dir /private/tmp/spinduck-purchase-v43 \
+    --codeweb-bin <codeweb 0.9.7> \
+    --codeweb-project /private/tmp/spinduck-purchase-v43
 plan: target=pkg_split_trade_step3_sh.prc_trd_deal_purchase routines=5 tables=1 missing=1
 MISS routine:fnc_com_get_seat_para <- pkg_split_trade_step3_sh.prc_trd_deal_purchase
 compile: entries=1 missing=1 failed=0 dynamic=0
 ```
 
-退出码 1，stderr 为空。计划 `generator = "codeweb 0.9.7"`，`schema_version = 1`，
-`ddl_routines` 5 个文件，`ddl_tables` 只有 `sql/ddl/tables.sql`。`sys_dummy` 出现为
-`REF table:sys_dummy read`，不是 `MISS`。`MISS` 行里没有 `par_oper_close_date`、
-`par_sys_marketrate`、`split_log_info`、`sys_dummy`。
+上面是摘录。完整 stdout 共 27 行，还含首行 `plan: <计划绝对路径> (updated)` 与 23 行 `REF`；
+`REF` 不是缺件，不参与退出码。退出码 1，stderr 0 字节。计划
+`generator = "codeweb 0.9.7"`，`schema_version = 1`，`ddl_routines` 5 个文件，
+`ddl_tables` 只有 `sql/ddl/tables.sql`。`sys_dummy` 出现为
+`REF table:sys_dummy read`（`PKG_SPLIT_TRADE_STEP3_SH.sql:948`），不是 `MISS`。
+`MISS` 行里没有 `par_oper_close_date`、`par_sys_marketrate`、`split_log_info`、`sys_dummy`。
 
-### V41.3 显式入口报出样本名
+### V43.3 显式入口报出样本名
 
 把入口改成定义该标量子查询的过程之后，样本名从调用方报出：
 
 ```text
-$ spinduck compile --dir /tmp/spinduck-purchase-ev \
+$ spinduck compile --dir /private/tmp/spinduck-purchase-v43 \
     --entry pkg_split_trade_step3_sh.prc_trd_hz_byfund \
-    --codeweb-bin <本机 codeweb 0.9.7> \
-    --codeweb-project /tmp/spinduck-purchase-ev
+    --codeweb-bin <codeweb 0.9.7> \
+    --codeweb-project /private/tmp/spinduck-purchase-v43
 plan: target=pkg_split_trade_step3_sh.prc_trd_hz_byfund routines=2 tables=2 missing=11
 MISS routine:fnc_get_fund_data_mode <- pkg_split_trade_step3_sh.prc_trd_hz_byfund
 compile: entries=1 missing=11 failed=0 dynamic=0
 ```
 
-退出码 1，stderr 为空。同一次还有另外 10 行 `MISS`（4 个 `relation:`、6 个其余 `routine:`），
-调用方都是 `pkg_split_trade_step3_sh.prc_trd_hz_byfund`。其中 `relation:par_oper_venture`
-与 V31.5 否掉的 `par_oper_close_date` 不是同一个名字。`sys_dummy` 仍是
-`REF table:sys_dummy read`。计划头同样是 `generator = "codeweb 0.9.7"`、`schema_version = 1`；
-`ddl_tables` 为 `sql/ddl/tables.sql` 与 `sql/ddl/views/view_check_para.sql`。
+同样是摘录（完整 stdout 另有首行计划路径与 29 行 `REF`）。退出码 1，stderr 0 字节。
+11 行 `MISS` = 4 个 `relation:` + 7 个 `routine:`，即除样本名外还有 10 行
+（4 个 `relation:`、6 个其余 `routine:`），调用方都是
+`pkg_split_trade_step3_sh.prc_trd_hz_byfund`。4 个 relation 是 `dat_fund_xw_venture`、
+`jyfy_temp`、`par_oper_venture`、`v_par_bond`；其中 `par_oper_venture` 与 V31.5 否掉的
+`par_oper_close_date` 不是同一个名字。`sys_dummy` 仍是 `REF table:sys_dummy read`
+（`PKG_SPLIT_TRADE_STEP3_SH.sql:208`）。计划头同样是 `generator = "codeweb 0.9.7"`、
+`schema_version = 1`；`ddl_routines` 2 个文件，`ddl_tables` 为 `sql/ddl/tables.sql` 与
+`sql/ddl/views/view_check_para.sql`。
 
-### V41.4 本轮不声称的事
+### V43.4 本轮不声称的事
 
 - 不把默认入口 `prc_trd_deal_purchase` 写成“因 `fnc_get_fund_data_mode` 失败”。那次失败的缺件是
   `routine:fnc_com_get_seat_para`。
 - 不把 `par_oper_close_date`、`par_sys_marketrate`、`split_log_info`、`sys_dummy` 写回缺件。
   V31.5 的改判继续成立。
 - 不删除 `plan` / `verify`，也不去掉裸 `call` 的词法门。别名周期是否结束仍要人确认。
+- 不声称这次用的 codeweb 是 `v0.9.7` tag 的纯净构建。它是 tag 加 `5f49620`，等价性论证
+  限于 SpinDuck 实际调用的 `export --format json`（不带 `--filter`）与 `diff` 两个面，
+  不覆盖 `detail` / `trace` / TUI。
+- 不声称原稿 `f696339` 上的输出与本轮逐字节相同。本轮是在 `2653c68` 上重跑后逐项核对，
+  结论一致；但两次之间 compile 路径有 463 行 delta，一致是实测结果而非推定。

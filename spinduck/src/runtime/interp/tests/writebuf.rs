@@ -263,6 +263,7 @@ fn should_fall_back_to_immediate_exec_for_insert_with_fn_sites_when_batch_commit
             },
             fn_insert,
         ],
+        ..IrProg::default()
     };
     let out = run_with_catalog(
         &prog,
@@ -427,6 +428,7 @@ fn should_flush_partial_batch_when_write_buf_cap_reached() {
         batch: true,
         wbuf: crate::runtime::interp::writebuf::shared_buffer_with_cap(2),
         current_error: None,
+        var_types: &prog.var_types,
     };
     let mut traps = Vec::new();
     let mut pc = 0usize;

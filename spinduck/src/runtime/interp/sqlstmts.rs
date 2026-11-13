@@ -102,7 +102,7 @@ fn write_into(
     }
     for (i, target) in into.iter().enumerate() {
         let v = row.get(i).cloned().unwrap_or(SpinValue::Null);
-        assign(env.frame, target, v)?;
+        assign(env, target, v)?;
     }
     Ok(())
 }
