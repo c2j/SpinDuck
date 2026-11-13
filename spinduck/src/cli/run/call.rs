@@ -368,6 +368,7 @@ mod tests {
         let plan_out = String::from_utf8(plan_buf).unwrap();
         assert_eq!(plan_code, EXIT_OK, "{plan_out}");
         let plan_path = root.join(".spinduck/plan/fnc_nv.toml");
+        assert!(plan_path.is_file(), "plan 落盘缺失");
         let (code, out) = run_str(&["call", "--plan", &plan_path.to_string_lossy(), "5", "null"]);
         assert_eq!(code, EXIT_OK, "{out}");
         assert!(out.contains("RETURN 5"), "{out}");

@@ -119,6 +119,14 @@ fn should_exit_0_and_write_runtime_manifest_for_clean_project() {
     assert!(out.starts_with("manifest: "), "{out}");
     assert!(out.contains("(updated)"), "首次核验须落运行态快照: {out}");
     assert!(
+        out.contains("plan: target=pkg_a.prc_x"),
+        "入口命中须正向钉死，不能只靠旧 PASS 行消失: {out}"
+    );
+    assert!(
+        out.contains("compile: entries=1 missing=0 failed=0 dynamic=0"),
+        "{out}"
+    );
+    assert!(
         !out.contains("PASS "),
         "场景 PASS 行已不在 verify 输出: {out}"
     );

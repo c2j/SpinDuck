@@ -348,7 +348,10 @@ fn should_render_reports_and_exit_1_when_chain_has_gaps() {
         text.contains("MISS routine:pkg_a.prc_gone <- pkg_a.prc_gap"),
         "{text}"
     );
-    assert!(text.contains("compile: entries=3"), "{text}");
+    assert!(
+        text.contains("compile: entries=3 missing=2 failed=0 dynamic=0"),
+        "缺件总数须钉死，不能只钉入口数：{text}"
+    );
     assert!(!text.contains("PASS Scenario"), "{text}");
     assert!(!text.contains("== entry"), "{text}");
 }
