@@ -27,6 +27,8 @@ pub struct Engine {
     /// 纯标量语句记忆化缓存（`ex` 内的 MemoizingExecutor 与本句柄共享），
     /// 每次顶层调用入口清空，给缓存一个确定的内存上界。
     memo: std::rc::Rc<crate::exec::MemoCache>,
+    /// 参数表点查缓存。与 memo 一样在顶层调用入口清空。
+    lookup: std::rc::Rc<crate::lookup_cache::LookupState>,
 }
 
 pub struct CallResultExt {
@@ -38,7 +40,9 @@ impl Engine {
         let mut catalog = RoutineCatalog::new();
         catalog.set_sql_rules(rules.clone());
         let memo = std::rc::Rc::new(crate::exec::MemoCache::default());
+        let lookup = std::rc::Rc::new(crate::lookup_cache::LookupState::default());
         let ex = Box::new(crate::exec::MemoizingExecutor::with_cache(ex, memo.clone()));
+        let ex = Box::new(crate::lookup_cache::LookupExecutor::new(ex, lookup.clone()));
         Self {
             ex,
             rules,
@@ -47,6 +51,7 @@ impl Engine {
             step_budget: crate::runtime::interp::DEFAULT_STEP_BUDGET,
             batch_commit: false,
             memo,
+            lookup,
         }
     }
 
@@ -334,6 +339,7 @@ impl Engine {
         sink: &mut dyn crate::exec::TraceSink,
     ) -> Result<CallResult, EngineError> {
         self.memo.clear();
+        self.lookup.clear();
         let routine = self
             .catalog
             .lookup(name)
