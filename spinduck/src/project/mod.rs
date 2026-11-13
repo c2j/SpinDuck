@@ -42,7 +42,9 @@ pub struct ProjectConfig {
     pub entries: Vec<EntryConfig>,
     /// `[paths].codeweb`（可选）：codeweb 项目根。缺省时向上查找 `codeweb.toml`。
     pub codeweb_dir: Option<PathBuf>,
-    /// 项目根（相对路径基准）
+    /// 从运行态 `conf/spinduck.toml` 载入。`root` 改回 `[runtime].source`，快照不回写。
+    pub loaded_as_runtime: bool,
+    /// 项目根（相对路径基准）。运行态快照载入后这是研发态源目录。
     pub root: PathBuf,
 }
 
@@ -63,9 +65,43 @@ impl ProjectConfig {
             )
         })?;
         let text = read_text(&file)?;
-        Self::from_toml_str(&text, dir)
+        let mut cfg = Self::from_toml_str(&text, dir)?;
+        if is_runtime_snapshot(&file) {
+            cfg.loaded_as_runtime = true;
+            if let Some(source) = runtime_source(&text) {
+                cfg.root = source;
+            }
+        }
+        Ok(cfg)
     }
+}
 
+fn is_runtime_snapshot(file: &Path) -> bool {
+    let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(parent) = file
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+    else {
+        return false;
+    };
+    name == "spinduck.toml" && parent == "conf"
+}
+
+fn runtime_source(text: &str) -> Option<PathBuf> {
+    let value: toml::Value = toml::from_str(text).ok()?;
+    let source = value.get("runtime")?.get("source")?.as_str()?;
+    let path = PathBuf::from(source);
+    if path.as_os_str().is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+impl ProjectConfig {
     /// 从 `start` 逐级向上查找项目根（含 `spinduck.toml` 或运行态快照的目录）。
     ///
     /// 用途：CLI 编译/校验语料目录时继承所在项目的规则与入口声明，
@@ -163,6 +199,7 @@ impl ProjectConfig {
             case_includes,
             entries,
             codeweb_dir,
+            loaded_as_runtime: false,
             root: root.to_path_buf(),
         })
     }

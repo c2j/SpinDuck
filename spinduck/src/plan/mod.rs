@@ -13,8 +13,8 @@ mod section_tests;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use closure::kernel_gaps;
 pub use closure::{build, plan_dir};
+pub(crate) use closure::{kernel_gaps, kernel_gaps_from_refs};
 
 use crate::error::EngineError;
 use std::path::{Path, PathBuf};

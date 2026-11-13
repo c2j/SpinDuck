@@ -1,25 +1,30 @@
-//! `verify` 子命令壳：定位项目 → 链路核验 → 渲染与退出码（§2.1：CLI 只做壳）。
+//! `verify` 子命令壳：定位项目 → 运行态快照 → 项目态 compile（§2.1：CLI 只做壳）。
 //!
-//! 核验逻辑全在 `crate::verify`；本文件只负责项目定位、逐行渲染与退出码。
+//! 不再调用 `verify::verify_project`。场景 PASS/SKIP 不在这条输出里。
 
-use crate::cli::run::{EXIT_FAIL, EXIT_OK};
 use crate::error::EngineError;
+use crate::plan::codeweb::CodewebExport;
 use crate::project::ProjectConfig;
-use crate::verify::{EntryReport, Status};
 use std::io::Write;
 use std::path::Path;
 
 /// `spinduck verify [项目目录]`：目录缺省为当前工作目录。
-pub fn verify_cmd(path: Option<&Path>, out: &mut dyn Write) -> Result<i32, EngineError> {
+///
+/// 保留快照同步与项目定位。链路与场景渲染改走项目态 compile（全部 `[[entry]]`）。
+pub fn verify_cmd(
+    path: Option<&Path>,
+    export: &impl CodewebExport,
+    out: &mut dyn Write,
+) -> Result<i32, EngineError> {
     let start = match path {
         Some(p) => p.to_path_buf(),
         None => std::env::current_dir().map_err(|e| EngineError::env(12, format!("cwd: {e}")))?,
     };
     let project = locate(&start)?;
-    // 先核验后落快照：核验没跑通就写运行态，等于声称了一个未被证明的可调用面
-    let reports = verify_project(&project)?;
+    // 没有入口就还不写快照：运行态不能声称一个没被点名的可调用面
+    let entries = crate::cli::run::project_entries(&project)?;
     sync_manifest(&project, out)?;
-    render(&reports, out)
+    crate::cli::run::compile_with_export(&project, &entries, None, export, out)
 }
 
 /// 运行态快照同步（§11.1 `conf/`）。
@@ -27,6 +32,16 @@ pub fn verify_cmd(path: Option<&Path>, out: &mut dyn Write) -> Result<i32, Engin
 /// 只在研发态目录（含手写 `spinduck.toml`）写入：从运行态目录执行时不回写，
 /// 快照的来源标注因此始终指向真源，"漂移由下一次 verify 判读"的口径才不会断。
 fn sync_manifest(project: &ProjectConfig, out: &mut dyn Write) -> Result<(), EngineError> {
+    if project.loaded_as_runtime {
+        let path = project.home_dir.join("conf").join("spinduck.toml");
+        writeln!(
+            out,
+            "manifest: {} (未改写：本目录即运行态快照)",
+            path.display()
+        )
+        .map_err(io_err)?;
+        return Ok(());
+    }
     let line = if project.root.join("spinduck.toml").is_file() {
         let s = crate::verify::sync_runtime_manifest(project)?;
         format!(
@@ -60,53 +75,6 @@ pub(crate) fn locate(start: &Path) -> Result<ProjectConfig, EngineError> {
             ),
         )
     })
-}
-
-#[cfg(feature = "native")]
-fn verify_project(project: &ProjectConfig) -> Result<Vec<EntryReport>, EngineError> {
-    crate::verify::verify_project(project)
-}
-
-#[cfg(not(feature = "native"))]
-fn verify_project(_project: &ProjectConfig) -> Result<Vec<EntryReport>, EngineError> {
-    Err(EngineError::env(
-        12,
-        "verify 需要 feature `native`（链路核验要把语料部署进内核）".to_string(),
-    ))
-}
-
-fn render(reports: &[EntryReport], out: &mut dyn Write) -> Result<i32, EngineError> {
-    let mut checks = 0usize;
-    let mut failed = 0usize;
-    let mut skipped = 0usize;
-    for r in reports {
-        writeln!(out, "== entry {}", r.entry).map_err(io_err)?;
-        for c in &r.checks {
-            checks += 1;
-            let mark = match c.status {
-                Status::Pass => "PASS",
-                Status::Fail => {
-                    failed += 1;
-                    "FAIL"
-                }
-                Status::Skip => {
-                    skipped += 1;
-                    "SKIP"
-                }
-            };
-            writeln!(out, "  {mark} {:?} {} — {}", c.kind, c.object, c.detail).map_err(io_err)?;
-        }
-    }
-    writeln!(
-        out,
-        "verify: entries={} checks={} failed={} skipped={}",
-        reports.len(),
-        checks,
-        failed,
-        skipped
-    )
-    .map_err(io_err)?;
-    Ok(if failed == 0 { EXIT_OK } else { EXIT_FAIL })
 }
 
 fn io_err(e: std::io::Error) -> EngineError {

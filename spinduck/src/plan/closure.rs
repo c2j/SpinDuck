@@ -1,83 +1,39 @@
 //! 闭包求值（design §6.1 / R3）：目标例程 → 源文件清单 + 链路对象清单 + 缺件表。
 //!
-//! 全程只做编译（`NoopExecutor`），不下内核：闭包描述的是**静态**引用关系，
-//! "内核里此刻有没有这张表"是 `deploy`/`verify` 下一步要证明的事，不在这里猜。
-//! 抽取口径一律复用链路核验的纯函数（`crate::verify::chain`），避免计划与核验两套真相。
+//! `build` 只走一次 codeweb 导出。词法 BFS 只留给旧计划与裸 `call` 的内核缺件门。
 
 use crate::catalog::CompiledRoutine;
-use crate::cli::{read_source_strict, NoopExecutor};
+use crate::cli::read_source_strict;
 use crate::engine::Engine;
 use crate::error::EngineError;
-use crate::plan::{MissingObject, RunPlan, SCHEMA_VERSION};
+use crate::plan::codeweb::{plans_from_export, CodewebExport};
+use crate::plan::{MissingObject, PlanRef, RunPlan};
 use crate::project::ProjectConfig;
-use crate::rules::RuleRegistry;
 use crate::verify::{
-    chain_object_refs, expr_func_names, is_object_name, normalize, routine_refs, sql_object_refs,
-    tokens, ObjectKind, ObjectRef, Tok,
+    chain_object_refs, expr_func_names, is_object_name, normalize, routine_refs, tokens,
+    ObjectKind, ObjectRef, Tok,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-/// 从目标例程出发求闭包并落成计划。
+/// 从目标例程出发求闭包并落成计划。一次导出，一个入口。
 ///
-/// `schema` 只透传进计划，不参与名字归一，也不参与 `deploy` 下发（对象一律进内核默认
-/// 目录 `main`，见 architecture §13.6）：链路抽取的归一名是"截尾两段"，与内核 catalog 的
-/// `schema.name` 同口径。
+/// `schema` 只写入计划：整段 `trim` + ASCII 小写，不经 `normalize`（不截段）。
+/// 导出失败即返回，不回退词法闭包。
 pub fn build(
     project: &ProjectConfig,
     target: &str,
     schema: Option<String>,
+    export: &impl CodewebExport,
 ) -> Result<RunPlan, EngineError> {
-    let (eng, routine_file) = register_routines(project)?;
-    let ddl_index = ddl_index(project)?;
-
-    let target = normalize(target.trim()).to_ascii_lowercase();
-    let entry = eng.catalog.lookup(&target).ok_or_else(|| {
-        EngineError::business(
-            150,
-            format!(
-                "计划目标例程 '{target}' 未在项目例程源中登记（检查 sql/routines 与 [[entry]]）"
-            ),
-        )
-    })?;
-
-    let mut ddl_tables: BTreeSet<String> = BTreeSet::new();
-    // 静态参照面：项目里**声明**过该对象即算满足，并把声明它的 DDL 文件收进部署清单
-    let (seen, missing) = walk_chain(&eng, entry, |kind, name, _| {
-        let id = object_identity(kind, name);
-        match ddl_file_for(&ddl_index, &id) {
-            Some(file) => {
-                ddl_tables.insert(file);
-                true
-            }
-            None => engine_provided(&id),
-        }
-    });
-
-    // 源文件按集合归并：一个文件常声明多个闭包成员，去重排序后才是文件清单
-    let mut routine_sources: BTreeSet<String> = BTreeSet::new();
-    for name in &seen {
-        if let Some(file) = routine_file.get(name) {
-            routine_sources.insert(file.clone());
-        }
-    }
-    expand_view_bodies(&mut ddl_tables, &view_sources(project)?, &ddl_index);
-    Ok(RunPlan {
-        target,
-        generator: generator(),
-        project_dir: project_dir_text(project),
-        schema: schema.map(|s| normalize(&s).to_ascii_lowercase()),
-        ddl_routines: routine_sources.into_iter().collect(),
-        ddl_tables: ddl_tables.into_iter().collect(),
-        materialize: Vec::new(),
-        writeback: Vec::new(),
-        refs: Vec::new(),
-        dynamic: Vec::new(),
-        missing: missing.into_iter().collect(),
-    })
+    let entry = target.to_string();
+    let mut plans = plans_from_export(project, std::slice::from_ref(&entry), schema, export)?;
+    plans
+        .pop()
+        .ok_or_else(|| EngineError::invariant(30, "单入口没有产出计划"))
 }
 
-/// 链路 BFS 的**唯一**一份实现（design D5：`plan` 与 `call` 必须同一条链、同一套归属）。
+/// 旧计划与裸 `call` 的词法 BFS。`build` 不再调用它。
 ///
 /// `on_object(kind, name, from)` 回答"该对象此刻算不算已满足"：`plan` 侧查项目 DDL 声明
 /// （顺便把文件收进清单，返回 true），`call` 侧查内核此刻的对象目录。判否的对象进缺件表，
@@ -161,7 +117,41 @@ pub(crate) fn kernel_gaps(
     Some((name, missing.into_iter().collect()))
 }
 
-/// 内核目录查名：全名精确优先，其次尾段（口径同 [`ddl_file_for`] 与 `verify::run::present`）。
+/// `--plan` 且 `generator` 以 `codeweb ` 开头时的缺件门。不调用 [`walk_chain`]。
+///
+/// 只把 `table` / `view` / `sequence` 的 `[[ref]]`（含 `role=type`）变成
+/// `relation:` / `sequence:` 再问 [`kernel_has`]。`[[dynamic]]` 与 `kind=routine` 不进这道门。
+/// 目标例程未登记返回 `None`，留给 `Engine::call` 的 `BIZ-0150`。
+pub(crate) fn kernel_gaps_from_refs(
+    eng: &Engine,
+    target: &str,
+    objects: &BTreeSet<ObjectRef>,
+    refs: &[PlanRef],
+) -> Option<(String, Vec<MissingObject>)> {
+    let entry = eng.catalog.lookup(target)?;
+    let name = entry.name.to_ascii_lowercase();
+    let mut missing: BTreeSet<MissingObject> = BTreeSet::new();
+    for r in refs {
+        let Some(id) = ref_object_id(&r.kind, &r.object) else {
+            continue;
+        };
+        if !kernel_has(objects, &id) {
+            missing.insert(gap(id, &r.from));
+        }
+    }
+    Some((name, missing.into_iter().collect()))
+}
+
+fn ref_object_id(kind: &str, object: &str) -> Option<String> {
+    let prefix = match kind {
+        "table" | "view" => "relation",
+        "sequence" => "sequence",
+        _ => return None,
+    };
+    Some(format!("{prefix}:{object}"))
+}
+
+/// 内核目录查名：全名精确优先，其次尾段（口径同 `verify::run::present`）。
 ///
 /// 语料写 `bigfund.t_a`、内核登记的是 `main.t_a`，两侧都截尾比对；尾段歧义取第一个，
 /// 与内核侧核验同样的近似度，不开第二套判定。
@@ -183,59 +173,9 @@ fn kernel_has(objects: &BTreeSet<ObjectRef>, id: &str) -> bool {
     })
 }
 
-/// 视图体的基表补全：计划里出现的视图文件，其视图体引用的表/序列也要进部署清单。
-///
-/// 为什么算闭包缺陷：下发顺序是"表 → 视图"，视图体引用的表没进清单，内核建视图就失败，
-/// `deploy_view` 于是静默退化成 `SELECT 1` 占位视图——对象在、列不在，读到该视图列的
-/// 语句在内核里报 Binder Error（真题实测）。
-/// 只补**有 DDL 文件**的引用：查不到声明的名字（`dual`、外部同义词）不据此报缺件，
-/// 维持"由下发期降级处理"的现状——否则一个语料外的别名就能把整份计划判红。
-/// 视图套视图沿队列继续展开，`insert` 的去重即终止条件（自引用与环都不转圈）。
-fn expand_view_bodies(
-    files: &mut BTreeSet<String>,
-    views: &BTreeMap<String, String>,
-    index: &BTreeMap<String, String>,
-) {
-    let mut queue: VecDeque<String> = files
-        .iter()
-        .filter(|f| views.contains_key(f.as_str()))
-        .cloned()
-        .collect();
-    while let Some(file) = queue.pop_front() {
-        let Some(text) = views.get(&file) else {
-            continue;
-        };
-        for o in sql_object_refs(text) {
-            let Some(dep) = ddl_file_for(index, &object_identity(o.kind, &o.name)) else {
-                continue;
-            };
-            if files.insert(dep.clone()) && views.contains_key(&dep) {
-                queue.push_back(dep);
-            }
-        }
-    }
-}
-
-/// 视图源文件 → 文本：只有 `sql/ddl/views/` 下有"体"可展开，表/序列 DDL 没有。
-fn view_sources(project: &ProjectConfig) -> Result<BTreeMap<String, String>, EngineError> {
-    let mut out = BTreeMap::new();
-    for f in project.view_files()? {
-        out.insert(rel_text(&project.root, &f), read_source_strict(&f)?);
-    }
-    Ok(out)
-}
-
 /// 计划文件的固定落盘子目录：`<home>/plan/`（§11.1 运行态分区，`home` 缺省 `.spinduck`）。
 pub fn plan_dir(project: &ProjectConfig) -> PathBuf {
     project.home_dir.join("plan")
-}
-
-/// 产出方标注：版本 + schema 口径，红时先怀疑两边不一致。
-fn generator() -> String {
-    format!(
-        "spinduck {} (plan schema {SCHEMA_VERSION})",
-        crate::version()
-    )
 }
 
 /// `project_dir`：项目根相对**计划文件所在目录**的路径（`../..` 形态，不含绝对路径）。
@@ -281,73 +221,13 @@ fn resolve_routine<'e>(callee: &str, pkg: &str, eng: &'e Engine) -> Option<&'e C
         .or_else(|| eng.catalog.lookup(callee))
 }
 
-/// DDL 索引查名：全名精确优先，其次尾段。
-///
-/// 口径同 `verify::run::present`：语料写 `bigfund.t_a`，DDL 声明的是裸名 `t_a`。
-/// 尾段歧义（两个 schema 同名表）取索引里的第一个，与内核侧核验同样的近似度。
-fn ddl_file_for(index: &BTreeMap<String, String>, id: &str) -> Option<String> {
-    if let Some(file) = index.get(id) {
-        return Some(file.clone());
-    }
-    let (prefix, name) = id.split_once(':')?;
-    let tail = name.rsplit('.').next()?;
-    if tail == name {
-        return None;
-    }
-    index.get(&format!("{prefix}:{tail}")).cloned()
-}
-
-/// 缺件与 DDL 索引共用的对象标识：`relation:<归一名>` / `sequence:<归一名>`。
+/// 缺件与词法门共用的对象标识：`relation:<归一名>` / `sequence:<归一名>`。
 fn object_identity(kind: ObjectKind, name: &str) -> String {
     let prefix = match kind {
         ObjectKind::Relation => "relation",
         ObjectKind::Sequence => "sequence",
     };
     format!("{prefix}:{name}")
-}
-
-/// 登记全部例程源（含桩包），返回引擎与"例程名 → 相对源文件"。
-///
-/// 名字归属由逐文件登记前后的目录差集得出，不解析 `CREATE` 语句文本；
-/// 同名跨文件重建（`CREATE OR REPLACE`）按后登记者归属。
-fn register_routines(
-    project: &ProjectConfig,
-) -> Result<(Engine, BTreeMap<String, String>), EngineError> {
-    let mut eng = Engine::new(Box::new(NoopExecutor), RuleRegistry::default());
-    let mut file_of: BTreeMap<String, String> = BTreeMap::new();
-    let files: Vec<PathBuf> = project
-        .routine_files()?
-        .into_iter()
-        .chain(project.stub_files()?)
-        .collect();
-    for f in files {
-        let before = eng.catalog.routine_names();
-        let text = read_source_strict(&f)?;
-        eng.register(&text)?;
-        let rel = rel_text(&project.root, &f);
-        for name in eng.catalog.routine_names().difference(&before) {
-            file_of.insert(name.clone(), rel.clone());
-        }
-    }
-    Ok((eng, file_of))
-}
-
-/// DDL 索引：`relation:`/`sequence:` 标识 → 声明它的相对文件。
-fn ddl_index(project: &ProjectConfig) -> Result<BTreeMap<String, String>, EngineError> {
-    let mut out = BTreeMap::new();
-    let files: Vec<PathBuf> = project
-        .ddl_files()?
-        .into_iter()
-        .chain(project.view_files()?)
-        .collect();
-    for f in files {
-        let text = read_source_strict(&f)?;
-        let rel = rel_text(&project.root, &f);
-        for (kind, name) in ddl_declared(&text) {
-            out.insert(object_identity(kind, &name), rel.clone());
-        }
-    }
-    Ok(out)
 }
 
 /// 归一名（无 `relation:` / `sequence:` 前缀）→ 相对 DDL 路径。
@@ -444,4 +324,58 @@ fn rel_text(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kernel_gaps_from_refs;
+    use crate::cli::NoopExecutor;
+    use crate::engine::Engine;
+    use crate::plan::PlanRef;
+    use crate::rules::RuleRegistry;
+    use crate::verify::{ObjectKind, ObjectRef};
+    use std::collections::BTreeSet;
+
+    fn row(object: &str, kind: &str, role: &str) -> PlanRef {
+        PlanRef {
+            object: object.to_string(),
+            kind: kind.to_string(),
+            role: role.to_string(),
+            from: "prc_main".to_string(),
+            at: "sql/r.sql:1".to_string(),
+        }
+    }
+
+    #[test]
+    fn should_check_codeweb_refs_against_the_kernel_without_reading_the_body() {
+        // 过程体是 NULL。词法门看不到任何表；这道门只看 ref。
+        let mut eng = Engine::new(Box::new(NoopExecutor), RuleRegistry::default());
+        eng.register("CREATE OR REPLACE PROCEDURE prc_main IS BEGIN NULL; END;")
+            .unwrap();
+        let objects = BTreeSet::from([
+            ObjectRef {
+                kind: ObjectKind::Relation,
+                name: "main.t_present".to_string(),
+            },
+            ObjectRef {
+                kind: ObjectKind::Relation,
+                name: "main.v_anchor".to_string(),
+            },
+        ]);
+        let refs = vec![
+            row("t_absent", "table", "read"),
+            row("t_present", "table", "write"),
+            row("v_anchor", "view", "type"),
+            row("seq_absent", "sequence", "read"),
+            row("prc_other", "routine", "call"),
+        ];
+        let (name, gaps) = kernel_gaps_from_refs(&eng, "prc_main", &objects, &refs).unwrap();
+        assert_eq!(name, "prc_main");
+        assert_eq!(
+            gaps.iter().map(|g| g.object.as_str()).collect::<Vec<_>>(),
+            vec!["relation:t_absent", "sequence:seq_absent"]
+        );
+        assert!(gaps.iter().all(|g| g.from == "prc_main"));
+        assert!(kernel_gaps_from_refs(&eng, "prc_missing", &objects, &refs).is_none());
+    }
 }

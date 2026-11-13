@@ -1,5 +1,6 @@
 //! `[[ref]]` / `[[dynamic]]` 的往返与排序。空段省略与旧计划全文在 `tests.rs`。
 
+use super::tests::{abs_file, cw, plan_for, write_rel, PROJECT_TOML};
 use super::{PlanDynamic, PlanRef, RunPlan, SCHEMA_VERSION};
 
 fn gap_plan() -> RunPlan {
@@ -161,4 +162,97 @@ fn ref_toml(kind: &str, role: &str) -> String {
          project_dir = \".\"\n\n[[ref]]\nobject = \"o\"\nkind = \"{kind}\"\n\
          role = \"{role}\"\nfrom = \"f\"\nat = \"a.sql:0\"\n"
     )
+}
+
+#[test]
+fn should_not_report_an_engine_provided_table_as_missing() {
+    // `sys_dummy` 由 `deploy_schema` 无条件建（`verify/deploy.rs`），项目里没有它的 DDL 文件。
+    // 静态闭包若按"无声明即缺件"处理，每个用它做常量取数的过程都会报假缺件；
+    // 它也没有源文件，所以既不进 ddl_tables 也不进 missing。
+    let tmp = tempfile::tempdir().unwrap();
+    write_rel(tmp.path(), "spinduck.toml", PROJECT_TOML);
+    write_rel(
+        tmp.path(),
+        "sql/routines/10_main.sql",
+        "CREATE OR REPLACE PROCEDURE prc_main IS
+  v_n INT;
+BEGIN
+  SELECT COUNT(*) INTO v_n FROM sys_dummy;
+END;
+/
+",
+    );
+    write_rel(
+        tmp.path(),
+        "sql/ddl/tables.sql",
+        "CREATE TABLE t_a (id INT);\n",
+    );
+    let root = tmp.path();
+    let file = abs_file(&root.join("sql/routines/10_main.sql"));
+    let plan = plan_for(
+        root,
+        "prc_main",
+        cw(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_main", "file": file},
+                {"id": 2, "type": "table", "name": "sys_dummy"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "table_access", "modes": ["read"], "file": file, "line": 1}
+            ]),
+        ),
+    );
+    assert!(
+        plan.missing.is_empty(),
+        "内核自建对象不该落缺件: {:?}",
+        plan.missing
+    );
+    assert!(
+        plan.ddl_tables.is_empty(),
+        "没有源文件的对象不该进部署清单: {:?}",
+        plan.ddl_tables
+    );
+}
+
+#[test]
+fn should_match_a_schema_qualified_reference_against_a_bare_ddl_name() {
+    // 语料写 `bigfund.t_a`、DDL 声明裸名 `t_a`：与 verify 的 present() 同口径（先全名后尾段）。
+    let tmp = tempfile::tempdir().unwrap();
+    write_rel(tmp.path(), "spinduck.toml", PROJECT_TOML);
+    write_rel(
+        tmp.path(),
+        "sql/routines/10_main.sql",
+        "CREATE OR REPLACE PROCEDURE prc_main IS
+BEGIN
+  DELETE FROM bigfund.t_a WHERE id = 1;
+END;
+/
+",
+    );
+    write_rel(
+        tmp.path(),
+        "sql/ddl/tables.sql",
+        "CREATE TABLE t_a (id INT);\n",
+    );
+    let root = tmp.path();
+    let file = abs_file(&root.join("sql/routines/10_main.sql"));
+    let plan = plan_for(
+        root,
+        "prc_main",
+        cw(
+            serde_json::json!([
+                {"id": 1, "type": "procedure", "name": "prc_main", "file": file},
+                {"id": 2, "type": "table", "schema": "bigfund", "name": "t_a"}
+            ]),
+            serde_json::json!([
+                {"source": 1, "target": 2, "type": "table_access", "modes": ["write"], "file": file, "line": 1}
+            ]),
+        ),
+    );
+    assert!(
+        plan.missing.is_empty(),
+        "尾段命中即不是缺件: {:?}",
+        plan.missing
+    );
+    assert_eq!(plan.ddl_tables, vec!["sql/ddl/tables.sql".to_string()]);
 }

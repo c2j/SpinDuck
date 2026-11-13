@@ -6,6 +6,7 @@
 use crate::cli::run::{EXIT_FAIL, EXIT_OK};
 use crate::cli::verify::locate;
 use crate::error::EngineError;
+use crate::plan::codeweb::CodewebExport;
 use crate::plan::{self, RunPlan};
 use crate::project::ProjectConfig;
 use std::io::Write;
@@ -22,6 +23,7 @@ pub fn plan_cmd(
     dir: Option<&Path>,
     routine: &str,
     schema: Option<String>,
+    export: &impl CodewebExport,
     out: &mut dyn Write,
 ) -> Result<i32, EngineError> {
     let start = match dir {
@@ -29,7 +31,7 @@ pub fn plan_cmd(
         None => std::env::current_dir().map_err(|e| EngineError::env(12, format!("cwd: {e}")))?,
     };
     let project = locate(&start)?;
-    let plan = plan::build(&project, routine, schema)?;
+    let plan = plan::build(&project, routine, schema, export)?;
     // 落盘名取自目录命中后的例程全名：解析器给出的名字不含路径分隔符，无需再清洗
     let written = write_plan(&project, &plan)?;
     render(&plan, &written, out)

@@ -179,6 +179,71 @@ pub(crate) fn write_bytes(dir: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
     p
 }
 
+/// 进程内 `plan` / `verify` 的导出夹具。生产二进制不读这份 JSON，也不新增旗标。
+struct JsonExport(Vec<u8>);
+
+impl spinduck_core::plan::codeweb::CodewebExport for JsonExport {
+    fn export_json(
+        &self,
+        _project: &Path,
+    ) -> Result<Box<dyn std::io::Read + Send>, spinduck_core::EngineError> {
+        Ok(Box::new(std::io::Cursor::new(self.0.clone())))
+    }
+}
+
+fn export_of(json: &serde_json::Value) -> JsonExport {
+    JsonExport(serde_json::to_vec(json).expect("夹具 JSON"))
+}
+
+fn finish_cmd(buf: Vec<u8>, result: Result<i32, spinduck_core::EngineError>) -> (i32, String) {
+    match result {
+        Ok(code) => (code, String::from_utf8(buf).expect("stdout utf-8")),
+        Err(e) => {
+            let mut buf = buf;
+            use std::io::Write;
+            let _ = writeln!(buf, "[{}] {}", e.code, e.message);
+            (EXIT_FAIL, String::from_utf8(buf).expect("stdout utf-8"))
+        }
+    }
+}
+
+/// 注入假导出跑 `plan`。调用前会放一个空 `codeweb.toml`，让项目根解析停在本目录。
+pub(crate) fn plan_in_process(
+    dir: &Path,
+    routine: &str,
+    schema: Option<&str>,
+    json: serde_json::Value,
+) -> (i32, String) {
+    let _ = std::fs::write(dir.join("codeweb.toml"), b"");
+    let export = export_of(&json);
+    let mut buf = Vec::new();
+    let result = spinduck_core::cli::plan_cmd(
+        Some(dir),
+        routine,
+        schema.map(str::to_string),
+        &export,
+        &mut buf,
+    );
+    finish_cmd(buf, result)
+}
+
+/// 注入假导出跑 `verify`。
+pub(crate) fn verify_in_process(dir: &Path, json: serde_json::Value) -> (i32, String) {
+    let _ = std::fs::write(dir.join("codeweb.toml"), b"");
+    let export = export_of(&json);
+    let mut buf = Vec::new();
+    let result = spinduck_core::cli::verify_cmd(Some(dir), &export, &mut buf);
+    finish_cmd(buf, result)
+}
+
+pub(crate) fn abs_file(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+pub(crate) fn cw_graph(nodes: serde_json::Value, edges: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"nodes": nodes, "edges": edges})
+}
+
 /// 编码对照判据的字面量（design §3.5 的 A0a 实验主角：交付件里 `WHERE status = '已成交'`
 /// 这一类形态）。两份源码只有它的字节表示不同。
 pub(crate) const FLAG_LITERAL: &str = "已成交";

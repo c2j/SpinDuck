@@ -11,7 +11,7 @@ mod manifest;
 mod run;
 
 pub use chain::{chain_object_refs, routine_refs, ObjectKind, ObjectRef};
-pub(crate) use chain::{expr_func_names, is_object_name, normalize, sql_object_refs, tokens, Tok};
+pub(crate) use chain::{expr_func_names, is_object_name, normalize, tokens, Tok};
 pub use deploy::{
     clamp_sequence_bounds, deploy_project, deploy_routines, deploy_schema, deploy_seeds,
     drop_cache_option, sql_units, strip_defaults, verify_project, ENGINE_PROVIDED_TABLES,

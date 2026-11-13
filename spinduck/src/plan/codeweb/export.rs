@@ -63,6 +63,18 @@ impl CodewebExport for CommandExport {
     }
 }
 
+/// `plan` / `verify` 的生产导出。二进制在 `export_json` 里解析，定位项目失败不必先有 codeweb。
+pub(crate) struct AmbientCommandExport;
+
+impl CodewebExport for AmbientCommandExport {
+    fn export_json(&self, project: &Path) -> Result<Box<dyn Read + Send>, EngineError> {
+        let from_env = std::env::var("SPINDUCK_CODEWEB").ok();
+        let path_var = std::env::var_os("PATH");
+        let bin = resolve_codeweb_bin(None, from_env.as_deref(), path_var.as_deref())?;
+        CommandExport::new(bin).export_json(project)
+    }
+}
+
 fn existing_bin(path: &Path) -> Result<PathBuf, EngineError> {
     if path.is_file() {
         Ok(path.to_path_buf())
