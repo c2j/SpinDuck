@@ -108,5 +108,5 @@ required-features = ["cli"]
 
 [patch."https://github.com/c2j/ogsql-parser"]
 # 把 codeweb 的 git ogsql-parser 重定向到本仓库子模块：进程内只能有一份
-# parser（AGENTS §1 版本锁定；codeweb v0.9.9 与子模块同为 v0.11.0 = 13d9baa）。
+# parser（AGENTS §1 版本锁定；codeweb v0.9.10 与子模块同为 v0.11.0 = 13d9baa）。
 ogsql-parser = { path = "../lib/ogsql-parser" }

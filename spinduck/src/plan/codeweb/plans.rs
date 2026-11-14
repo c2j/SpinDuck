@@ -22,7 +22,8 @@ pub fn plans_from_source(
     source: &impl CodewebSource,
 ) -> Result<Vec<RunPlan>, EngineError> {
     let codeweb_root = codeweb_project_root(project)?;
-    let graph = source.load_graph(&codeweb_root).map_err(export_failure)?;
+    // 诊断文案由取图实现给出（docs/embeded-codeweb.md §4.4），此处不二次包裹。
+    let graph = source.load_graph(&codeweb_root)?;
     let generator = source.generator();
     let ddl = ddl_name_index(project)?;
     let schema = lowered_schema(schema);
@@ -59,16 +60,6 @@ pub(crate) fn codeweb_project_root(project: &ProjectConfig) -> Result<PathBuf, E
                 format!("未找到 codeweb 项目: {}", project.root.display()),
             )
         })
-}
-
-fn export_failure(err: EngineError) -> EngineError {
-    if err.message.starts_with("codeweb export 失败:") {
-        return err;
-    }
-    if let Some(at) = err.message.find("codeweb export 失败:") {
-        return EngineError::env(30, err.message[at..].to_string());
-    }
-    EngineError::env(30, format!("codeweb export 失败: {}", err.message))
 }
 
 fn lowered_schema(schema: Option<String>) -> Option<String> {

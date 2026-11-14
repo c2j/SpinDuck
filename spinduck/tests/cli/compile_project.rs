@@ -144,7 +144,7 @@ fn should_fail_with_env_30_when_codeweb_toml_is_absent() {
 }
 
 #[test]
-fn should_fail_with_env_30_when_the_entry_is_absent_from_the_graph() {
+fn should_fail_with_biz_150_when_the_entry_is_absent_from_the_graph() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let (dir, cw) = project(root, "pkg_a.prc_x");

@@ -8,6 +8,7 @@
 mod parse;
 mod plans;
 mod source;
+mod thin;
 mod walk;
 
 use std::path::Path;

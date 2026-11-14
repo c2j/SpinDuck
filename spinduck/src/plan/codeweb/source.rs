@@ -33,8 +33,9 @@ impl CodewebSource for JsonCodewebSource {
     }
 
     fn load_graph(&self, _codeweb_root: &Path) -> Result<CodewebGraph, EngineError> {
+        // 解析器已给出 `codeweb JSON 解析失败:` 前缀的诊断，直接透出
+        // （不再拼已退役的 "export" 字眼，链路见 plans_from_source）。
         parse_codeweb_json(&String::from_utf8_lossy(&self.json))
-            .map_err(|e| EngineError::env(30, format!("codeweb export 失败: {}", e.message)))
     }
 }
 
@@ -67,7 +68,7 @@ impl CodewebSource for EmbeddedCodewebSource {
             proj.analyze().map_err(map_codeweb_err)?;
         }
         let thin = proj.export_thin_graph().map_err(map_codeweb_err)?;
-        Ok(super::parse::from_thin_graph(thin))
+        Ok(super::thin::from_thin_graph(thin))
     }
 }
 
@@ -172,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn should_map_bad_json_to_env_30_with_the_export_failure_prefix() {
+    fn should_map_bad_json_to_env_30_with_the_parse_error_prefix() {
         let src = JsonCodewebSource {
             generator: "codeweb 0.9.9".to_string(),
             json: b"{ not json".to_vec(),
@@ -180,8 +181,8 @@ mod tests {
         let err = src.load_graph(std::path::Path::new("/proj")).unwrap_err();
         assert_eq!(err.code.to_string(), "ENV-0030");
         assert!(
-            err.message.starts_with("codeweb export 失败:"),
-            "plans.rs::export_failure 的匹配前缀依赖它: {}",
+            err.message.starts_with("codeweb JSON 解析失败:"),
+            "解析器自己的诊断前缀必须原样透出（不再二次包裹）: {}",
             err.message
         );
     }
