@@ -1,52 +1,106 @@
 //! 项目态 `compile`：一次 codeweb 导出，按入口落计划，再对闭包源做 IR 体检。
 //!
-//! 不调用 `plan::closure::build`。二进制在导出之前解析；找不到就返回，不退回词法闭包。
+//! 不调用 `plan::closure::build`。二进制在导出里惰性解析（项目发现失败不必先有
+//! codeweb）；找不到就返回，不退回词法闭包。
 
 use super::compile::rules_for_paths;
 use super::{io_err, EXIT_FAIL, EXIT_OK};
-use crate::cli::plan::{write_plan, PlanWrite};
-use crate::cli::verify::locate;
 use crate::cli::{read_source_strict, NoopExecutor};
 use crate::engine::Engine;
 use crate::error::EngineError;
-use crate::plan::codeweb::{plans_from_export, resolve_codeweb_bin, CodewebExport, CommandExport};
-use crate::plan::RunPlan;
-use crate::project::{qualified_routine, ProjectConfig};
+use crate::plan::codeweb::{plans_from_export, AmbientCommandExport, CodewebExport};
+use crate::plan::{write_plan, PlanWrite, RunPlan};
+use crate::project::ProjectConfig;
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// `compile` 的项目旗标。路径模式不走这里。
-pub(crate) struct ProjectCompile {
+pub struct ProjectCompile {
     pub dir: Option<PathBuf>,
     pub schema: Option<String>,
     pub entries: Vec<String>,
     pub codeweb_bin: Option<PathBuf>,
     pub codeweb_project: Option<PathBuf>,
+    /// 同步运行态快照（`conf/spinduck.runtime.toml`），默认关。
+    pub sync_manifest: bool,
 }
 
 pub(super) fn compile_project_cmd(
     opts: ProjectCompile,
     out: &mut dyn Write,
 ) -> Result<i32, EngineError> {
+    let (project, entries) = locate_project(&opts)?;
+    if opts.sync_manifest {
+        sync_manifest_line(&project, out)?;
+    }
+    let export = AmbientCommandExport {
+        flag: opts.codeweb_bin,
+    };
+    compile_with_export(&project, &entries, opts.schema, &export, out)
+}
+
+/// 注入导出的项目态 compile：测试不启动 codeweb，其余口径与真二进制一致。
+pub fn compile_project_with_export(
+    opts: ProjectCompile,
+    export: &impl CodewebExport,
+    out: &mut dyn Write,
+) -> Result<i32, EngineError> {
+    let (project, entries) = locate_project(&opts)?;
+    if opts.sync_manifest {
+        sync_manifest_line(&project, out)?;
+    }
+    compile_with_export(&project, &entries, opts.schema, export, out)
+}
+
+fn locate_project(opts: &ProjectCompile) -> Result<(ProjectConfig, Vec<String>), EngineError> {
     let start = match &opts.dir {
         Some(path) => path.clone(),
         None => std::env::current_dir().map_err(|e| EngineError::env(12, format!("cwd: {e}")))?,
     };
-    let mut project = locate(&start)?;
-    if let Some(dir) = opts.codeweb_project {
-        project.codeweb_dir = Some(dir);
+    let mut project = ProjectConfig::locate(&start)?;
+    if let Some(dir) = &opts.codeweb_project {
+        project.codeweb_dir = Some(dir.clone());
     }
     let entries = resolve_entries(&project, &opts.entries)?;
-    let env = std::env::var("SPINDUCK_CODEWEB").ok();
-    let path_var = std::env::var_os("PATH");
-    let bin = resolve_codeweb_bin(
-        opts.codeweb_bin.as_deref(),
-        env.as_deref(),
-        path_var.as_deref(),
-    )?;
-    let export = CommandExport::new(bin);
-    compile_with_export(&project, &entries, opts.schema, &export, out)
+    Ok((project, entries))
+}
+
+/// 运行态快照同步（§11.1 `conf/`），渲染为 `manifest:` 行。
+///
+/// 只在研发态目录（含手写 `spinduck.toml`）写入：从运行态目录执行时不回写，
+/// 快照的来源标注因此始终指向真源。没有 `[[entry]]` 声明就不写快照：
+/// 运行态不能声称一个没被点名的可调用面。
+pub(crate) fn sync_manifest_line(
+    project: &ProjectConfig,
+    out: &mut dyn Write,
+) -> Result<(), EngineError> {
+    if project.loaded_as_runtime || !project.root.join("spinduck.toml").is_file() {
+        let path = project
+            .home_dir
+            .join("conf")
+            .join(crate::project::SNAPSHOT_FILE);
+        writeln!(
+            out,
+            "manifest: {} (未改写：本目录即运行态快照)",
+            path.display()
+        )
+        .map_err(io_err)?;
+        return Ok(());
+    }
+    project_entries(project)?;
+    let s = crate::project::sync_runtime_manifest(project)?;
+    writeln!(
+        out,
+        "manifest: {} ({})",
+        s.path.display(),
+        if s.changed { "updated" } else { "unchanged" }
+    )
+    .map_err(io_err)?;
+    if let Some(legacy) = s.removed_legacy {
+        writeln!(out, "manifest: 已删除旧名快照 {}", legacy.display()).map_err(io_err)?;
+    }
+    Ok(())
 }
 
 /// 计划落盘与退出码。`export` 由调用方注入，测试不启动 codeweb。
@@ -82,7 +136,7 @@ pub(crate) fn compile_with_export(
     })
 }
 
-/// 项目声明里的全部入口。`verify` 与不带 `--entry` 的项目态 compile 共用。
+/// 项目声明里的全部入口。`--sync-manifest` 与不带 `--entry` 的项目态 compile 共用。
 pub(crate) fn project_entries(project: &ProjectConfig) -> Result<Vec<String>, EngineError> {
     resolve_entries(project, &[])
 }
@@ -92,10 +146,12 @@ fn resolve_entries(
     explicit: &[String],
 ) -> Result<Vec<String>, EngineError> {
     if !explicit.is_empty() {
-        return explicit
+        // 显式 --entry 只做归一（trim + 小写，与 walk.rs 的入口处理同口径）：
+        // 独立例程用裸名，包内例程用全名。包限定校验只属于 [[entry]] 声明。
+        return Ok(explicit
             .iter()
-            .map(|name| qualified_routine(name))
-            .collect();
+            .map(|name| name.trim().to_ascii_lowercase())
+            .collect());
     }
     if project.entries.is_empty() {
         return Err(EngineError::env(

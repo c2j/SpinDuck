@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 /// `plan` 的静态闭包也读同一份清单——按"无声明即缺件"处理会对每个使用者报假缺件。
 pub const ENGINE_PROVIDED_TABLES: &[&str] = &["sys_dummy"];
 
-/// 部署并核验整个项目（`verify` 子命令的唯一入口，需 `native`）。
+/// 部署并核验整个项目（库级入口，需 `native`；issue #38 删除 `verify` 子命令后
+/// 仅链路守护测试消费）。
 ///
 /// 顺序：表 DDL → 占位视图 → `sys_dummy`（A 模式单行表等价物）→ 桩包与例程注册
 /// → 数据集种子；随后按 `[[entry]]` 逐条核验链路，并对声明了入口的用例执行场景。

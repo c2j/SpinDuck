@@ -10,13 +10,14 @@
 mod case;
 mod entry;
 mod fs;
+mod manifest;
 
 #[cfg(test)]
 mod tests;
 
 pub use case::{AssertKind, CaseAssert, CaseConfig, CaseKind, Scenario};
-pub(crate) use entry::qualified_routine;
 pub use entry::EntryConfig;
+pub use manifest::{manifest_text, sync_runtime_manifest, ManifestSync, SNAPSHOT_FILE};
 
 use crate::error::EngineError;
 use crate::project::fs::{cfg_err, list_dir_suffix, read_text, sql_files};
@@ -42,7 +43,7 @@ pub struct ProjectConfig {
     pub entries: Vec<EntryConfig>,
     /// `[paths].codeweb`（可选）：codeweb 项目根。缺省时向上查找 `codeweb.toml`。
     pub codeweb_dir: Option<PathBuf>,
-    /// 从运行态 `conf/spinduck.toml` 载入。`root` 改回 `[runtime].source`，快照不回写。
+    /// 从运行态 `conf/spinduck.runtime.toml` 载入。`root` 改回 `[runtime].source`，快照不回写。
     pub loaded_as_runtime: bool,
     /// 项目根（相对路径基准）。运行态快照载入后这是研发态源目录。
     pub root: PathBuf,
@@ -52,14 +53,14 @@ impl ProjectConfig {
     /// 读取项目声明；相对路径以项目根为基准解析。
     ///
     /// 声明文件两处（§11.1/§12.1）：研发态 `<dir>/spinduck.toml`（手写真源，优先）、
-    /// 运行态 `<dir>/conf/spinduck.toml`（`verify` 生成的快照，路径已绝对化，
-    /// 故运行态目录自带可加载声明）。
+    /// 运行态 `<dir>/conf/spinduck.runtime.toml`（`compile --sync-manifest` 生成的快照，
+    /// 路径已绝对化，故运行态目录自带可加载声明）。
     pub fn load(dir: &Path) -> Result<Self, EngineError> {
         let file = fs::project_file(dir).ok_or_else(|| {
             EngineError::env(
                 30,
                 format!(
-                    "未在 {} 找到项目声明（spinduck.toml 或 conf/spinduck.toml）",
+                    "未在 {} 找到项目声明（spinduck.toml 或 conf/spinduck.runtime.toml）",
                     dir.display()
                 ),
             )
@@ -74,6 +75,24 @@ impl ProjectConfig {
         }
         Ok(cfg)
     }
+
+    /// 项目定位：目录本身有声明文件（研发态或运行态快照）直接用，否则向上查找。
+    ///
+    /// 跨命令共用（compile / deploy / call）：错误消息不绑定子命令名（F7）。
+    pub fn locate(start: &Path) -> Result<Self, EngineError> {
+        if fs::project_file(start).is_some() {
+            return Self::load(start);
+        }
+        Self::discover(start).ok_or_else(|| {
+            EngineError::env(
+                30,
+                format!(
+                    "未在 {} 及其上级目录找到项目声明（spinduck.toml 或 conf/spinduck.runtime.toml）",
+                    start.display()
+                ),
+            )
+        })
+    }
 }
 
 fn is_runtime_snapshot(file: &Path) -> bool {
@@ -87,7 +106,7 @@ fn is_runtime_snapshot(file: &Path) -> bool {
     else {
         return false;
     };
-    name == "spinduck.toml" && parent == "conf"
+    name == manifest::SNAPSHOT_FILE && parent == "conf"
 }
 
 fn runtime_source(text: &str) -> Option<PathBuf> {

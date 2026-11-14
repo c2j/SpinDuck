@@ -103,10 +103,11 @@ export SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
 # rules: … target_duckdb=1.5.5 probe_duckdb=1.5.5 match=true
 ```
 
-### 5. 链路校验（verify）
+### 5. 项目态编译与运行计划（compile --dir）
 
-在项目根（含 `spinduck.toml`）声明本项目对外可调用的存过全名，`verify` 从这些入口
-出发沿调用链逐对象核验——语料是否齐全、链路对象是否真在核内、声明的场景能否执行：
+在项目根（含 `spinduck.toml`）声明本项目对外可调用的存过全名，项目态 `compile`
+从这些入口（或显式 `--entry`，独立例程可用裸名）出发，经 codeweb 0.9.7 图求闭包、
+按入口落盘运行计划，并对闭包源做 IR 体检——缺件即红，不留"生成了但跑不通"的中间态：
 
 ```toml
 # spinduck.toml —— 示意声明形状：[[entry]] 允许多条，全名必须是 package.procedure 形态
@@ -119,36 +120,31 @@ routine = "pkg_qq_split.prc_general_deal_inst_sh_buy"
 kind = "function"
 ```
 
-下面是**在库项目的真实输出**（clone 后即可复现；考题项目不在库内，不能当例子）：
+下面是输出形态（契约示意，逐字口径见 `tests/cli/compile_entry.rs` 与
+`compile_manifest.rs`；复现需 codeweb 0.9.7 在 PATH 或经 `--codeweb-bin` 给出）：
 
 ```bash
-./target/debug/spinduck verify ../golden/case_corpus_purchase
-# manifest: ../golden/case_corpus_purchase/.spinduck/conf/spinduck.toml (updated|unchanged)
-# == entry pkg_split_trade_step3_sh.prc_trd_deal_purchase
-#   PASS Entry pkg_split_trade_step3_sh.prc_trd_deal_purchase — 入口在例程目录命中且种类一致
-#   PASS Routine pkg_split_trade_log.inst_log — 由 pkg_split_trade_step3_sh.prc_trd_deal_purchase 调用，已登记
-#   PASS Relation dat_trd_repurchase — 内核存在（main.dat_trd_repurchase）
-#   PASS Relation mid_yjqs_detail — 内核存在（main.mid_yjqs_detail）
-#   PASS Relation par_fund_partner — 内核存在（main.par_fund_partner）
-#   PASS Relation par_fund_seat — 内核存在（main.par_fund_seat）
-#   PASS Relation par_fund_seat_para — 内核存在（main.par_fund_seat_para）
-#   PASS Relation par_sys_purchase — 内核存在（main.par_sys_purchase）
-#   PASS Relation swh_all_kind — 内核存在（main.swh_all_kind）
-#   PASS Relation sys_dummy — 内核存在（main.sys_dummy）
-#   SKIP Scenario - — 无场景声明该入口；2 条 [[case.assert]] 已由用例 corpus_purchase 覆盖该例程，本命令不执行断言（断言层见 cases_native）
-# verify: entries=1 checks=11 failed=0 skipped=1
+./target/debug/spinduck compile --dir ../golden/case_corpus_purchase --sync-manifest
+# manifest: ../golden/case_corpus_purchase/.spinduck/conf/spinduck.runtime.toml (updated|unchanged)
+# plan: …/.spinduck/plan/pkg_split_trade_step3_sh.prc_trd_deal_purchase.toml (updated|unchanged)
+# plan: target=pkg_split_trade_step3_sh.prc_trd_deal_purchase routines=3 tables=1 missing=0
+# compile: entries=1 missing=0 failed=0 dynamic=0
 ```
 
-链路断点/缺表时长这样（示意片段，非某项目完整输出）：
+缺件/体检失败时长这样（示意片段）：
 
 ```
-#   FAIL Routine pkg_x.prc_gone — 链路断点：被 pkg_y.prc_z 调用，但语料中未登记
-#   FAIL Relation t_missing — 链路 SQL 引用，内核目录无此对象（缺 DDL/桩，或部署顺序不符）
+# MISS relation:t_missing <- prc_x          # 缺件归属到引用它的例程，同时写进计划 [[missing]]
+# FAIL sql/routines/bad.sql  [ENG-0022] …   # IR 体检失败，在 compile: 摘要之后逐条列出
+# compile: entries=1 missing=1 failed=0 dynamic=0
 ```
 
-出现 `FAIL` 退出码为 1。核验同时把可调用面与资产绝对路径写成运行态快照
-`<home>/conf/spinduck.toml`（唯一写入者 = `verify`，禁止手改）；把该目录单独交给
-运行侧即可脱离研发态目录复现同一核验结论。
+出现 `MISS`/`FAIL` 退出码为 1。`--sync-manifest` 同时把可调用面与资产绝对路径写成
+运行态快照 `<home>/conf/spinduck.runtime.toml`（唯一写入者 = `compile --sync-manifest`，
+禁止手改；写入成功后删除旧名快照 `conf/spinduck.toml`）；把该目录单独交给运行侧
+即可脱离研发态目录复现同一结论。旧 `plan`/`verify` 子命令已删除（issue #38）：
+计划面收敛到 `compile --entry`，链路核验（`verify_project`）保留为库级守护测试
+（`tests/verify_chain.rs`），不再是 CLI 契约。
 
 ## 能力矩阵
 
@@ -175,7 +171,7 @@ kind = "function"
 | 合并 COMMIT 开关（`Engine::batch_commit`） | ✅ 默认 OFF（§3.5 逐行即时提交不变）；ON 时过程内 INSERT 攒批合并 + COMMIT 吞并 + 出口统一提交（100k 稳态 938s→316s；CLI `call --batch-commit`，大业务配 `--step-budget` 放大预算；失败行数据级跳过的偏差点见 writebuf.rs，validation V26.3/V26.7） |
 | 用例原生断言层（无容器） | ✅ `[[case.assert]]`（`rows`/`call`/`out`/`error` 四维，进程内内核逐值比对）+ 语料形态覆盖门禁 `config/corpus_forms.toml`（`architecture.md` §12.1、validation V21） |
 | 审计日志 `call --trace`（text/jsonl、四级阶梯、sqlid + sidecar 全文反查）与 `explain --trace` 关联视图 | ✅ 逐条全量、逐行 flush、缺件即红不留文件（validation V39；§11.2「落地口径」列明 `elapsed_us`/`step`/轮转未落地） |
-| 入口链路核验 `spinduck verify` | ✅ `[[entry]]` 全名声明 → 例程断点 / 表·序列缺失 / 场景可执行逐条判定 + 运行态 `conf/` 快照（`architecture.md` §11.1、§12.1） |
+| 项目态编译 `spinduck compile --dir` | ✅ codeweb 图闭包 → 按入口落盘运行计划 + IR 体检 + 缺件即红；`--sync-manifest` 写运行态 `conf/spinduck.runtime.toml` 快照（`architecture.md` §11.1、§12.1；旧 `plan`/`verify` 子命令已删除，issue #38） |
 | `RETURN NEXT` / `PIPE ROW` / 集合类型（嵌套表/数组）/ 带参游标 | ⛔ 待做（语料仅 3+1 例；`RETURN NEXT`/`PIPE ROW`/集合元素**赋值**/`OPEN c(args)` 编译期显式拒绝，集合元素**读取**不属拒绝面，见「已知限制」） |
 | 例程目录持久化 | ✅ 内核内 `spinduck_routines` 表存源 DDL 文本，`reload_catalog` 按当前规则重放编译（`--db` 落盘后跨进程恢复） |
 

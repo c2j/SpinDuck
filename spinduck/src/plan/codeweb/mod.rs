@@ -10,8 +10,8 @@ mod walk;
 
 use std::path::Path;
 
+pub(crate) use export::AmbientCommandExport;
 pub use export::CodewebExport;
-pub(crate) use export::{resolve_codeweb_bin, AmbientCommandExport, CommandExport};
 pub use parse::{parse_codeweb_json, parse_codeweb_reader, CodewebGraph};
 pub use plans::plans_from_export;
 pub use walk::closure_from_graph;

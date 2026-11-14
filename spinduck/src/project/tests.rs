@@ -168,8 +168,8 @@ fn should_discover_project_root_from_nested_path() {
 fn should_load_runtime_snapshot_from_conf_and_prefer_dev_file() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    // 运行态目录：只有 `verify` 生成的 conf/ 快照，没有手写 spinduck.toml
-    write(root, "conf/spinduck.toml", PROJ);
+    // 运行态目录：只有 `compile --sync-manifest` 生成的 conf/ 快照，没有手写 spinduck.toml
+    write(root, "conf/spinduck.runtime.toml", PROJ);
     assert_eq!(
         ProjectConfig::load(root).unwrap().name,
         "demo-procs",
@@ -196,6 +196,25 @@ fn should_return_none_when_no_project_file_above() {
     let orphan = tmp.path().join("corpus/routines");
     std::fs::create_dir_all(&orphan).unwrap();
     assert!(ProjectConfig::discover(&orphan).is_none());
+}
+
+#[test]
+fn should_locate_error_mention_only_project_declaration() {
+    // F7：locate 跨命令共用，错误消息不得绑定具体子命令名
+    let e = ProjectConfig::locate(std::path::Path::new("/nonexistent/spinduck-f7")).unwrap_err();
+    let msg = e.message;
+    assert!(msg.contains("项目声明"), "{msg}");
+    assert!(!msg.contains("verify"), "消息不得带 verify 字样: {msg}");
+}
+
+#[test]
+fn should_not_recognize_legacy_snapshot_name() {
+    // issue #38：彻底换名，不留旧名 fallback——旧名快照不再是项目声明
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "conf/spinduck.toml", PROJ);
+    assert!(ProjectConfig::load(root).is_err());
+    assert!(ProjectConfig::discover(root).is_none());
 }
 
 #[test]

@@ -64,18 +64,42 @@ fn should_exit_2_when_call_gets_neither_a_routine_nor_a_plan() {
 }
 
 #[test]
-fn should_mention_project_compile_without_dropping_plan_verify_wording() {
+fn should_mention_project_compile_without_plan_verify_lines() {
+    // issue #38：plan/verify 子命令已删除，usage 不得再列；`call --plan` 是计划文件
+    // 旗标而非子命令，必须保留（按行首断言，避免子串误伤）。
     let (code, out, err) = cli(&["help"]);
     assert_eq!(code, EXIT_OK, "{out}");
     assert_eq!(err, "");
     assert!(out.contains("compile [--dir <项目目录>]"), "{out}");
     assert!(out.contains("--codeweb-bin"), "{out}");
+    assert!(out.contains("--sync-manifest"), "{out}");
+    for line in out.lines() {
+        let head = line.trim_start();
+        assert!(
+            !head.starts_with("plan ") && !head.starts_with("verify "),
+            "usage 不得再列已删除的子命令: {line}"
+        );
+    }
     assert!(
-        out.contains("本发布周期的兼容入口，由项目态 compile 替换"),
-        "{out}"
+        out.lines()
+            .any(|l| l.trim_start().starts_with("call --plan")),
+        "call --plan 行必须保留: {out}"
     );
-    assert!(out.contains("call --plan"), "{out}");
     assert!(out.contains("内置种子 < 项目发现 < --rules"), "{out}");
+}
+
+#[test]
+fn should_reject_plan_and_verify_as_unknown_subcommands() {
+    // issue #38：旧命令名不留墓碑提示，直接落未知子命令路径（退出码 2 + ENG-0010）。
+    for name in ["plan", "verify"] {
+        let (code, out, err) = cli(&[name]);
+        assert_eq!(code, EXIT_USAGE, "{name}: {out}");
+        assert!(
+            out.starts_with(&format!("[ENG-0010] usage: unknown subcommand {name}\n")),
+            "{name}: {out}"
+        );
+        assert_eq!(err, "", "{name}: 全部输出走 stdout");
+    }
 }
 
 #[test]

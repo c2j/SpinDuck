@@ -18,9 +18,11 @@
 //! V37（审核应修：`compare --key` 的键列两侧都校验——参照侧改名/换位两条契约）。
 //!
 //! 按职责分子模块（AGENTS §3：单文件 ≤500 行），本文件只放共享夹具与接缝：
-//! `usage`（版本/用法/输出通道）、`compile`、`rules_explain`、`call`（含编码两代判定与
-//! 三形态）、`verify`、`plan`（运行计划落盘与缺件红）、`deploy`（按计划建落盘库、
-//! 缺件即拒）、`query`（一条 SQL → 结果快照落盘）、`compare`（两份快照逐值裁决）、
+//! `usage`（版本/用法/输出通道）、`compile`、`compile_project`（真 codeweb 桩）、
+//! `compile_manifest`（`--sync-manifest`）、`compile_entry`（计划面：闭包/缺件/字节复现）、
+//! `compile_surface`（项目定位与编码判定）、`rules_explain`、`call`（含编码两代判定与
+//! 三形态）、`deploy`（按计划建落盘库、缺件即拒）、`query`（一条 SQL → 结果快照落盘）、
+//! `compare`（两份快照逐值裁决）、
 //! `gauss_boundary`（`materialize`/`sync` 的门禁）、`trace`（`call --trace` 的审计
 //! 落盘：text/jsonl 两形态、级别阶梯、缺件即不产文件、日志已存在即拒绝覆盖）。
 //!
@@ -39,14 +41,18 @@ mod call;
 mod compare;
 #[path = "cli/compile.rs"]
 mod compile;
+#[path = "cli/compile_entry.rs"]
+mod compile_entry;
+#[path = "cli/compile_manifest.rs"]
+mod compile_manifest;
 #[path = "cli/compile_project.rs"]
 mod compile_project;
+#[path = "cli/compile_surface.rs"]
+mod compile_surface;
 #[path = "cli/deploy.rs"]
 mod deploy;
 #[path = "cli/gauss_boundary.rs"]
 mod gauss_boundary;
-#[path = "cli/plan.rs"]
-mod plan;
 #[path = "cli/query.rs"]
 mod query;
 #[path = "cli/rules_explain.rs"]
@@ -55,8 +61,6 @@ mod rules_explain;
 mod trace;
 #[path = "cli/usage.rs"]
 mod usage;
-#[path = "cli/verify.rs"]
-mod verify;
 
 pub(crate) const EXIT_OK: i32 = 0;
 pub(crate) const EXIT_FAIL: i32 = 1;
@@ -207,32 +211,27 @@ fn finish_cmd(buf: Vec<u8>, result: Result<i32, spinduck_core::EngineError>) -> 
     }
 }
 
-/// 注入假导出跑 `plan`。调用前会放一个空 `codeweb.toml`，让项目根解析停在本目录。
-pub(crate) fn plan_in_process(
+/// 注入假导出跑项目态 `compile`（可带 `--sync-manifest`）。
+/// 调用前会放一个空 `codeweb.toml`，让项目根解析停在本目录。
+pub(crate) fn compile_project_in_process(
     dir: &Path,
-    routine: &str,
+    entries: &[&str],
     schema: Option<&str>,
+    sync_manifest: bool,
     json: serde_json::Value,
 ) -> (i32, String) {
     let _ = std::fs::write(dir.join("codeweb.toml"), b"");
     let export = export_of(&json);
+    let opts = spinduck_core::cli::ProjectCompile {
+        dir: Some(dir.to_path_buf()),
+        schema: schema.map(str::to_string),
+        entries: entries.iter().map(|s| s.to_string()).collect(),
+        codeweb_bin: None,
+        codeweb_project: None,
+        sync_manifest,
+    };
     let mut buf = Vec::new();
-    let result = spinduck_core::cli::plan_cmd(
-        Some(dir),
-        routine,
-        schema.map(str::to_string),
-        &export,
-        &mut buf,
-    );
-    finish_cmd(buf, result)
-}
-
-/// 注入假导出跑 `verify`。
-pub(crate) fn verify_in_process(dir: &Path, json: serde_json::Value) -> (i32, String) {
-    let _ = std::fs::write(dir.join("codeweb.toml"), b"");
-    let export = export_of(&json);
-    let mut buf = Vec::new();
-    let result = spinduck_core::cli::verify_cmd(Some(dir), &export, &mut buf);
+    let result = spinduck_core::cli::compile_project_with_export(opts, &export, &mut buf);
     finish_cmd(buf, result)
 }
 

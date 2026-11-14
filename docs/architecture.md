@@ -628,7 +628,7 @@ $SPINDUCK_HOME/                       # 根路径，配置项 home；默认 ./�
 ├── conf/
 │   ├── engine.toml                   # 引擎配置（threads/memory/limits/路径/日志策略）
 │   ├── rewrite-rules.toml            # 规则文件（种子或项目覆盖副本）
-│   ├── spinduck.toml                 # 项目声明的运行态快照（`verify` 生成，见 §12.1）
+│   ├── spinduck.runtime.toml         # 项目声明的运行态快照（`compile --sync-manifest` 生成，见 §12.1）
 │   └── conf.d/                       # 项目级覆盖片段（后加载覆盖先加载）
 ├── data/                             # 内核托管：数据库文件（每库一文件，多租户=多文件，§10.2）
 │   ├── <dbname>.duckdb               #   例程 catalog 亦在其内（§3.6）
@@ -959,16 +959,23 @@ include = ["cases/*.case.toml"]
 extensions = []                     # 静态链接清单（离线部署 §10.6）
 audit_retention_days = 180          # 部署参数预览（engine.toml 生成模板）
 
-[[entry]]                           # 本项目对外可调用面（0..n 条；verify 的核验起点）
+[[entry]]                           # 本项目对外可调用面（0..n 条；项目态 compile 的闭包起点）
 routine = "pkg_x.prc_y"             # 必须 package.procedure 全名（归一小写）
 kind = "procedure"                  # function | procedure（缺省 procedure）
 ```
 
-**入口声明与链路核验（`spinduck verify [项目目录]`）**
+**入口声明与项目态编译（`spinduck compile --dir <项目目录>`）**
 
 接入验收的口径是"从对外可调用面出发，链路上每个对象都能落地"，而不是"文件都编
 译得过"。因此项目声明显式承载 `[[entry]]`（全名必须带包限定——裸过程名在语料里
-可能同名不同包，链路无法唯一定位），`verify` 据此展开四类核验：
+可能同名不同包，链路无法唯一定位；显式 `--entry` 不受此限，独立例程可用裸名）。
+项目态 compile 一次 codeweb 导出，按入口各求一份闭包、落盘运行计划（§13.5），
+再对闭包源做 IR 体检：缺件（`MISS`）或体检失败（`FAIL`）即退出码 1。
+旧 `plan`/`verify` 子命令已删除（issue #38）：计划面收敛到 `compile --entry`，
+快照同步收敛到 `compile --sync-manifest`。
+
+链路核验的四类判定口径保留为**库级**能力（`verify_project`，守护测试
+`tests/verify_chain.rs` 与用例断言层消费，不再是 CLI 契约）：
 
 | 核验项 | 判定 | 失败含义 |
 |---|---|---|
@@ -1004,15 +1011,17 @@ SQL 侧对象名取自改写前的静态扫描（`FROM`/`JOIN`/`UPDATE`/`INSERT 
 两者读同一份 `sql/` 与 `cases/datasets/`，互不嵌套：断言层不是黄金层的子集，黄金层的
 结论也不作为断言层的期望来源。该划分的实测理由见 validation.md V21.12。
 
-**运行态项目快照（§11.1 `conf/spinduck.toml`）**：`verify` 同时把"运行态所需的
-那部分声明"（项目名/内核版本 + 可调用面 + 资产绝对路径 + `[runtime]` 来源标注）
-写入 `<home>/conf/spinduck.toml`。设计取舍：
+**运行态项目快照（§11.1 `conf/spinduck.runtime.toml`）**：`compile --sync-manifest`
+把"运行态所需的那部分声明"（项目名/内核版本 + 可调用面 + 资产绝对路径 + `[runtime]`
+来源标注）写入 `<home>/conf/spinduck.runtime.toml`。设计取舍：
 
-1. **单一写入者**——快照由 `verify` 生成，手写真源仍是项目根的 `spinduck.toml`；
-   快照带 `source`/`generated_by`，内容与真源漂移由下一次 `verify` 报告（`updated`）。
+1. **单一写入者**——快照由 `compile --sync-manifest` 生成（默认关），手写真源仍是
+   项目根的 `spinduck.toml`；快照带 `source`/`generated_by`，内容与真源漂移由下一次
+   同步报告（`updated`）。写入成功后删除旧名快照 `conf/spinduck.toml`（issue #38
+   彻底换名，不留读取 fallback）。
 2. **运行态目录自足**——资产路径已绝对化，故 `ProjectConfig::load` 认
-   `<dir>/spinduck.toml` 与 `<dir>/conf/spinduck.toml` 两处（前者优先），把
-   `.spinduck/` 单独交给运行侧也能复现同一核验结论；此时**不回写**快照，来源
+   `<dir>/spinduck.toml` 与 `<dir>/conf/spinduck.runtime.toml` 两处（前者优先），把
+   `.spinduck/` 单独交给运行侧也能复现同一结论；此时**不回写**快照，来源
    标注始终指向研发态真源。
 3. **不复制资产**——快照只是指针集合（源码/规则/用例仍在研发态目录），避免
    "运行态有一份过期语料"这类二次漂移。
@@ -1025,12 +1034,13 @@ SQL 侧对象名取自改写前的静态扫描（`FROM`/`JOIN`/`UPDATE`/`INSERT 
 `EntryConfig`）已实现本结构的声明识别（路径解析、用例枚举、数据集/基线定位、
 物化清单、`[[entry]]` 可调用面）；黄金对比 harness（`spinduck/tests/common`）是其
 首个消费者，`golden/case_*` 全部按本布局组织。已入库项目里 `golden/case_corpus_purchase`
-声明 1 条入口（包限定过程），`spinduck verify ../golden/case_corpus_purchase` 在**进程内
-内核**上即可跑通全链（`entries=1 checks=11 failed=0`，无需容器）；其余三个项目的主角是
-独立例程（`prc_agg_fund` / `fnc_get_stock_kind` / `fnc_com_get_min_tax`，无包限定），按
-"入口必须全名定位"的口径不声明 `[[entry]]`，其正确性由 `[[case.assert]]` 断言层
-兜住。`spinduck verify`（`spinduck_core::verify`：链路抽取 `chain` / 部署 `deploy` /
-逐对象判定 `run` / 运行态快照 `manifest`）已落地，
+声明 1 条入口（包限定过程）。旧 `spinduck verify` 曾在**进程内内核**上跑通全链
+（`entries=1 checks=11 failed=0`，无需容器）；issue #38 删除该子命令后，这条链保留为
+库级守护测试（`tests/verify_chain.rs`），CLI 面由项目态 compile 承接（需 codeweb 0.9.7）。
+其余三个项目的主角是独立例程（`prc_agg_fund` / `fnc_get_stock_kind` / `fnc_com_get_min_tax`，
+无包限定），按"入口必须全名定位"的口径不声明 `[[entry]]`，其正确性由 `[[case.assert]]`
+断言层兜住。`spinduck_core::verify`（链路抽取 `chain` / 部署 `deploy` / 逐对象判定 `run`）
+与 `spinduck_core::project::manifest`（运行态快照）已落地，
 `spinduck init/load/register/golden` 命令面属后续里程碑（P1/P3）。
 
 ---
@@ -1096,7 +1106,7 @@ materialize(物化快照+时间戳)
 
 ### 13.5 运行计划（`run-plan`，design §6.1 的落地 schema）
 
-`plan` 子命令把"一次闭包求值所需的全部对象与文件"落成计划文件，落在
+项目态 `compile` 把"一次闭包求值所需的全部对象与文件"落成计划文件，落在
 `<home>/plan/<target>.toml`（§11.1 运行态分区）；计划是**数据**不是执行结果，
 由 `deploy`（A2-3）消费。产出方 `spinduck/src/plan/`。
 
@@ -1128,8 +1138,8 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
 | 文件清单 | 一个文件常声明多个闭包成员，故按**文件**去重排序；路径一律相对项目根、`/` 分隔 |
 | 可复现 | 渲染前排序去重、段序与字段序固定、不写日期、不写绝对路径 → 同输入逐字节相同；落盘只在内容变化时写，摘要行末词随之为 `updated` 或 `unchanged` |
 | 退出码 | `[[missing]]` 空 = 0；非空 = 1（照抄缺件行 `MISS <object> <- <from>`）；目标例程未登记 = 1（`BIZ-0150`）且不落盘；参数用法错 = 2 |
-| 静态边界 | 词法扫描不建 AST：注释与字符串字面量不参与，改写后形态（`nextval('seq')`、空格拆开的限定名）按原文单独取一次。计划描述静态引用，"此刻内核里有没有这张表"归 `deploy`/`verify` |
-| 逗号连表的关系名 | `FROM a t, b s` 是语料主形态，而 `FROM` 只出现一次：`sql_object_refs` 取到第一个关系名后走 `comma_join_refs` 把逗号连表里其余名字一并取回（别名只有在紧跟逗号时才当别名，`FROM a, b` 的 `b` 是表不是别名）。括号子查询（`FROM (SELECT 1) x, t_b b`）由 `subquery_tail_refs` 越过整对括号后继续取连表；带括号的调用形态（`unnest(…)`、`read_csv(…)`）与非对象名一律不收——宁少不误。这条刀口同时决定 `verify` 的链路判定与 `plan` 的部署清单（两者共用同一函数），改它等于同时改两个面 |
+| 静态边界 | 词法扫描不建 AST：注释与字符串字面量不参与，改写后形态（`nextval('seq')`、空格拆开的限定名）按原文单独取一次。计划描述静态引用，"此刻内核里有没有这张表"归 `deploy`/链路核验 |
+| 逗号连表的关系名 | `FROM a t, b s` 是语料主形态，而 `FROM` 只出现一次：`sql_object_refs` 取到第一个关系名后走 `comma_join_refs` 把逗号连表里其余名字一并取回（别名只有在紧跟逗号时才当别名，`FROM a, b` 的 `b` 是表不是别名）。括号子查询（`FROM (SELECT 1) x, t_b b`）由 `subquery_tail_refs` 越过整对括号后继续取连表；带括号的调用形态（`unnest(…)`、`read_csv(…)`）与非对象名一律不收——宁少不误。这条刀口同时决定链路核验（库级）的判定与计划的部署清单（两者共用同一函数），改它等于同时改两个面 |
 | 视图体的基表 | 视图文件进清单后，再展开一层它的**视图体**引用（`closure::expand_view_bodies`，用 `chain::sql_object_refs`，与例程体同一条抽取管线，不开第二套词法）。理由：下发顺序是"表 → 视图"，视图体读的表没进清单时内核建视图必失败，`deploy_view` 就静默退化成 `SELECT 1` 占位视图——对象在、列不在。只补**有 DDL 文件**的引用；查不到声明的名字（`dual`、外部同义词）不据此报缺件，否则一个语料外的别名就把整份计划判红 |
 
 ### 13.6 `deploy`：计划的消费面（design §6.2，A2-3）
@@ -1140,20 +1150,20 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
 |---|---|---|
 | 壳 | `spinduck/src/cli/deploy.rs` | 读计划 → 缺件即拒 → 定位项目 → 开库 → 打印一行汇总。零引擎逻辑（§1） |
 | 消费 | `spinduck/src/plan/deploy.rs` | `resolve`（计划 → 逐条核对存在的文件，视图/表分流）与 `apply`（逐文件下发）分成两段：全部文件核对完才碰内核 |
-| 下发 | `spinduck/src/verify/deploy.rs` 的 `deploy_ddl_file` / `deploy_view_file` / `ensure_engine_provided_tables` / `register_routine_files`（`pub(crate)`） | 与 `verify` 共用同一套逐文件实现，顺序同为 表/序列 → 视图 → `sys_dummy` → 例程；视图是否走视图体由 `creates_view()` 判定，走的是链路同一把词法刀（注释与字符串不参与） |
+| 下发 | `spinduck/src/verify/deploy.rs` 的 `deploy_ddl_file` / `deploy_view_file` / `ensure_engine_provided_tables` / `register_routine_files`（`pub(crate)`） | 与库级链路核验共用同一套逐文件实现，顺序同为 表/序列 → 视图 → `sys_dummy` → 例程；视图是否走视图体由 `creates_view()` 判定，走的是链路同一把词法刀（注释与字符串不参与） |
 
 口径：
 
 - 输入是**计划里的文件清单**（`sources.ddl_routines` / `sources.ddl_tables`），不做目录发现——
   design §6.2 三点差异的第一条。清单外的资产一律不下发，`deploy` 因此可复现。
-- 库**落盘**：开库发生在 CLI 接缝处（`DuckExecutor::open(--db)`），`verify` 侧仍是
+- 库**落盘**：开库发生在 CLI 接缝处（`DuckExecutor::open(--db)`），库级链路核验仍是
   `open_in_memory`，接缝签名未动。开库排在文件核对之后——`open` 会创建文件，先开后查等于
   留下半成品库。
 - 缺件面：`[[missing]]` 非空 → rc=1，照抄 `MISS <object> <- <from>`，不开库、不建对象；
   计划列出的文件不存在 → `ENV-0030`。两条都不要求项目声明 `[[entry]]`（计划的入口是目标例程）。
 - **不跑种子**：`cases/datasets/*` 与 `materialize` / `writeback` 两条清单都不消费——数据面归
   §13.1 的物化，装配面只管对象与例程。
-- `plan.schema` 只随计划透传、不参与下发：对象一律落在内核默认目录 `main`，与 `verify` 的既有
+- `plan.schema` 只随计划透传、不参与下发：对象一律落在内核默认目录 `main`，与链路核验的既有
   判定口径一致。design §6.1 的草图只给了 `schema` 字段、没有约定 `deploy` 用它建 schema，
   本文把它**明确记为未落地**（validation V31.7），不假装支持。
 - **非幂等**：对同一个已装配过的库文件再跑一次会撞 `CREATE TABLE` 已存在（内核报错原样带出，
@@ -1181,7 +1191,7 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
 | 段 | 落点 | 职责 |
 |---|---|---|
 | 壳 | `spinduck/src/cli/run/call.rs` 的 `call_target_and_sources` / `refuse_on_kernel_gaps` | 解析目标与源清单、按计划拒、按内核拒；零闭包逻辑（§1） |
-| 判定 | `spinduck/src/plan/closure.rs` 的 `walk_chain`（BFS 本体）+ `kernel_gaps`（内核参照面） | **一份闭包实现，两个参照面**：`build`（`plan`）以项目 DDL 声明为参照，`kernel_gaps`（`call`）以 `verify::kernel_objects` 为参照。不允许再出现第二套 BFS——否则计划说干净、门说缺件的漂移只是换了个方向。被调面的采集同样只有一套：`chain::routine_refs`（结论）+ `chain::expr_func_names`（候选，由目录判），两个参照面共用 |
+| 判定 | `spinduck/src/plan/closure.rs` 的 `walk_chain`（BFS 本体）+ `kernel_gaps`（内核参照面） | **一份闭包实现，两个参照面**：`build`（计划面）以项目 DDL 声明为参照，`kernel_gaps`（`call`）以 `verify::kernel_objects` 为参照。不允许再出现第二套 BFS——否则计划说干净、门说缺件的漂移只是换了个方向。被调面的采集同样只有一套：`chain::routine_refs`（结论）+ `chain::expr_func_names`（候选，由目录判），两个参照面共用 |
 | 解析 | `spinduck/src/cli/args/mod.rs` 的 `CallTarget::{Routine, Plan}`（`--plan` 形态的解析在 `spinduck/src/cli/args/call.rs`） | 目标形态是枚举不是可选字段：`--plan` 下位置参数**全部**归实参（不猜例程名），两者皆无即用法错且诊断同时点名两条路 |
 
 口径：
@@ -1198,7 +1208,7 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
 - 目标未登记时 `kernel_gaps` 给 `None`：那是 `BIZ-0150` 的故障域，门不抢判（§5 归域在产生点）。
 - `routine:` 缺件与表/序列缺件同列一份清单，按标识排序去重；`engine_provided`（`sys_dummy`）短路。
 - 名称口径与调用本身同源：目标走 `catalog.lookup`（与 `Engine::call` 同一个键），摘要行
-  `target=` 用小写归一名，与 `plan`/`deploy` 一致——门不能比它守护的那次调用更宽或更严。
+  `target=` 用小写归一名，与计划/`deploy` 一致——门不能比它守护的那次调用更宽或更严。
 - **表达式级被调函数进闭包（design A2-5，V34）**：`routine_refs` 只给"确定是例程"的名字
   （语句级 `CALL` + 带包限定的表达式调用 + SQL 下沉点），PL 表达式里的裸名调用
   （`v := fnc_x()`）走第三个采集面 `expr_func_names`——它交的是**候选**，不是结论：
@@ -1225,7 +1235,7 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
 | 段 | 落点 | 职责 |
 |---|---|---|
 | 判定 | `spinduck/src/source.rs` 的 `read_text` / `decode` | **唯一**的读入实现：`std::fs::read` → UTF-8 严格 → `encoding_rs::GBK.decode`（`had_errors` 即拒）→ `ENV-0030`。`decode` 不碰磁盘，三种字节形态都能单测 |
-| 执行/计划/部署/核验/比对面 | `cli::read_source_strict`（`call`、`explain`、`plan`、`call --plan`、`query` 的 SQL 文件、`compare` 的两份快照）与 `verify/deploy.rs` 的四文件下发点（表 DDL、视图、例程注册、数据集种子） | 全部走同一把刀。`verify/deploy.rs` 原先各写一份 `read_to_string`，故 GBK 语料在 `plan` 侧可读、`verify` 侧报编码错——同一份资产两个结论，正是 §13.7 反对的漂移形态 |
+| 执行/计划/部署/核验/比对面 | `cli::read_source_strict`（`call`、`explain`、项目态 compile 的 IR 体检、`deploy`、`query` 的 SQL 文件、`compare` 的两份快照）与 `verify/deploy.rs` 的四文件下发点（表 DDL、视图、例程注册、数据集种子） | 全部走同一把刀。`verify/deploy.rs` 原先各写一份 `read_to_string`，故 GBK 语料在计划侧可读、核验侧报编码错——同一份资产两个结论，正是 §13.7 反对的漂移形态 |
 | 体检面 | `cli::read_source`（`compile`） | **不参与解码**：有损 UTF-8 + `(non-utf8)` 标记，rc=0。语料体检要"一趟扫完并按错误码分类"，停在第一个编码问题就让体检本身没法用（design §3.5 末段的原始取舍，D9② 未改） |
 | 依赖 | `spinduck/Cargo.toml` 的 `encoding_rs = "=0.8.44"` | 由 `ogsql-parser` 的传递依赖提为直接依赖：`Cargo.lock` 只多一行（该 crate 进 `spinduck` 的依赖表），零新增 crate、零新增 `cargo audit` 面 |
 

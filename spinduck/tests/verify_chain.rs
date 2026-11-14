@@ -1,7 +1,7 @@
-//! `verify` 链路核验（真实内核，`--features native`）：入口声明 → 语料部署 → 逐对象核验。
+//! 链路核验（真实内核，`--features native`）：入口声明 → 语料部署 → 逐对象核验。
 //!
-//! 用一个临时项目锁定核验面：入口命中/未命中、链路例程断点、链路表缺席、
-//! 场景可执行、无场景入口显式 Skip、运行态快照落盘与再核验。
+//! 库函数 `verify_project` 的 5 条守护一字不动；走 CLI 的 4 条改经项目态
+//! `compile --sync-manifest`（issue #38：`verify` 命令已收口到 compile）。
 //! 全部资产来自项目声明（零硬编码路径，§12.1）。
 
 #![cfg(feature = "native")]
@@ -139,11 +139,19 @@ impl spinduck_core::plan::codeweb::CodewebExport for FixtureExport {
     }
 }
 
-fn verify_export(root: &Path, json: serde_json::Value) -> (i32, String) {
+fn compile_export(root: &Path, json: serde_json::Value) -> (i32, String) {
     std::fs::write(root.join("codeweb.toml"), b"").unwrap();
     let export = FixtureExport(serde_json::to_vec(&json).unwrap());
+    let opts = spinduck_core::cli::ProjectCompile {
+        dir: Some(root.to_path_buf()),
+        schema: None,
+        entries: vec![],
+        codeweb_bin: None,
+        codeweb_project: None,
+        sync_manifest: true,
+    };
     let mut buf = Vec::new();
-    let result = spinduck_core::cli::verify_cmd(Some(root), &export, &mut buf);
+    let result = spinduck_core::cli::compile_project_with_export(opts, &export, &mut buf);
     match result {
         Ok(code) => (code, String::from_utf8(buf).unwrap()),
         Err(e) => {
@@ -337,7 +345,7 @@ fn should_render_reports_and_exit_1_when_chain_has_gaps() {
     let root = tmp.path();
     fixture(root);
     let file = forward(&root.join("sql/routines/pkg_a.sql"));
-    let (code, text) = verify_export(root, chain_graph(&file, ChainShape::WithGaps));
+    let (code, text) = compile_export(root, chain_graph(&file, ChainShape::WithGaps));
     assert_eq!(code, 1, "有链路缺口必须非零退出：{text}");
     assert!(text.contains("manifest: "), "{text}");
     assert!(
@@ -370,7 +378,7 @@ fn should_exit_0_when_every_entry_is_clean() {
     write(root, "cases/x.case.toml", CASE);
     write(root, "cases/datasets/seed.sql", SEED);
     let file = forward(&root.join("sql/routines/pkg_a.sql"));
-    let (code, text) = verify_export(root, chain_graph(&file, ChainShape::Clean));
+    let (code, text) = compile_export(root, chain_graph(&file, ChainShape::Clean));
     assert_eq!(code, 0, "干净链路应零退出：{text}");
     assert!(
         text.contains("compile: entries=1 missing=0 failed=0 dynamic=0"),
@@ -399,7 +407,7 @@ fn should_reject_project_without_entry_declarations() {
 }
 
 #[test]
-fn should_not_write_manifest_when_verify_fails_before_reporting() {
+fn should_not_write_manifest_when_compile_fails_before_reporting() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write(
@@ -409,31 +417,36 @@ fn should_not_write_manifest_when_verify_fails_before_reporting() {
     );
     let mut buf: Vec<u8> = Vec::new();
     let code = spinduck_core::cli::run::run(
-        &["verify".to_string(), root.to_string_lossy().to_string()],
+        &[
+            "compile".to_string(),
+            "--dir".to_string(),
+            root.to_string_lossy().to_string(),
+            "--sync-manifest".to_string(),
+        ],
         &mut buf,
     );
     let text = String::from_utf8(buf).unwrap();
     assert_eq!(code, 1, "缺入口声明必须非零退出：{text}");
     assert!(
-        !root.join(".spinduck/conf/spinduck.toml").exists(),
+        !root.join(".spinduck/conf/spinduck.runtime.toml").exists(),
         "核验未跑通就落快照＝运行态声称了一个没被证明的可调用面"
     );
 }
 
 #[test]
-fn should_snapshot_manifest_in_home_conf_and_verify_runtime_dir_alone() {
+fn should_snapshot_manifest_in_home_conf_and_compile_runtime_dir_alone() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     fixture(root);
     let home = root.join(".spinduck");
-    let snap = home.join("conf/spinduck.toml");
+    let snap = home.join("conf/spinduck.runtime.toml");
     let file = forward(&root.join("sql/routines/pkg_a.sql"));
     let graph = chain_graph(&file, ChainShape::WithGaps);
 
-    let (_, first) = verify_export(root, graph.clone());
+    let (_, first) = compile_export(root, graph.clone());
     assert!(
         first.contains(&format!("manifest: {}", snap.display())) && first.contains("(updated)"),
-        "研发态 verify 必须落运行态快照并报告路径与变化：{first}"
+        "研发态 compile --sync-manifest 必须落运行态快照并报告路径与变化：{first}"
     );
 
     let text =
@@ -448,7 +461,7 @@ fn should_snapshot_manifest_in_home_conf_and_verify_runtime_dir_alone() {
     );
 
     // 运行态目录独立核验：同一缺件，且不回写快照（真源仍 = 研发态 spinduck.toml）
-    let (code2, second) = verify_export(&home, graph);
+    let (code2, second) = compile_export(&home, graph);
     assert!(
         second.contains("MISS relation:t_missing <- pkg_a.prc_gap"),
         "运行态目录必须复现同一缺件：{second}"
@@ -464,7 +477,7 @@ fn should_snapshot_manifest_in_home_conf_and_verify_runtime_dir_alone() {
     assert_eq!(
         std::fs::read_to_string(&snap).unwrap(),
         text,
-        "两次 verify 后快照内容一字不变"
+        "两次同步后快照内容一字不变"
     );
     assert_eq!(code2, 1, "缺口仍在，退出码不变");
 }
