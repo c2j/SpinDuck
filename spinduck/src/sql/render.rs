@@ -17,9 +17,16 @@ pub fn expr_to_sql(e: &IrExpr, rules: &RuleRegistry) -> Option<String> {
             let rs = expr_to_sql(r, rules)?;
             Some(format!("({ls} {} {rs})", bin_op_sql(*op)))
         }
+        IrExpr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => render_case(operand.as_deref(), whens, else_expr.as_deref(), |e| {
+            expr_to_sql(e, rules)
+        }),
         IrExpr::Not(x) => Some(format!("(NOT {})", expr_to_sql(x, rules)?)),
         IrExpr::IsNull(x) => Some(format!("({} IS NULL)", expr_to_sql(x, rules)?)),
-        IrExpr::FuncCall { name, args } => {
+        IrExpr::FuncCall { name, args, .. } => {
             let target = rules
                 .functions
                 .get(&name.to_ascii_uppercase())
@@ -44,6 +51,29 @@ pub fn expr_to_sql(e: &IrExpr, rules: &RuleRegistry) -> Option<String> {
         // 由解释器 SqlFn 下沉路径承担）
         IrExpr::Field { .. } | IrExpr::CursorAttr { .. } | IrExpr::SqlFn { .. } => None,
     }
+}
+
+fn render_case(
+    operand: Option<&IrExpr>,
+    whens: &[(IrExpr, IrExpr)],
+    else_expr: Option<&IrExpr>,
+    mut render: impl FnMut(&IrExpr) -> Option<String>,
+) -> Option<String> {
+    let mut sql = String::from("CASE");
+    if let Some(e) = operand {
+        sql.push_str(&format!(" {}", render(e)?));
+    }
+    for (condition, result) in whens {
+        sql.push_str(&format!(
+            " WHEN {} THEN {}",
+            render(condition)?,
+            render(result)?
+        ));
+    }
+    if let Some(e) = else_expr {
+        sql.push_str(&format!(" ELSE {}", render(e)?));
+    }
+    Some(format!("{sql} END"))
 }
 
 fn bin_op_sql(op: BinOp) -> &'static str {
@@ -152,9 +182,16 @@ fn render_binds(e: &IrExpr, binds: &mut Vec<(String, crate::ir::BindSrc)>) -> Op
             }
             Some(format!("({ls} {} {rs})", bin_op_sql(*op)))
         }
+        IrExpr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => render_case(operand.as_deref(), whens, else_expr.as_deref(), |e| {
+            render_binds(e, binds)
+        }),
         IrExpr::Not(x) => Some(format!("(NOT {})", render_binds(x, binds)?)),
         IrExpr::IsNull(x) => Some(format!("({} IS NULL)", render_binds(x, binds)?)),
-        IrExpr::FuncCall { name, args } | IrExpr::SqlFn { name, args } => {
+        IrExpr::FuncCall { name, args, .. } | IrExpr::SqlFn { name, args, .. } => {
             let mut parts = Vec::with_capacity(args.len());
             for a in args {
                 parts.push(render_binds(a, binds)?);
@@ -248,6 +285,7 @@ mod tests {
         let e = IrExpr::FuncCall {
             name: "nvl".to_string(),
             args: vec![var("a"), IrExpr::Const(SpinValue::Int(0))],
+            prepared: crate::sql::apply_ast_transforms("SELECT nvl($p0, $p1)"),
         };
         assert_eq!(expr_to_sql(&e, &rules).as_deref(), Some("coalesce(a, 0)"));
     }
@@ -261,6 +299,7 @@ mod tests {
         let e = IrExpr::FuncCall {
             name: "decode".to_string(),
             args: vec![var("a")],
+            prepared: crate::sql::apply_ast_transforms("SELECT decode($p0)"),
         };
         assert_eq!(expr_to_sql(&e, &rules), None);
     }

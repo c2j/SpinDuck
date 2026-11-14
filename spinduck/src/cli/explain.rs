@@ -45,7 +45,7 @@ fn lines(prog: &IrProg) -> Vec<IrLine> {
 /// 该指令携带的静态 SQL（`explain` ↔ `trace` 的关联面）。
 fn static_sql(st: &IrStmt) -> Option<&str> {
     match st {
-        IrStmt::SqlQuery { sql, .. } => Some(sql),
+        IrStmt::SqlQuery { sql, .. } | IrStmt::FoldedQuery { sql, .. } => Some(sql),
         IrStmt::SqlExec { sql, .. } => Some(sql),
         IrStmt::OpenCursor {
             source: CursorSource::Static { sql, .. },
@@ -119,6 +119,15 @@ fn describe(st: &IrStmt) -> (&'static str, String) {
                 "{} into [{}]",
                 one_line(sql),
                 into.iter().map(target_text).collect::<Vec<_>>().join(", ")
+            ),
+        ),
+        IrStmt::FoldedQuery { sql, target, expr } => (
+            "folded_query",
+            format!(
+                "{}; {} := {}",
+                one_line(sql),
+                target_text(target),
+                expr_text(expr)
             ),
         ),
         IrStmt::SqlExec { sql, .. } => ("sql_exec", one_line(sql)),
@@ -197,15 +206,36 @@ fn expr_text(e: &IrExpr) -> String {
         IrExpr::Var(v) => v.0.clone(),
         IrExpr::Field { rec, field } => format!("{}.{}", rec.0, field),
         IrExpr::Bin { op, l, r } => format!("({} {} {})", expr_text(l), op_text(*op), expr_text(r)),
+        IrExpr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            let mut text = String::from("case");
+            if let Some(e) = operand {
+                text.push_str(&format!(" {}", expr_text(e)));
+            }
+            for (condition, result) in whens {
+                text.push_str(&format!(
+                    " when {} then {}",
+                    expr_text(condition),
+                    expr_text(result)
+                ));
+            }
+            if let Some(e) = else_expr {
+                text.push_str(&format!(" else {}", expr_text(e)));
+            }
+            format!("{text} end")
+        }
         IrExpr::Not(x) => format!("(not {})", expr_text(x)),
         IrExpr::IsNull(x) => format!("({} is null)", expr_text(x)),
-        IrExpr::FuncCall { name, args } => format!(
+        IrExpr::FuncCall { name, args, .. } => format!(
             "{}({})",
             name,
             args.iter().map(expr_text).collect::<Vec<_>>().join(", ")
         ),
         IrExpr::CursorAttr { cursor, kind } => format!("{}%{:?}", cursor.0, kind),
-        IrExpr::SqlFn { name, args } => format!(
+        IrExpr::SqlFn { name, args, .. } => format!(
             "{}({}) [sql]",
             name,
             args.iter().map(expr_text).collect::<Vec<_>>().join(", ")

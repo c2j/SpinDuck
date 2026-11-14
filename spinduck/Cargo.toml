@@ -45,6 +45,14 @@ toml = "0.8"
 tempfile = "3"
 
 [[test]]
+name = "guard_dummy_fold"
+path = "tests/guard/guard_dummy_fold.rs"
+
+[[test]]
+name = "guard_scalar_sql"
+path = "tests/guard/guard_scalar_sql.rs"
+
+[[test]]
 name = "guard_lookup_cache_dynamic"
 path = "tests/guard/guard_lookup_cache_dynamic.rs"
 

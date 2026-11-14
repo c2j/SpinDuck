@@ -9,6 +9,7 @@
 //! `sql`（SQL 语句/赋值目标/循环标签）、`expr`（表达式编译与原子量）。
 
 mod control;
+mod dummy;
 mod entry;
 mod expr;
 mod sql;
@@ -23,5 +24,6 @@ pub use entry::{
 pub(crate) use expr::{ident0, ident1, ident_path, parse_decimal_literal};
 pub(crate) use types::CompiledCursorSql;
 pub use types::{
-    AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, Label, TrapEntry, VarName,
+    AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, Label, ScalarSql,
+    TrapEntry, VarName,
 };

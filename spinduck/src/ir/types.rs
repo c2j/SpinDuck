@@ -56,12 +56,20 @@ pub enum IrExpr {
         l: Box<IrExpr>,
         r: Box<IrExpr>,
     },
+    /// 首个命中分支惰性求值；简单 CASE 的选择子只求值一次。
+    Case {
+        operand: Option<Box<IrExpr>>,
+        whens: Vec<(IrExpr, IrExpr)>,
+        else_expr: Option<Box<IrExpr>>,
+    },
     Not(Box<IrExpr>),
     IsNull(Box<IrExpr>),
     /// 函数调用：PL 上下文一律解释器直调（M6 接例程表；M2 求值时报 ENG）
     FuncCall {
         name: String,
         args: Vec<IrExpr>,
+        /// 目录未命中时使用的内建 SQL；保留执行期分派与报错时机。
+        prepared: Result<String, crate::error::EngineError>,
     },
     /// SQL 内建函数（§8.2 [functions] `@` 变换标记）：整体下沉为单条
     /// `SELECT name(args)` 交给内核求值，保留中间类型（日期算术不能经
@@ -69,12 +77,35 @@ pub enum IrExpr {
     SqlFn {
         name: String,
         args: Vec<IrExpr>,
+        /// 编译期改写结果；错误延迟到该表达式实际执行时报告。
+        prepared: Result<ScalarSql, crate::error::EngineError>,
     },
     /// 游标属性：cursor%NOTFOUND 等（§7.3.3）
     CursorAttr {
         cursor: VarName,
         kind: CursorAttrKind,
     },
+}
+
+impl IrExpr {
+    /// 构造函数调用并预计算目录未命中时的内建 SQL。
+    pub fn function_call(name: String, args: Vec<IrExpr>) -> Self {
+        let ph: Vec<_> = (0..args.len()).map(|i| format!("$p{i}")).collect();
+        let prepared =
+            crate::sql::apply_ast_transforms(&format!("SELECT {name}({})", ph.join(", ")));
+        Self::FuncCall {
+            name,
+            args,
+            prepared,
+        }
+    }
+}
+
+/// 编译期生成的标量 SQL 与按名绑定源。
+#[derive(Debug, Clone)]
+pub struct ScalarSql {
+    pub sql: String,
+    pub binds: Vec<(String, BindSrc)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +159,12 @@ pub enum IrStmt {
         into: Vec<AssignTarget>,
         /// SQL 上下文例程调用下沉计划（§8.3；空 = 无）
         fn_sites: Vec<crate::sql::FnSite>,
+    },
+    /// 哑表行数检查与折叠赋值共占一步，保持原 SELECT INTO 的预算边界。
+    FoldedQuery {
+        sql: String,
+        target: AssignTarget,
+        expr: IrExpr,
     },
     /// DML/DDL（Truncate/Insert/Update/Delete/...）
     SqlExec {

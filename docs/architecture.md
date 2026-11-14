@@ -323,6 +323,26 @@ INSERT，只按写目标表失效，INSERT SELECT 的只读来源表不失效；
 认不出的查询（`CASE`、不等谓词、连接）、构建失败、排序键并列，或排序值无法在
 进程内比较，都原样下发。机制见 `src/lookup_cache/`，实证见 validation V42/V45。
 
+### 3.5.2 标量模板前移与哑表投影折叠
+
+`SqlFn` 在编译时保存改写后的 `ScalarSql`（SQL + 按名绑定源）；运行时只解析帧绑定并
+查询。`FuncCall` 保存内建回退模板，但仍先查运行期例程目录，未命中才求值实参并执行
+模板。两类模板均保存 `Result`，改写失败延迟到表达式真正执行时报告，不提前改变注册
+结果；嵌套日期函数仍整棵下沉，避免中间日期经 `SpinValue` 文本化。
+
+`IrExpr::Case` 逐臂惰性求值：简单 CASE 选择子只求值一次，NULL 不匹配 NULL；搜索
+CASE 仅 TRUE 命中，省略 ELSE 返回 NULL。SQL 渲染和闭包遍历覆盖所有分支。
+
+哑表折叠采用保守白名单：单投影、单 INTO，只有普通 Null/Bool/Int/Text 字面量和
+结果同类型的嵌套 CASE；简单 CASE 不接受文本比较（collation 依赖）。函数、序列、
+算术、小数、未知变量/记录字段、混合类型及额外 SQL 子句不折叠。替换投影为 1 后，
+完整格式化 SQL 必须匹配 `SELECT 1 FROM sys_dummy` 或 `SELECT 1 FROM dual`。
+
+`sys_dummy` 是可变普通表，`dual` 也没有引擎单行保证，因此不能删除关系访问。
+`FoldedQuery` 在一条 IR 内先刷触及该表的缓冲、检查 0/1/>1 行，再按原写槽规则赋值，
+保持原 SELECT INTO 的步数预算及错误/回滚边界。该路径仍有一次 SQL 调用，不声称
+零次下发，也不放宽现有混合类型 CASE 的内核报错。实证见 validation V46。
+
 ### 3.6 目录与持久化
 
 例程定义存 DuckDB 内部表 `spinduck_routines(name, kind, source, registered_at)`。
