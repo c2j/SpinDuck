@@ -234,6 +234,17 @@ issue #85 形态）。三条纪律原样继承：**保守失败**（探针失败
 
 ## 6. 评审决议（2026-11-11）
 
+- **进度输出（已落地）**：多表形态每表完成即输出 `[k/total] MATERIALIZE t rows=N`
+  / `[k/total] FAIL t <域-####>`（完成序，行主体与单表契约同形）；单表形态
+  输出不变。stderr 保持空（§1 契约）。调度只有 io 层
+  `materialize_parallel_with_progress` 一份，CLI 只做完成序渲染。
+- **deploy 物化清单守卫（已落地）**：`deploy` 在**开库前**用项目 DDL 解析出的
+  表名集合核验 `[sources].materialize`（静态读 DDL，不执行、不查
+  `duckdb_tables()`、不创建库文件）；缺表输出 `MISS relation:<t> <- materialize
+  清单` 并 exit 1——把"缺表"从 materialize 层提前到 deploy 层红，输入面缺口在
+  正确的层暴露且不留半成品库（回归
+  `should_reject_deploy_when_materialize_list_table_not_covered_by_ddl`、
+  正路径 `should_accept_deploy_when_materialize_list_table_is_covered_by_ddl`）。
 - **保留批量 INSERT 路径**为可显式指定的模式（§3.3），COPY STREAM 为默认——特殊表
   有逃生门，快路径有自动回落；
 - **并行分片 COPY 列为后续项**（§3.5）：无主键/联合主键表经 ctid 或 hash 取模同样

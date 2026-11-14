@@ -8,6 +8,8 @@
 use super::{io_err, EXIT_FAIL, EXIT_OK};
 use crate::cli::args::Command;
 use crate::error::EngineError;
+#[cfg(feature = "gauss")]
+use crate::io::MaterializeOutcome;
 use std::io::Write;
 #[cfg(feature = "gauss")]
 use std::path::Path;
@@ -107,6 +109,22 @@ fn warn_degraded(table: &str, degraded: Option<&str>) {
     }
 }
 
+/// 多表形态逐表进度行：`[k/total]` 前缀 + 与单表契约同形的行主体；
+/// 返回该行是否失败。完成即输出（V27 §3.6：不再等全部结束才有输出）。
+#[cfg(feature = "gauss")]
+fn report_one(
+    out: &mut dyn Write,
+    k: usize,
+    total: usize,
+    item: &(String, Result<MaterializeOutcome, EngineError>),
+) -> std::io::Result<bool> {
+    match &item.1 {
+        Ok(o) => writeln!(out, "[{k}/{total}] MATERIALIZE {} rows={}", item.0, o.rows)?,
+        Err(e) => writeln!(out, "[{k}/{total}] FAIL {} {e}", item.0)?,
+    }
+    Ok(item.1.is_err())
+}
+
 #[cfg(feature = "gauss")]
 pub(super) fn materialize_cmd(
     parts: MaterializeParts,
@@ -122,9 +140,20 @@ pub(super) fn materialize_cmd(
         writeln!(out, "MATERIALIZE {} rows={}", table, outcome.rows).map_err(io_err)?;
         return Ok(EXIT_OK);
     }
-    // 多表形态（V27 §3.6）：--jobs 个工作线程，每线程独立 GaussDB 连接 +
-    // 独立 DuckDB 连接句柄（同进程同库多连接，MVCC 处理并发写不同表）
-    let jobs = parts.jobs.unwrap_or(4).min(parts.tables.len());
+    materialize_multi(&parts, &duck, &workdir, out)
+}
+
+/// 多表形态（V27 §3.6）：--jobs 个工作线程，每线程独立 GaussDB 连接 + 独立
+/// DuckDB 连接句柄（同进程同库多连接，MVCC 处理并发写不同表）。
+///
+/// 调度只有 io 层一份；本函数只组装批次并提供完成序渲染回调（§1「CLI 仅壳」）。
+#[cfg(feature = "gauss")]
+fn materialize_multi(
+    parts: &MaterializeParts,
+    duck: &crate::sql::DuckExecutor,
+    workdir: &Path,
+    out: &mut dyn Write,
+) -> Result<i32, EngineError> {
     let executors = (0..parts.tables.len())
         .map(|_| {
             let cloned = duck
@@ -134,27 +163,43 @@ pub(super) fn materialize_cmd(
             Ok::<_, EngineError>(crate::sql::DuckExecutor::from_connection(cloned))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let outcomes = crate::io::materialize_parallel(
-        jobs,
-        parts.tables.clone(),
-        &workdir,
+    let total = parts.tables.len();
+    let mut render_err: Option<EngineError> = None;
+    let outcomes = crate::io::materialize_parallel_with_progress(
+        crate::io::MaterializeBatch {
+            jobs: parts.jobs.unwrap_or(4),
+            tables: parts.tables.clone(),
+            workdir,
+        },
         open_gauss,
         executors,
+        |k, total, item| {
+            if render_err.is_some() {
+                return;
+            }
+            // 降级预警与进度行同序：stderr 只留摘要，stdout 契约不变（#17）
+            if let Ok(o) = &item.1 {
+                warn_degraded(&item.0, o.degraded.as_deref());
+            }
+            if let Err(e) = report_one(out, k, total, item) {
+                render_err = Some(io_err(e));
+            }
+        },
     );
-    let mut failed = 0;
-    for (table, result) in &outcomes {
-        match result {
-            Ok(o) => {
-                warn_degraded(table, o.degraded.as_deref());
-                writeln!(out, "MATERIALIZE {} rows={}", table, o.rows).map_err(io_err)?;
-            }
-            Err(e) => {
-                failed += 1;
-                // 单表失败不中断其余表（快照批次语义），任一失败整体退出码 1
-                writeln!(out, "FAIL {} {}", table, e).map_err(io_err)?;
-            }
-        }
+    if let Some(e) = render_err {
+        return Err(e);
     }
+    // 结果计数兜底：少一条结果就不得被判成成功（单表失败仍由 failed 计数退出 1）
+    if outcomes.len() != total {
+        return Err(EngineError::env(
+            20,
+            format!("多表物化结果缺失：收到 {} / 期望 {}", outcomes.len(), total),
+        ));
+    }
+    let failed = outcomes
+        .iter()
+        .filter(|(_, result)| result.is_err())
+        .count();
     if failed > 0 {
         return Ok(EXIT_FAIL);
     }
@@ -220,6 +265,52 @@ pub(super) fn sync_cmd(parts: SyncParts, _out: &mut dyn Write) -> Result<i32, En
 #[cfg(all(test, feature = "gauss"))]
 mod tests {
     use super::*;
+    use crate::io::{MaterializeMode, MaterializeOutcome};
+
+    /// V27 §3.6 进度输出：多表形态每表完成即输出一行 `[k/total]` 前缀行
+    /// （完成序，不再等全部结束），行主体与单表契约同形。
+    #[test]
+    fn should_report_per_table_progress_prefix_and_fail_lines() {
+        let mut buf: Vec<u8> = Vec::new();
+        let results = [
+            (
+                "t_a".to_string(),
+                Ok(MaterializeOutcome {
+                    rows: 630468,
+                    mode: MaterializeMode::CopyStream,
+                    degraded: None,
+                }),
+            ),
+            (
+                "t_bad".to_string(),
+                Err(EngineError::env(20, String::from("源端缺表"))),
+            ),
+            (
+                "t_c".to_string(),
+                Ok(MaterializeOutcome {
+                    rows: 312,
+                    mode: MaterializeMode::CopyStream,
+                    degraded: None,
+                }),
+            ),
+        ];
+        let total = results.len();
+        let mut failed = 0;
+        for (k, item) in results.iter().enumerate() {
+            if report_one(&mut buf, k + 1, total, item).unwrap() {
+                failed += 1;
+            }
+        }
+        let text = String::from_utf8(buf).unwrap();
+        assert_eq!(failed, 1);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "[1/3] MATERIALIZE t_a rows=630468", "{text}");
+        assert!(
+            lines[1].starts_with("[2/3] FAIL t_bad [ENV-0020]"),
+            "{text}"
+        );
+        assert_eq!(lines[2], "[3/3] MATERIALIZE t_c rows=312", "{text}");
+    }
 
     #[test]
     fn should_put_workdir_beside_db_when_db_has_parent_dir() {

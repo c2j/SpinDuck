@@ -19,7 +19,10 @@ pub type GaussRows = (Vec<String>, Vec<Vec<Option<String>>>);
 
 mod materialize;
 
-pub use materialize::{materialize_parallel, MaterializeMode, MaterializeOutcome};
+pub use materialize::{
+    materialize_parallel, materialize_parallel_with_progress, MaterializeBatch, MaterializeMode,
+    MaterializeOutcome,
+};
 
 /// GaussDB 连接（同步，无 TLS；v1 单连接）。
 pub struct GaussConn {
