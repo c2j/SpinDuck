@@ -1,7 +1,7 @@
 # SpinDuck 进程内嵌入 codeweb 设计文档
 
 > 状态：**Implemented（2026-11-14）** — 替代 `docs/design-production-gaussdb.md` D4 进程外契约  
-> 适用仓库：`c2j/codeweb`（`v0.9.9`，已发版）与 `c2j/SpinDuck`（`0.1.21`）  
+> 适用仓库：`c2j/codeweb`（`v0.9.10`，已发版）与 `c2j/SpinDuck`（`0.1.21`）  
 > 前置假设：双方已完成 `ogsql-parser` 版本对齐（`v0.11.0` = 子模块 `13d9baa`）
 >
 > **落地记录**
@@ -14,6 +14,11 @@
 >   接缝；`0727d89` `from_thin_graph` 映射 + `EmbeddedCodewebSource`；`5f9b525` 调用点
 >   替换与进程外契约退役（`--codeweb-bin` / `SPINDUCK_CODEWEB` 删除、`--analyze` 新增）；
 >   `cebd488` 版本 bump + generator 守护测试 + validation V46。
+> - **`v0.9.10`（`315f11a`）修数据格式缺陷**：`55f366b` 让持久化类型（`Node::JspPage/
+>   JspSql`、`Edge::ContainsSql`、`NodeKey::JspPage/JspSql`、`StoreStats::jsp_*`）不再
+>   随 feature 门控——此前 full 构建与 analyze-only 构建写出的 store 互不可读
+>   （bincode 变体索引错位），`STORE_VERSION` 15 → 16，双向互通实测与守卫测试见
+>   validation V47.1。SpinDuck 依赖随之升到 `tag = "v0.9.10"`。
 > - 与本文的偏差（以代码为准）：`jsp` feature 蕴含 `java`（JSP 管线复用 ogsql 的 Java
 >   抽取）；`ogsql-parser` 与扫描类依赖（rayon/walkdir/globset/blake3/encoding_rs/
 >   indicatif）保持非 optional（任何可用形态的核心），`analyze` 是形态标记而非裁剪这些；

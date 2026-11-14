@@ -299,11 +299,11 @@ fn should_collect_routine_and_ddl_files_transitively_into_the_plan() {
         ),
     );
 
-    // generator 必须来自链接的 codeweb 版本（嵌入契约；不再硬编码字面量）
-    assert_eq!(
-        plan.generator,
-        format!("codeweb {}", crate::plan::codeweb::embedded_version())
-    );
+    // generator 必须**透传自取图来源**（本测试的夹具是 JSON 源，见 `json_source`）；
+    // 嵌入形态「generator = 链接的 codeweb 版本」由
+    // `plan::codeweb::source::tests::should_write_a_semver_generator_from_the_embedded_source`
+    // 单独锁定。
+    assert_eq!(plan.generator, "codeweb 0.9.9");
     assert_eq!(plan.target, "prc_main");
     assert_eq!(
         plan.ddl_routines,

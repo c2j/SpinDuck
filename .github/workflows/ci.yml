@@ -89,9 +89,10 @@ jobs:
             --ignore RUSTSEC-2026-0369 \
             --ignore RUSTSEC-2026-0429
       # 审计盲区（非豁免，是覆盖不到）：codeweb 是 git 依赖
-      # （c2j/codeweb @ tag v0.9.9，嵌入取图，见 docs/embeded-codeweb.md），
+      # （c2j/codeweb @ tag v0.9.10，嵌入取图，见 docs/embeded-codeweb.md），
       # 不在 crates.io advisory 面内，cargo audit 不产出它的公告；tag 升级必须
-      # 人工复核依赖面变化与 ThinGraph 投影等价测试（validation V46.3）。
+      # 人工复核依赖面变化与 ThinGraph 投影等价测试（validation V46.3）；
+      # store 格式由 STORE_VERSION 守卫，跨 feature 布局约束见 validation V47.1。
       # 另一条同类盲区：gauss feature 的 `gaussdb` 是 git 依赖
       # （rust-opengauss @ b95ed0b9），不在 crates.io advisory 面内，cargo audit
       # 不产出它的公告。机械化入口只有本地 `cargo test --features gauss-sha256`

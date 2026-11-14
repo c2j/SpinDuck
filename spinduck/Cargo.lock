@@ -408,8 +408,8 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "codeweb"
-version = "0.9.9"
-source = "git+https://github.com/c2j/codeweb?tag=v0.9.9#f67b6c151151bd854f0580ee3a3ac7b21462ad97"
+version = "0.9.10"
+source = "git+https://github.com/c2j/codeweb?tag=v0.9.10#315f11a123bbada7c67717cc299866da6b5219e8"
 dependencies = [
  "bincode",
  "bitflags 2.13.2",

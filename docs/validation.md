@@ -4824,3 +4824,87 @@ SpinDuck 侧：`parse::tests::should_map_thin_graph_to_the_same_thin_graph_as_th
 - 不声称 Windows/macOS 发版矩阵已覆盖本改动（矩阵现状见 architecture 决策记录 ⑬）。
 - 不声称 codeweb 的 Java/JSP 能力可经嵌入获得：`analyze` 形态明确不含 java/jsp，
   ThinGraph 投影也跳过 Java/JSP 节点（与 SpinDuck 闭包面一致）。
+
+## V47. 嵌入后实测：跨 feature store 缺陷 + 内存/耗时（2026-11-14）
+
+本条是 embedded-codeweb Phase 4 的记录。前半是一次**真实缺陷**的发现与修复（v0.9.9 →
+v0.9.10），后半是内存/耗时数据与决策门结论。
+
+### V47.1 缺陷：store 的 bincode 布局依赖 feature 组合
+
+Phase 4 首次在真实体量上跑 embedding 时，analyze-only 构建（SpinDuck 的形态）读 full 构建
+写出的 store 直接失败：
+
+```text
+$ spinduck compile --dir <big> --codeweb-project <big>
+[ENV-0030] codeweb 加载失败: export error: bincode deserialize: io error:  (110571219 bytes)
+```
+
+而同一 store 用 full 构建的 codeweb CLI `export --format json` 正常（exit 0）。根因：
+bincode 用**变体索引**编码枚举，而 `Node::JspPage` / `Node::JspSql`（`cfg(feature = "jsp")`）、
+`Edge::ContainsSql`（`any(jsp, java)`）、`NodeKey::JspPage/JspSql`、`StoreStats::jsp_*`
+都在 feature 门控后面——full 构建的变体编号比 analyze-only 多两个，两边写出的 store
+互不可读。这不是"版本漂移"，是**同一版本号下按构建形态分裂的数据格式**。
+
+修复（codeweb `55f366b`，发版 `v0.9.10`）：
+
+- 持久化类型不再随 feature 门控：`Node::JspPage/JspSql`、`Edge::ContainsSql`、
+  `NodeKey::JspPage/JspSql`、`StoreStats::jsp_pages/jsp_sql`、`parser::jsp_types` 全部
+  无条件（jsp 的**行为**路径仍门控：节点创建、搜索回退、展示名缩短）。
+- `STORE_VERSION` 15 → 16：v15 store 一律按过期拒绝（不迁移，`analyze` 重建）；
+  修复版本对 v15 的自愈行为见 `analyze` 输出 `rebuilt store v15 → v16`。
+- 守卫测试 `graph::tests::should_keep_persisted_enum_variants_feature_independent`
+  钉死变体索引（JspPage=19、JspSql=20、ContainsSql=7）：重排/新增变体而不 bump
+  store 版本会直接红。
+
+**双向互通实测**（语料：8001 文件 / 72,051 节点 / 248,000 边 / store 105 MB）：
+
+```text
+# full 构建写 → analyze-only 读（修复前此处 bincode 报错）
+$ codeweb analyze --project <big>            # rebuilt store v15 → v16
+$ spinduck compile --dir <big> --codeweb-project <big>
+plan: target=pkg_syn_00000.prc_0 routines=1 tables=0 missing=8   # exit 0
+
+# analyze-only 写 → full 构建读
+$ echo "-- touch" >> <big>/sql/00000.sql
+$ spinduck compile --dir <big> --codeweb-project <big> --analyze
+compile: entries=1 missing=8 failed=0 dynamic=0
+$ codeweb export --format json --project <big>   # exit 0
+$ codeweb diff --project <big>
+Up to date. No changes detected.
+```
+
+### V47.2 内存与耗时（105 MB store 语料）
+
+`synthetic` 语料（`spinduck-build` 外的临时目录生成：8001 个包文件 × 8 过程 + 50 张表；
+72,051 节点 / 248,000 边；store 105 MB；`analyze` 全量 3.8s / 1.10 GB 峰值——codeweb
+进程侧基线）。host release 二进制（macOS arm64，`--features cli`），`/usr/bin/time -l`：
+
+| 路径 | wall | peak RSS |
+|---|---|---|
+| 嵌入只读（`diff` + load store + ThinGraph 投影 + 闭包 + 落计划） | **0.31 s** | **610 MB** |
+| 嵌入 `--analyze`（增量分析 + load + 投影 + 闭包） | **3.67 s** | **1.21 GB** |
+| 基线主导步骤：`codeweb export --format json`（full 构建，读同一 store 并序列化） | **0.39 s** | **898 MB** |
+| 基线 `diff` 单步（manifest 指纹扫描 8001 文件，不读 store） | **0.03 s** | **21 MB** |
+
+**决策门（计划 T4.1）**：接受，不立项「加载即投影」。依据：
+1. 只读路径峰值 **610 MB < 基线 898 MB**——旧管道里 codeweb 进程也要整份 store
+   物化后才能序列化 JSON，嵌入没有把"两份进程各持一份"变成"一份进程持两份"；
+   真正的增量是 `--analyze`（1.21 GB，+0.31 GB over 基线主导步骤），在门限（1 GB）内；
+2. `diff` 快路径确认：0.03s / 21 MB，`load_manifest_only` 未退化成全 store 加载；
+3. 每个 compile 只调一次 `load_graph`（`plans_from_source` 单点调用，`CountingSource`
+   测试锁定多入口共用一次取图）。
+
+### V47.3 不声称
+
+- 不声称真实语料的绝对峰值：本表是 105 MB store 的 synthetic 语料；真实语料 456 MB
+  store 约 4.3×（线性外推 ≈ 2.6 GB 只读 / 5.2 GB 分析），未在真实语料上实测。
+  若真实环境出现 OOM，处置路线已备（`GraphStore::load_bincode_filtered` 或重字段
+  独立文件，独立 PR），不在本批。
+- 不声称 `--analyze` 的增量成本可忽略：3.67s 对 8001 文件是增量扫描 + 单文件重解析，
+  不是全量；全量是 3.8s（与上表 codeweb analyze 同量级，说明增量收益在小改动下有限，
+  真实体量的全量成本更高）。
+- 不声称 Windows/macOS 双架构发版矩阵已用本改动复验（Linux x86_64 的 zigbuild 冒烟
+  见 Task 3.9 记录：GLIBC 上限 2.28 = 策略上限）。
+- 不声称单写者假设之外还有并发保护（`compile --analyze` 双写竞争属未定义行为，
+  口径见 architecture §13.5 并发写守卫行）。
