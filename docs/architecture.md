@@ -1115,7 +1115,7 @@ materialize(物化快照+时间戳)
 [plan]
 schema_version = 1
 target    = "pkg_split_trade_step2.prc_pre_deal_shjycf"   # 归一小写的例程全名
-generator = "spinduck 0.1.2 (plan schema 1)"             # 红时先怀疑两边口径
+generator = "codeweb 0.9.9"                              # 红时先怀疑两边口径（= 链接的 codeweb 版本）
 project_dir = "../.."                                    # 相对计划文件所在目录，不含绝对路径
 schema    = "bigfund"                                    # --schema 透传；缺省整行不写
 
@@ -1133,7 +1133,9 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
 | 项 | 口径 |
 |---|---|
 | 对象标识 | `relation:` / `sequence:` / `routine:` 三前缀。视图与表同为 `relation`（链路抽取本就归一类），故没有 design 草图里的 `table:` |
-| 闭包来源 | 项目闭包来自一次 codeweb 0.9.7 JSON 导出，不再用 SpinDuck 自有的链路抽取 |
+| 闭包来源 | 项目闭包来自进程内嵌 codeweb 的一次取图（`CodewebSource` → `EmbeddedCodewebSource` → `ThinGraph`），不再用 SpinDuck 自有的链路抽取；进程外二进制（`--codeweb-bin` / `SPINDUCK_CODEWEB`）已于 2026-11-14 退役（设计见 `docs/embeded-codeweb.md`，实证见 validation V46） |
+| generator | `codeweb <semver>`，取自编译进来的 `codeweb::embed::version()`（`plan::codeweb::embedded_version()`）；codeweb 发版升级即自动变化，有守护测试防倒退成硬编码字面量 |
+| 图新鲜度与降级 | `DiffStatus`（store 存在性 / 版本 / 增删改清单）判定；缺失或过期一律 `[ENV-0030]`，**不回退词法闭包**；`compile --analyze` 允许取图前进程内增量分析 |
 | 名字归一 | `db.schema.name` 截尾两段 + 小写；被调例程先按调用方所属包补全再试裸名，DDL 名先全名后尾段（同 `verify::run::resolve_routine` / `present`，两处实现分开的唯一原因是容器类型不同） |
 | 引擎自建对象 | `deploy_schema` 自己建的表（`ENGINE_PROVIDED_TABLES`，现为 `sys_dummy`）没有源文件：既不进 `ddl_tables` 也不报缺件 |
 | 文件清单 | 一个文件常声明多个闭包成员，故按**文件**去重排序；路径一律相对项目根、`/` 分隔 |
@@ -1337,6 +1339,9 @@ duckdb 类型；⑥ fastaas 子模块保留现状（私有项目）。
 > `libduckdb-sys` 的 **build-dependency**（`bundled` 解压缩包用），不进运行时产物；
 > 升级它即违反 §1 内核版本锚定（`duckdb = "=1.10505.0"`），故 CI 显式 `--ignore` 四条，
 > 内核升级 PR（V6 门禁）必须复评该清单。
+> 同类的**审计盲区**（非豁免）：嵌入的 `codeweb` 是 git 依赖（`c2j/codeweb @ tag
+> v0.9.9`），不在 crates.io advisory 面内；tag 升级必须人工复核其依赖面变化与
+> ThinGraph 投影等价测试（validation V46.1/V46.3），复评节奏同 ⑫ 的 rev 纪律。
 > ⑪ **CI 口令与目录**：golden job 的 GaussDB 口令改为 runner 内随机生成（一次一密，
 > 不落仓库），三条子模块步骤显式 `working-directory: .`（`defaults` 为 `spinduck/`，
 > 在 crate 目录内 `git submodule update --init lib/ogsql-parser` 报 pathspec 不匹配）。
