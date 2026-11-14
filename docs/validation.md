@@ -4686,7 +4686,7 @@ cargo audit --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 \
 - 机器：本机 apple silicon，2026-11-14。release，`cargo build --release --locked --features cli`。
 - A/B 同基：基线 SHA `12b9756`，分支改动以 `git stash` 前后对照（同一基线、
   同一库副本、同一调用序列）；合并头 `02afd28`（含 `origin/main` `59acb9a` / PR #39）。
-- 生产库：`/tmp/spinduck-perf/bench.duckdb`（143 MiB，V42 同库；参数表
+- 生产体量对照库：`/tmp/spinduck-perf/bench.duckdb`（143,667,200 字节，约 137 MiB，V42 同库；参数表
   `par_fund_partner` 47,095、`par_fund_seat` 620,630、`par_sys_purchase` 427,436 等；
   游标日 `20250715` 且 `scdm = '001'` 的 `mid_yjqs_detail` 500 行 → 490 行指令）。
 - 入口：`golden/case_corpus_purchase/.spinduck/plan/pkg_split_trade_step3_sh.prc_trd_deal_purchase.toml`，
@@ -4709,7 +4709,7 @@ cargo audit --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 \
 ### 计时（放大游标）
 
 临时原生脚手架（复用 `cases_native` 的 `deploy_project` 部署
-`case_corpus_purchase`，按 GROUP BY 键 `security_id` 复制 A0001 族 20000 份并克隆
+`case_corpus_purchase`，按不同 `security_id` 复制 A0001 族 20000 行并克隆
 `par_sys_purchase`；`gddm`/`xwdm`/`sub_gddm` 不变以保持配置连接）。`eng.call`
 （noop sink），`step_budget = 1e8`，release，各模式取 3 次最小墙钟。**脚手架测量后
 删除，不入库**；负载是合成规模输入，非考题产物。
@@ -4724,41 +4724,133 @@ cargo audit --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 \
 生产体量两侧 490 行 7 列有序导出（`fund_code, seat_code, security_id, purchase_no,
 purchase_yj, purchase_days, purchase_money`，`ORDER BY 1,2,3,4`）sha256 同为
 `9bd68b44a2a4ebc4f23de112543b49e3de82d5816f9fa31cc6482d1b1bd56eaf`。
-放大游标输出行数 = 2 + scale 逐值闭合（scale=10 时 12 行、scale=20000 时 20002 行）。
+放大游标只断言输出行数 = 2 + scale（scale=10 时 12 行、scale=20000 时 20002 行），
+没有逐列比较该组产物。purchase 游标是逐行 SELECT，不含 GROUP BY；之前把同包另一个
+过程的 GROUP BY 误当成该入口的条件，不影响已测行数，但不能据此推断写缓冲组数。
 
 ### 测试
 
-- `writebuf_flush` 守护：caught-error 后剩余组存活、成功组不重放（修前 `remove(0)`
-  路径会丢组）。
+- `writebuf_flush` 语义锁定：caught-error 后剩余组存活、成功组不重放；旧 `remove(0)`
+  同样保留未处理组，本轮索引消费是等价重构，不是修复丢组。
 - `trace_short_circuit`：noop sink 在构造 `TraceEvent` 前短路。
 - `lookup_cache::tests_invalidate`：INSERT 失效前缀语义。
 - 合并头门禁：`cargo fmt --all -- --check` OK；`cargo clippy --all-features --tests
-  -- -D warnings` 干净；`cargo test --features cli` 全绿（460 lib + 111 集成 + cli
-  契约层）；`cargo audit --no-fetch`（4 条构建期 zip 豁免）exit 0，依赖树与
+  -- -D warnings` 干净；`cargo test --features cli` 全绿（460 lib + 111 CLI
+  契约及其他集成测试）；`cargo audit --no-fetch`（4 条构建期 zip 豁免）exit 0，依赖树与
   `origin/main` 逐字节相同（`Cargo.toml`/`Cargo.lock` 无 diff）。
 - 黄金层：本机 A 模式容器（`opengauss/opengauss:5.0.0`，127.0.0.1:5433）合并头
   `02afd28` 复跑 `cargo test --features gauss` 全绿（600 通过 / 0 失败，含
-  `gauss_e2e`、`gauss_sha256`、`golden_corpus_gauss`、`golden_corpus_purchase`、
-  `golden_gauss`、`cases_native`；唯一 panic 来自 `should_panic` 守护测试），
-  容器全程 healthy。
+  `gauss_e2e`、`golden_corpus_gauss`、`golden_corpus_purchase`、
+  `golden_gauss`、`cases_native`；唯一 panic 来自 `should_panic` 守护测试）。
+  `gauss_sha256` 未启用对应 feature，收集 0 个测试；容器前后健康检查均为 healthy，
+  未连续监控其整个生命周期。
 
 ### 不声称
 
 - 不把生产体量 −4% 说成倍数级加速：V42 的点查缓存已吃掉大头（3.62 → 1.50），
   本轮是其上的增量热路径抛光。
-- 放大游标只证明热路径 delta 随缓冲组数增长，不代表生产日终批处理的端到端加速；
-  其参数表仍为 fixture 体量（2–4 行），不压点查缓存——生产体量那组才压参数表。
-- 不声称 `--batch-commit` 在生产体量上有收益（两侧持平，490 组的 O(N²) flush 可忽略）。
+- 放大游标仅记录该合成负载的整体差异，未测写缓冲组数，不能归因于 O(N) flush，
+  也不代表生产日终批处理的端到端加速。伙伴、席位表仍为 fixture 体量，
+  `par_sys_purchase` 随克隆增至 20002 行；V42 同库一组则有更大的参数表。
+- 不声称本 PR 在生产体量的 `--batch-commit` 模式有额外收益（两侧持平）；
+  490 行输出不等于 490 个缓冲组。
 - 计时为墙钟 / user，未单独剥离 DuckDB SQL 执行与解释器开销的占比。
 
-## V46. 嵌入 codeweb v0.9.9：进程外契约退役与等价实证（2026-11-14）
+### PR #41 审核修正（2026-11-14）
+
+- 多语句 INSERT 后续 DELETE/UPDATE 漏失效已复现：
+  `should_invalidate_tables_written_after_first_insert` 修前实际 `Str("7")`、期望 `Str("9")`；
+  修后两个分支均通过。含分号文本保守回落完整分词，不增加手写 SQL 引号解析器。
+- `tests/guard/guard_lookup_cache_dynamic.rs` 注册为独立测试目标：
+  `should_reject_stale_lookup_after_dynamic_delete` 修前 `call` 错误返回成功，修后返回
+  `BIZ-0100` / `NO_DATA_FOUND`，且未捕获错误回滚调用（源表 1 行、other 0 行）。
+- `tests_invalidate` 补 WITH、注释分隔关键字、转义标识符、列清单 INSERT SELECT、
+  字符串内分号/转义单引号、dollar quote、多语句及分词失败的回落断言。
+- `should_preserve_seven_group_order_across_middle_failure` 在重构前通过，锁定七个
+  交替前缀组、中间失败、回放和异常恢复的完整下发顺序；提取 `replay_group` 后仍通过。
+  原两条 `writebuf_flush` 测试保留断言，改称既有语义锁定，不再声称修前丢组。
+- `should_preserve_batch_skip_replay_with_disabled_sink` 同时断言启用/禁用 sink 的
+  回放 SQL 顺序一致，启用时精确输出一条 `BatchSkip(1, KERNEL-0010 bad row)`，
+  禁用时不接收事件；在重构前后均通过。
+- 2026-11-14 审核修正阶段维护者明确答复“确认保留” `TraceSink::is_enabled()`：
+  授权限于此默认方法（默认 true、noop false）；不涵盖后续 SqlExecutor 或 AppendBatch。
+- 本轮 `cargo fmt --all -- --check`、`cargo clippy --all-features --tests -- -D warnings`
+  通过；`cargo test --features cli` 共 669 通过 / 0 失败；`cargo audit --no-fetch`
+  加 CI 四条 zip 豁免通过（缓存库 1509 条公告）。Cargo.toml 仅注册测试，未改依赖。
+- 本机 A 模式容器 `cargo test --features gauss` 共 607 通过 / 0 失败，容器前后
+  healthy；未启用 gauss-sha256，不声称覆盖独立 sha256 实例。
+- 上文性能数保留为审核前测量，不作为本次修复后的重新计量结果。
+
+## V46. 标量模板前移、惰性 CASE 与受限哑表折叠（2026-11-14）
+
+基线为 PR #41 合并提交 `1eb177e8f1e668a2571cb10ec885792c98b7b568`；机制见
+architecture §3.5.2。本轮未修改已有测试断言、输入或期望值，仅获准给旧 IR 构造器
+补模板字段；新增测试登记于 `guard_scalar_sql`、`guard_dummy_fold` 等目标。
+
+### Red → Green 与范围
+
+- `should_prepare_scalar_sql_during_compilation` / `should_prepare_builtin_fallback_during_compilation`：
+  首跑因缺少 `prepared` 字段编译失败；实现模板后通过。
+  `should_preserve_scalar_sql_text_and_bindings` 在改动前后逐字锁定嵌套日期 SQL、SUBSTRING
+  与命名绑定。错误模板测试确认不执行分支不报错、执行时仍为 BIZ-0131。
+- `should_evaluate_case_expression_lazily_with_unknown_conditions` 首跑 ENG-0026 不支持 CASE，
+  实现后通过；补简单选择子只求值一次、NULL 不匹配 NULL、缺 ELSE、嵌套 CASE 渲染与
+  每个位置的闭包依赖收集测试。
+- `should_preserve_kernel_case_type_error_on_dummy_query` 实测 SQL 混合分支
+  `CASE WHEN TRUE THEN 'ok' ELSE 1 END` 为 KERNEL-0010，而 PL 赋值返回 `ok`。
+  因此未做无条件折叠；维护者选择“仅折叠可证明子集”。
+- `should_fold_homogeneous_literal_case_with_cardinality_probe` 首跑仍是原 CASE 查询而红，
+  实现后通过。缺表/空表/单行/多行守护在折叠前后通过，覆盖 sys_dummy 与 dual。
+  同类型常量矩阵与强制保留的 `WHERE TRUE` 内核路径逐值一致；未知类型、字段、
+  函数、序列、算术、混合类型及附加子句维持 SqlQuery。
+- 自查发现拆成 Query+Assign 会多消耗一步：`should_preserve_dummy_query_step_budget_boundary`
+  在预算 3 时实测 ENG-0032；改为单条 `FoldedQuery` 后预算 3 成功、预算 2 保持 ENG-0032。
+  `should_flush_dummy_writes_before_probe_and_rollback_on_cardinality_error` 确认批缓冲读自己写，
+  多行异常后新增行回滚。重构仅提取 INTO 目标编译，接缝签名未改。
+
+### 本地门禁
+
+- `cargo fmt --all -- --check`、`cargo clippy --all-features --tests -- -D warnings` 通过。
+- `cargo test --features cli`：685 通过 / 0 失败；含 466 lib、111 CLI、7 dummy guard、
+  6 scalar guard；`cargo test --features gauss`：623 通过 / 0 失败。
+  黄金层仅连接本机 A 模式容器 127.0.0.1:5433，口令运行时从容器环境取得，不落文件。
+  前后健康检查为 healthy，不代表连续生命周期监测；未运行独立 gauss-sha256 实例。
+- 中途 `cargo test --all-features case` 因未注入参照连接环境在黄金目标显式失败；随后
+  以上完整 CLI/gauss 门禁通过，不把该中途执行报告为通过。
+- 在线 `cargo audit` 拉取 RustSec 时网络失败；`cargo audit --no-fetch` 加 CI 既有四条
+  zip 豁免通过（1509 条缓存公告 / 242 依赖）。不声称缓存结果是最新在线审计。
+  Cargo.lock 无修改，Cargo.toml 只增加两个测试目标。
+
+### 同库 release A/B
+
+基线在独立 detached worktree 构建，本轮候选在当前工作树构建；均为
+`cargo build --release --locked --features cli`、v0.1.20、同一台 Apple Silicon。
+复用 V45 的 143,667,200 字节本地 bench.duckdb，每次调用前复制到独立副本；真实
+purchase 源码和既有计划，参数 `'20250715' null`，不触碰远端生产库、不启用 trace。
+每模式预热一轮，随后基线/候选交替两轮，计时期间未并行运行本会话测试任务。
+
+| 模式 | 基线 real / user（两次） | 候选 real / user（两次） | real 均值 |
+|---|---|---|---|
+| batch OFF | 1.60 / 1.56；1.63 / 1.58 | 1.57 / 1.55；1.58 / 1.55 | 1.615 → 1.575 s（约 −2.5%） |
+| batch ON | 1.47 / 1.39；1.43 / 1.37 | 1.42 / 1.35；1.41 / 1.35 | 1.450 → 1.415 s（约 −2.4%） |
+
+四侧均 `OUT p_o_succeed = 0`；按 V45 的日期/市场过滤和四键排序导出 490 行 × 7 列，
+两组 `compare` 均 diffs=0，四份 JSON 逐字节 SHA-256 同为
+`28157fdc973fbea350cc239bfeb2fb09f672b683007212311edde77b534e26d6`。
+这只是两次热缓存样本，不声称统计显著或倍数级收益。
+
+`explain` 确认真实 purchase 的记录字段 CASE 仍为 SqlQuery、没有 FoldedQuery；未知
+字段类型不在本次证明子集内。不能把整过程差异归因于哑表折叠，也没有宣称覆盖此前
+20000 行放大数据集（本轮未重跑该合成脚手架）。
+
+## V47. 嵌入 codeweb v0.9.9：进程外契约退役与等价实证（2026-11-14）
 
 本条目记录 docs/embeded-codeweb.md / docs/plans/2026-11-14-embedded-codeweb.md 的落地
 证据。**V43 记录的进程外口径（`--codeweb-bin` + stderr 哨兵 + `--version` 词匹配）已
 整体退役**，取代它的是 `codeweb::embed` 结构化 API；V43 的 MISS/REF 结论本身不被本条目
-改写（图语义未变，见 V46.3 等价实证）。
+改写（图语义未变，见 V47.3 等价实证）。
 
-### V46.1 版本对齐与单 parser 证明
+### V47.1 版本对齐与单 parser 证明
 
 - codeweb 侧：`ogsql-parser` git tag `v0.10.0` → `v0.11.0`（= 子模块 pin
   `13d9baa4358ca9537eb4f753fd2e5cd2d5a2517b`，远端 tag 复核一致）；连带
@@ -4774,7 +4866,7 @@ purchase_yj, purchase_days, purchase_money`，`ORDER BY 1,2,3,4`）sha256 同为
   节点数为 0（codeweb 以 `default-features = false, features = ["analyze"]` 引入，
   CLI/TUI/serve/MCP/JSP/Java 编译面全部裁掉）。
 
-### V46.2 契约变化（相对 V43）
+### V47.2 契约变化（相对 V43）
 
 | 面 | V43（进程外） | 现在（嵌入） |
 |---|---|---|
@@ -4790,7 +4882,7 @@ purchase_yj, purchase_days, purchase_money`，`ORDER BY 1,2,3,4`）sha256 同为
 （`should_write_a_semver_generator_from_the_embedded_source`）。同一构建内同输入同输出的
 复现性口径不变；跨构建的字节比较现在要求 codeweb 版本一致。
 
-### V46.3 等价实证（ThinGraph ↔ JSON 1:1）
+### V47.3 等价实证（ThinGraph ↔ JSON 1:1）
 
 codeweb 侧两条测试锁定映射不漂移：
 
@@ -4805,7 +4897,7 @@ SpinDuck 侧：`parse::tests::should_map_thin_graph_to_the_same_thin_graph_as_th
 断言同一逻辑图经 JSON 与经 `from_thin_graph` 产出**逐字段相等**的内部瘦图
 （9 类节点、7 类边、8 种 AccessMode、write_kinds）；`walk.rs` 零改动。
 
-### V46.4 门禁实测（本 worktree）
+### V47.4 门禁实测（本 worktree）
 
 - 基线（改依赖前）：`cargo test --features cli` 662 passed / 0 failed。
 - Task 3.1（依赖 + patch）：662 不变。
@@ -4817,7 +4909,7 @@ SpinDuck 侧：`parse::tests::should_map_thin_graph_to_the_same_thin_graph_as_th
 - Task 3.7（generator 守护）：+1。
 - `cargo fmt --all -- --check`、`cargo clippy --all-features -- -D warnings` 干净。
 
-### V46.5 不声称
+### V47.5 不声称
 
 - 不声称嵌入后更快：本条目只给正确性与契约面证据，内存/耗时实测见 Phase 4 条目。
 - 不声称 `--analyze` 在生产体量上的增量分析成本已被测过（Phase 4 记录）。
@@ -4825,12 +4917,12 @@ SpinDuck 侧：`parse::tests::should_map_thin_graph_to_the_same_thin_graph_as_th
 - 不声称 codeweb 的 Java/JSP 能力可经嵌入获得：`analyze` 形态明确不含 java/jsp，
   ThinGraph 投影也跳过 Java/JSP 节点（与 SpinDuck 闭包面一致）。
 
-## V47. 嵌入后实测：跨 feature store 缺陷 + 内存/耗时（2026-11-14）
+## V48. 嵌入后实测：跨 feature store 缺陷 + 内存/耗时（2026-11-14）
 
 本条是 embedded-codeweb Phase 4 的记录。前半是一次**真实缺陷**的发现与修复（v0.9.9 →
 v0.9.10），后半是内存/耗时数据与决策门结论。
 
-### V47.1 缺陷：store 的 bincode 布局依赖 feature 组合
+### V48.1 缺陷：store 的 bincode 布局依赖 feature 组合
 
 Phase 4 首次在真实体量上跑 embedding 时，analyze-only 构建（SpinDuck 的形态）读 full 构建
 写出的 store 直接失败：
@@ -4879,7 +4971,7 @@ $ codeweb diff --project <big>
 Up to date. No changes detected.
 ```
 
-### V47.2 内存与耗时（105 MB store 语料）
+### V48.2 内存与耗时（105 MB store 语料）
 
 `synthetic` 语料（`spinduck-build` 外的临时目录生成：8001 个包文件 × 8 过程 + 50 张表；
 72,051 节点 / 248,000 边；store 105 MB；`analyze` 全量 3.8s / 1.10 GB 峰值——codeweb
@@ -4900,7 +4992,7 @@ Up to date. No changes detected.
 3. 每个 compile 只调一次 `load_graph`（`plans_from_source` 单点调用，`CountingSource`
    测试锁定多入口共用一次取图）。
 
-### V47.3 不声称
+### V48.3 不声称
 
 - 不声称真实语料的绝对峰值：本表是 105 MB store 的 synthetic 语料；真实语料 456 MB
   store 约 4.3×（线性外推 ≈ 2.6 GB 只读 / 5.2 GB 分析），未在真实语料上实测。
@@ -4914,7 +5006,7 @@ Up to date. No changes detected.
 - 不声称单写者假设之外还有并发保护（`compile --analyze` 双写竞争属未定义行为，
   口径见 architecture §13.5 并发写守卫行）。
 
-### V47.4 依赖面与产物回归（计划 T4.4）
+### V48.4 依赖面与产物回归（计划 T4.4）
 
 - **lockfile crate 数**：242（v0.1.20，嵌入前）→ **285**（+43）。新增面全部为纯 Rust
   （petgraph / bincode / bitflags / rayon / walkdir / globset / blake3 / csv / pathdiff /

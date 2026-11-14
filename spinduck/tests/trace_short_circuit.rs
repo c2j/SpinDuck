@@ -83,6 +83,93 @@ fn should_not_construct_events_for_disabled_sink_on_cursor_paths() {
         .unwrap();
 }
 
+struct FailBadRow {
+    calls: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+}
+
+impl SqlExecutor for FailBadRow {
+    fn query(&self, _sql: &str, _binds: &BindMap) -> Result<RowStream, EngineError> {
+        Ok(RowStream::new(Vec::new(), Vec::new()))
+    }
+
+    fn execute(&self, sql: &str, binds: &BindMap) -> Result<ExecOutcome, EngineError> {
+        if sql.to_ascii_lowercase().starts_with("insert") {
+            assert_eq!(binds, &BindMap::new());
+            self.calls.borrow_mut().push(
+                sql.split_whitespace()
+                    .collect::<String>()
+                    .to_ascii_lowercase(),
+            );
+        }
+        if sql.contains("'bad'") {
+            return Err(EngineError::kernel(10, "bad row"));
+        }
+        Ok(ExecOutcome { rows_affected: 1 })
+    }
+}
+
+#[derive(Default)]
+struct EnabledSink(Vec<TraceEvent>);
+
+impl TraceSink for EnabledSink {
+    fn on_event(&mut self, event: TraceEvent) {
+        self.0.push(event);
+    }
+}
+
+#[test]
+fn should_preserve_batch_skip_replay_with_disabled_sink() {
+    for enabled in [false, true] {
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut eng = Engine::new(
+            Box::new(FailBadRow {
+                calls: calls.clone(),
+            }),
+            RuleRegistry::default(),
+        );
+        eng.batch_commit = true;
+        eng.register(
+            "CREATE OR REPLACE PROCEDURE prc_skip IS BEGIN \
+            INSERT INTO t_log VALUES ('first'); INSERT INTO t_log VALUES ('bad'); \
+            INSERT INTO t_log VALUES ('last'); END;",
+        )
+        .unwrap();
+        let mut recording = EnabledSink::default();
+        let mut disabled = DisabledSink;
+        let sink: &mut dyn TraceSink = if enabled {
+            &mut recording
+        } else {
+            &mut disabled
+        };
+        eng.call_with_sink("prc_skip", &[], sink).unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                "insertintot_logvalues('first'),('bad'),('last')",
+                "insertintot_logvalues('first')",
+                "insertintot_logvalues('bad')",
+                "insertintot_logvalues('last')",
+            ]
+        );
+        let skips: Vec<_> = recording
+            .0
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::BatchSkip { rows, first_error } => Some((*rows, first_error.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            skips,
+            if enabled {
+                vec![(1, "KERNEL-0010 bad row")]
+            } else {
+                vec![]
+            }
+        );
+    }
+}
+
 #[test]
 fn should_default_trace_sink_to_enabled_and_noop_to_disabled() {
     assert!(!spinduck_core::exec::TraceNoopSink.is_enabled());

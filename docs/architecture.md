@@ -297,6 +297,16 @@ PopFrame）。语义要点：
   语义跳过、不进入 PL 异常处理器（inst_log 缺失）。机制细节见
   `runtime/interp/writebuf.rs` 头注释，实证见 validation V26.3/V26.7。
 
+写缓冲按索引消费组，成功时清空，首行回放失败时仅 `drain(..=i)` 出账已处理组；
+未处理组留在缓冲中，错误被 PL 捕获后仍可在出口刷盘。这与旧 `remove(0)` 的行为
+等价，但避免交替前缀形成大量组时的反复搬移。`replay_group` 保留首行错误上抛、
+后续坏行跳过及 `BatchSkip` 事件语义。缓冲表名用增量 `HashSet` 维护，出账后从
+剩余组重建，避免每次读自己写判定都重新扫描全部组。
+
+`TraceSink::is_enabled()` 默认 `true`；noop 实现返回 `false`，表示不接收任何事件。
+调用点必须在构造事件（SQL 克隆、绑定表复制）之前判断，不依赖 sink 空实现吞事件。
+该约束同样覆盖合并 INSERT、逐行回放及 `BatchSkip`；不改变启用 sink 的事件顺序。
+
 ### 3.5.1 参数表点查缓存
 
 循环里的点查（等值、日期 `BETWEEN`、`IN` 列表、同一列上的 `OR`、单列 `IN`
@@ -305,10 +315,33 @@ PopFrame）。语义要点：
 语义不变，结果列名跟 SELECT 列表走。投影里的 `coalesce` 留在构建 SQL 中，由内核计算。
 
 刷新点只有两处：写入都走当前连接的 `SqlExecutor::execute`，调用内没有第二写者。
-顶层 `call` 入口清空；`execute` 的标识符命中已缓存表名时丢掉该表的索引，下一次
-查询重建，因此能看见本事务刚写入的行。认不出的语句（`CASE`、不等谓词、连接）、
-构建失败、排序键并列，或排序值无法在进程内比较，都原样下发。机制见 `src/lookup_cache/`，
-实证见 validation V42。
+顶层 `call` 入口清空；空缓存的 `execute` 不扫描 SQL。对于不含分号且前缀可识别的
+INSERT，只按写目标表失效，INSERT SELECT 的只读来源表不失效；其余形态完整分词，
+标识符命中已缓存表名即丢掉该表索引，分词失败则清空缓存。分号检查不区分引号、
+注释或尾部分隔符：宁可保守回落，也不能遗漏多语句动态 SQL 后续的写入。
+下一次查询重建，因此能看见本事务刚写入的行。输出列名在建槽时解析一次并随槽缓存。
+认不出的查询（`CASE`、不等谓词、连接）、构建失败、排序键并列，或排序值无法在
+进程内比较，都原样下发。机制见 `src/lookup_cache/`，实证见 validation V42/V45。
+
+### 3.5.2 标量模板前移与哑表投影折叠
+
+`SqlFn` 在编译时保存改写后的 `ScalarSql`（SQL + 按名绑定源）；运行时只解析帧绑定并
+查询。`FuncCall` 保存内建回退模板，但仍先查运行期例程目录，未命中才求值实参并执行
+模板。两类模板均保存 `Result`，改写失败延迟到表达式真正执行时报告，不提前改变注册
+结果；嵌套日期函数仍整棵下沉，避免中间日期经 `SpinValue` 文本化。
+
+`IrExpr::Case` 逐臂惰性求值：简单 CASE 选择子只求值一次，NULL 不匹配 NULL；搜索
+CASE 仅 TRUE 命中，省略 ELSE 返回 NULL。SQL 渲染和闭包遍历覆盖所有分支。
+
+哑表折叠采用保守白名单：单投影、单 INTO，只有普通 Null/Bool/Int/Text 字面量和
+结果同类型的嵌套 CASE；简单 CASE 不接受文本比较（collation 依赖）。函数、序列、
+算术、小数、未知变量/记录字段、混合类型及额外 SQL 子句不折叠。替换投影为 1 后，
+完整格式化 SQL 必须匹配 `SELECT 1 FROM sys_dummy` 或 `SELECT 1 FROM dual`。
+
+`sys_dummy` 是可变普通表，`dual` 也没有引擎单行保证，因此不能删除关系访问。
+`FoldedQuery` 在一条 IR 内先刷触及该表的缓冲、检查 0/1/>1 行，再按原写槽规则赋值，
+保持原 SELECT INTO 的步数预算及错误/回滚边界。该路径仍有一次 SQL 调用，不声称
+零次下发，也不放宽现有混合类型 CASE 的内核报错。实证见 validation V46。
 
 ### 3.6 目录与持久化
 
@@ -1133,7 +1166,7 @@ from   = "pkg_a.fnc_x"                                    # 引用它的例程�
 | 项 | 口径 |
 |---|---|
 | 对象标识 | `relation:` / `sequence:` / `routine:` 三前缀。视图与表同为 `relation`（链路抽取本就归一类），故没有 design 草图里的 `table:` |
-| 闭包来源 | 项目闭包来自进程内嵌 codeweb 的一次取图（`CodewebSource` → `EmbeddedCodewebSource` → `ThinGraph`），不再用 SpinDuck 自有的链路抽取；进程外二进制（`--codeweb-bin` / `SPINDUCK_CODEWEB`）已于 2026-11-14 退役（设计见 `docs/embeded-codeweb.md`，实证见 validation V46） |
+| 闭包来源 | 项目闭包来自进程内嵌 codeweb 的一次取图（`CodewebSource` → `EmbeddedCodewebSource` → `ThinGraph`），不再用 SpinDuck 自有的链路抽取；进程外二进制（`--codeweb-bin` / `SPINDUCK_CODEWEB`）已于 2026-11-14 退役（设计见 `docs/embeded-codeweb.md`，实证见 validation V47） |
 | generator | `codeweb <semver>`，取自编译进来的 `codeweb::embed::version()`（`plan::codeweb::embedded_version()`）；codeweb 发版升级即自动变化，有守护测试防倒退成硬编码字面量 |
 | 图新鲜度与降级 | `DiffStatus`（store 存在性 / 版本 / 增删改清单）判定；缺失或过期一律 `[ENV-0030]`，**不回退词法闭包**；`compile --analyze` 允许取图前进程内增量分析 |
 | 并发写守卫 | **单写者假设（v1，不加锁）**：`compile --analyze` 会在 spinduck 进程内向 `.codeweb/store.*` 落盘；两个 spinduck（或与 codeweb CLI）**同时**对该项目 `analyze` 属未定义行为（可能互相覆盖）。口径：一个 codeweb 项目同一时刻只允许一个分析者；需要并发时先做 advisory lock（`create_new` 哨兵 + 过期检测，独立设计，未立项）。只读路径（默认无 `--analyze`，或 store 已最新）无写、无此限制 |
@@ -1342,7 +1375,7 @@ duckdb 类型；⑥ fastaas 子模块保留现状（私有项目）。
 > 内核升级 PR（V6 门禁）必须复评该清单。
 > 同类的**审计盲区**（非豁免）：嵌入的 `codeweb` 是 git 依赖（`c2j/codeweb @ tag
 > v0.9.10`），不在 crates.io advisory 面内；tag 升级必须人工复核其依赖面变化与
-> ThinGraph 投影等价测试（validation V46.1/V46.3），复评节奏同 ⑫ 的 rev 纪律。
+> ThinGraph 投影等价测试（validation V47.1/V47.3），复评节奏同 ⑫ 的 rev 纪律。
 > ⑪ **CI 口令与目录**：golden job 的 GaussDB 口令改为 runner 内随机生成（一次一密，
 > 不落仓库），三条子模块步骤显式 `working-directory: .`（`defaults` 为 `spinduck/`，
 > 在 crate 目录内 `git submodule update --init lib/ogsql-parser` 报 pathspec 不匹配）。

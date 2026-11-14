@@ -107,15 +107,14 @@ impl Compiler {
                     .unwrap_or(false)
                 {
                     // @变换标记（@to_char/@to_date/@intertonum…）：SQL-first 下沉
+                    let prepared = prepare_scalar_sql(&mapped, &compiled);
                     return Ok(IrExpr::SqlFn {
                         name: mapped,
                         args: compiled,
+                        prepared,
                     });
                 }
-                Ok(IrExpr::FuncCall {
-                    name: mapped,
-                    args: compiled,
-                })
+                Ok(IrExpr::function_call(mapped, compiled))
             }
             Expr::Parenthesized(inner) => self.expr(inner),
             Expr::UnaryOp { op, expr } if op == "-" => Ok(IrExpr::Bin {
@@ -186,7 +185,25 @@ impl Compiler {
                     or_chain(parts)
                 })
             }
-            // 其余表达式（LIKE/CASE/子查询…）M2 不支持；SQL 侧表达式的
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+            } => Ok(IrExpr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|e| self.expr(e).map(Box::new))
+                    .transpose()?,
+                whens: whens
+                    .iter()
+                    .map(|w| Ok((self.expr(&w.condition)?, self.expr(&w.result)?)))
+                    .collect::<Result<_, EngineError>>()?,
+                else_expr: else_expr
+                    .as_ref()
+                    .map(|e| self.expr(e).map(Box::new))
+                    .transpose()?,
+            }),
+            // 其余表达式（LIKE/子查询…）M2 不支持；SQL 侧表达式的
             // 大多数场景发生在 SQL 文本内（M3 改写管线），PL 侧按需逐里程碑扩展
             other => Err(EngineError::invariant(
                 26,
@@ -194,6 +211,23 @@ impl Compiler {
             )),
         }
     }
+}
+
+fn prepare_scalar_sql(name: &str, args: &[IrExpr]) -> Result<ScalarSql, EngineError> {
+    let mut parts = Vec::with_capacity(args.len());
+    let mut binds = Vec::new();
+    for arg in args {
+        let (text, sources) = crate::sql::render::expr_to_sql_binds(arg).ok_or_else(|| {
+            EngineError::invariant(64, "SqlFn argument not renderable (cursor attribute?)")
+        })?;
+        parts.push(text);
+        binds.extend(sources);
+    }
+    let sql = format!("SELECT {}({})", name.to_ascii_lowercase(), parts.join(", "));
+    Ok(ScalarSql {
+        sql: crate::sql::apply_ast_transforms(&sql)?,
+        binds,
+    })
 }
 
 /// 条件链左结合组合（OR）：`a OR b OR c`。

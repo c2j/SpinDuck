@@ -108,6 +108,10 @@ fn walk_code(code: &[IrStmt], w: &mut Walk) {
                 w.texts.push(sql.clone());
                 walk_sites(fn_sites, w);
             }
+            IrStmt::FoldedQuery { sql, expr, .. } => {
+                w.texts.push(sql.clone());
+                walk_expr(expr, w);
+            }
             IrStmt::SqlExecDynamic { text_expr, .. } => walk_expr(text_expr, w),
             IrStmt::OpenCursor { source, .. } => match source {
                 CursorSource::Static { sql, fn_sites, .. } => {
@@ -148,8 +152,20 @@ fn walk_expr(expr: &IrExpr, w: &mut Walk) {
                 stack.push(r);
                 stack.push(l);
             }
+            IrExpr::Case {
+                operand,
+                whens,
+                else_expr,
+            } => {
+                stack.extend(operand.as_deref());
+                for (condition, result) in whens {
+                    stack.push(condition);
+                    stack.push(result);
+                }
+                stack.extend(else_expr.as_deref());
+            }
             IrExpr::Not(inner) | IrExpr::IsNull(inner) => stack.push(inner),
-            IrExpr::FuncCall { name, args } => {
+            IrExpr::FuncCall { name, args, .. } => {
                 let lower = name.to_ascii_lowercase();
                 if lower.contains('.') {
                     w.refs.insert(lower.clone());

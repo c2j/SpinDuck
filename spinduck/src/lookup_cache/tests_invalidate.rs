@@ -59,6 +59,69 @@ fn probe_value(ex: &LookupExecutor) -> SpinValue {
 }
 
 #[test]
+fn should_invalidate_tables_written_after_first_insert() {
+    for stmt in [
+        "INSERT INTO other VALUES (1); DELETE FROM par_sys_purchase",
+        "INSERT INTO other VALUES (1); UPDATE par_sys_purchase SET purchase_days = 9",
+    ] {
+        let (inner, queries) = Inner::new(&["7", "9"]);
+        let ex = cache(Box::new(inner));
+        assert_eq!(probe_value(&ex), SpinValue::Str("7".into()));
+        ex.execute(stmt, &BindMap::new()).unwrap();
+        assert_eq!(probe_value(&ex), SpinValue::Str("9".into()), "{stmt}");
+        assert_eq!(queries.borrow().len(), 2, "{stmt}");
+    }
+}
+
+#[test]
+fn should_fall_back_for_ambiguous_insert_forms() {
+    for stmt in [
+        "WITH src AS (SELECT 1) INSERT INTO par_sys_purchase SELECT * FROM src",
+        "insert/*c*/into par_sys_purchase VALUES (1)",
+        "INSERT INTO \"a\"\"b\" SELECT * FROM par_sys_purchase",
+        "INSERT INTO other VALUES ('a;''b'); DELETE FROM par_sys_purchase",
+        "INSERT INTO other VALUES (1); -- next statement\nUPDATE par_sys_purchase SET purchase_days = 9",
+        "INSERT INTO other VALUES ($tag$a;b$tag$); DELETE FROM par_sys_purchase",
+    ] {
+        assert_eq!(insert_target(stmt), None, "{stmt}");
+        let (inner, queries) = Inner::new(&["7", "9"]);
+        let ex = cache(Box::new(inner));
+        assert_eq!(probe_value(&ex), SpinValue::Str("7".into()));
+        ex.execute(stmt, &BindMap::new()).unwrap();
+        assert_eq!(probe_value(&ex), SpinValue::Str("9".into()), "{stmt}");
+        assert_eq!(queries.borrow().len(), 2, "{stmt}");
+    }
+}
+
+#[test]
+fn should_preserve_cache_for_single_insert_select_and_literal_semicolons() {
+    for stmt in [
+        "INSERT INTO other(a) SELECT security_id FROM par_sys_purchase",
+        "/* leading */ INSERT INTO other VALUES ('a;b')",
+        "INSERT INTO other VALUES ('a;''b')",
+        "INSERT INTO other VALUES (1); -- trailing comment",
+    ] {
+        let (inner, queries) = Inner::new(&["7"]);
+        let ex = cache(Box::new(inner));
+        assert_eq!(probe_value(&ex), SpinValue::Str("7".into()));
+        ex.execute(stmt, &BindMap::new()).unwrap();
+        assert_eq!(probe_value(&ex), SpinValue::Str("7".into()), "{stmt}");
+        assert_eq!(queries.borrow().len(), 1, "{stmt}");
+    }
+}
+
+#[test]
+fn should_clear_cache_when_fallback_tokenization_fails() {
+    let (inner, queries) = Inner::new(&["7", "9"]);
+    let ex = cache(Box::new(inner));
+    assert_eq!(probe_value(&ex), SpinValue::Str("7".into()));
+    ex.execute("INSERT INTO other VALUES ('unterminated;", &BindMap::new())
+        .unwrap();
+    assert_eq!(probe_value(&ex), SpinValue::Str("9".into()));
+    assert_eq!(queries.borrow().len(), 2);
+}
+
+#[test]
 fn should_invalidate_target_on_large_values_insert() {
     let (inner, queries) = Inner::new(&["7", "9"]);
     let ex = cache(Box::new(inner));

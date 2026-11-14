@@ -64,29 +64,53 @@ pub fn eval(e: &IrExpr, env: &mut EvalEnv<'_>) -> Result<SpinValue, EngineError>
             let r = eval(r, env)?;
             eval_bin(*op, &l, &r)
         }
+        IrExpr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => eval_case(operand.as_deref(), whens, else_expr.as_deref(), env),
         IrExpr::CursorAttr { cursor, kind } => Ok(f.cursor_attr(cursor, *kind)),
-        IrExpr::SqlFn { name, args } => eval_sqlfn(name, args, env),
-        IrExpr::FuncCall { name, args } => eval_funccall(name, args, env),
+        IrExpr::SqlFn { prepared, .. } => eval_sqlfn(prepared, env),
+        IrExpr::FuncCall {
+            name,
+            args,
+            prepared,
+        } => eval_funccall(name, args, prepared, env),
+    }
+}
+
+fn eval_case(
+    operand: Option<&IrExpr>,
+    whens: &[(IrExpr, IrExpr)],
+    else_expr: Option<&IrExpr>,
+    env: &mut EvalEnv<'_>,
+) -> Result<SpinValue, EngineError> {
+    let selected = operand.map(|e| eval(e, env)).transpose()?;
+    for (condition, result) in whens {
+        let hit = match &selected {
+            Some(value) => {
+                eval_bin(BinOp::Eq, value, &eval(condition, env)?)? == SpinValue::Bool(true)
+            }
+            None => eval_cond(condition, env)? == Some(true),
+        };
+        if hit {
+            return eval(result, env);
+        }
+    }
+    match else_expr {
+        Some(e) => eval(e, env),
+        None => Ok(SpinValue::Null),
     }
 }
 
 /// §8.2 @变换标记：整体下沉单条 SQL（保留日期等中间类型，不经 SpinValue）。
 fn eval_sqlfn(
-    name: &str,
-    args: &[IrExpr],
+    prepared: &Result<crate::ir::ScalarSql, EngineError>,
     env: &mut EvalEnv<'_>,
 ) -> Result<SpinValue, EngineError> {
-    let Some((arg_sql, binds_vec)) = crate::sql::render::expr_to_sql_binds(&e_sqlfn_args(args))
-    else {
-        return Err(EngineError::invariant(
-            64,
-            "SqlFn argument not renderable (cursor attribute?)",
-        ));
-    };
-    let sql = format!("SELECT {}({})", name.to_ascii_lowercase(), arg_sql);
-    let sql = crate::sql::apply_ast_transforms(&sql)?;
-    let bind_map = crate::runtime::interp::resolve_binds(&binds_vec, env.frame)?;
-    let mut rows = env.ex.query(&sql, &bind_map)?;
+    let template = prepared.as_ref().map_err(Clone::clone)?;
+    let bind_map = crate::runtime::interp::resolve_binds(&template.binds, env.frame)?;
+    let mut rows = env.ex.query(&template.sql, &bind_map)?;
     Ok(rows
         .fetch_many(1)
         .into_iter()
@@ -101,10 +125,11 @@ fn eval_sqlfn(
 fn eval_funccall(
     name: &str,
     args: &[IrExpr],
+    prepared: &Result<String, EngineError>,
     env: &mut EvalEnv<'_>,
 ) -> Result<SpinValue, EngineError> {
     let Some(routine) = env.cat.lookup(name).cloned() else {
-        return eval_builtin(env, name, args);
+        return eval_builtin(env, prepared, args);
     };
     if routine.kind != crate::catalog::RoutineKind::Function {
         return Err(EngineError::business(
@@ -145,29 +170,17 @@ fn eval_funccall(
     }
 }
 
-/// PL 上下文的内建/库函数参数：以 SqlFn 形态渲染参数列表（供下沉）。
-fn e_sqlfn_args(args: &[IrExpr]) -> IrExpr {
-    IrExpr::SqlFn {
-        name: String::new(),
-        args: args.to_vec(),
-    }
-}
-
 fn eval_builtin(
     env: &mut EvalEnv<'_>,
-    name: &str,
+    prepared: &Result<String, EngineError>,
     args: &[IrExpr],
 ) -> Result<SpinValue, EngineError> {
     let mut binds = crate::exec::BindMap::new();
-    let mut ph = Vec::with_capacity(args.len());
     for (i, a) in args.iter().enumerate() {
-        let key = format!("$p{i}");
-        binds.insert(key.clone(), eval(a, env)?);
-        ph.push(key);
+        binds.insert(format!("$p{i}"), eval(a, env)?);
     }
-    let sql = format!("SELECT {}({})", name, ph.join(", "));
-    let sql = crate::sql::apply_ast_transforms(&sql)?;
-    let mut rows = env.ex.query(&sql, &binds)?;
+    let sql = prepared.as_ref().map_err(Clone::clone)?;
+    let mut rows = env.ex.query(sql, &binds)?;
     Ok(rows
         .fetch_many(1)
         .into_iter()
