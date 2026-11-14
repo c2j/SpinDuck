@@ -4,7 +4,6 @@ use super::*;
 use crate::error::EngineError;
 use crate::plan::codeweb::JsonCodewebSource;
 use crate::plan::MissingObject;
-use std::io::Read;
 use std::path::Path;
 
 pub(super) fn plan_with_two_routines_and_a_gap() -> RunPlan {

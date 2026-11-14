@@ -248,11 +248,7 @@ mod tests {
     use crate::cli::run::{run_str, EXIT_OK};
 
     #[cfg(feature = "native")]
-    use crate::error::EngineError;
-    #[cfg(feature = "native")]
     use crate::plan::codeweb::JsonCodewebSource;
-    #[cfg(feature = "native")]
-    use std::path::Path;
 
     #[cfg(feature = "native")]
     fn json_source(json: Vec<u8>) -> JsonCodewebSource {
