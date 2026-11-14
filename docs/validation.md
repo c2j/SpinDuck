@@ -4665,3 +4665,88 @@ cargo audit --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 \
 - 不动 `docs/runbook-real-gaussdb.md`（维护者未提交的在制品，本 PR 不携带；
   runbook 里旧命令形态的更新随其本人提交落地）。
 - 不 bump 版本号（随独立发版 PR，AGENTS §9 发版顺序）。
+
+## V45. P0 热路径优化：生产体量与放大游标两组实测（2026-11-14）
+
+机制见 `spinduck/src/exec.rs`（`TraceSink::is_enabled`）、
+`spinduck/src/runtime/interp/writebuf.rs`（O(N) flush + 增量 `HashSet`）、
+`spinduck/src/lookup_cache/mod.rs`（INSERT 增量失效 + 建槽缓存）。本节只记实测。
+
+**结论**：
+
+- 生产体量（V42 同库 `bench.duckdb`，490 行指令）：默认无 `--batch-commit`
+  墙钟 1.815 s → 1.74 s（约 −4%），user 1.73 s → 1.695 s；`--batch-commit`
+  两侧持平（约 1.59 s）。两侧 `OUT p_o_succeed = 0`，490 行有序导出逐字节相同。
+- 放大游标（真实 purchase 过程源码，本地内存 DuckDB，20000 个 distinct
+  `security_id` 组）：batch OFF 11.86 s → 10.91 s（−8.0%），ON 5.00 s → 4.25 s
+  （−15.0%）；输出 20002 行线性闭合（基线 2 + 20000）。
+
+### 环境
+
+- 机器：本机 apple silicon，2026-11-14。release，`cargo build --release --locked --features cli`。
+- A/B 同基：基线 SHA `12b9756`，分支改动以 `git stash` 前后对照（同一基线、
+  同一库副本、同一调用序列）；合并头 `02afd28`（含 `origin/main` `59acb9a` / PR #39）。
+- 生产库：`/tmp/spinduck-perf/bench.duckdb`（143 MiB，V42 同库；参数表
+  `par_fund_partner` 47,095、`par_fund_seat` 620,630、`par_sys_purchase` 427,436 等；
+  游标日 `20250715` 且 `scdm = '001'` 的 `mid_yjqs_detail` 500 行 → 490 行指令）。
+- 入口：`golden/case_corpus_purchase/.spinduck/plan/pkg_split_trade_step3_sh.prc_trd_deal_purchase.toml`，
+  `spinduck call --plan <计划> --db <副本> '20250715' null`。计时跑未加 `--trace`
+  （noop sink，生产默认执行面）。
+- 对照二进制：`/tmp/perf-p0/spinduck-main`（基线 SHA 构建）vs
+  `/tmp/perf-p0/spinduck-branch`（分支构建），均 v0.1.20。
+
+### 计时（生产体量）
+
+`/usr/bin/time -p`，热页缓存，预热一次再计时两次。下表是 `real` / `user`：
+
+| 侧 | 模式 | 计时 1 | 计时 2 | 均值 real |
+|---|---|---:|---:|---:|
+| main | nobatch | 1.82 / 1.73 | 1.81 / 1.73 | 1.815 |
+| branch | nobatch | 1.75 / 1.70 | 1.73 / 1.69 | 1.74 |
+| main | batch | 1.59 / 1.49 | 1.59 / 1.48 | 1.59 |
+| branch | batch | 1.59 / 1.50 | 1.60 / 1.51 | 1.595 |
+
+### 计时（放大游标）
+
+临时原生脚手架（复用 `cases_native` 的 `deploy_project` 部署
+`case_corpus_purchase`，按 GROUP BY 键 `security_id` 复制 A0001 族 20000 份并克隆
+`par_sys_purchase`；`gddm`/`xwdm`/`sub_gddm` 不变以保持配置连接）。`eng.call`
+（noop sink），`step_budget = 1e8`，release，各模式取 3 次最小墙钟。**脚手架测量后
+删除，不入库**；负载是合成规模输入，非考题产物。
+
+| 模式 | main | branch | delta |
+|---|---:|---:|---:|
+| OFF | 11.86 s | 10.91 s | −8.0% |
+| ON | 5.00 s | 4.25 s | −15.0% |
+
+### 产物
+
+生产体量两侧 490 行 7 列有序导出（`fund_code, seat_code, security_id, purchase_no,
+purchase_yj, purchase_days, purchase_money`，`ORDER BY 1,2,3,4`）sha256 同为
+`9bd68b44a2a4ebc4f23de112543b49e3de82d5816f9fa31cc6482d1b1bd56eaf`。
+放大游标输出行数 = 2 + scale 逐值闭合（scale=10 时 12 行、scale=20000 时 20002 行）。
+
+### 测试
+
+- `writebuf_flush` 守护：caught-error 后剩余组存活、成功组不重放（修前 `remove(0)`
+  路径会丢组）。
+- `trace_short_circuit`：noop sink 在构造 `TraceEvent` 前短路。
+- `lookup_cache::tests_invalidate`：INSERT 失效前缀语义。
+- 合并头门禁：`cargo fmt --all -- --check` OK；`cargo clippy --all-features --tests
+  -- -D warnings` 干净；`cargo test --features cli` 全绿（460 lib + 111 集成 + cli
+  契约层）；`cargo audit --no-fetch`（4 条构建期 zip 豁免）exit 0，依赖树与
+  `origin/main` 逐字节相同（`Cargo.toml`/`Cargo.lock` 无 diff）。
+- 黄金层：本机 A 模式容器（`opengauss/opengauss:5.0.0`，127.0.0.1:5433）合并头
+  `02afd28` 复跑 `cargo test --features gauss` 全绿（600 通过 / 0 失败，含
+  `gauss_e2e`、`gauss_sha256`、`golden_corpus_gauss`、`golden_corpus_purchase`、
+  `golden_gauss`、`cases_native`；唯一 panic 来自 `should_panic` 守护测试），
+  容器全程 healthy。
+
+### 不声称
+
+- 不把生产体量 −4% 说成倍数级加速：V42 的点查缓存已吃掉大头（3.62 → 1.50），
+  本轮是其上的增量热路径抛光。
+- 放大游标只证明热路径 delta 随缓冲组数增长，不代表生产日终批处理的端到端加速；
+  其参数表仍为 fixture 体量（2–4 行），不压点查缓存——生产体量那组才压参数表。
+- 不声称 `--batch-commit` 在生产体量上有收益（两侧持平，490 组的 O(N²) flush 可忽略）。
+- 计时为墙钟 / user，未单独剥离 DuckDB SQL 执行与解释器开销的占比。
