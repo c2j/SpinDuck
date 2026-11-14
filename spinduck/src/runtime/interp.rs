@@ -213,7 +213,9 @@ fn run_inner(
             // 程序尾部：隐式完成（无 RETURN 的过程）
             None => return Ok(RunOutcome::Completed),
         };
-        env.sink.on_event(spinduck_trace_event(st));
+        if env.sink.is_enabled() {
+            env.sink.on_event(spinduck_trace_event(st));
+        }
         match st {
             IrStmt::Nop => *pc += 1,
             // 事务语句即时作用于当前事务并重开（最外层统一边界见 engine.call）

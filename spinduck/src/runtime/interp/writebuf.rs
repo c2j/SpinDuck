@@ -19,6 +19,7 @@ use crate::exec::{BindMap, SqlExecutor, TraceEvent, TraceSink};
 use crate::runtime::interp::dynamic::sql_literal;
 use crate::runtime::interp::Env;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 /// 缓冲行数上限：超过即刷盘（内存上界）。
@@ -39,33 +40,21 @@ pub(in crate::runtime) struct WriteBuffer {
     buffered: usize,
     /// 攒批行数上限（满则先刷盘，第四轮复核应修 ⑤：测试可注入小上限）
     cap: usize,
+    /// 已缓冲表名 token（小写，`schema.table` 全名 + 尾段各一份）：push 时
+    /// 增量维护，flush 后按剩余组重建——读自己写判定不再逐条重解析前缀。
+    tables: HashSet<String>,
 }
 
 impl WriteBuffer {
-    /// 已缓冲表名（读自己写的刷盘判定）：保留 `schema.table` 全名与
-    /// 去引号形态各一份——touches 侧分词会把 `sch.t` 切成两段，
-    /// 全名与尾段都要能命中（V24 评审应修 9：限定名漏判 → 读到旧数据）。
-    fn tables(&self) -> Vec<String> {
-        let mut out = Vec::new();
+    /// 按当前剩余组重建表名 token 集（flush 出账后调用：成功路径组已空 →
+    /// 集清空；错误路径仅剩余组保留 → 集随之收缩，不误删仍缓冲的表）。
+    fn rebuild_tables(&mut self) {
+        self.tables.clear();
         for g in &self.groups {
-            let Some(t) = g.prefix.split_whitespace().nth(2) else {
-                continue;
-            };
-            // `INSERT INTO t(a, …)`（表名与列清单无空格，golden case_split_agg
-            // 即此写法）：按 '(' 截掉列清单（复核应修 3，原取到 "t(a," 永不命中）
-            let t = t
-                .split('(')
-                .next()
-                .unwrap_or(t)
-                .trim_end_matches('(')
-                .trim_matches('"')
-                .to_string();
-            out.push(t.clone());
-            if let Some((_, last)) = t.rsplit_once('.') {
-                out.push(last.to_string());
+            for t in table_tokens(&g.prefix) {
+                self.tables.insert(t);
             }
         }
-        out
     }
 
     /// 攒一条 INSERT；缓冲满则先刷盘。
@@ -88,6 +77,10 @@ impl WriteBuffer {
             .map(|g| g.prefix == prefix)
             .unwrap_or(false);
         if !is_last_same {
+            // 新组：前缀解析一次，表名 token 增量入集（同前缀续攒无需重解析）
+            for t in table_tokens(&prefix) {
+                self.tables.insert(t);
+            }
             self.groups.push(BufGroup {
                 prefix,
                 rows: Vec::new(),
@@ -100,66 +93,111 @@ impl WriteBuffer {
         Ok(())
     }
 
-    /// 刷盘：逐组消费（每组处理完立即出账），同前缀合并为一条多值 INSERT；
-    /// 失败回退逐行重放。任何时刻失败，已下发组不重复（V24 评审阻塞项 3）。
+    /// 刷盘：按索引逐组消费（不再 `remove(0)`——交替前缀可攒出上万组，
+    /// 头删是 O(N²)），同前缀合并为一条多值 INSERT；失败回退逐行重放。
+    /// 组内首行失败视为表级错误上抛：出账已处理组 `[0..=i]`，**剩余组保留**
+    /// （错误若被 PL 处理器捕获，剩余组须在例程出口刷盘，不得随错误丢弃）。
     /// 每条实际下发的语句（含回放行）补发 `SqlExec` 事件（复核应修 B：
     /// OFF 路径每条语句一事件，ON 路径不能在 JSONL 面上消失）。
     fn flush(&mut self, ex: &dyn SqlExecutor, sink: &mut dyn TraceSink) -> Result<(), EngineError> {
-        let emit = |sink: &mut dyn TraceSink, sql: &str| {
-            sink.on_event(TraceEvent::SqlExec {
-                sql: sql.to_string(),
-                binds: BindMap::new(),
-                elapsed_us: 0,
-            });
-        };
-        while !self.groups.is_empty() {
-            let g = self.groups.remove(0);
-            // push 保证每组入账即带行，空组不可达（复核文档 7：不再保留分支）
+        let mut fail: Option<(usize, EngineError)> = None;
+        for (i, g) in self.groups.iter().enumerate() {
             let merged = format!("{} VALUES {}", g.prefix, g.rows.join(", "));
-            emit(sink, &merged);
-            if let Err(first_err) = ex.execute(&merged, &BindMap::new()) {
-                // 回退逐行：失败行按数据语义跳过；组内首行失败视为表级错误上抛。
-                // 上抛前先出账本组（已重放的行不重复），剩余组随外层错误丢弃。
-                self.buffered -= g.rows.len();
-                let mut first_row = true;
-                let mut skipped = 0usize;
-                let mut skip_reason = String::new();
-                for row in &g.rows {
-                    let stmt = format!("{} VALUES {}", g.prefix, row);
-                    emit(sink, &stmt);
-                    match ex.execute(&stmt, &BindMap::new()) {
-                        Ok(_) => first_row = false,
-                        Err(row_err) => {
-                            if first_row {
-                                return Err(first_err);
-                            }
-                            // 跳行留痕（复核应修 2）：不上抛但必须可观测
-                            skipped += 1;
-                            if skip_reason.is_empty() {
-                                // 带错误码（第四轮②）：引擎缺陷与业务跳行不靠文本猜
-                                skip_reason = format!("{} {}", row_err.code, row_err.message);
-                            }
-                            first_row = false;
-                        }
-                    }
-                }
-                if skipped > 0 {
-                    sink.on_event(TraceEvent::BatchSkip {
-                        rows: skipped,
-                        first_error: skip_reason,
-                    });
-                }
-            } else {
-                self.buffered -= g.rows.len();
+            self.buffered -= g.rows.len();
+            let result = execute_traced(ex, sink, &merged)
+                .or_else(|first_err| replay_group(g, ex, sink, first_err));
+            if let Err(e) = result {
+                fail = Some((i, e));
+                break;
             }
         }
-        Ok(())
+        let result = match fail {
+            // 出账已处理组（含失败组），剩余组留存待出口刷盘
+            Some((idx, e)) => {
+                self.groups.drain(..=idx);
+                Err(e)
+            }
+            None => {
+                self.groups.clear();
+                Ok(())
+            }
+        };
+        self.rebuild_tables();
+        result
     }
 
     fn flush_discard(&mut self) {
         self.groups.clear();
+        self.tables.clear();
         self.buffered = 0;
     }
+}
+
+fn execute_traced(
+    ex: &dyn SqlExecutor,
+    sink: &mut dyn TraceSink,
+    sql: &str,
+) -> Result<(), EngineError> {
+    if sink.is_enabled() {
+        sink.on_event(TraceEvent::SqlExec {
+            sql: sql.to_string(),
+            binds: BindMap::new(),
+            elapsed_us: 0,
+        });
+    }
+    ex.execute(sql, &BindMap::new()).map(|_| ())
+}
+
+fn replay_group(
+    group: &BufGroup,
+    ex: &dyn SqlExecutor,
+    sink: &mut dyn TraceSink,
+    first_err: EngineError,
+) -> Result<(), EngineError> {
+    let mut skipped = 0usize;
+    let mut skip_reason = String::new();
+    for (i, row) in group.rows.iter().enumerate() {
+        let stmt = format!("{} VALUES {}", group.prefix, row);
+        let Err(row_err) = execute_traced(ex, sink, &stmt) else {
+            continue;
+        };
+        if i == 0 {
+            return Err(first_err);
+        }
+        skipped += 1;
+        if skip_reason.is_empty() {
+            skip_reason = format!("{} {}", row_err.code, row_err.message);
+        }
+    }
+    if skipped > 0 && sink.is_enabled() {
+        sink.on_event(TraceEvent::BatchSkip {
+            rows: skipped,
+            first_error: skip_reason,
+        });
+    }
+    Ok(())
+}
+
+/// 从 `insert into <表> (列清单)` 前缀提取表名 token（小写）：全名 + 尾段。
+/// `INSERT INTO t(a, …)`（表名与列清单无空格，golden case_split_agg 即此写法）
+/// 按 '(' 截掉列清单（复核应修 3，原取到 "t(a," 永不命中）；限定名 `sch.t`
+/// 全名与尾段都要能命中（V24 评审应修 9：touches 侧分词口径）。
+fn table_tokens(prefix: &str) -> Vec<String> {
+    let Some(t) = prefix.split_whitespace().nth(2) else {
+        return Vec::new();
+    };
+    let t = t
+        .split('(')
+        .next()
+        .unwrap_or(t)
+        .trim_end_matches('(')
+        .trim_matches('"')
+        .to_ascii_lowercase();
+    let mut out = vec![t.clone()];
+    if let Some((_, last)) = t.rsplit_once('.') {
+        out.push(last.to_string());
+    }
+    out
 }
 
 /// VALUES 段字面量化：把 `$ident` 占位符就地替换为对应字面量，其余文本
@@ -237,11 +275,14 @@ fn is_insert(sql: &str) -> bool {
 }
 
 /// SQL 文本的标识符 token 集（小写），用于「是否触及缓冲表」判定。
-fn touches_buffered_table(sql: &str, tables: &[String]) -> bool {
+fn touches_buffered_table(sql: &str, tables: &HashSet<String>) -> bool {
+    if tables.is_empty() {
+        return false;
+    }
     // 标识符字符集含 '.' 与 '"'：限定名 `sch.t` 成单 token 参与匹配
     sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"'))
         .map(|t| t.trim_matches('"').to_ascii_lowercase())
-        .any(|t| tables.iter().any(|bt| bt.eq_ignore_ascii_case(&t)))
+        .any(|t| tables.contains(&t))
 }
 
 /// 开关 ON 时：INSERT 攒缓冲（返回 true = 已缓冲，调用方跳过即时下发）；
@@ -296,8 +337,11 @@ pub(in crate::runtime) fn flush_if_touches(
     let Some(rc) = env.wbuf.clone() else {
         return Ok(());
     };
-    let tables = rc.borrow().tables();
-    if !tables.is_empty() && touches_buffered_table(sql, &tables) {
+    let hit = {
+        let buf = rc.borrow();
+        touches_buffered_table(sql, &buf.tables)
+    };
+    if hit {
         rc.borrow_mut().flush(env.ex, env.sink)?;
     }
     Ok(())
@@ -323,6 +367,7 @@ pub(in crate::runtime) fn shared_buffer() -> WBufOpt {
     Some(Rc::new(RefCell::new(WriteBuffer {
         groups: Vec::new(),
         buffered: 0,
+        tables: HashSet::new(),
         cap: WRITE_BUF_CAP,
     })))
 }
@@ -334,6 +379,7 @@ pub(in crate::runtime) fn shared_buffer_with_cap(cap: usize) -> WBufOpt {
     Some(Rc::new(RefCell::new(WriteBuffer {
         groups: Vec::new(),
         buffered: 0,
+        tables: HashSet::new(),
         cap,
     })))
 }

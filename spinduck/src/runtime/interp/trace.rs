@@ -36,5 +36,9 @@ fn variant_name(st: &IrStmt) -> &'static str {
 
 pub(crate) struct TraceNoop;
 impl TraceSink for TraceNoop {
+    #[inline]
+    fn is_enabled(&self) -> bool {
+        false
+    }
     fn on_event(&mut self, _event: TraceEvent) {}
 }

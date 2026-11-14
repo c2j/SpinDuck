@@ -239,6 +239,11 @@ pub trait SqlExecutor {
 
 /// 可观测埋点接缝：core 一次埋点，CLI 渲染与生产监控共用（§2.1/§10.5）。
 pub trait TraceSink {
+    /// false 表示不接收任何事件；调用方必须在构造事件前短路，默认 true。
+    #[inline]
+    fn is_enabled(&self) -> bool {
+        true
+    }
     fn on_event(&mut self, event: TraceEvent);
 }
 
@@ -275,6 +280,10 @@ pub enum TraceEvent {
 /// 空埋点（引擎默认 sink；AGENTS §5：日志只经 TraceSink）。
 pub struct TraceNoopSink;
 impl TraceSink for TraceNoopSink {
+    #[inline]
+    fn is_enabled(&self) -> bool {
+        false
+    }
     fn on_event(&mut self, _event: TraceEvent) {}
 }
 

@@ -26,6 +26,8 @@ use std::rc::Rc;
 mod tests;
 #[cfg(all(test, feature = "native"))]
 mod tests_duck;
+#[cfg(test)]
+mod tests_invalidate;
 
 /// 调用级缓存。`Engine::call` 入口 [`LookupState::clear`]。
 #[derive(Debug, Default)]
@@ -71,11 +73,13 @@ impl SqlExecutor for LookupExecutor {
         }
         match self.build(&plan, binds) {
             Ok(index) => {
+                let names = output_schema(sql, plan.proj_len());
                 self.state.slots.borrow_mut().insert(
                     id.clone(),
                     Slot::Ready {
                         plan: Box::new(plan),
                         index: Box::new(index),
+                        names,
                     },
                 );
                 self.answer(&id, sql, binds)
@@ -102,9 +106,8 @@ impl LookupExecutor {
         let outcome = {
             let slots = self.state.slots.borrow();
             match slots.get(id) {
-                Some(Slot::Ready { plan, index }) => {
-                    let names = output_schema(sql, plan.proj_len());
-                    (probe::probe(plan, index, binds), names)
+                Some(Slot::Ready { plan, index, names }) => {
+                    (probe::probe(plan, index, binds), names.clone())
                 }
                 _ => (probe::ProbeOut::Fallback, Vec::new()),
             }
@@ -130,6 +133,9 @@ impl LookupExecutor {
     }
 
     fn invalidate(&self, sql: &str) {
+        if self.state.slots.borrow().is_empty() {
+            return;
+        }
         let Some(names) = mentioned(sql) else {
             self.state.clear();
             return;
@@ -146,8 +152,15 @@ impl LookupExecutor {
 
 #[derive(Debug)]
 enum Slot {
-    Ready { plan: Box<Plan>, index: Box<Index> },
-    Off { tables: Vec<String> },
+    Ready {
+        plan: Box<Plan>,
+        index: Box<Index>,
+        /// 建槽时解析一次的输出列名（命中路径不再重解析 SQL）
+        names: Vec<String>,
+    },
+    Off {
+        tables: Vec<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -243,6 +256,11 @@ fn bind_subset(binds: &BindMap, names: &[String]) -> Result<BindMap, EngineError
 }
 
 fn mentioned(sql: &str) -> Option<HashSet<String>> {
+    // 无分号 INSERT 只失效写表，免去万行合并 VALUES 的全串分词；
+    // INSERT … SELECT 读到的表不被写入，不再过度失效。
+    if let Some(target) = insert_target(sql) {
+        return Some(HashSet::from([target]));
+    }
     let tokens = Tokenizer::new(sql).tokenize().ok()?;
     Some(
         tokens
@@ -253,6 +271,65 @@ fn mentioned(sql: &str) -> Option<HashSet<String>> {
             })
             .collect(),
     )
+}
+
+/// 无分号 INSERT 的写目标（尾段、小写）；其余形态回落全串分词。
+fn insert_target(sql: &str) -> Option<String> {
+    // 连字面量内的分号也保守回落，避免把多语句后续写入漏出失效集。
+    if sql.as_bytes().contains(&b';') {
+        return None;
+    }
+    let t = crate::exec::strip_leading_comments(sql);
+    let t = keyword(t, "insert")?;
+    let t = keyword(t, "into")?;
+    let (last, rest) = qualified_ident(t.trim_start())?;
+    match rest.chars().next() {
+        None | Some(' ' | '\t' | '\n' | '\r' | '(' | ';') => Some(last.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// 大小写不敏感关键字（后随空白才算词边界），返回剩余文本。
+fn keyword<'a>(t: &'a str, kw: &str) -> Option<&'a str> {
+    let t = t.trim_start();
+    let head = t.get(..kw.len())?;
+    if !head.eq_ignore_ascii_case(kw) {
+        return None;
+    }
+    let rest = &t[kw.len()..];
+    rest.starts_with(|c: char| c.is_ascii_whitespace())
+        .then_some(rest)
+}
+
+/// 限定标识符（a.b."C"）：返回（尾段内容, 剩余文本）。引号内的点是名字的一部分。
+fn qualified_ident(t: &str) -> Option<(String, &str)> {
+    let mut rest = t;
+    loop {
+        let (seg, r) = ident_segment(rest)?;
+        rest = r;
+        match rest.strip_prefix('.') {
+            Some(r) => rest = r,
+            None => return Some((seg, rest)),
+        }
+    }
+}
+
+fn ident_segment(t: &str) -> Option<(String, &str)> {
+    if let Some(r) = t.strip_prefix('"') {
+        let end = r.find('"')?;
+        // "" 转义引号形态少见：保守回落全串分词
+        if r[end + 1..].starts_with('"') {
+            return None;
+        }
+        return Some((r[..end].to_string(), &r[end + 1..]));
+    }
+    let end = t
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(t.len());
+    if end == 0 {
+        return None;
+    }
+    Some((t[..end].to_string(), &t[end..]))
 }
 
 fn empty_stream(sql: &str, proj_len: usize) -> RowStream {
