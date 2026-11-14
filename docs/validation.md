@@ -4686,7 +4686,7 @@ cargo audit --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 \
 - 机器：本机 apple silicon，2026-11-14。release，`cargo build --release --locked --features cli`。
 - A/B 同基：基线 SHA `12b9756`，分支改动以 `git stash` 前后对照（同一基线、
   同一库副本、同一调用序列）；合并头 `02afd28`（含 `origin/main` `59acb9a` / PR #39）。
-- 生产库：`/tmp/spinduck-perf/bench.duckdb`（143 MiB，V42 同库；参数表
+- 生产体量对照库：`/tmp/spinduck-perf/bench.duckdb`（143,667,200 字节，约 137 MiB，V42 同库；参数表
   `par_fund_partner` 47,095、`par_fund_seat` 620,630、`par_sys_purchase` 427,436 等；
   游标日 `20250715` 且 `scdm = '001'` 的 `mid_yjqs_detail` 500 行 → 490 行指令）。
 - 入口：`golden/case_corpus_purchase/.spinduck/plan/pkg_split_trade_step3_sh.prc_trd_deal_purchase.toml`，
@@ -4709,7 +4709,7 @@ cargo audit --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 \
 ### 计时（放大游标）
 
 临时原生脚手架（复用 `cases_native` 的 `deploy_project` 部署
-`case_corpus_purchase`，按 GROUP BY 键 `security_id` 复制 A0001 族 20000 份并克隆
+`case_corpus_purchase`，按不同 `security_id` 复制 A0001 族 20000 行并克隆
 `par_sys_purchase`；`gddm`/`xwdm`/`sub_gddm` 不变以保持配置连接）。`eng.call`
 （noop sink），`step_budget = 1e8`，release，各模式取 3 次最小墙钟。**脚手架测量后
 删除，不入库**；负载是合成规模输入，非考题产物。
@@ -4724,29 +4724,59 @@ cargo audit --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 \
 生产体量两侧 490 行 7 列有序导出（`fund_code, seat_code, security_id, purchase_no,
 purchase_yj, purchase_days, purchase_money`，`ORDER BY 1,2,3,4`）sha256 同为
 `9bd68b44a2a4ebc4f23de112543b49e3de82d5816f9fa31cc6482d1b1bd56eaf`。
-放大游标输出行数 = 2 + scale 逐值闭合（scale=10 时 12 行、scale=20000 时 20002 行）。
+放大游标只断言输出行数 = 2 + scale（scale=10 时 12 行、scale=20000 时 20002 行），
+没有逐列比较该组产物。purchase 游标是逐行 SELECT，不含 GROUP BY；之前把同包另一个
+过程的 GROUP BY 误当成该入口的条件，不影响已测行数，但不能据此推断写缓冲组数。
 
 ### 测试
 
-- `writebuf_flush` 守护：caught-error 后剩余组存活、成功组不重放（修前 `remove(0)`
-  路径会丢组）。
+- `writebuf_flush` 语义锁定：caught-error 后剩余组存活、成功组不重放；旧 `remove(0)`
+  同样保留未处理组，本轮索引消费是等价重构，不是修复丢组。
 - `trace_short_circuit`：noop sink 在构造 `TraceEvent` 前短路。
 - `lookup_cache::tests_invalidate`：INSERT 失效前缀语义。
 - 合并头门禁：`cargo fmt --all -- --check` OK；`cargo clippy --all-features --tests
-  -- -D warnings` 干净；`cargo test --features cli` 全绿（460 lib + 111 集成 + cli
-  契约层）；`cargo audit --no-fetch`（4 条构建期 zip 豁免）exit 0，依赖树与
+  -- -D warnings` 干净；`cargo test --features cli` 全绿（460 lib + 111 CLI
+  契约及其他集成测试）；`cargo audit --no-fetch`（4 条构建期 zip 豁免）exit 0，依赖树与
   `origin/main` 逐字节相同（`Cargo.toml`/`Cargo.lock` 无 diff）。
 - 黄金层：本机 A 模式容器（`opengauss/opengauss:5.0.0`，127.0.0.1:5433）合并头
   `02afd28` 复跑 `cargo test --features gauss` 全绿（600 通过 / 0 失败，含
-  `gauss_e2e`、`gauss_sha256`、`golden_corpus_gauss`、`golden_corpus_purchase`、
-  `golden_gauss`、`cases_native`；唯一 panic 来自 `should_panic` 守护测试），
-  容器全程 healthy。
+  `gauss_e2e`、`golden_corpus_gauss`、`golden_corpus_purchase`、
+  `golden_gauss`、`cases_native`；唯一 panic 来自 `should_panic` 守护测试）。
+  `gauss_sha256` 未启用对应 feature，收集 0 个测试；容器前后健康检查均为 healthy，
+  未连续监控其整个生命周期。
 
 ### 不声称
 
 - 不把生产体量 −4% 说成倍数级加速：V42 的点查缓存已吃掉大头（3.62 → 1.50），
   本轮是其上的增量热路径抛光。
-- 放大游标只证明热路径 delta 随缓冲组数增长，不代表生产日终批处理的端到端加速；
-  其参数表仍为 fixture 体量（2–4 行），不压点查缓存——生产体量那组才压参数表。
-- 不声称 `--batch-commit` 在生产体量上有收益（两侧持平，490 组的 O(N²) flush 可忽略）。
+- 放大游标仅记录该合成负载的整体差异，未测写缓冲组数，不能归因于 O(N) flush，
+  也不代表生产日终批处理的端到端加速。伙伴、席位表仍为 fixture 体量，
+  `par_sys_purchase` 随克隆增至 20002 行；V42 同库一组则有更大的参数表。
+- 不声称本 PR 在生产体量的 `--batch-commit` 模式有额外收益（两侧持平）；
+  490 行输出不等于 490 个缓冲组。
 - 计时为墙钟 / user，未单独剥离 DuckDB SQL 执行与解释器开销的占比。
+
+### PR #41 审核修正（2026-11-14）
+
+- 多语句 INSERT 后续 DELETE/UPDATE 漏失效已复现：
+  `should_invalidate_tables_written_after_first_insert` 修前实际 `Str("7")`、期望 `Str("9")`；
+  修后两个分支均通过。含分号文本保守回落完整分词，不增加手写 SQL 引号解析器。
+- `tests/guard/guard_lookup_cache_dynamic.rs` 注册为独立测试目标：
+  `should_reject_stale_lookup_after_dynamic_delete` 修前 `call` 错误返回成功，修后返回
+  `BIZ-0100` / `NO_DATA_FOUND`，且未捕获错误回滚调用（源表 1 行、other 0 行）。
+- `tests_invalidate` 补 WITH、注释分隔关键字、转义标识符、列清单 INSERT SELECT、
+  字符串内分号/转义单引号、dollar quote、多语句及分词失败的回落断言。
+- `should_preserve_seven_group_order_across_middle_failure` 在重构前通过，锁定七个
+  交替前缀组、中间失败、回放和异常恢复的完整下发顺序；提取 `replay_group` 后仍通过。
+  原两条 `writebuf_flush` 测试保留断言，改称既有语义锁定，不再声称修前丢组。
+- `should_preserve_batch_skip_replay_with_disabled_sink` 同时断言启用/禁用 sink 的
+  回放 SQL 顺序一致，启用时精确输出一条 `BatchSkip(1, KERNEL-0010 bad row)`，
+  禁用时不接收事件；在重构前后均通过。
+- 2026-11-14 审核修正阶段维护者明确答复“确认保留” `TraceSink::is_enabled()`：
+  授权限于此默认方法（默认 true、noop false）；不涵盖后续 SqlExecutor 或 AppendBatch。
+- 本轮 `cargo fmt --all -- --check`、`cargo clippy --all-features --tests -- -D warnings`
+  通过；`cargo test --features cli` 共 669 通过 / 0 失败；`cargo audit --no-fetch`
+  加 CI 四条 zip 豁免通过（缓存库 1509 条公告）。Cargo.toml 仅注册测试，未改依赖。
+- 本机 A 模式容器 `cargo test --features gauss` 共 607 通过 / 0 失败，容器前后
+  healthy；未启用 gauss-sha256，不声称覆盖独立 sha256 实例。
+- 上文性能数保留为审核前测量，不作为本次修复后的重新计量结果。

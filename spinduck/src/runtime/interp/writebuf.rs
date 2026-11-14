@@ -100,63 +100,16 @@ impl WriteBuffer {
     /// 每条实际下发的语句（含回放行）补发 `SqlExec` 事件（复核应修 B：
     /// OFF 路径每条语句一事件，ON 路径不能在 JSONL 面上消失）。
     fn flush(&mut self, ex: &dyn SqlExecutor, sink: &mut dyn TraceSink) -> Result<(), EngineError> {
-        let emit = |sink: &mut dyn TraceSink, sql: &str| {
-            if sink.is_enabled() {
-                sink.on_event(TraceEvent::SqlExec {
-                    sql: sql.to_string(),
-                    binds: BindMap::new(),
-                    elapsed_us: 0,
-                });
-            }
-        };
-        // 首行失败时记录 (组索引, 表级错误)，循环外统一出账——避免在持有
-        // 组借用时 drain（借用冲突），也保证剩余组原样留存。
         let mut fail: Option<(usize, EngineError)> = None;
-        let mut i = 0;
-        while i < self.groups.len() {
-            let g = &self.groups[i];
-            // push 保证每组入账即带行，空组不可达（复核文档 7：不再保留分支）
+        for (i, g) in self.groups.iter().enumerate() {
             let merged = format!("{} VALUES {}", g.prefix, g.rows.join(", "));
-            emit(sink, &merged);
-            if let Err(first_err) = ex.execute(&merged, &BindMap::new()) {
-                // 回退逐行：失败行按数据语义跳过；组内首行失败视为表级错误上抛。
-                self.buffered -= g.rows.len();
-                let mut first_row = true;
-                let mut skipped = 0usize;
-                let mut skip_reason = String::new();
-                for row in &g.rows {
-                    let stmt = format!("{} VALUES {}", g.prefix, row);
-                    emit(sink, &stmt);
-                    match ex.execute(&stmt, &BindMap::new()) {
-                        Ok(_) => first_row = false,
-                        Err(row_err) => {
-                            if first_row {
-                                fail = Some((i, first_err));
-                                break;
-                            }
-                            // 跳行留痕（复核应修 2）：不上抛但必须可观测
-                            skipped += 1;
-                            if skip_reason.is_empty() {
-                                // 带错误码（第四轮②）：引擎缺陷与业务跳行不靠文本猜
-                                skip_reason = format!("{} {}", row_err.code, row_err.message);
-                            }
-                            first_row = false;
-                        }
-                    }
-                }
-                if fail.is_some() {
-                    break;
-                }
-                if skipped > 0 && sink.is_enabled() {
-                    sink.on_event(TraceEvent::BatchSkip {
-                        rows: skipped,
-                        first_error: skip_reason,
-                    });
-                }
-            } else {
-                self.buffered -= g.rows.len();
+            self.buffered -= g.rows.len();
+            let result = execute_traced(ex, sink, &merged)
+                .or_else(|first_err| replay_group(g, ex, sink, first_err));
+            if let Err(e) = result {
+                fail = Some((i, e));
+                break;
             }
-            i += 1;
         }
         let result = match fail {
             // 出账已处理组（含失败组），剩余组留存待出口刷盘
@@ -178,6 +131,51 @@ impl WriteBuffer {
         self.tables.clear();
         self.buffered = 0;
     }
+}
+
+fn execute_traced(
+    ex: &dyn SqlExecutor,
+    sink: &mut dyn TraceSink,
+    sql: &str,
+) -> Result<(), EngineError> {
+    if sink.is_enabled() {
+        sink.on_event(TraceEvent::SqlExec {
+            sql: sql.to_string(),
+            binds: BindMap::new(),
+            elapsed_us: 0,
+        });
+    }
+    ex.execute(sql, &BindMap::new()).map(|_| ())
+}
+
+fn replay_group(
+    group: &BufGroup,
+    ex: &dyn SqlExecutor,
+    sink: &mut dyn TraceSink,
+    first_err: EngineError,
+) -> Result<(), EngineError> {
+    let mut skipped = 0usize;
+    let mut skip_reason = String::new();
+    for (i, row) in group.rows.iter().enumerate() {
+        let stmt = format!("{} VALUES {}", group.prefix, row);
+        let Err(row_err) = execute_traced(ex, sink, &stmt) else {
+            continue;
+        };
+        if i == 0 {
+            return Err(first_err);
+        }
+        skipped += 1;
+        if skip_reason.is_empty() {
+            skip_reason = format!("{} {}", row_err.code, row_err.message);
+        }
+    }
+    if skipped > 0 && sink.is_enabled() {
+        sink.on_event(TraceEvent::BatchSkip {
+            rows: skipped,
+            first_error: skip_reason,
+        });
+    }
+    Ok(())
 }
 
 /// 从 `insert into <表> (列清单)` 前缀提取表名 token（小写）：全名 + 尾段。

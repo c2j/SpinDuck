@@ -239,8 +239,7 @@ pub trait SqlExecutor {
 
 /// 可观测埋点接缝：core 一次埋点，CLI 渲染与生产监控共用（§2.1/§10.5）。
 pub trait TraceSink {
-    /// 是否接收事件：调用方在构造 TraceEvent（sql 克隆 / binds 深拷贝）之前
-    /// 短路。默认 true——现有 sink 不覆写即行为不变。
+    /// false 表示不接收任何事件；调用方必须在构造事件前短路，默认 true。
     #[inline]
     fn is_enabled(&self) -> bool {
         true

@@ -256,7 +256,7 @@ fn bind_subset(binds: &BindMap, names: &[String]) -> Result<BindMap, EngineError
 }
 
 fn mentioned(sql: &str) -> Option<HashSet<String>> {
-    // INSERT 只失效写表：前缀扫描免去万行合并 VALUES 的全串分词；
+    // 无分号 INSERT 只失效写表，免去万行合并 VALUES 的全串分词；
     // INSERT … SELECT 读到的表不被写入，不再过度失效。
     if let Some(target) = insert_target(sql) {
         return Some(HashSet::from([target]));
@@ -273,9 +273,12 @@ fn mentioned(sql: &str) -> Option<HashSet<String>> {
     )
 }
 
-/// INSERT 写目标（尾段、小写）：只扫语句前缀。认不出的形态返回 None，
-/// 回落全串分词（保守口径不变）。
+/// 无分号 INSERT 的写目标（尾段、小写）；其余形态回落全串分词。
 fn insert_target(sql: &str) -> Option<String> {
+    // 连字面量内的分号也保守回落，避免把多语句后续写入漏出失效集。
+    if sql.as_bytes().contains(&b';') {
+        return None;
+    }
     let t = crate::exec::strip_leading_comments(sql);
     let t = keyword(t, "insert")?;
     let t = keyword(t, "into")?;

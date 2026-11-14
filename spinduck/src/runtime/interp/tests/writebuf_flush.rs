@@ -1,4 +1,4 @@
-//! flush 失败语义守护：组内首行失败上抛后，若错误被 PL 处理器捕获，
+//! flush 既有语义锁定：组内首行失败上抛后，若错误被 PL 处理器捕获，
 //! 剩余组必须留在缓冲并在例程出口刷盘——不得随错误丢弃（数据丢失）。
 
 use super::*;
@@ -57,6 +57,74 @@ fn exc_block(body: Vec<PlStatement>, handler: Vec<PlStatement>) -> PlStatement {
         },
         None,
     ))
+}
+
+fn compact_calls(ex: &FailOnTable) -> Vec<String> {
+    ex.calls
+        .borrow()
+        .iter()
+        .map(|s| {
+            s.split_whitespace()
+                .collect::<String>()
+                .to_ascii_lowercase()
+        })
+        .collect()
+}
+
+#[test]
+fn should_preserve_seven_group_order_across_middle_failure() {
+    let ex = FailOnTable {
+        fail_prefix: "insert into bad",
+        calls: RefCell::new(Vec::new()),
+    };
+    let block = exc_block(
+        vec![
+            insert_stmt("a", "'1'"),
+            insert_stmt("b", "'2'"),
+            insert_stmt("a", "'3'"),
+            insert_stmt("bad", "'4'"),
+            insert_stmt("a", "'5'"),
+            insert_stmt("b", "'6'"),
+            insert_stmt("a", "'7'"),
+            sql_stmt("DELETE FROM bad"),
+        ],
+        vec![assign(var("v_caught"), lit_str("yes"))],
+    );
+    let prog = compile_stmts(&[block]).unwrap();
+    let mut frame = Frame::new();
+    let result = run_with_catalog(
+        &prog,
+        &mut frame,
+        &ex,
+        &mut crate::exec::TraceNoopSink,
+        &crate::catalog::RoutineCatalog::new(),
+        0,
+        crate::runtime::RunLimits {
+            budget: DEFAULT_STEP_BUDGET,
+            batch_commit: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(result, RunOutcome::Completed);
+    assert_eq!(
+        frame.get(&VarName("v_caught".into())),
+        Some(&SpinValue::Str("yes".into()))
+    );
+    assert_eq!(
+        compact_calls(&ex),
+        vec![
+            "insertintoa(a)values('1')",
+            "insertintob(a)values('2')",
+            "insertintoa(a)values('3')",
+            "insertintobad(a)values('4')",
+            "insertintobad(a)values('4')",
+            "rollback",
+            "begintransaction",
+            "insertintoa(a)values('5')",
+            "insertintob(a)values('6')",
+            "insertintoa(a)values('7')",
+        ]
+    );
 }
 
 #[test]
