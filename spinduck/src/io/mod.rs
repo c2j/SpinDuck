@@ -11,7 +11,10 @@ pub mod sync;
 pub mod sync_tx;
 
 #[cfg(feature = "gauss")]
-pub use gauss::{materialize_parallel, GaussConn, MaterializeMode, MaterializeOutcome};
+pub use gauss::{
+    materialize_parallel, materialize_parallel_with_progress, GaussConn, MaterializeBatch,
+    MaterializeMode, MaterializeOutcome,
+};
 
 #[cfg(feature = "gauss")]
 pub use sync::{resolve_mode, SyncMode, SyncOutcome};

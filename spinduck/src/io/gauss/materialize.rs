@@ -298,65 +298,8 @@ impl GaussConn {
 ///
 /// 单表失败不中断其余表（快照批次语义）；结果按输入表序返回，失败以
 /// `Err` 体现，由调用方决定呈现与退出码。表数少于 `jobs` 时按表数收敛。
-/// 线程聚合的逐表结果：(输入序, 表名, 物化结果/错误)。
-type TableResults = Vec<(usize, String, Result<MaterializeOutcome, EngineError>)>;
-
-pub fn materialize_parallel<T, F>(
-    jobs: usize,
-    tables: Vec<String>,
-    workdir: &Path,
-    open_source: F,
-    duck_executors: Vec<T>,
-) -> Vec<(String, Result<MaterializeOutcome, EngineError>)>
-where
-    T: crate::exec::SqlExecutor + Send + 'static,
-    F: Fn() -> Result<GaussConn, EngineError> + Sync,
-{
-    // 前置条件硬断言（#21-4）：release 下也生效。长度不一致时线程池按索引取
-    // 执行器会越界 panic，且 panic 经 thread::scope 抛出主线程，与「单表失败不
-    // 中断其余表」相反——公共 API 的契约不能只靠调用方自觉。
-    assert_eq!(
-        tables.len(),
-        duck_executors.len(),
-        "materialize_parallel: 表与执行器须一一对应"
-    );
-    let jobs = jobs.max(1).min(tables.len());
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    // 执行器按索引所有权移交（take）：线程只触碰自己的 T，约束收敛到 Send 即可
-    let pool: std::sync::Mutex<Vec<Option<T>>> =
-        std::sync::Mutex::new(duck_executors.into_iter().map(Some).collect());
-    let results: std::sync::Mutex<TableResults> = std::sync::Mutex::new(Vec::new());
-    std::thread::scope(|s| {
-        for _ in 0..jobs {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if i >= tables.len() {
-                    break;
-                }
-                let Some(duck) = pool.lock().unwrap_or_else(|e| e.into_inner())[i].take() else {
-                    break;
-                };
-                let res = open_source()
-                    .and_then(|mut og| og.materialize(&duck, &tables[i], None, workdir));
-                // 锁中毒只在持锁线程 panic 时发生——结果聚合继续（该线程的结果已丢，
-                // 由对应表的缺失暴露），不放大成整体失败
-                results
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push((i, tables[i].clone(), res));
-            });
-        }
-    });
-    let mut out = results
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .drain(..)
-        .collect::<Vec<_>>();
-    out.sort_by_key(|(i, _, _)| *i);
-    out.into_iter()
-        .map(|(_, table, res)| (table, res))
-        .collect()
-}
+mod parallel;
+pub use parallel::{materialize_parallel, materialize_parallel_with_progress, MaterializeBatch};
 
 /// CSV 记录计数状态机（评审 P1 修正）：字节级、编码无关——`"` `,` `\n` `\r`
 /// 均为 ASCII 定界符，不可能是 UTF-8 尾字节（≥0x80）或 GBK/Big5 尾字节
@@ -662,5 +605,48 @@ mod tests {
             || unreachable!("断言先于连接发生"),
             executors,
         );
+    }
+
+    /// 源连接失败即可：物化的错误路径不需要真实 GaussDB，仍覆盖调度、
+    /// 回调与结果聚合三条接缝。
+    fn failing_source() -> Result<GaussConn, EngineError> {
+        Err(EngineError::env(20, "注入：无源连接".to_string()))
+    }
+
+    #[test]
+    fn should_call_progress_once_per_table_in_completion_order() {
+        let tables = vec!["t_a".to_string(), "t_b".to_string(), "t_c".to_string()];
+        let executors: Vec<FakeCopyDuck> = (0..3).map(|_| FakeCopyDuck::loaded(0)).collect();
+        let mut seen = Vec::new();
+        let out = materialize_parallel_with_progress(
+            MaterializeBatch {
+                jobs: 2,
+                tables,
+                workdir: Path::new("."),
+            },
+            failing_source,
+            executors,
+            |k, total, item| seen.push((k, total, item.0.clone())),
+        );
+        assert_eq!(out.len(), 3, "结果按输入表数返回");
+        assert!(out.iter().all(|(_, r)| r.is_err()));
+        // 完成序：k 必须恰好是 1..=total，各一次
+        let ks: Vec<usize> = seen.iter().map(|(k, _, _)| *k).collect();
+        assert_eq!(ks, vec![1, 2, 3]);
+        assert!(seen.iter().all(|(_, total, _)| *total == 3));
+    }
+
+    #[test]
+    fn should_materialize_every_table_on_second_call_in_same_process() {
+        // F1 守护：游标必须是每次调用局部新建。进程级 static 会在第二次调用时
+        // 停在上次终值，所有表被静默跳过（收 0 条结果且返回成功）。
+        let tables = vec!["t_a".to_string(), "t_b".to_string(), "t_c".to_string()];
+        for round in 0..2 {
+            let executors: Vec<FakeCopyDuck> = (0..3).map(|_| FakeCopyDuck::loaded(0)).collect();
+            let out =
+                materialize_parallel(2, tables.clone(), Path::new("."), failing_source, executors);
+            assert_eq!(out.len(), 3, "第 {} 次调用丢了表: {out:?}", round + 1);
+            assert!(out.iter().all(|(_, r)| r.is_err()));
+        }
     }
 }

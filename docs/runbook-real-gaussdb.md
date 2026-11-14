@@ -146,7 +146,9 @@ target/release/spinduck deploy "$PLAN" --db run/local.duckdb
 
 ```bash
 TABLES=$(sed -n '/^\[sources\]/,/^\[/p' "$PLAN" | grep '^"' | tr -d '"' | paste -sd, -)
-target/release/spinduck materialize --db run/local.duckdb --table "$TABLES" --jobs 4
+target/release/spinduck materialize --db run/local.duckdb --table "$TABLES" --jobs 8
+# 多表形态每表完成即输出 [k/总数] 前缀行；deploy 会在部署时核验清单内
+# 每张表已被项目 DDL 建好（缺表 = MISS + exit 1，先补 sql/ddl 再重跑）
 # 或沿用逐表形态：
 # for t in …; do target/release/spinduck materialize --db run/local.duckdb --table "$t"; done
 ```

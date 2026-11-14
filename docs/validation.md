@@ -4102,6 +4102,28 @@ exit 2、真实参 `100` → RETURN 0.08 exit 0；规则项目 `compile` 绿且 
     显式逃生门 `mode = "insert_batch"`（设计 §3.3）确认未实现，口径降级为设计目标；
     源端故障隔离样本待补（夹具表存在但 `--where` 引用不存在的列）。
 
+- **真实例实测回填（2026-11-11 晚，v0.1.18 `472cd96`，真实例 17 表 ≈740 万行）**：
+  `--jobs 8` 全量物化 **1m56s**（对比优化前 64 分钟，**~33 倍**；聚合 ≈64k 行/s），
+  user CPU 3m59s > 墙钟——并行度生效；最大表 par_sys_securities 4.36M 行并入其中。
+  该实测跑的是 v0.1.18 二进制（已含本节 PR-A2 并行调度），**不含** PR #27 的
+  完成序渲染与 deploy 守卫；后两者不改变物化吞吐。
+- **PR #27 进度输出与 deploy 守卫（2026-11-14 评审修正）**：
+  - **进度**：多表完成即输出 `[k/total]` 行（完成序），失败行
+    `[k/total] FAIL t <域-####>`；调度下沉到 io 层唯一实现
+    `materialize_parallel_with_progress`（完成序回调），`materialize_parallel`
+    保留为无回调包装。守护 `should_report_per_table_progress_prefix_and_fail_lines`、
+    `should_call_progress_once_per_table_in_completion_order`。
+  - **F1 游标**：调度游标改为每次调用局部 `AtomicUsize`（进程级 static 会让同进程
+    第二次调用跳过全部表并静默成功）。守护
+    `should_materialize_every_table_on_second_call_in_same_process`。
+  - **守卫**：`deploy` 在 `open_engine` 之前静态解析 `deployment.ddl` 的
+    `CREATE TABLE` 名（含引擎自建表），与 `[sources].materialize` 按名比对；
+    缺表 → `MISS relation:<t> <- materialize 清单` + exit 1，且**不创建库文件**
+    （负路径断言 `!db.exists()`）；正路径 `should_accept_deploy_when_materialize_list_table_is_covered_by_ddl`
+    锁定全覆盖 → EXIT_OK。物化名按 ENV-0015 同口径（ASCII 小写原名）比对，
+    DDL 侧取 DuckDB `table_name` 尾段；守卫不得比 ENV-0015 宽松，否则缺表会推迟
+    到 materialize 层才红。单元测试见 `plan::deploy::tests`。
+
 
 ## V39. `--trace` 审计日志落地：sqlid 指纹 + sidecar 反查 + `explain --trace` 关联视图（2026-11-11）
 

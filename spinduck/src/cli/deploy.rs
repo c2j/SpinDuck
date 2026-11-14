@@ -35,6 +35,35 @@ pub fn deploy_cmd(plan_path: &Path, db: &Path, out: &mut dyn Write) -> Result<i3
     let deployment = plan::deploy::resolve(&project, &plan)?;
     let ddl_files = deployment.ddl.len() + deployment.views.len();
     let routine_files = deployment.routines.len();
+
+    // V27 物化清单守卫（评审 2026-11-14 F2）：`[sources].materialize` 的每张表
+    // 必须被本项目 DDL 建出。核对读 DDL 名字集合，**先于 open_engine**——失败时
+    // 不落半成品库；名称归一与比较同一口径，不把外部输入拼进 SQL。
+    let covered = plan::deploy::deployed_table_names(&deployment)?;
+    let mut missing_materialize = Vec::new();
+    for t in &plan.materialize {
+        if !covered.contains(&plan::deploy::materialize_key(t)) {
+            missing_materialize.push(t);
+        }
+    }
+    if !missing_materialize.is_empty() {
+        for t in &missing_materialize {
+            writeln!(
+                out,
+                "MISS relation:{t} <- materialize 清单（项目 DDL 未覆盖：请补 sql/ddl 或从清单移除）"
+            )
+            .map_err(io_err)?;
+        }
+        writeln!(
+            out,
+            "deploy: target={} materialize 清单缺表 {} 张，拒绝部署",
+            plan.target,
+            missing_materialize.len()
+        )
+        .map_err(io_err)?;
+        return Ok(EXIT_FAIL);
+    }
+
     let rules = RuleRegistry::default().with_project_rules(&project.rules_files)?;
     let mut eng = open_engine(db, rules)?;
     plan::deploy::apply(&mut eng, &deployment)?;

@@ -534,3 +534,61 @@ END;
         "空表数回 0 —— 视图体是真下发并执行过的: {out}"
     );
 }
+
+/// V27 物化清单守卫（评审 2026-11-14）：清单里的表未被项目 DDL 覆盖 → deploy
+/// 层 `MISS relation:<t>` + exit 1，且**先于开库**（不留下半成品库文件）。
+#[test]
+fn should_reject_deploy_when_materialize_list_table_not_covered_by_ddl() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = deployed_plan(tmp.path());
+    // 人工把 mid_missing 填进清单（plan 生成时恒空，由人/--from-codeweb 填，§6.4）
+    let text = std::fs::read_to_string(&plan).unwrap();
+    let patched = text.replace("materialize = []", "materialize = [\"mid_missing\"]");
+    assert_ne!(text, patched, "夹具必须真的改到清单: {text}");
+    std::fs::write(&plan, patched).unwrap();
+
+    let db = tmp.path().join("work.duckdb");
+    let (code, out, err) = cli(&[
+        "deploy",
+        &plan.to_string_lossy(),
+        "--db",
+        &db.to_string_lossy(),
+    ]);
+    assert_eq!(code, EXIT_FAIL, "{out}");
+    assert_eq!(err, "", "全部输出走 stdout");
+    assert!(
+        out.contains("MISS relation:mid_missing"),
+        "缺件口径同源：{out}"
+    );
+    assert!(out.contains("materialize 清单"), "{out}");
+    assert!(
+        !db.exists(),
+        "守卫必须先于 open_engine：拒绝部署时不得落半成品库: {out}"
+    );
+}
+
+/// 守卫正路径：清单全覆盖 → 正常部署并落库（评审要求补的反向断言）。
+#[test]
+fn should_accept_deploy_when_materialize_list_table_is_covered_by_ddl() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = deployed_plan(tmp.path());
+    let text = std::fs::read_to_string(&plan).unwrap();
+    let patched = text.replace("materialize = []", "materialize = [\"t_a\"]");
+    assert_ne!(text, patched, "夹具必须真的改到清单: {text}");
+    std::fs::write(&plan, patched).unwrap();
+
+    let db = tmp.path().join("work.duckdb");
+    let (code, out, err) = cli(&[
+        "deploy",
+        &plan.to_string_lossy(),
+        "--db",
+        &db.to_string_lossy(),
+    ]);
+    assert_eq!(code, EXIT_OK, "{out}");
+    assert_eq!(err, "", "全部输出走 stdout");
+    assert!(
+        !out.contains("MISS relation:t_a"),
+        "已覆盖的表不得报缺件: {out}"
+    );
+    assert!(db.is_file(), "守卫通过后必须真的部署: {out}");
+}
