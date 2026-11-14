@@ -17,10 +17,15 @@ use std::path::{Path, PathBuf};
 
 /// `compile` 的项目旗标。路径模式不走这里。
 pub struct ProjectCompile {
+    /// 项目目录；缺省为当前工作目录。
     pub dir: Option<PathBuf>,
+    /// 只写入计划的 schema；不参与入口匹配、不参与 `deploy`。
     pub schema: Option<String>,
+    /// 显式入口（可重复）；为空时取项目声明的全部 `[[entry]]`。
     pub entries: Vec<String>,
+    /// codeweb 二进制路径（`--codeweb-bin`），优先于环境变量与 PATH。
     pub codeweb_bin: Option<PathBuf>,
+    /// codeweb 项目根（`--codeweb-project`），覆盖 `[paths].codeweb` 与向上发现。
     pub codeweb_project: Option<PathBuf>,
     /// 同步运行态快照（`conf/spinduck.runtime.toml`），默认关。
     pub sync_manifest: bool,

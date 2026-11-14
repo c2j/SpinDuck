@@ -216,7 +216,7 @@ pub fn usage() -> &'static str {
      \x20 compile [--dir <项目目录>] [--schema <名>] [--entry <routine>]...\n\
      \x20      [--codeweb-bin <path>] [--codeweb-project <dir>] [--sync-manifest]\n\
      \x20                                项目态：一次导出 codeweb 图，按入口落盘计划并 IR 体检；\n\
-     \x20                                  --sync-manifest 同步运行态快照 conf/spinduck.runtime.toml\n\
+     \x20                                --sync-manifest 同步运行态快照 conf/spinduck.runtime.toml\n\
      \x20 rules probe <rules.toml>        规则文件版本锚定检查\n\
      \x20 explain --file <sql> [--trace <审计日志>] <routine>\n\
      \x20                                打印例程 IR（不执行）；给 --trace 则逐行标注该次真实运行的命中\n\

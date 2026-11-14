@@ -974,8 +974,9 @@ kind = "procedure"                  # function | procedure（缺省 procedure）
 旧 `plan`/`verify` 子命令已删除（issue #38）：计划面收敛到 `compile --entry`，
 快照同步收敛到 `compile --sync-manifest`。
 
-链路核验的四类判定口径保留为**库级**能力（`verify_project`，守护测试
-`tests/verify_chain.rs` 与用例断言层消费，不再是 CLI 契约）：
+链路核验的四类判定口径保留为**库级**能力（`verify_project`，由守护测试
+`tests/verify_chain.rs` 消费；用例断言层 `cases_native` 复用同一套
+`deploy_project` 下发口径，不再是 CLI 契约）：
 
 | 核验项 | 判定 | 失败含义 |
 |---|---|---|

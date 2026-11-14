@@ -4508,7 +4508,7 @@ compile: entries=1 missing=11 failed=0 dynamic=0
 - 不声称原稿 `f696339` 上的输出与本轮逐字节相同。本轮是在 `2653c68` 上重跑后逐项核对，
   结论一致；但两次之间 compile 路径新增 463 行（同一口径），一致是实测结果而非推定。
 
-## V44. issue #38 收口：删除 `plan` / `verify` 子命令，静态入口只剩项目态 compile（2026-11-13）
+## V44. issue #38 收口：删除 `plan` / `verify` 子命令，静态入口只剩项目态 compile（2026-11-14）
 
 ### V44.1 决策与授权口径
 
@@ -4557,7 +4557,7 @@ V43.4「不删除 plan / verify……别名周期是否结束仍要人确认」�
   `src/project/manifest.rs::should_remove_legacy_snapshot_after_writing_new_name`、
   `src/project/tests.rs::should_not_recognize_legacy_snapshot_name`。
 
-### V44.4 门禁证据（本机，2026-11-13，分支 feat/issue-38-drop-plan-verify）
+### V44.4 门禁证据（本机实测 2026-11-13，提交 2026-11-14，分支 feat/issue-38-drop-plan-verify）
 
 ```text
 cargo fmt --all -- --check                      # 干净
@@ -4585,9 +4585,10 @@ cargo audit --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 \
    是否进一步删除属后续 PR，本轮不动。
 2. 快照名换名 + 旧名删除（V44.3）；旧名快照不再被任何读取面识别。
 3. 显式 `--entry` 接受裸名（V44.2）；`[[entry]]` 声明面不变。
-4. `compile --sync-manifest` 承接旧 `verify` 的清单同步语义，但**不再**把整库
-   装进内存 DuckDB 跑场景 call——那是 `verify_project` 的库级行为，现由
-   `tests/verify_chain.rs` 守护；CLI 面的多维断言走 `cases_native`。
+4. `compile --sync-manifest` 承接旧 `verify` 的清单同步语义。旧 `verify` 自 PR #32
+   起已不再调用 `verify_project`（整库装内存、跑场景 call 是更早的形态）；
+   `verify_project` 的库级能力现由 `tests/verify_chain.rs` 守护，CLI 面的多维断言
+   走 `cases_native`。
 5. 旧 `verify` 的 `== entry` / `PASS` / `verify: entries=` 输出形态消失，
    换成 `manifest:` + `plan:` + `compile:` 汇总（#33 已定的项目态契约）。
 
@@ -4659,6 +4660,8 @@ cargo audit --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 \
 - 不声称带真 codeweb 的端到端复跑（本机无二进制）；计划字节等价沿用 V43 与
   进程内假导出契约，`plan::build` 与 compile 同走 `plans_from_export` 是代码事实。
 - 不删除 `verify_project` / `plan::build` 库函数（只剩测试消费者，后续 PR 再议）。
+- 不声称相对 `--dir` 的快照路径已绝对化：`manifest_text` 原样写 `project.root`，
+  运行态自足问题另见 #40（既有行为，不阻塞本 issue）。
 - 不动 `docs/runbook-real-gaussdb.md`（维护者未提交的在制品，本 PR 不携带；
   runbook 里旧命令形态的更新随其本人提交落地）。
 - 不 bump 版本号（随独立发版 PR，AGENTS §9 发版顺序）。

@@ -81,7 +81,7 @@ pub(crate) const P_FORALL: &str =
 /// 与 [`write_gbk_routine`] 成对的 UTF-8 写法（编码对照的另一半）。
 pub(crate) const P_LITERAL_UTF8: &str =
     "CREATE OR REPLACE PROCEDURE prc_gbk(p_o OUT VARCHAR2) IS BEGIN p_o := '中文'; END;";
-/// `verify` 的项目声明：入口须包限定（`src/project/entry.rs` 要求名字含 `.`）。
+/// 项目态 `compile` 的项目声明：入口须包限定（`src/project/entry.rs` 要求名字含 `.`）。
 pub(crate) const PROJECT_X: &str =
     "[project]\nname = \"v\"\nkernel = \"1.5.5\"\n\n[[entry]]\nroutine = \"pkg_a.prc_x\"\n";
 pub(crate) const PROJECT_GBK: &str =
