@@ -255,6 +255,12 @@ fn run_inner(
                 sqlstmts::query(env, sql, binds, into, fn_sites)?;
                 *pc += 1;
             }
+            IrStmt::FoldedQuery { sql, target, expr } => {
+                writebuf::flush_if_touches(env, sql)?;
+                sqlstmts::query(env, sql, &[], &[], &[])?;
+                flow::assign_step(env, target, expr)?;
+                *pc += 1;
+            }
             IrStmt::SqlExec {
                 sql,
                 binds,

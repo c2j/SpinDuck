@@ -22,7 +22,7 @@ fn variant_name(st: &IrStmt) -> &'static str {
         IrStmt::Return { .. } => "Return",
         IrStmt::TxCommit => "TxCommit",
         IrStmt::TxRollback => "TxRollback",
-        IrStmt::SqlQuery { .. } => "SqlQuery",
+        IrStmt::SqlQuery { .. } | IrStmt::FoldedQuery { .. } => "SqlQuery",
         IrStmt::SqlExec { .. } => "SqlExec",
         IrStmt::Perform { .. } => "Perform",
         IrStmt::OpenCursor { .. } => "OpenCursor",

@@ -146,6 +146,36 @@ fn assign(expr: IrExpr) -> IrStmt {
 }
 
 #[test]
+fn should_collect_calls_in_every_case_expression_position() {
+    let call = |name: &str| IrExpr::function_call(name.into(), Vec::new());
+    let prog = IrProg {
+        code: vec![assign(IrExpr::Case {
+            operand: Some(Box::new(call("pkg.selector"))),
+            whens: vec![(call("pkg.condition"), call("pkg.result"))],
+            else_expr: Some(Box::new(call("pkg.otherwise"))),
+        })],
+        ..IrProg::default()
+    };
+    let expected: Vec<String> = [
+        "pkg.condition",
+        "pkg.otherwise",
+        "pkg.result",
+        "pkg.selector",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert_eq!(
+        routine_refs(&prog).into_iter().collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(
+        expr_func_names(&prog).into_iter().collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
 fn should_collect_routine_refs_from_ir_and_skip_bare_builtins() {
     let prog = IrProg {
         code: vec![
@@ -157,10 +187,12 @@ fn should_collect_routine_refs_from_ir_and_skip_bare_builtins() {
             assign(IrExpr::FuncCall {
                 name: "pkg_a.fn_c".into(),
                 args: vec![IrExpr::Const(SpinValue::Int(1))],
+                prepared: crate::sql::apply_ast_transforms("SELECT pkg_a.fn_c($p0)"),
             }),
             assign(IrExpr::FuncCall {
                 name: "trunc".into(),
                 args: vec![],
+                prepared: crate::sql::apply_ast_transforms("SELECT trunc()"),
             }),
             IrStmt::SqlQuery {
                 sql: "SELECT 1".into(),
@@ -190,6 +222,7 @@ fn should_report_bare_expression_calls_as_candidates_not_as_routine_refs() {
         code: vec![assign(IrExpr::FuncCall {
             name: "trunc".into(),
             args: vec![],
+            prepared: crate::sql::apply_ast_transforms("SELECT trunc()"),
         })],
         ..IrProg::default()
     };
@@ -204,7 +237,9 @@ fn should_report_bare_expression_calls_as_candidates_not_as_routine_refs() {
             args: vec![IrExpr::FuncCall {
                 name: "fnc_hidden".into(),
                 args: vec![],
+                prepared: crate::sql::apply_ast_transforms("SELECT fnc_hidden()"),
             }],
+            prepared: crate::sql::apply_ast_transforms("SELECT PKG_A.fn_c($p0)"),
         })],
         ..IrProg::default()
     };

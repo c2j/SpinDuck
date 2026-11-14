@@ -29,26 +29,13 @@ impl Compiler {
                     )),
                 );
                 let unit = rewrite_sql(&formatted, &self.vars, &self.rules, &self.routine_names)?;
-                let into = match into_targets {
-                    None => Vec::new(),
-                    Some(targets) => {
-                        let mut out = Vec::new();
-                        for t in targets {
-                            match t {
-                                ogsql_parser::ast::SelectTarget::Expr(e, _) => {
-                                    out.push(self.assign_target(&e)?);
-                                }
-                                ogsql_parser::ast::SelectTarget::Star(_) => {
-                                    return Err(EngineError::invariant(
-                                        42,
-                                        "SELECT * INTO is not supported",
-                                    ));
-                                }
-                            }
-                        }
-                        out
-                    }
-                };
+                let into = self.compile_into_targets(into_targets.unwrap_or_default())?;
+                if unit.fn_sites.is_empty()
+                    && unit.binds.is_empty()
+                    && super::dummy::emit(self, &sel.node, &into)
+                {
+                    return Ok(());
+                }
                 let (sql, binds, fn_sites) = (unit.text, unit.binds, unit.fn_sites);
                 self.code.push(IrStmt::SqlQuery {
                     sql,
@@ -74,6 +61,21 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    fn compile_into_targets(
+        &mut self,
+        targets: Vec<ogsql_parser::ast::SelectTarget>,
+    ) -> Result<Vec<AssignTarget>, EngineError> {
+        targets
+            .into_iter()
+            .map(|target| match target {
+                ogsql_parser::ast::SelectTarget::Expr(expr, _) => self.assign_target(&expr),
+                ogsql_parser::ast::SelectTarget::Star(_) => {
+                    Err(EngineError::invariant(42, "SELECT * INTO is not supported"))
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn loop_end_label(&mut self, explicit: Option<&str>) -> Result<String, EngineError> {

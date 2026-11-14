@@ -4780,3 +4780,65 @@ purchase_yj, purchase_days, purchase_money`，`ORDER BY 1,2,3,4`）sha256 同为
 - 本机 A 模式容器 `cargo test --features gauss` 共 607 通过 / 0 失败，容器前后
   healthy；未启用 gauss-sha256，不声称覆盖独立 sha256 实例。
 - 上文性能数保留为审核前测量，不作为本次修复后的重新计量结果。
+
+## V46. 标量模板前移、惰性 CASE 与受限哑表折叠（2026-11-14）
+
+基线为 PR #41 合并提交 `1eb177e8f1e668a2571cb10ec885792c98b7b568`；机制见
+architecture §3.5.2。本轮未修改已有测试断言、输入或期望值，仅获准给旧 IR 构造器
+补模板字段；新增测试登记于 `guard_scalar_sql`、`guard_dummy_fold` 等目标。
+
+### Red → Green 与范围
+
+- `should_prepare_scalar_sql_during_compilation` / `should_prepare_builtin_fallback_during_compilation`：
+  首跑因缺少 `prepared` 字段编译失败；实现模板后通过。
+  `should_preserve_scalar_sql_text_and_bindings` 在改动前后逐字锁定嵌套日期 SQL、SUBSTRING
+  与命名绑定。错误模板测试确认不执行分支不报错、执行时仍为 BIZ-0131。
+- `should_evaluate_case_expression_lazily_with_unknown_conditions` 首跑 ENG-0026 不支持 CASE，
+  实现后通过；补简单选择子只求值一次、NULL 不匹配 NULL、缺 ELSE、嵌套 CASE 渲染与
+  每个位置的闭包依赖收集测试。
+- `should_preserve_kernel_case_type_error_on_dummy_query` 实测 SQL 混合分支
+  `CASE WHEN TRUE THEN 'ok' ELSE 1 END` 为 KERNEL-0010，而 PL 赋值返回 `ok`。
+  因此未做无条件折叠；维护者选择“仅折叠可证明子集”。
+- `should_fold_homogeneous_literal_case_with_cardinality_probe` 首跑仍是原 CASE 查询而红，
+  实现后通过。缺表/空表/单行/多行守护在折叠前后通过，覆盖 sys_dummy 与 dual。
+  同类型常量矩阵与强制保留的 `WHERE TRUE` 内核路径逐值一致；未知类型、字段、
+  函数、序列、算术、混合类型及附加子句维持 SqlQuery。
+- 自查发现拆成 Query+Assign 会多消耗一步：`should_preserve_dummy_query_step_budget_boundary`
+  在预算 3 时实测 ENG-0032；改为单条 `FoldedQuery` 后预算 3 成功、预算 2 保持 ENG-0032。
+  `should_flush_dummy_writes_before_probe_and_rollback_on_cardinality_error` 确认批缓冲读自己写，
+  多行异常后新增行回滚。重构仅提取 INTO 目标编译，接缝签名未改。
+
+### 本地门禁
+
+- `cargo fmt --all -- --check`、`cargo clippy --all-features --tests -- -D warnings` 通过。
+- `cargo test --features cli`：685 通过 / 0 失败；含 466 lib、111 CLI、7 dummy guard、
+  6 scalar guard；`cargo test --features gauss`：623 通过 / 0 失败。
+  黄金层仅连接本机 A 模式容器 127.0.0.1:5433，口令运行时从容器环境取得，不落文件。
+  前后健康检查为 healthy，不代表连续生命周期监测；未运行独立 gauss-sha256 实例。
+- 中途 `cargo test --all-features case` 因未注入参照连接环境在黄金目标显式失败；随后
+  以上完整 CLI/gauss 门禁通过，不把该中途执行报告为通过。
+- 在线 `cargo audit` 拉取 RustSec 时网络失败；`cargo audit --no-fetch` 加 CI 既有四条
+  zip 豁免通过（1509 条缓存公告 / 242 依赖）。不声称缓存结果是最新在线审计。
+  Cargo.lock 无修改，Cargo.toml 只增加两个测试目标。
+
+### 同库 release A/B
+
+基线在独立 detached worktree 构建，本轮候选在当前工作树构建；均为
+`cargo build --release --locked --features cli`、v0.1.20、同一台 Apple Silicon。
+复用 V45 的 143,667,200 字节本地 bench.duckdb，每次调用前复制到独立副本；真实
+purchase 源码和既有计划，参数 `'20250715' null`，不触碰远端生产库、不启用 trace。
+每模式预热一轮，随后基线/候选交替两轮，计时期间未并行运行本会话测试任务。
+
+| 模式 | 基线 real / user（两次） | 候选 real / user（两次） | real 均值 |
+|---|---|---|---|
+| batch OFF | 1.60 / 1.56；1.63 / 1.58 | 1.57 / 1.55；1.58 / 1.55 | 1.615 → 1.575 s（约 −2.5%） |
+| batch ON | 1.47 / 1.39；1.43 / 1.37 | 1.42 / 1.35；1.41 / 1.35 | 1.450 → 1.415 s（约 −2.4%） |
+
+四侧均 `OUT p_o_succeed = 0`；按 V45 的日期/市场过滤和四键排序导出 490 行 × 7 列，
+两组 `compare` 均 diffs=0，四份 JSON 逐字节 SHA-256 同为
+`28157fdc973fbea350cc239bfeb2fb09f672b683007212311edde77b534e26d6`。
+这只是两次热缓存样本，不声称统计显著或倍数级收益。
+
+`explain` 确认真实 purchase 的记录字段 CASE 仍为 SqlQuery、没有 FoldedQuery；未知
+字段类型不在本次证明子集内。不能把整过程差异归因于哑表折叠，也没有宣称覆盖此前
+20000 行放大数据集（本轮未重跑该合成脚手架）。

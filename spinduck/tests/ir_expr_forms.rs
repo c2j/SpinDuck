@@ -13,6 +13,54 @@ fn engine() -> Engine {
 }
 
 #[test]
+fn should_evaluate_case_expression_lazily_with_unknown_conditions() {
+    let mut eng = engine();
+    eng.register(
+        "CREATE FUNCTION f_case_expr(p IN BOOLEAN) RETURN NUMBER IS BEGIN \
+        RETURN CASE WHEN p THEN 7 WHEN NULL THEN 1 / 0 ELSE 9 END; END;",
+    )
+    .unwrap();
+    for (input, expected) in [
+        (SpinValue::Bool(true), 7),
+        (SpinValue::Bool(false), 9),
+        (SpinValue::Null, 9),
+    ] {
+        assert_eq!(
+            eng.call("f_case_expr", &[input]).unwrap().return_value,
+            Some(SpinValue::Int(expected))
+        );
+    }
+}
+
+#[test]
+fn should_not_match_null_in_simple_case_and_default_to_null() {
+    let mut eng = engine();
+    eng.register(
+        "CREATE FUNCTION f_simple_case(p IN NUMBER) RETURN VARCHAR2 IS BEGIN \
+        RETURN CASE p WHEN NULL THEN 'bad' WHEN 2 THEN 'two' END; END;",
+    )
+    .unwrap();
+    assert_eq!(
+        eng.call("f_simple_case", &[SpinValue::Null])
+            .unwrap()
+            .return_value,
+        Some(SpinValue::Null)
+    );
+    assert_eq!(
+        eng.call("f_simple_case", &[SpinValue::Int(2)])
+            .unwrap()
+            .return_value,
+        Some(SpinValue::Str("two".into()))
+    );
+    assert_eq!(
+        eng.call("f_simple_case", &[SpinValue::Int(3)])
+            .unwrap()
+            .return_value,
+        Some(SpinValue::Null)
+    );
+}
+
+#[test]
 fn should_compile_if_without_else_branch() {
     // 回归：空 ELSE 时 `if_next` 标签未 mark，fixup 解析失败（ENG-0020）
     let mut eng = engine();
