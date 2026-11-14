@@ -6,6 +6,7 @@
 mod export;
 mod parse;
 mod plans;
+mod source;
 mod walk;
 
 use std::path::Path;
@@ -14,6 +15,7 @@ pub(crate) use export::AmbientCommandExport;
 pub use export::CodewebExport;
 pub use parse::{parse_codeweb_json, parse_codeweb_reader, CodewebGraph};
 pub use plans::plans_from_export;
+pub use source::{CodewebSource, JsonCodewebSource};
 pub use walk::closure_from_graph;
 
 /// 闭包求值的项目侧输入：根用于剥路径，索引只回答「这个关系名的 CREATE 在哪」。
