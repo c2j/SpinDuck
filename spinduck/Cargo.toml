@@ -92,6 +92,10 @@ path = "tests/guard/guard_register_silent_drop.rs"
 name = "guard_patterns_outer_join_residual"
 path = "tests/guard/guard_patterns_outer_join_residual.rs"
 
+[[test]]
+name = "guard_fnsites_batch"
+path = "tests/guard/guard_fnsites_batch.rs"
+
 # CLI 契约层（AGENTS §4.1）跑真 `[[bin]] spinduck`，该 bin 要 `cli` feature。用
 # required-features 而非 `#![cfg]`：后者在 `--features native` 下收集 0 条 = "跳过即绿"。
 # CI 的 Test job 因此单步 `cargo test --features cli`（cli ⊇ native，覆盖面只增不减，
