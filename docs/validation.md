@@ -4846,7 +4846,7 @@ bincode 用**变体索引**编码枚举，而 `Node::JspPage` / `Node::JspSql`�
 都在 feature 门控后面——full 构建的变体编号比 analyze-only 多两个，两边写出的 store
 互不可读。这不是"版本漂移"，是**同一版本号下按构建形态分裂的数据格式**。
 
-修复（codeweb `55f366b`，发版 `v0.9.10`）：
+修复（codeweb `55f366b`，发版 `v0.9.10` = `d04a9ed`）：
 
 - 持久化类型不再随 feature 门控：`Node::JspPage/JspSql`、`Edge::ContainsSql`、
   `NodeKey::JspPage/JspSql`、`StoreStats::jsp_pages/jsp_sql`、`parser::jsp_types` 全部
@@ -4856,6 +4856,11 @@ bincode 用**变体索引**编码枚举，而 `Node::JspPage` / `Node::JspSql`�
 - 守卫测试 `graph::tests::should_keep_persisted_enum_variants_feature_independent`
   钉死变体索引（JspPage=19、JspSql=20、ContainsSql=7）：重排/新增变体而不 bump
   store 版本会直接红。
+- **tag 重打说明**：第一次 `v0.9.10` 指向 `315f11a`，其 Build workflow 在 CLI 回归测试
+  `regress_issue_159_sequence_inferred.rs` 上红（该测试把"重建后的 store 版本头"
+  写死为 15；`d04a9ed` 改为引用 `STORE_VERSION` 常量）。因 Release job 被跳过、
+  未发布任何资产，tag 删除后重打在 `d04a9ed`（正文与产物不变，仅测试断言修正）；
+  SpinDuck 的 lockfile 随后跟到 `#d04a9ede`。
 
 **双向互通实测**（语料：8001 文件 / 72,051 节点 / 248,000 边 / store 105 MB）：
 

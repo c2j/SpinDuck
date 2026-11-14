@@ -14,7 +14,8 @@
 >   接缝；`0727d89` `from_thin_graph` 映射 + `EmbeddedCodewebSource`；`5f9b525` 调用点
 >   替换与进程外契约退役（`--codeweb-bin` / `SPINDUCK_CODEWEB` 删除、`--analyze` 新增）；
 >   `cebd488` 版本 bump + generator 守护测试 + validation V46。
-> - **`v0.9.10`（`315f11a`）修数据格式缺陷**：`55f366b` 让持久化类型（`Node::JspPage/
+> - **`v0.9.10`（`d04a9ed`；tag 初次打在 `315f11a`，因 CLI 回归测试写死 store 版本号
+>   红过一次，Release 未发布资产，修正后 tag 重打）修数据格式缺陷**：`55f366b` 让持久化类型（`Node::JspPage/
 >   JspSql`、`Edge::ContainsSql`、`NodeKey::JspPage/JspSql`、`StoreStats::jsp_*`）不再
 >   随 feature 门控——此前 full 构建与 analyze-only 构建写出的 store 互不可读
 >   （bincode 变体索引错位），`STORE_VERSION` 15 → 16，双向互通实测与守卫测试见
