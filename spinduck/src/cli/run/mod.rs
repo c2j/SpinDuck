@@ -13,8 +13,8 @@ use call::{call_cmd, cmd_call};
 use compile::{compile_cmd, explain_cmd};
 use compile_project::compile_project_cmd;
 #[cfg(test)]
-pub(crate) use compile_project::compile_with_export;
-pub use compile_project::{compile_project_with_export, ProjectCompile};
+pub(crate) use compile_project::compile_with_source;
+pub use compile_project::{compile_project_with_source, ProjectCompile};
 use io::{cmd_materialize, cmd_sync, materialize_cmd, sync_cmd};
 
 use crate::cli::args::{parse, usage, Command};
@@ -82,7 +82,7 @@ fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError> {
             dir,
             schema,
             entries,
-            codeweb_bin,
+            analyze,
             codeweb_project,
             sync_manifest,
         } => compile_project_cmd(
@@ -90,7 +90,7 @@ fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError> {
                 dir,
                 schema,
                 entries,
-                codeweb_bin,
+                analyze,
                 codeweb_project,
                 sync_manifest,
             },

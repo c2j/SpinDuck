@@ -128,30 +128,26 @@ END;
 /
 "#;
 
-struct FixtureExport(Vec<u8>);
-
-impl spinduck_core::plan::codeweb::CodewebExport for FixtureExport {
-    fn export_json(
-        &self,
-        _project: &Path,
-    ) -> Result<Box<dyn std::io::Read + Send>, spinduck_core::EngineError> {
-        Ok(Box::new(std::io::Cursor::new(self.0.clone())))
+fn fixture_source(json: Vec<u8>) -> spinduck_core::plan::codeweb::JsonCodewebSource {
+    spinduck_core::plan::codeweb::JsonCodewebSource {
+        generator: "codeweb 0.9.9".to_string(),
+        json,
     }
 }
 
 fn compile_export(root: &Path, json: serde_json::Value) -> (i32, String) {
     std::fs::write(root.join("codeweb.toml"), b"").unwrap();
-    let export = FixtureExport(serde_json::to_vec(&json).unwrap());
+    let export = fixture_source(serde_json::to_vec(&json).unwrap());
     let opts = spinduck_core::cli::ProjectCompile {
         dir: Some(root.to_path_buf()),
         schema: None,
         entries: vec![],
-        codeweb_bin: None,
+        analyze: false,
         codeweb_project: None,
         sync_manifest: true,
     };
     let mut buf = Vec::new();
-    let result = spinduck_core::cli::compile_project_with_export(opts, &export, &mut buf);
+    let result = spinduck_core::cli::compile_project_with_source(opts, &export, &mut buf);
     match result {
         Ok(code) => (code, String::from_utf8(buf).unwrap()),
         Err(e) => {

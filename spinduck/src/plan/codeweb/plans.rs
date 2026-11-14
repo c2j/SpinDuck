@@ -2,31 +2,28 @@
 //!
 //! 不调用 `plan::closure::build`，也不按入口各起一次子进程。
 
-use super::export::CodewebExport;
-use super::{closure_from_graph, parse_codeweb_reader, ClosureContext, GraphClosure};
+use super::source::CodewebSource;
+use super::{closure_from_graph, ClosureContext, GraphClosure};
 use crate::error::EngineError;
 use crate::plan::closure::{ddl_name_index, project_dir_text};
 use crate::plan::{MissingObject, PlanDynamic, PlanRef, RunPlan};
 use crate::project::ProjectConfig;
 use std::collections::BTreeSet;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// 新计划的产出方字面量。不写日期，也不写 spinduck 自己的版本。
-pub const GENERATOR: &str = "codeweb 0.9.7";
-
-/// 导出并解析一次，再对每个入口调用 [`closure_from_graph`]。
-pub fn plans_from_export(
+/// 取图一次，再对每个入口调用 [`closure_from_graph`]。
+///
+/// `generator` 由取图实现给出（嵌入形态 = 链接进来的 codeweb 版本），
+/// 不再有硬编码字面量——版本漂移在类型层面消失。
+pub fn plans_from_source(
     project: &ProjectConfig,
     entries: &[String],
     schema: Option<String>,
-    export: &impl CodewebExport,
+    source: &impl CodewebSource,
 ) -> Result<Vec<RunPlan>, EngineError> {
     let codeweb_root = codeweb_project_root(project)?;
-    let mut reader = export.export_json(&codeweb_root)?;
-    let parsed = parse_codeweb_reader(reader.as_mut());
-    drain(reader.as_mut())?;
-    let graph = parsed.map_err(export_failure)?;
+    let graph = source.load_graph(&codeweb_root).map_err(export_failure)?;
+    let generator = source.generator();
     let ddl = ddl_name_index(project)?;
     let schema = lowered_schema(schema);
     let ctx = ClosureContext {
@@ -36,7 +33,12 @@ pub fn plans_from_export(
     let mut plans = Vec::with_capacity(entries.len());
     for entry in entries {
         let closure = closure_from_graph(&graph, entry, &ctx)?;
-        plans.push(plan_from_closure(project, closure, schema.clone()));
+        plans.push(plan_from_closure(
+            project,
+            closure,
+            schema.clone(),
+            generator.clone(),
+        ));
     }
     Ok(plans)
 }
@@ -59,13 +61,6 @@ pub(crate) fn codeweb_project_root(project: &ProjectConfig) -> Result<PathBuf, E
         })
 }
 
-fn drain(reader: &mut dyn Read) -> Result<(), EngineError> {
-    match std::io::copy(reader, &mut std::io::sink()) {
-        Ok(_) => Ok(()),
-        Err(e) => Err(export_failure(EngineError::env(30, e.to_string()))),
-    }
-}
-
 fn export_failure(err: EngineError) -> EngineError {
     if err.message.starts_with("codeweb export 失败:") {
         return err;
@@ -85,10 +80,11 @@ fn plan_from_closure(
     project: &ProjectConfig,
     closure: GraphClosure,
     schema: Option<String>,
+    generator: String,
 ) -> RunPlan {
     RunPlan {
         target: closure.target,
-        generator: GENERATOR.to_string(),
+        generator,
         project_dir: project_dir_text(project),
         schema,
         ddl_routines: closure.ddl_routines,
@@ -133,20 +129,26 @@ fn sorted_by<T: Ord>(items: impl IntoIterator<Item = T>) -> Vec<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{parse_codeweb_json, CodewebGraph};
     use super::*;
-    use crate::cli::run::compile_with_export;
+    use crate::cli::run::compile_with_source;
     use std::cell::Cell;
     use std::path::Path;
 
-    struct FakeExport {
+    /// 注入取图来源并记录调用次数（守「多入口只取一次图」）。
+    struct CountingSource {
         calls: Cell<usize>,
         json: Vec<u8>,
     }
 
-    impl CodewebExport for FakeExport {
-        fn export_json(&self, _project: &Path) -> Result<Box<dyn Read + Send>, EngineError> {
+    impl CodewebSource for CountingSource {
+        fn generator(&self) -> String {
+            "codeweb 0.9.9".to_string()
+        }
+
+        fn load_graph(&self, _codeweb_root: &Path) -> Result<CodewebGraph, EngineError> {
             self.calls.set(self.calls.get() + 1);
-            Ok(Box::new(std::io::Cursor::new(self.json.clone())))
+            parse_codeweb_json(&String::from_utf8_lossy(&self.json))
         }
     }
 
@@ -180,13 +182,13 @@ mod tests {
         if project.codeweb_dir.is_none() && codeweb_project_root(project).is_err() {
             std::fs::write(project.root.join("codeweb.toml"), "").unwrap();
         }
-        let fake = FakeExport {
+        let fake = CountingSource {
             calls: Cell::new(0),
             json: serde_json::to_vec(&json).unwrap(),
         };
         let entries: Vec<String> = entries.iter().map(|s| (*s).to_string()).collect();
         let mut buf = Vec::new();
-        let code = compile_with_export(
+        let code = compile_with_source(
             project,
             &entries,
             schema.map(str::to_string),
@@ -236,7 +238,7 @@ mod tests {
         for target in ["pkg_a.prc_a", "pkg_b.prc_b"] {
             let text =
                 std::fs::read_to_string(root.join(format!("x/y/plan/{target}.toml"))).unwrap();
-            assert!(text.contains("generator = \"codeweb 0.9.7\""), "{text}");
+            assert!(text.contains("generator = \"codeweb 0.9.9\""), "{text}");
             assert!(text.contains("schema = \"a.b.c\""), "{text}");
             assert!(text.contains("project_dir = \"../../..\""), "{text}");
             assert!(text.contains("materialize = []"), "{text}");
@@ -354,7 +356,7 @@ mod tests {
         let file = write_sql(root, "sql/routines/pkg_a.sql", NULL_PROC);
         let project = load_project(root, "");
         std::fs::write(root.join("codeweb.toml"), "").unwrap();
-        let fake = FakeExport {
+        let fake = CountingSource {
             calls: Cell::new(0),
             json: serde_json::to_vec(&serde_json::json!({
                 "nodes": [proc_node(1, "pkg_a", "prc_main", &file)],
@@ -362,7 +364,7 @@ mod tests {
             }))
             .unwrap(),
         };
-        let err = compile_with_export(
+        let err = compile_with_source(
             &project,
             &["pkg_a.prc_other".to_string()],
             None,

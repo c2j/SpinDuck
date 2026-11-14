@@ -250,19 +250,15 @@ mod tests {
     #[cfg(feature = "native")]
     use crate::error::EngineError;
     #[cfg(feature = "native")]
-    use crate::plan::codeweb::CodewebExport;
-    #[cfg(feature = "native")]
-    use std::io::Read;
+    use crate::plan::codeweb::JsonCodewebSource;
     #[cfg(feature = "native")]
     use std::path::Path;
 
     #[cfg(feature = "native")]
-    struct JsonExport(Vec<u8>);
-
-    #[cfg(feature = "native")]
-    impl CodewebExport for JsonExport {
-        fn export_json(&self, _project: &Path) -> Result<Box<dyn Read + Send>, EngineError> {
-            Ok(Box::new(std::io::Cursor::new(self.0.clone())))
+    fn json_source(json: Vec<u8>) -> JsonCodewebSource {
+        JsonCodewebSource {
+            generator: "codeweb 0.9.9".to_string(),
+            json,
         }
     }
 
@@ -355,7 +351,7 @@ mod tests {
         std::fs::write(root.join("codeweb.toml"), b"").unwrap();
         let file = root.join("sql/routines/r.sql");
         let file_s = file.to_string_lossy().replace('\\', "/");
-        let export = JsonExport(
+        let export = json_source(
             serde_json::to_vec(&serde_json::json!({
                 "nodes": [{"id": 1, "type": "function", "name": "fnc_nv", "file": file_s}],
                 "edges": []
@@ -367,11 +363,11 @@ mod tests {
             dir: Some(root.to_path_buf()),
             schema: None,
             entries: vec!["fnc_nv".to_string()],
-            codeweb_bin: None,
+            analyze: false,
             codeweb_project: None,
             sync_manifest: false,
         };
-        let plan_code = crate::cli::compile_project_with_export(opts, &export, &mut plan_buf)
+        let plan_code = crate::cli::compile_project_with_source(opts, &export, &mut plan_buf)
             .unwrap_or_else(|e| panic!("{}", e.message));
         let plan_out = String::from_utf8(plan_buf).unwrap();
         assert_eq!(plan_code, EXIT_OK, "{plan_out}");

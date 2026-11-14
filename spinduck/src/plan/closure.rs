@@ -6,7 +6,7 @@ use crate::catalog::CompiledRoutine;
 use crate::cli::read_source_strict;
 use crate::engine::Engine;
 use crate::error::EngineError;
-use crate::plan::codeweb::{plans_from_export, CodewebExport};
+use crate::plan::codeweb::{plans_from_source, CodewebSource};
 use crate::plan::{MissingObject, PlanRef, RunPlan};
 use crate::project::ProjectConfig;
 use crate::verify::{
@@ -16,18 +16,18 @@ use crate::verify::{
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-/// 从目标例程出发求闭包并落成计划。一次导出，一个入口。
+/// 从目标例程出发求闭包并落成计划。一次取图，一个入口。
 ///
 /// `schema` 只写入计划：整段 `trim` + ASCII 小写，不经 `normalize`（不截段）。
-/// 导出失败即返回，不回退词法闭包。
+/// 取图失败即返回，不回退词法闭包。
 pub fn build(
     project: &ProjectConfig,
     target: &str,
     schema: Option<String>,
-    export: &impl CodewebExport,
+    source: &impl CodewebSource,
 ) -> Result<RunPlan, EngineError> {
     let entry = target.to_string();
-    let mut plans = plans_from_export(project, std::slice::from_ref(&entry), schema, export)?;
+    let mut plans = plans_from_source(project, std::slice::from_ref(&entry), schema, source)?;
     plans
         .pop()
         .ok_or_else(|| EngineError::invariant(30, "单入口没有产出计划"))

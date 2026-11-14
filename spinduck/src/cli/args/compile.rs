@@ -11,7 +11,7 @@ struct CompileScan {
     dir: Option<PathBuf>,
     schema: Option<String>,
     entries: Vec<String>,
-    codeweb_bin: Option<PathBuf>,
+    analyze: bool,
     codeweb_project: Option<PathBuf>,
     sync_manifest: bool,
     paths: Vec<PathBuf>,
@@ -28,7 +28,7 @@ pub(super) fn parse_compile(rest: &[String]) -> Result<Command, EngineError> {
             dir: scan.dir,
             schema: scan.schema,
             entries: scan.entries,
-            codeweb_bin: scan.codeweb_bin,
+            analyze: scan.analyze,
             codeweb_project: scan.codeweb_project,
             sync_manifest: scan.sync_manifest,
         });
@@ -44,7 +44,7 @@ fn scan_compile(rest: &[String]) -> Result<CompileScan, EngineError> {
         dir: None,
         schema: None,
         entries: Vec::new(),
-        codeweb_bin: None,
+        analyze: false,
         codeweb_project: None,
         sync_manifest: false,
         paths: Vec::new(),
@@ -73,13 +73,9 @@ fn scan_compile(rest: &[String]) -> Result<CompileScan, EngineError> {
                 scan.project_mode = true;
                 scan.entries.push(next_arg(&mut it, "--entry <routine>")?);
             }
-            "--codeweb-bin" => {
+            "--analyze" => {
                 scan.project_mode = true;
-                set_path(
-                    &mut scan.codeweb_bin,
-                    "--codeweb-bin",
-                    next_arg(&mut it, "--codeweb-bin <path>")?,
-                )?;
+                scan.analyze = true;
             }
             "--codeweb-project" => {
                 scan.project_mode = true;
@@ -129,8 +125,7 @@ mod tests {
             "pkg.a",
             "--entry",
             "pkg.b",
-            "--codeweb-bin",
-            "cw",
+            "--analyze",
             "--codeweb-project",
             "root",
             "--dir",
@@ -143,7 +138,7 @@ mod tests {
                 dir: Some(PathBuf::from("proj")),
                 schema: Some("S".into()),
                 entries: vec!["pkg.a".into(), "pkg.b".into()],
-                codeweb_bin: Some(PathBuf::from("cw")),
+                analyze: true,
                 codeweb_project: Some(PathBuf::from("root")),
                 sync_manifest: false,
             }
@@ -159,7 +154,7 @@ mod tests {
                 dir: Some(PathBuf::from("proj")),
                 schema: None,
                 entries: vec![],
-                codeweb_bin: None,
+                analyze: false,
                 codeweb_project: None,
                 sync_manifest: true,
             }
@@ -171,7 +166,7 @@ mod tests {
         for argv in [
             v(&["compile", "a.sql", "--dir", "p"]),
             v(&["compile", "--entry", "pkg.a", "a.sql"]),
-            v(&["compile", "--codeweb-bin", "cw", "a.sql"]),
+            v(&["compile", "--analyze", "a.sql"]),
         ] {
             let err = parse(&argv).unwrap_err();
             assert_eq!(err.code.to_string(), "ENG-0010", "{argv:?}: {err}");
@@ -192,7 +187,8 @@ mod tests {
         // issue #38：plan/verify 子命令已删除；`call --plan` 是旗标，按行首保留。
         let text = usage();
         assert!(text.contains("compile [--dir <项目目录>]"), "{text}");
-        assert!(text.contains("--codeweb-bin"), "{text}");
+        assert!(text.contains("--analyze"), "{text}");
+        assert!(!text.contains("--codeweb-bin"), "{text}");
         assert!(text.contains("--codeweb-project"), "{text}");
         assert!(text.contains("--sync-manifest"), "{text}");
         for line in text.lines() {

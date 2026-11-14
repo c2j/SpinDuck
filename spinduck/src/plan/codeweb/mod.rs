@@ -1,9 +1,10 @@
-//! codeweb 0.9.7 JSON 的瘦投影、闭包，以及一次导出映射成多份计划。
+//! codeweb 瘦图的投影、闭包，以及一次取图映射成多份计划。
 //!
 //! `closure_from_graph` 不启进程。项目态 compile 与 `plan::closure::build` 都经
-//! [`plans_from_export`] 导出一次，再按入口调用它。
+//! [`plans_from_source`] 取一次图，再按入口调用它。取图实现见 [`CodewebSource`]：
+//! 生产走进程内嵌入（[`EmbeddedCodewebSource`]），测试注入内存 JSON
+//! （[`JsonCodewebSource`]）；进程外二进制路径已退役（docs/embeded-codeweb.md §4.5）。
 
-mod export;
 mod parse;
 mod plans;
 mod source;
@@ -11,12 +12,15 @@ mod walk;
 
 use std::path::Path;
 
-pub(crate) use export::AmbientCommandExport;
-pub use export::CodewebExport;
 pub use parse::{parse_codeweb_json, parse_codeweb_reader, CodewebGraph};
-pub use plans::plans_from_export;
+pub use plans::plans_from_source;
 pub use source::{CodewebSource, EmbeddedCodewebSource, JsonCodewebSource};
 pub use walk::closure_from_graph;
+
+/// 链接进来的 codeweb 版本：计划 `generator` 的唯一来源（消除硬编码版本漂移）。
+pub fn embedded_version() -> &'static str {
+    codeweb::embed::version()
+}
 
 /// 闭包求值的项目侧输入：根用于剥路径，索引只回答「这个关系名的 CREATE 在哪」。
 #[derive(Debug, Clone, Copy)]
