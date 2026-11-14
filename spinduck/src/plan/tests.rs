@@ -2,9 +2,8 @@
 
 use super::*;
 use crate::error::EngineError;
-use crate::plan::codeweb::CodewebExport;
+use crate::plan::codeweb::JsonCodewebSource;
 use crate::plan::MissingObject;
-use std::io::Read;
 use std::path::Path;
 
 pub(super) fn plan_with_two_routines_and_a_gap() -> RunPlan {
@@ -236,11 +235,10 @@ fn fixture_project(root: &Path, ddl: &str) {
     write_rel(root, "sql/ddl/tables.sql", ddl);
 }
 
-struct JsonExport(Vec<u8>);
-
-impl CodewebExport for JsonExport {
-    fn export_json(&self, _project: &Path) -> Result<Box<dyn Read + Send>, EngineError> {
-        Ok(Box::new(std::io::Cursor::new(self.0.clone())))
+fn json_source(json: Vec<u8>) -> JsonCodewebSource {
+    JsonCodewebSource {
+        generator: "codeweb 0.9.9".to_string(),
+        json,
     }
 }
 
@@ -254,7 +252,7 @@ pub(super) fn cw(nodes: serde_json::Value, edges: serde_json::Value) -> serde_js
 
 fn plan_from(root: &Path, target: &str, json: serde_json::Value) -> Result<RunPlan, EngineError> {
     std::fs::write(root.join("codeweb.toml"), b"").unwrap();
-    let export = JsonExport(serde_json::to_vec(&json).unwrap());
+    let export = json_source(serde_json::to_vec(&json).unwrap());
     crate::plan::build(
         &crate::project::ProjectConfig::load(root).unwrap(),
         target,
@@ -300,7 +298,11 @@ fn should_collect_routine_and_ddl_files_transitively_into_the_plan() {
         ),
     );
 
-    assert_eq!(plan.generator, "codeweb 0.9.7");
+    // generator 必须**透传自取图来源**（本测试的夹具是 JSON 源，见 `json_source`）；
+    // 嵌入形态「generator = 链接的 codeweb 版本」由
+    // `plan::codeweb::source::tests::should_write_a_semver_generator_from_the_embedded_source`
+    // 单独锁定。
+    assert_eq!(plan.generator, "codeweb 0.9.9");
     assert_eq!(plan.target, "prc_main");
     assert_eq!(
         plan.ddl_routines,

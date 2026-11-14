@@ -10,7 +10,7 @@ mod query;
 pub mod run;
 mod trace;
 
-pub use run::{compile_project_with_export, ProjectCompile};
+pub use run::{compile_project_with_source, ProjectCompile};
 
 use crate::engine::Engine;
 use crate::error::EngineError;

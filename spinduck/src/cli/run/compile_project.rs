@@ -1,14 +1,14 @@
-//! 项目态 `compile`：一次 codeweb 导出，按入口落计划，再对闭包源做 IR 体检。
+//! 项目态 `compile`：一次取图（进程内嵌 codeweb），按入口落计划，再对闭包源做 IR 体检。
 //!
-//! 不调用 `plan::closure::build`。二进制在导出里惰性解析（项目发现失败不必先有
-//! codeweb）；找不到就返回，不退回词法闭包。
+//! 不调用 `plan::closure::build`；取图失败直接返回，不退回词法闭包。
+//! `--analyze` 允许在取图前于进程内完成增量分析。
 
 use super::compile::rules_for_paths;
 use super::{io_err, EXIT_FAIL, EXIT_OK};
 use crate::cli::{read_source_strict, NoopExecutor};
 use crate::engine::Engine;
 use crate::error::EngineError;
-use crate::plan::codeweb::{plans_from_export, AmbientCommandExport, CodewebExport};
+use crate::plan::codeweb::{plans_from_source, CodewebSource, EmbeddedCodewebSource};
 use crate::plan::{write_plan, PlanWrite, RunPlan};
 use crate::project::ProjectConfig;
 use std::collections::BTreeSet;
@@ -23,8 +23,8 @@ pub struct ProjectCompile {
     pub schema: Option<String>,
     /// 显式入口（可重复）；为空时取项目声明的全部 `[[entry]]`。
     pub entries: Vec<String>,
-    /// codeweb 二进制路径（`--codeweb-bin`），优先于环境变量与 PATH。
-    pub codeweb_bin: Option<PathBuf>,
+    /// 取图前允许进程内分析（`--analyze`）：store 缺失/过期/源码变动时先补分析。
+    pub analyze: bool,
     /// codeweb 项目根（`--codeweb-project`），覆盖 `[paths].codeweb` 与向上发现。
     pub codeweb_project: Option<PathBuf>,
     /// 同步运行态快照（`conf/spinduck.runtime.toml`），默认关。
@@ -39,23 +39,23 @@ pub(super) fn compile_project_cmd(
     if opts.sync_manifest {
         sync_manifest_line(&project, out)?;
     }
-    let export = AmbientCommandExport {
-        flag: opts.codeweb_bin,
+    let source = EmbeddedCodewebSource {
+        auto_analyze: opts.analyze,
     };
-    compile_with_export(&project, &entries, opts.schema, &export, out)
+    compile_with_source(&project, &entries, opts.schema, &source, out)
 }
 
-/// 注入导出的项目态 compile：测试不启动 codeweb，其余口径与真二进制一致。
-pub fn compile_project_with_export(
+/// 注入取图来源的项目态 compile：测试注入内存 JSON，其余口径与嵌入式生产一致。
+pub fn compile_project_with_source(
     opts: ProjectCompile,
-    export: &impl CodewebExport,
+    source: &impl CodewebSource,
     out: &mut dyn Write,
 ) -> Result<i32, EngineError> {
     let (project, entries) = locate_project(&opts)?;
     if opts.sync_manifest {
         sync_manifest_line(&project, out)?;
     }
-    compile_with_export(&project, &entries, opts.schema, export, out)
+    compile_with_source(&project, &entries, opts.schema, source, out)
 }
 
 fn locate_project(opts: &ProjectCompile) -> Result<(ProjectConfig, Vec<String>), EngineError> {
@@ -108,15 +108,15 @@ pub(crate) fn sync_manifest_line(
     Ok(())
 }
 
-/// 计划落盘与退出码。`export` 由调用方注入，测试不启动 codeweb。
-pub(crate) fn compile_with_export(
+/// 计划落盘与退出码。`source` 由调用方注入（生产 = 嵌入实现，测试 = JSON 夹具）。
+pub(crate) fn compile_with_source(
     project: &ProjectConfig,
     entries: &[String],
     schema: Option<String>,
-    export: &impl CodewebExport,
+    source: &impl CodewebSource,
     out: &mut dyn Write,
 ) -> Result<i32, EngineError> {
-    let plans = plans_from_export(project, entries, schema, export)?;
+    let plans = plans_from_source(project, entries, schema, source)?;
     let written = write_plans(project, &plans)?;
     render_plans(&plans, &written, out)?;
     let failed = ir_failures(project, &plans)?;

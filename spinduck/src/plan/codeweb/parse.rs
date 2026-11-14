@@ -1,4 +1,4 @@
-//! codeweb 0.9.7 `export --format json` 的瘦反序列化。
+//! codeweb `export --format json` 的瘦反序列化，以及嵌入 ThinGraph 的等价映射。
 //!
 //! 不 `deny_unknown_fields`：`columns`、`column_analysis`、`sql`、`body` 留在
 //! serde 的跳过路径里，不进入 [`CodewebGraph`]。`explicit` / `system` 缺省为 false。
@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 /// 瘦图。节点 id 用 JSON 的 `id`，不是数组下标。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodewebGraph {
     pub(super) nodes: BTreeMap<usize, Node>,
     pub(super) out: BTreeMap<usize, Vec<OutEdge>>,
@@ -16,7 +16,7 @@ pub struct CodewebGraph {
     pub(super) contains: Vec<(usize, usize)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Node {
     Routine {
         name: String,
@@ -52,13 +52,13 @@ pub(super) enum Node {
     Builtin,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct OutEdge {
     pub(super) target: usize,
     pub(super) kind: EdgeKind,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum EdgeKind {
     Direct {
         file: String,

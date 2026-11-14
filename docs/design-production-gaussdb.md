@@ -33,7 +33,7 @@
 | 真实交付件的编码能不能吃下 | **D9② 后：能，且是显式地能**（V33）。三代形态：① 改动前——`compile` 有损解码并打 `(non-utf8)`；`call --file` 同样有损但**把标记丢弃**（`spinduck/src/cli/run.rs:244`）→ 中文字面量静默变形，同一份源码仅编码不同就 `RETURN MATCH` / `RETURN NO_MATCH` 两条都 rc=0；`verify` 走 `read_to_string` → 直接红。② D9①（V29）——执行面判红 `[ENV-0030]` + rc=1，静默消失，代价是 §4 那 3,149 个 GBK 文件一律跑不起来。③ D9②（V33）——读入时两把严格判定 UTF-8 → GBK，都不合法才红；交付件 3,149 个 GBK 文件**全部** GBK 严格可解（实测计数见 V33.4，两侧同源码不同编码现给同一个 `MATCH`）。`compile` 体检面仍是有损 + `(non-utf8)`，那是 §3.5 末段的刻意保留 |
 | 千万级取数/回写能不能用 | **不能直接用**。取数把整个结果集收进 `Vec` 再逐行拼字面量 `INSERT`；回写逐行 `execute`、无事务、无幂等（`spinduck/src/io/gauss.rs:88,111,142`） |
 | 能不能拿它当复现证据 | **本地夹具能，真实例不能**。夹具侧早有逐值裁决：`[[case.assert]]` 四维（call/out/rows/error）跑进程内内核 + golden `expected.json` 比基线（V21）。**V35 把这条裁决从夹具搬进了 CLI 链**：`query <db> --sql-file --out` 落一份结果快照 JSON，`compare a.json b.json [--key]` 按值判红（rc=1 + `DIFF` 行），于是 §3.3 形态 C 那类"CLI 链上无人比对返回值"的绿在本机已不可能悄悄过去——前提是你把 `query`/`compare` 挂进验证脚本。**没变的一半**：参照侧（GaussDB 实例）仍没有采集入口，快照两边都只能来自内核/夹具，"接到外部实例"属 A3/A4 之后（§7 A5 实例半边） |
-| codeweb 能不能作 crate 引入 | **不能**（四条阻塞，§5 D4）。**能**作进程外分析器产出 JSON 计划，A 路径已在真实交付件上跑通（§4） |
+| codeweb 能不能作 crate 引入 | **能，且已嵌入（2026-11-14）**：四条阻塞全部解除（§5 D4 决议追加），进程内以 `codeweb::embed` 结构化 API 取瘦图；进程外 `--codeweb-bin` 契约退役（V47）。A 路径仍在真实交付件上成立（§4） |
 | 离"能在真实例上出可信结果"多远 | 8 个阶段（§7：A0a/A0b + A1–A6）。**A0a（本机取证，零功能改动）已完成**；A0b 与 A1 起都要等实例到手。**A2 的设计内本机项已全部完成**：D9①（编码判红，V29）、`plan`（V30）、`deploy`（V31）、缺件红扩到执行面 + `call --plan`（V32）、D9② 真 GBK 解码（V33）、A2-5 表达式级被调函数进闭包（V34）。**A5 的本机半边也已完成（V35）**：`query` 落结果快照 + `compare` 逐值裁决 + 归一两份副本收口成 core 单一实现。⇒ **本机可推进项到此清零**：A0b/A1/A3/A4/A6 与 A5 的实例半边全部要实例 |
 
 ---
@@ -292,7 +292,8 @@ UTF-8 源 + UTF-8 参数 → RETURN MATCH      rc=0      ← 不变
 > 只有当"临时目录不可注入"成为阻塞时才提 `BulkSink` 新接缝或 `SqlExecutor` 签名变更
 > （后者 = Ask-first，破坏所有消费者）。
 >
-> **D4 codeweb 走进程外契约，否掉 crate 引入**。四条实测阻塞：
+> **D4 codeweb 走进程外契约，否掉 crate 引入**（2026-11-12 原始决议；2026-11-14 已被
+> 「D4 决议追加：嵌入替代」取代，见本条末尾）。四条实测阻塞：
 > ① 无 `[lib]`/`[[bin]]` 声明、仅 `src/main.rs`，**没有可链接的库目标**；
 > ② 仓库**无 LICENSE 文件**（`Cargo.toml` 也没 `license` 字段），法律面不清；
 > ③ 它 pin `ogsql-parser git tag v0.10.0`，而 SpinDuck 按 AGENTS §1 锁**本地 path 依赖
@@ -306,6 +307,24 @@ UTF-8 源 + UTF-8 参数 → RETURN MATCH      rc=0      ← 不变
 > （机器可读全图）与 `conflicts`（JSON，`schema_version: 1`，默认 `severity_filter = high`）
 > → SpinDuck 的 `plan` 输入；`trace --exact` 只有 tree/path 文本形态，**不作为契约面**。
 > 计划文件里记 generator 版本，同输入必须同字节，红时先怀疑口径再怀疑实现。
+>
+> **D4 决议追加：嵌入替代（2026-11-14，取代上段进程外契约）**。四条阻塞逐条解除：
+> ① codeweb 已拆出 `[lib] codeweb` + `[[bin]]`（`required-features = ["cli"]`，PR
+> `a224f50`，tag `v0.9.9`）；② 仓库新增 `LICENSE-MIT` / `LICENSE-APACHE` +
+> `license = "MIT OR Apache-2.0"`（PR `c113e17`）；③ codeweb 的 ogsql-parser 升至
+> `v0.11.0` = 子模块 pin `13d9baa`（PR `d9be49c`），且 SpinDuck 侧
+> `[patch."https://github.com/c2j/ogsql-parser"]` 把 git 源重定向到
+> `../lib/ogsql-parser`，`cargo tree -i ogsql-parser` 恰一个节点（validation V47.1）；
+> ④ `--no-default-features --features cli` 的门控缺口由 lib 拆分 + `ContainsSql`
+> 谓词拓宽（`any(jsp, java)`）修复；嵌入形态进一步以 `features = ["analyze"]` 裁掉
+> CLI/TUI/serve/MCP/JSP/Java 面，依赖树零 `ratatui/axum/rmcp/tree-sitter/clap`。
+> **新契约**：`codeweb::embed::{EmbeddedProject, DiffStatus, ThinGraph}` 进程内调用，
+> 取代 `--version` 词匹配 / stderr 哨兵 / JSON 管道三件套；结构化错误
+> （`StoreNotFound` / `StoreVersionMismatch`）取代 stderr 文本解析。SpinDuck 侧
+> `--codeweb-bin` 与 `SPINDUCK_CODEWEB` **彻底退役**（无弃用期），新增
+> `compile --analyze` 允许取图前进程内增量分析；默认仍是只读严格校验。
+> **不变量**：`walk.rs` 闭包算法零改动；`codeweb 0.9.7 → 0.9.9` 的 generator diff
+> 是机制性变化（版本来自链接进来的库），见 validation V47.2。
 >
 > **D5 缺件即红，禁止静默**（回应 §3.3）：`--plan` 展开后，闭包内任一表/视图/序列/函数
 > 未登记 → 列出**缺件清单**并退出非 0，且在红之前**不执行**目标例程。规则 `[rejects]`

@@ -183,20 +183,12 @@ pub(crate) fn write_bytes(dir: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
     p
 }
 
-/// 进程内 `plan` / `verify` 的导出夹具。生产二进制不读这份 JSON，也不新增旗标。
-struct JsonExport(Vec<u8>);
-
-impl spinduck_core::plan::codeweb::CodewebExport for JsonExport {
-    fn export_json(
-        &self,
-        _project: &Path,
-    ) -> Result<Box<dyn std::io::Read + Send>, spinduck_core::EngineError> {
-        Ok(Box::new(std::io::Cursor::new(self.0.clone())))
+/// 进程内取图夹具：测试注入内存 JSON，不碰真实 codeweb 项目。
+fn export_of(json: &serde_json::Value) -> spinduck_core::plan::codeweb::JsonCodewebSource {
+    spinduck_core::plan::codeweb::JsonCodewebSource {
+        generator: "codeweb 0.9.9".to_string(),
+        json: serde_json::to_vec(json).expect("夹具 JSON"),
     }
-}
-
-fn export_of(json: &serde_json::Value) -> JsonExport {
-    JsonExport(serde_json::to_vec(json).expect("夹具 JSON"))
 }
 
 fn finish_cmd(buf: Vec<u8>, result: Result<i32, spinduck_core::EngineError>) -> (i32, String) {
@@ -226,12 +218,12 @@ pub(crate) fn compile_project_in_process(
         dir: Some(dir.to_path_buf()),
         schema: schema.map(str::to_string),
         entries: entries.iter().map(|s| s.to_string()).collect(),
-        codeweb_bin: None,
+        analyze: false,
         codeweb_project: None,
         sync_manifest,
     };
     let mut buf = Vec::new();
-    let result = spinduck_core::cli::compile_project_with_export(opts, &export, &mut buf);
+    let result = spinduck_core::cli::compile_project_with_source(opts, &export, &mut buf);
     finish_cmd(buf, result)
 }
 

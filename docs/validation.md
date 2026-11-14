@@ -4842,3 +4842,184 @@ purchase 源码和既有计划，参数 `'20250715' null`，不触碰远端生�
 `explain` 确认真实 purchase 的记录字段 CASE 仍为 SqlQuery、没有 FoldedQuery；未知
 字段类型不在本次证明子集内。不能把整过程差异归因于哑表折叠，也没有宣称覆盖此前
 20000 行放大数据集（本轮未重跑该合成脚手架）。
+
+## V47. 嵌入 codeweb v0.9.9：进程外契约退役与等价实证（2026-11-14）
+
+本条目记录 docs/embeded-codeweb.md / docs/plans/2026-11-14-embedded-codeweb.md 的落地
+证据。**V43 记录的进程外口径（`--codeweb-bin` + stderr 哨兵 + `--version` 词匹配）已
+整体退役**，取代它的是 `codeweb::embed` 结构化 API；V43 的 MISS/REF 结论本身不被本条目
+改写（图语义未变，见 V47.3 等价实证）。
+
+### V47.1 版本对齐与单 parser 证明
+
+- codeweb 侧：`ogsql-parser` git tag `v0.10.0` → `v0.11.0`（= 子模块 pin
+  `13d9baa4358ca9537eb4f753fd2e5cd2d5a2517b`，远端 tag 复核一致）；连带
+  `tree-sitter` 0.24 → 0.25、`tree-sitter-java` 0.23 → 0.23.5（v0.11.0 声明
+  `links = "tree-sitter"`，单副本强制）。`Parser::set_timeout_micros` 在 0.25 弃用，
+  迁移为 `parse_with_options` + 5 秒进度回调，超时行为与错误路径不变。升级前后
+  codeweb 全量测试逐项一致（851/17/7/44/3；`mcp_test` 2 个既有失败未变更）。
+- SpinDuck 侧：`cargo tree -i ogsql-parser --features cli` 恰一个节点：
+  `ogsql-parser v0.11.0 (<worktree>/lib/ogsql-parser)`，消费者为 `codeweb v0.9.9`
+  与 `spinduck v0.1.21`。`[patch."https://github.com/c2j/ogsql-parser"]` 生效
+  （无 git 源副本 = 进程内单份 parser）。
+- 依赖面：`cargo tree --features cli` 中 `ratatui|axum|rmcp|tree-sitter|clap`
+  节点数为 0（codeweb 以 `default-features = false, features = ["analyze"]` 引入，
+  CLI/TUI/serve/MCP/JSP/Java 编译面全部裁掉）。
+
+### V47.2 契约变化（相对 V43）
+
+| 面 | V43（进程外） | 现在（嵌入） |
+|---|---|---|
+| 版本核对 | `codeweb --version` 输出词匹配 `0.9.7` | 编译期 `codeweb::embed::version()` |
+| 新鲜度 | `codeweb diff` stderr 逐字节等于哨兵 | `DiffStatus { store_exists, stale_store_version, added/modified/deleted }` |
+| 取图 | `codeweb export --format json` 管道 | `EmbeddedProject::export_thin_graph() -> ThinGraph` |
+| 错误 | stderr 文本 + 退出码 | `CodeWebError::{StoreNotFound, StoreVersionMismatch}` 等结构化变体 |
+| 降级 | `--codeweb-bin` / `SPINDUCK_CODEWEB` / PATH 三级查找 | 全部删除（无进程可查）；缺失/过期一律 `ENV-0030`，不回退词法闭包 |
+
+计划文件 `generator` 字段：`codeweb 0.9.7` → `codeweb 0.9.9`。这是**机制性变化**而非
+手写迁移——generator 由链接进来的 codeweb 版本决定（`plan::codeweb::embedded_version()`），
+未来随 codeweb 发版自动变化，硬编码字面量（旧 `const GENERATOR`）已删除并有守护测试
+（`should_write_a_semver_generator_from_the_embedded_source`）。同一构建内同输入同输出的
+复现性口径不变；跨构建的字节比较现在要求 codeweb 版本一致。
+
+### V47.3 等价实证（ThinGraph ↔ JSON 1:1）
+
+codeweb 侧两条测试锁定映射不漂移：
+
+- `embed::tests::thin_projection_pins_the_full_variant_mapping_table`：手工构造覆盖
+  全部 Node/Edge 变体的图，断言投影恰好保留 9 类节点 / 7 类边，字段逐项全等
+  （AccessMode 位掩码展开顺序与 JSON `modes` 数组一致；`write_kinds` 排序）；
+- `tests/embed_test.rs::export_thin_graph_matches_the_json_projection_one_to_one`：
+  serve_demo fixture 端到端比对 `export/json.rs::to_json` 与 ThinGraph 的
+  (id, tag) 节点集与 (source, target, type) 边集。
+
+SpinDuck 侧：`parse::tests::should_map_thin_graph_to_the_same_thin_graph_as_the_equivalent_json`
+断言同一逻辑图经 JSON 与经 `from_thin_graph` 产出**逐字段相等**的内部瘦图
+（9 类节点、7 类边、8 种 AccessMode、write_kinds）；`walk.rs` 零改动。
+
+### V47.4 门禁实测（本 worktree）
+
+- 基线（改依赖前）：`cargo test --features cli` 662 passed / 0 failed。
+- Task 3.1（依赖 + patch）：662 不变。
+- Task 3.2（接缝）：665（+3）。
+- Task 3.3+3.4（映射 + 嵌入实现）：674（+4 +5；含真实 tempfile 项目进程内
+  `analyze` 的缺 store / 过期版本 / 源码变动 / 缺 codeweb.toml 四类错误映射）。
+- Task 3.5（调用点替换 + 退役）：669（−4 旧 export 进程测试 −1 桩契约测试
+  +1 缺 toml 场景；cli 契约层 111 → 110 为同一口径迁移，非删断言）。
+- Task 3.7（generator 守护）：+1。
+- `cargo fmt --all -- --check`、`cargo clippy --all-features -- -D warnings` 干净。
+
+### V47.5 不声称
+
+- 不声称嵌入后更快：本条目只给正确性与契约面证据，内存/耗时实测见 Phase 4 条目。
+- 不声称 `--analyze` 在生产体量上的增量分析成本已被测过（Phase 4 记录）。
+- 不声称 Windows/macOS 发版矩阵已覆盖本改动（矩阵现状见 architecture 决策记录 ⑬）。
+- 不声称 codeweb 的 Java/JSP 能力可经嵌入获得：`analyze` 形态明确不含 java/jsp，
+  ThinGraph 投影也跳过 Java/JSP 节点（与 SpinDuck 闭包面一致）。
+
+## V48. 嵌入后实测：跨 feature store 缺陷 + 内存/耗时（2026-11-14）
+
+本条是 embedded-codeweb Phase 4 的记录。前半是一次**真实缺陷**的发现与修复（v0.9.9 →
+v0.9.10），后半是内存/耗时数据与决策门结论。
+
+### V48.1 缺陷：store 的 bincode 布局依赖 feature 组合
+
+Phase 4 首次在真实体量上跑 embedding 时，analyze-only 构建（SpinDuck 的形态）读 full 构建
+写出的 store 直接失败：
+
+```text
+$ spinduck compile --dir <big> --codeweb-project <big>
+[ENV-0030] codeweb 加载失败: export error: bincode deserialize: io error:  (110571219 bytes)
+```
+
+而同一 store 用 full 构建的 codeweb CLI `export --format json` 正常（exit 0）。根因：
+bincode 用**变体索引**编码枚举，而 `Node::JspPage` / `Node::JspSql`（`cfg(feature = "jsp")`）、
+`Edge::ContainsSql`（`any(jsp, java)`）、`NodeKey::JspPage/JspSql`、`StoreStats::jsp_*`
+都在 feature 门控后面——full 构建的变体编号比 analyze-only 多两个，两边写出的 store
+互不可读。这不是"版本漂移"，是**同一版本号下按构建形态分裂的数据格式**。
+
+修复（codeweb `55f366b`，发版 `v0.9.10` = `d04a9ed`）：
+
+- 持久化类型不再随 feature 门控：`Node::JspPage/JspSql`、`Edge::ContainsSql`、
+  `NodeKey::JspPage/JspSql`、`StoreStats::jsp_pages/jsp_sql`、`parser::jsp_types` 全部
+  无条件（jsp 的**行为**路径仍门控：节点创建、搜索回退、展示名缩短）。
+- `STORE_VERSION` 15 → 16：v15 store 一律按过期拒绝（不迁移，`analyze` 重建）；
+  修复版本对 v15 的自愈行为见 `analyze` 输出 `rebuilt store v15 → v16`。
+- 守卫测试 `graph::tests::should_keep_persisted_enum_variants_feature_independent`
+  钉死变体索引（JspPage=19、JspSql=20、ContainsSql=7）：重排/新增变体而不 bump
+  store 版本会直接红。
+- **tag 重打说明**：第一次 `v0.9.10` 指向 `315f11a`，其 Build workflow 在 CLI 回归测试
+  `regress_issue_159_sequence_inferred.rs` 上红（该测试把"重建后的 store 版本头"
+  写死为 15；`d04a9ed` 改为引用 `STORE_VERSION` 常量）。因 Release job 被跳过、
+  未发布任何资产，tag 删除后重打在 `d04a9ed`（正文与产物不变，仅测试断言修正）；
+  SpinDuck 的 lockfile 随后跟到 `#d04a9ede`。
+
+**双向互通实测**（语料：8001 文件 / 72,051 节点 / 248,000 边 / store 105 MB）：
+
+```text
+# full 构建写 → analyze-only 读（修复前此处 bincode 报错）
+$ codeweb analyze --project <big>            # rebuilt store v15 → v16
+$ spinduck compile --dir <big> --codeweb-project <big>
+plan: target=pkg_syn_00000.prc_0 routines=1 tables=0 missing=8   # exit 0
+
+# analyze-only 写 → full 构建读
+$ echo "-- touch" >> <big>/sql/00000.sql
+$ spinduck compile --dir <big> --codeweb-project <big> --analyze
+compile: entries=1 missing=8 failed=0 dynamic=0
+$ codeweb export --format json --project <big>   # exit 0
+$ codeweb diff --project <big>
+Up to date. No changes detected.
+```
+
+### V48.2 内存与耗时（105 MB store 语料）
+
+`synthetic` 语料（`spinduck-build` 外的临时目录生成：8001 个包文件 × 8 过程 + 50 张表；
+72,051 节点 / 248,000 边；store 105 MB；`analyze` 全量 3.8s / 1.10 GB 峰值——codeweb
+进程侧基线）。host release 二进制（macOS arm64，`--features cli`），`/usr/bin/time -l`：
+
+| 路径 | wall | peak RSS |
+|---|---|---|
+| 嵌入只读（`diff` + load store + ThinGraph 投影 + 闭包 + 落计划） | **0.31 s** | **610 MB** |
+| 嵌入 `--analyze`（增量分析 + load + 投影 + 闭包） | **3.67 s** | **1.21 GB** |
+| 基线主导步骤：`codeweb export --format json`（full 构建，读同一 store 并序列化） | **0.39 s** | **898 MB** |
+| 基线 `diff` 单步（manifest 指纹扫描 8001 文件，不读 store） | **0.03 s** | **21 MB** |
+
+**决策门（计划 T4.1）**：接受，不立项「加载即投影」。依据：
+1. 只读路径峰值 **610 MB < 基线 898 MB**——旧管道里 codeweb 进程也要整份 store
+   物化后才能序列化 JSON，嵌入没有把"两份进程各持一份"变成"一份进程持两份"；
+   真正的增量是 `--analyze`（1.21 GB，+0.31 GB over 基线主导步骤），在门限（1 GB）内；
+2. `diff` 快路径确认：0.03s / 21 MB，`load_manifest_only` 未退化成全 store 加载；
+3. 每个 compile 只调一次 `load_graph`（`plans_from_source` 单点调用，`CountingSource`
+   测试锁定多入口共用一次取图）。
+
+### V48.3 不声称
+
+- 不声称真实语料的绝对峰值：本表是 105 MB store 的 synthetic 语料；真实语料 456 MB
+  store 约 4.3×（线性外推 ≈ 2.6 GB 只读 / 5.2 GB 分析），未在真实语料上实测。
+  若真实环境出现 OOM，处置路线已备（`GraphStore::load_bincode_filtered` 或重字段
+  独立文件，独立 PR），不在本批。
+- 不声称 `--analyze` 的增量成本可忽略：3.67s 对 8001 文件是增量扫描 + 单文件重解析，
+  不是全量；全量是 3.8s（与上表 codeweb analyze 同量级，说明增量收益在小改动下有限，
+  真实体量的全量成本更高）。
+- 不声称 Windows/macOS 双架构发版矩阵已用本改动复验（Linux x86_64 的 zigbuild 冒烟
+  见 Task 3.9 记录：GLIBC 上限 2.28 = 策略上限）。
+- 不声称单写者假设之外还有并发保护（`compile --analyze` 双写竞争属未定义行为，
+  口径见 architecture §13.5 并发写守卫行）。
+
+### V48.4 依赖面与产物回归（计划 T4.4）
+
+- **lockfile crate 数**：242（v0.1.20，嵌入前）→ **285**（+43）。新增面全部为纯 Rust
+  （petgraph / bincode / bitflags / rayon / walkdir / globset / blake3 / csv / pathdiff /
+  regex / toml / encoding_rs 及其传递项——其中 encoding_rs/regex/toml 在嵌入前已在树内）。
+  无新的 C/C++ 依赖：交叉编译与 glibc 判定都不受影响，证据是产物侧而不是工具承诺。
+- **Linux x86_64 产物**（`cargo zigbuild --target x86_64-unknown-linux-gnu.2.28`）：
+  未压缩 **44.3 MB**（44,319,688 B）；同格式 tar.gz **15.38 MB**（15,381,135 B）
+  vs `v0.1.20` 发布资产 14.21 MB（14,211,155 B），**+8.2%**。
+- **glibc 上限**：`check_max_glibc.py` → 需要 `GLIBC_2.28` = 策略上限（与嵌入前一致）。
+- **构建时长**：clean 的 zigbuild（含 duckdb bundled C++ 交叉编译）**4m18s**（v0.9.9
+  依赖态）；v0.9.10 增量重建 16.2s。嵌入的 codeweb 在 clean 构建上额外贡献约 2–3 分钟
+  （codeweb 自身 `--features full` clean 构建实测 2m51s，analyze-only 更少）。
+- **审计面**：`cargo audit`（CI 同口径四条 zip 豁免）exit 0；codeweb 为 git 依赖属审计
+  盲区（已登记，见 architecture ⑩ 与 ci.yml 注释），新增 2 条 unmaintained 级 warning
+  （`bincode` RUSTSEC-2025-0141、`unsafe-libyaml` RUSTSEC-2024-0449，均非漏洞级，
+  不改变门禁结果）。

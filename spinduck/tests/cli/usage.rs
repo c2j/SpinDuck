@@ -71,7 +71,8 @@ fn should_mention_project_compile_without_plan_verify_lines() {
     assert_eq!(code, EXIT_OK, "{out}");
     assert_eq!(err, "");
     assert!(out.contains("compile [--dir <项目目录>]"), "{out}");
-    assert!(out.contains("--codeweb-bin"), "{out}");
+    assert!(out.contains("--analyze"), "{out}");
+    assert!(!out.contains("--codeweb-bin"), "进程外二进制已退役: {out}");
     assert!(out.contains("--sync-manifest"), "{out}");
     for line in out.lines() {
         let head = line.trim_start();
