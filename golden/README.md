@@ -190,11 +190,12 @@ CASES_PROBE=1 cargo test --features native --test cases_native -- --nocapture
 ```
 
 - 项目里一条 `[[case.assert]]` 都没有 = 显式变红（空覆盖不接受）。
-- 链路核验也不需要容器：`case_corpus_purchase/spinduck.toml` 声明了 1 条
-  `[[entry]]`，`cargo run --features cli -- verify ../golden/case_corpus_purchase`
-  在进程内内核上逐对象核验（`entries=1 checks=11 failed=0`），同时把运行态快照
-  落到 `.spinduck/conf/spinduck.toml`（gitignore）。其余三个用例的主角是无包限定的
-  独立例程，按"入口必须全名定位"不声明 `[[entry]]`，由断言层兜住。
+- 链路核验（库级）也不需要容器：`case_corpus_purchase/spinduck.toml` 声明了 1 条
+  `[[entry]]`，`cargo test --features cli --test verify_chain` 在进程内内核上逐对象核验
+  （V20 历史口径 `entries=1 checks=11 failed=0`；`spinduck verify` 子命令已随 issue #38
+  删除）。CLI 面的等价入口是 `compile --dir`（需 codeweb 0.9.7）；`--sync-manifest`
+  把运行态快照落到 `.spinduck/conf/spinduck.runtime.toml`（gitignore）。其余三个用例的
+  主角是无包限定的独立例程，按"入口必须全名定位"不声明 `[[entry]]`，由断言层兜住。
 - 断言期望值与容器基线（`expected.json`）互不替代：前者锁"本引擎在样例数据上的
   行为"，后者锁"参照实现的行为"；改动导致前者变化时按 AGENTS §4.3 说明差异含义。
 - 已退役：原用例 5（`case_corpus_hz_byfund`，热点过程 `prc_trd_hz_byfund` 的容器逐行

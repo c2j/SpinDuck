@@ -13,6 +13,7 @@ struct CompileScan {
     entries: Vec<String>,
     codeweb_bin: Option<PathBuf>,
     codeweb_project: Option<PathBuf>,
+    sync_manifest: bool,
     paths: Vec<PathBuf>,
     project_mode: bool,
 }
@@ -29,6 +30,7 @@ pub(super) fn parse_compile(rest: &[String]) -> Result<Command, EngineError> {
             entries: scan.entries,
             codeweb_bin: scan.codeweb_bin,
             codeweb_project: scan.codeweb_project,
+            sync_manifest: scan.sync_manifest,
         });
     }
     if scan.paths.is_empty() {
@@ -44,6 +46,7 @@ fn scan_compile(rest: &[String]) -> Result<CompileScan, EngineError> {
         entries: Vec::new(),
         codeweb_bin: None,
         codeweb_project: None,
+        sync_manifest: false,
         paths: Vec::new(),
         project_mode: false,
     };
@@ -85,6 +88,10 @@ fn scan_compile(rest: &[String]) -> Result<CompileScan, EngineError> {
                     "--codeweb-project",
                     next_arg(&mut it, "--codeweb-project <dir>")?,
                 )?;
+            }
+            "--sync-manifest" => {
+                scan.project_mode = true;
+                scan.sync_manifest = true;
             }
             t if t.starts_with("--") => {
                 return Err(usage_err(format!("compile 不接受旗标，未知参数: {t}")));
@@ -138,6 +145,23 @@ mod tests {
                 entries: vec!["pkg.a".into(), "pkg.b".into()],
                 codeweb_bin: Some(PathBuf::from("cw")),
                 codeweb_project: Some(PathBuf::from("root")),
+                sync_manifest: false,
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_sync_manifest_flag_as_project_mode() {
+        let got = parse(&v(&["compile", "--dir", "proj", "--sync-manifest"])).unwrap();
+        assert_eq!(
+            got,
+            Command::CompileProject {
+                dir: Some(PathBuf::from("proj")),
+                schema: None,
+                entries: vec![],
+                codeweb_bin: None,
+                codeweb_project: None,
+                sync_manifest: true,
             }
         );
     }
@@ -164,21 +188,25 @@ mod tests {
     }
 
     #[test]
-    fn usage_should_mention_project_compile_and_keep_plan_verify_compatible() {
+    fn usage_should_mention_project_compile_without_plan_verify_lines() {
+        // issue #38：plan/verify 子命令已删除；`call --plan` 是旗标，按行首保留。
         let text = usage();
         assert!(text.contains("compile [--dir <项目目录>]"), "{text}");
         assert!(text.contains("--codeweb-bin"), "{text}");
         assert!(text.contains("--codeweb-project"), "{text}");
+        assert!(text.contains("--sync-manifest"), "{text}");
+        for line in text.lines() {
+            let head = line.trim_start();
+            assert!(
+                !head.starts_with("plan ") && !head.starts_with("verify "),
+                "usage 不得再列已删除的子命令: {line}"
+            );
+        }
         assert!(
-            text.contains("本发布周期的兼容入口，由项目态 compile 替换"),
+            text.lines()
+                .any(|l| l.trim_start().starts_with("call --plan")),
             "{text}"
         );
-        assert!(text.contains("call --plan"), "{text}");
         assert!(text.contains("内置种子 < 项目发现 < --rules"), "{text}");
-        let compat = text
-            .lines()
-            .filter(|line| line.contains("本发布周期的兼容入口"))
-            .count();
-        assert!(compat >= 2, "plan 与 verify 都要注明兼容入口: {text}");
     }
 }

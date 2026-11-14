@@ -4507,3 +4507,161 @@ compile: entries=1 missing=11 failed=0 dynamic=0
   不覆盖 `detail` / `trace` / TUI。
 - 不声称原稿 `f696339` 上的输出与本轮逐字节相同。本轮是在 `2653c68` 上重跑后逐项核对，
   结论一致；但两次之间 compile 路径新增 463 行（同一口径），一致是实测结果而非推定。
+
+## V44. issue #38 收口：删除 `plan` / `verify` 子命令，静态入口只剩项目态 compile（2026-11-14）
+
+### V44.1 决策与授权口径
+
+issue #38 原案有两条硬前提：别名随 v0.1.21 发布、留一个发布周期的兼容窗口。维护者
+（本仓作者）以「spinduck 还处于项目早期，不需要顾虑向后兼容性问题」**明确豁免这两条
+前提**，并批准两项 Ask-first 决策：
+
+1. 受影响的人类测试**改写为 compile 等价**，保留全部行为断言（逐条清单见 V44.6；
+   `verify_chain.rs` 的 5 条库级守护一字不动）；
+2. 运行态快照**彻底换名** `conf/spinduck.toml` → `conf/spinduck.runtime.toml`，
+   **不留旧名读取回退**；`--sync-manifest` 写新名成功后删除旧名快照并打一行说明。
+
+V43.4「不删除 plan / verify……别名周期是否结束仍要人确认」的那条保留项，由本次
+维护者确认关闭。V43 及更早条目是历史证据，一字未动。
+
+### V44.2 命令面契约（删除后的可观察行为）
+
+- `spinduck plan …` / `spinduck verify …` 落未知子命令路径：退出码 2，stdout 首行
+  `[ENG-0010] usage: unknown subcommand {plan|verify}`，stderr 空，**不留墓碑提示**。
+  守护：`tests/cli/usage.rs::should_reject_plan_and_verify_as_unknown_subcommands`。
+- usage 不再列 `plan` / `verify` 行；`call --plan`（计划文件旗标，不是子命令）保留。
+  守护：`tests/cli/usage.rs::should_mention_project_compile_without_plan_verify_lines`
+  与 `src/cli/args/compile.rs::usage_should_mention_project_compile_without_plan_verify_lines`
+  （按行首断言，避免子串误伤）。
+- 项目定位收口为 `ProjectConfig::locate`（compile / deploy / call 共用），错误消息
+  不绑定子命令名：`未在 … 找到项目声明（spinduck.toml 或 conf/spinduck.runtime.toml）`。
+- 显式 `--entry` 只做归一（trim + ASCII 小写），**允许裸名**（独立例程与 walk.rs
+  同口径）；包限定校验只属于 `[[entry]]` 声明面（`project/entry.rs` 契约不变）。
+  这是「compile 是 plan 的超集替换」的必要条件：旧 plan 接受裸名目标。
+- 诊断优先级：先项目发现（`未找到 codeweb 项目` / 项目声明缺失），后 codeweb 二进制
+  解析（`--codeweb-bin` > `SPINDUCK_CODEWEB` > `PATH`，命中即停）。二进制在
+  `export_json` 里才解析（`AmbientCommandExport { flag }`），因此无 codeweb 的机器
+  （本机与 CI 均无）上两条真二进制 ENV-0030 测试仍然可跑。
+
+### V44.3 快照换名与 `--sync-manifest`
+
+- 唯一写入者 = `compile --sync-manifest`；旗标默认关，关闭时不打 `manifest:` 行、
+  不落 `conf/`（#33 的 stdout 契约不变）。
+- 开启时 `manifest:` 行先于 `plan:`；快照覆盖**全部** `[[entry]]`（与 `--entry`
+  子集无关）；没有 `[[entry]]` 声明即 `ENV-0030` 且不落快照。
+- 运行态目录执行不回写：`manifest: <path> (未改写：本目录即运行态快照)`。
+- 写新名成功后删除旧名：`manifest: 已删除旧名快照 <path>`。读取面**不认**旧名
+  （`project::fs::project_file` 只认 `spinduck.toml` 与 `conf/spinduck.runtime.toml`）。
+- 模块迁移：`verify/manifest.rs` → `project/manifest.rs`；`write_plan` 从已删除的
+  `cli/plan.rs` 迁入 `plan/mod.rs`。守护：`tests/cli/compile_manifest.rs` 7 条、
+  `src/project/manifest.rs::should_remove_legacy_snapshot_after_writing_new_name`、
+  `src/project/tests.rs::should_not_recognize_legacy_snapshot_name`。
+
+### V44.4 门禁证据（本机实测 2026-11-13，提交 2026-11-14，分支 feat/issue-38-drop-plan-verify）
+
+```text
+cargo fmt --all -- --check                      # 干净
+cargo clippy --all-features -- -D warnings      # 干净
+cargo test --features cli                       # 全部 ok，0 failed / 0 ignored
+cargo audit --ignore RUSTSEC-2026-0367 --ignore RUSTSEC-2026-0368 \
+            --ignore RUSTSEC-2026-0369 --ignore RUSTSEC-2026-0429   # exit 0
+```
+
+- 单测 **453** 通过；CLI 契约 **111** 通过（gauss feature 门控的 2 条不计）；
+  其余套件：cases_native 6、compiler_contracts 18、corpus_sql_forms 9、
+  verify_chain 9、ir_expr_forms 13、trace_events 6、guard×10 共 26，全部 ok。
+- audit 裸跑报 4 条，全部是构建期 `zip` 的已留档豁免（与 ci.yml Security Audit
+  job 的 `--ignore` 清单逐条一致）；加豁免后 exit 0。
+- **Golden job 本机未跑**：本机无 docker（`docker info` 失败）。黄金层证据只能
+  由 CI 的 openGauss 5.0.0 服务容器给出，本 PR 以 CI 为准，不声称本机覆盖。
+- 本机无 codeweb 0.9.7（PATH / `SPINDUCK_CODEWEB` 均无）：真二进制测试只断言
+  项目发现阶段的 ENV-0030，不依赖 codeweb 在场；带 codeweb 的端到端行为由
+  V43 的实测与进程内假导出契约覆盖，本轮未新增真 codeweb 实测。
+
+### V44.5 行为差异清单（相对删除前）
+
+1. `plan` / `verify` 命令消失（V44.2）；`verify_project` / `plan::build` 库函数
+   **保留但只剩测试消费者**（`tests/verify_chain.rs`、`src/plan/tests.rs`），
+   是否进一步删除属后续 PR，本轮不动。
+2. 快照名换名 + 旧名删除（V44.3）；旧名快照不再被任何读取面识别。
+3. 显式 `--entry` 接受裸名（V44.2）；`[[entry]]` 声明面不变。
+4. `compile --sync-manifest` 承接旧 `verify` 的清单同步语义。旧 `verify` 自 PR #32
+   起已不再调用 `verify_project`（整库装内存、跑场景 call 是更早的形态）；
+   `verify_project` 的库级能力现由 `tests/verify_chain.rs` 守护，CLI 面的多维断言
+   走 `cases_native`。
+5. 旧 `verify` 的 `== entry` / `PASS` / `verify: entries=` 输出形态消失，
+   换成 `manifest:` + `plan:` + `compile:` 汇总（#33 已定的项目态契约）。
+
+### V44.6 人类测试逐条处置清单（issue #38 决策 4）
+
+**删除（行为随命令消失，5 条）**：
+
+- `src/cli/args/project.rs::should_parse_verify_with_optional_path_and_reject_extra_args`
+- `src/cli/args/project.rs::should_parse_plan_with_dir_and_schema`
+- `src/cli/args/project.rs::should_reject_plan_without_routine_or_with_extra_positionals`
+- `src/cli/verify.rs::should_plan_error_reuse_neutral_locate_message`（F7 中性消息
+  的 plan 侧；compile 侧同行为由迁移后的 locate 测试守护）
+- `tests/cli/plan.rs::should_exit_2_with_eng_0010_when_target_routine_is_absent`
+  （位置参数目标的用法错形态消失；「无入口即拒」的等价覆盖 =
+  `tests/cli/compile_project.rs::should_refuse_project_compile_when_the_project_has_no_entry`）
+
+**迁移（断言一字不动，1 条）**：
+
+- `src/cli/verify.rs::should_locate_error_mention_only_project_declaration` →
+  `src/project/tests.rs` 同名（locate 收口进 `ProjectConfig`，消息文案更新为
+  新快照名，断言结构不变）
+
+**改写为 compile 等价（命令面换、行为断言保留）**：
+
+- `tests/cli/plan.rs` → `tests/cli/compile_entry.rs`：8 条闭包/计划断言原名保留
+  （expression_called_function×2、builtin_expression_call、clean_closure、
+  list_every_missing_object、byte_identical、schema_override、biz_0150），
+  夹具改经 `compile_project_in_process`；其中 4 条另加 `compile:` 汇总断言。
+  2 条真二进制 ENV-0030 测试改名为
+  `should_exit_1_when_the_real_binary_compile_cannot_find_a_codeweb_project`
+  （`[[entry]]` 面）与 `should_exit_1_when_compile_with_entry_flag_cannot_find_a_codeweb_project`
+  （`--entry` 面）。
+- `tests/cli/verify.rs` → `tests/cli/compile_surface.rs`：4 条全部改经
+  `compile --dir` / `compile --sync-manifest`；GBK 那条改名
+  `should_compile_a_gbk_package_without_complaining_about_encoding`；
+  manifest 那条断言新快照名。
+- `tests/verify_chain.rs`：库级 `verify_project` 5 条守护**一字不动**；走 CLI 的
+  4 条改经 `compile --sync-manifest`（`should_render_reports_and_exit_1_when_chain_has_gaps`、
+  `should_exit_0_when_every_entry_is_clean`、
+  `should_not_write_manifest_when_compile_fails_before_reporting`（原 verify 名）、
+  `should_snapshot_manifest_in_home_conf_and_compile_runtime_dir_alone`（原 verify 名）），
+  快照路径断言换新名。
+- `src/cli/run/mod.rs::should_fail_verify_when_project_file_is_missing` →
+  `should_fail_project_compile_when_project_file_is_missing`（同断言：退出码 +
+  诊断指向 `spinduck.toml`）。
+- `src/cli/run/call.rs::should_load_project_rules_for_call_plan_form`：计划夹具
+  改由 `compile_project_with_export` 写出（generator 为 codeweb），规则加载断言不变。
+- `src/cli/args/mod.rs::should_reject_duplicate_single_value_flag`：去掉 2 条
+  plan 夹具（命令已删），deploy/query 等其余夹具与断言不变。
+- `src/cli/args/compile.rs::usage_should_mention_project_compile_and_keep_plan_verify_compatible`
+  → `usage_should_mention_project_compile_without_plan_verify_lines`（V44.2）。
+- `tests/cli/usage.rs::should_mention_project_compile_without_dropping_plan_verify_wording`
+  → `should_mention_project_compile_without_plan_verify_lines`（V44.2）。
+- `tests/cli/deploy.rs` / `tests/cli/query.rs`：6 处计划夹具调用点由
+  `plan_in_process` 换成 `compile_project_in_process`（单入口、计划字节同路径
+  生成），部署/查询断言不变。
+
+**新增（新行为的新守护）**：
+
+- `tests/cli/compile_manifest.rs` 7 条（V44.3 各款）；
+- `tests/cli/usage.rs::should_reject_plan_and_verify_as_unknown_subcommands`；
+- `src/cli/args/compile.rs::should_parse_sync_manifest_flag_as_project_mode`；
+- `src/project/manifest.rs::should_remove_legacy_snapshot_after_writing_new_name`；
+- `src/project/tests.rs::should_not_recognize_legacy_snapshot_name`。
+
+### V44.7 本轮不声称的事
+
+- 不声称黄金层本机通过（无容器，V44.4）；以 CI golden job 为准。
+- 不声称带真 codeweb 的端到端复跑（本机无二进制）；计划字节等价沿用 V43 与
+  进程内假导出契约，`plan::build` 与 compile 同走 `plans_from_export` 是代码事实。
+- 不删除 `verify_project` / `plan::build` 库函数（只剩测试消费者，后续 PR 再议）。
+- 不声称相对 `--dir` 的快照路径已绝对化：`manifest_text` 原样写 `project.root`，
+  运行态自足问题另见 #40（既有行为，不阻塞本 issue）。
+- 不动 `docs/runbook-real-gaussdb.md`（维护者未提交的在制品，本 PR 不携带；
+  runbook 里旧命令形态的更新随其本人提交落地）。
+- 不 bump 版本号（随独立发版 PR，AGENTS §9 发版顺序）。

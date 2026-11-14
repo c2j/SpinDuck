@@ -30,7 +30,7 @@ pub fn deploy_cmd(plan_path: &Path, db: &Path, out: &mut dyn Write) -> Result<i3
         return Ok(EXIT_FAIL);
     }
 
-    let project = crate::cli::verify::locate(&plan.project_root(plan_path))?;
+    let project = crate::project::ProjectConfig::locate(&plan.project_root(plan_path))?;
     // 清单核对先于开库：DuckDB 的 open 即建文件，晚一步就留下半成品
     let deployment = plan::deploy::resolve(&project, &plan)?;
     let ddl_files = deployment.ddl.len() + deployment.views.len();

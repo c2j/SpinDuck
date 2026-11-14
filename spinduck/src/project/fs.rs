@@ -6,14 +6,14 @@ use std::path::{Path, PathBuf};
 /// 目录内单次读取上限（防止误把大文件当配置）。
 const MAX_CONFIG_BYTES: u64 = 1 << 20;
 
-/// 目录内的项目声明文件：手写 `spinduck.toml` 优先，其次 `verify` 落下的
-/// 运行态快照 `conf/spinduck.toml`（§11.1 `conf/` 分区）。
+/// 目录内的项目声明文件：手写 `spinduck.toml` 优先，其次 `compile --sync-manifest`
+/// 落下的运行态快照 `conf/spinduck.runtime.toml`（§11.1 `conf/` 分区）。
 pub(crate) fn project_file(dir: &Path) -> Option<PathBuf> {
     let dev = dir.join("spinduck.toml");
     if dev.is_file() {
         return Some(dev);
     }
-    let snapshot = dir.join("conf").join("spinduck.toml");
+    let snapshot = dir.join("conf").join(super::manifest::SNAPSHOT_FILE);
     snapshot.is_file().then_some(snapshot)
 }
 

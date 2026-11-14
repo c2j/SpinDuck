@@ -6,14 +6,11 @@ pub mod args;
 mod compare;
 mod deploy;
 pub mod explain;
-mod plan;
 mod query;
 pub mod run;
 mod trace;
-mod verify;
 
-pub use plan::plan_cmd;
-pub use verify::verify_cmd;
+pub use run::{compile_project_with_export, ProjectCompile};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -62,7 +59,7 @@ pub fn read_source(path: &std::path::Path) -> Result<(String, bool), EngineError
 /// 严格读取源码文本：UTF-8 → GBK 两把判定，都不成立即红（design §3.5 / D9①②）。
 ///
 /// 与 [`read_source`] 的分工：`compile` 是语料体检面，保留有损解码 + `(non-utf8)` 标记；
-/// `call`/`explain`/`plan`/`deploy`/`query`/`compare` 是执行与比对面，同一份源码只可能因
+/// `call`/`explain`/`deploy`/`query`/`compare` 是执行与比对面，同一份源码只可能因
 /// 编码不同**报错**或被**正确还原**，不可能返回不同的值。实现收口在 [`crate::source`]：
 /// 缺文件等 I/O 失败为 `ENV-0010`（`source.rs` env(10)），编码双判失败为 `ENV-0030`（D9①②）。
 pub fn read_source_strict(path: &std::path::Path) -> Result<String, EngineError> {

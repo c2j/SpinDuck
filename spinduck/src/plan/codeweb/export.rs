@@ -63,14 +63,22 @@ impl CodewebExport for CommandExport {
     }
 }
 
-/// `plan` / `verify` 的生产导出。二进制在 `export_json` 里解析，定位项目失败不必先有 codeweb。
-pub(crate) struct AmbientCommandExport;
+/// 项目态 compile 的生产导出。二进制在 `export_json` 里才解析（`--codeweb-bin` >
+/// `SPINDUCK_CODEWEB` > `PATH`），定位项目失败不必先有 codeweb——诊断优先级因此
+/// 与项目发现一致：先报"未找到 codeweb 项目"，再报二进制不可用。
+pub(crate) struct AmbientCommandExport {
+    pub(crate) flag: Option<PathBuf>,
+}
 
 impl CodewebExport for AmbientCommandExport {
     fn export_json(&self, project: &Path) -> Result<Box<dyn Read + Send>, EngineError> {
         let from_env = std::env::var("SPINDUCK_CODEWEB").ok();
         let path_var = std::env::var_os("PATH");
-        let bin = resolve_codeweb_bin(None, from_env.as_deref(), path_var.as_deref())?;
+        let bin = resolve_codeweb_bin(
+            self.flag.as_deref(),
+            from_env.as_deref(),
+            path_var.as_deref(),
+        )?;
         CommandExport::new(bin).export_json(project)
     }
 }

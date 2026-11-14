@@ -3,7 +3,7 @@
 //! 契约：解析失败返回 `ENG-0010`（用法错误），退出码 2；未知子命令同上。
 //!
 //! 按子命令职责分文件（§3 单文件 ≤500 行，先例见 `tests/cli.rs`）：`call` 面在
-//! `call.rs`，项目/计划/部署面在 `project.rs`，快照面在 `snapshot.rs`，内核与 IO
+//! `call.rs`，项目/部署面在 `project.rs`，快照面在 `snapshot.rs`，内核与 IO
 //! 面在 `exec.rs`。本文件只留 `Command`/`CallTarget` 契约、`parse` 派发、共享旗标
 //! 工具与 usage 文案。
 
@@ -16,7 +16,7 @@ mod snapshot;
 use call::parse_call;
 use compile::parse_compile;
 use exec::{parse_explain, parse_materialize, parse_sync};
-use project::{parse_deploy, parse_plan, parse_verify};
+use project::parse_deploy;
 use snapshot::{parse_compare, parse_query};
 
 use crate::error::EngineError;
@@ -39,6 +39,8 @@ pub enum Command {
         entries: Vec<String>,
         codeweb_bin: Option<PathBuf>,
         codeweb_project: Option<PathBuf>,
+        /// 同步运行态快照（`conf/spinduck.runtime.toml`），默认关。
+        sync_manifest: bool,
     },
     /// 规则文件探针（版本锚定检查）。
     RulesProbe { path: PathBuf },
@@ -73,14 +75,6 @@ pub enum Command {
         slice: Option<String>,
         /// mode=upsert 的键列 `a,b`。
         key: Option<String>,
-    },
-    /// 链路校验（§12.1 入口声明）：从 `[[entry]]` 出发逐对象核验。
-    Verify { path: Option<PathBuf> },
-    /// 运行计划生成（design §6.1）：目标例程 → 闭包清单落盘。
-    Plan {
-        dir: Option<PathBuf>,
-        routine: String,
-        schema: Option<String>,
     },
     /// 按运行计划把资产装进**落盘**的本地 DuckDB（design §6.2，A2-3）。
     Deploy { plan: PathBuf, db: PathBuf },
@@ -162,8 +156,6 @@ pub fn parse(argv: &[String]) -> Result<Command, EngineError> {
         "explain" => parse_explain(&argv[1..]),
         "materialize" => parse_materialize(&argv[1..]),
         "sync" => parse_sync(&argv[1..]),
-        "verify" => parse_verify(&argv[1..]),
-        "plan" => parse_plan(&argv[1..]),
         "deploy" => parse_deploy(&argv[1..]),
         "query" => parse_query(&argv[1..]),
         "compare" => parse_compare(&argv[1..]),
@@ -222,14 +214,12 @@ pub fn usage() -> &'static str {
      \x20 version                         打印版本\n\
      \x20 compile <path>...               语料编译体检（递归 *.sql）\n\
      \x20 compile [--dir <项目目录>] [--schema <名>] [--entry <routine>]...\n\
-     \x20      [--codeweb-bin <path>] [--codeweb-project <dir>]\n\
-     \x20                                项目态：一次导出 codeweb 图，按入口落盘计划并 IR 体检\n\
+     \x20      [--codeweb-bin <path>] [--codeweb-project <dir>] [--sync-manifest]\n\
+     \x20                                项目态：一次导出 codeweb 图，按入口落盘计划并 IR 体检；\n\
+     \x20                                --sync-manifest 同步运行态快照 conf/spinduck.runtime.toml\n\
      \x20 rules probe <rules.toml>        规则文件版本锚定检查\n\
      \x20 explain --file <sql> [--trace <审计日志>] <routine>\n\
      \x20                                打印例程 IR（不执行）；给 --trace 则逐行标注该次真实运行的命中\n\
-     \x20 verify [项目目录]               同步清单并对全部 [[entry]] 做项目态 compile（本发布周期的兼容入口，由项目态 compile 替换）\n\
-     \x20 plan [--dir <项目目录>] [--schema <名>] <routine>\n\
-     \x20                                求目标例程闭包并落盘运行计划（缺件即判红；本发布周期的兼容入口，由项目态 compile 替换）\n\
      \x20 deploy <计划.toml> --db <f>    按运行计划把资产装进落盘的本地 DuckDB（缺件即拒）\n\
      \x20 query --db <f> --sql-file <F.sql> --out <F.json>\n\
      \x20                                跑一条 SQL，把结果集落成快照文件（内核文本，未归一）\n\
@@ -276,8 +266,6 @@ mod tests {
     fn should_reject_duplicate_single_value_flag() {
         // F5：语义单值的旗标重复给 = 手误，不得静默 last-wins（与位置参数重复即报错同纪律）
         for argv in [
-            v(&["plan", "--dir", "a", "--dir", "b", "r"]),
-            v(&["plan", "--schema", "a", "--schema", "b", "r"]),
             v(&["deploy", "--db", "a", "--db", "b", "p.toml"]),
             v(&[
                 "query",

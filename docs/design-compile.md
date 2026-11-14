@@ -19,6 +19,8 @@
 
 实现偏差（PR #1–#4 已落地；与本文设计口径的差异在此列出，读代码时以此为准）：`expand_view_bodies`、`register_routines`、`ddl_file_for` 已删除；`CodewebExport::export_json` 返回 `Box<dyn std::io::Read + Send>`；`closure_from_graph` 多一个 `&ClosureContext<'_>` 参数；`plan/codeweb.rs` 实际拆成 `plan/codeweb/` 目录；计划里的相对路径保留 codeweb `file` 的 `./` 段（如 `./sql/routines/...`）。
 
+别名期取消（issue #38 已落地，V44）：维护者以「项目早期，不顾虑向后兼容」豁免了本文的两条硬前提（别名随 v0.1.21 发布、留一个发布周期的兼容窗口），`plan` / `verify` 子命令**直接删除**，不留别名、不留旧快照名读取回退。下文凡涉及「别名期」「`plan_cmd` / `verify_cmd`」「`tests/cli/plan.rs` / `tests/cli/verify.rs`」的段落均为历史设计口径：现状是项目态 `compile --dir`（`--entry` 可给裸名）、`compile --sync-manifest` 写 `conf/spinduck.runtime.toml`（写入成功后删除旧名 `conf/spinduck.toml`），人类测试经逐条批准后改写为 compile 等价（清单见 V44 与 PR 说明）。`verify_project` 库级能力保留，由 `tests/verify_chain.rs` 消费。
+
 ---
 
 ## Overview
@@ -144,7 +146,7 @@ spinduck compile --dir <项目目录> [--schema <名>] [--entry <routine>]...
 
 | 旗标 | 规则 |
 |---|---|
-| `--dir` | 缺省为 cwd。与 `plan` 一样，由 `cli/verify.rs::locate` 找 `spinduck.toml` 或 `conf/spinduck.toml`。找不到 = 今天的 `ENV-0030` 文案（「未在 … 找到项目声明」），不提子命令名 |
+| `--dir` | 缺省为 cwd。与 `plan` 一样，由 `cli/verify.rs::locate` 找 `spinduck.toml` 或 `conf/spinduck.toml`。找不到 = 今天的 `ENV-0030` 文案（「未在 … 找到项目声明」），不提子命令名。（issue #38 后：定位收口为 `ProjectConfig::locate`，快照名改 `conf/spinduck.runtime.toml`，V44） |
 | `--entry` | 可重复。缺省 = 该项目全部 `[[entry]]`（`ProjectConfig.entries`，`project/entry.rs` 要求 `package.procedure`）。给出时**只**用给出的名字，不要求它事先写在 `[[entry]]` 里——与今天 `plan` 不拿 `[[entry]]` 限制目标的口径一致（design §6.2）。每个入口各写一份 `<home>/plan/<target>.toml` |
 | `--schema` | 只写入 `plan.schema`（归一小写）。不参与匹配，不参与 `deploy`。与 `closure.rs::build` 24–25 行的注释一致 |
 | `--codeweb-bin` | 见下方解析顺序 |
@@ -153,7 +155,7 @@ spinduck compile --dir <项目目录> [--schema <名>] [--entry <routine>]...
 
 零个 `--entry` 且项目没有 `[[entry]]`：`ENV-0030`，消息说明项目模式需要至少一个入口。不退回逐文件体检，也不退回词法闭包。
 
-`plan` 在别名期的 argv 不变：`plan [--dir <项目目录>] [--schema <名>] <routine>`，等价于 `compile --dir <dir> --schema <名> --entry <routine>`。`verify [项目目录]` 在别名期等价于「`sync_manifest`（保留）+ 对该目录全部 `[[entry]]` 跑项目态 compile」。它不再调用 `verify::verify_project`。这一步会改 `tests/cli/verify.rs` 与 `tests/cli/plan.rs` 的可观察结果，见 PR Plan，不在实现里静默改断言。
+`plan` 在别名期的 argv 不变：`plan [--dir <项目目录>] [--schema <名>] <routine>`，等价于 `compile --dir <dir> --schema <名> --entry <routine>`。`verify [项目目录]` 在别名期等价于「`sync_manifest`（保留）+ 对该目录全部 `[[entry]]` 跑项目态 compile」。它不再调用 `verify::verify_project`。这一步会改 `tests/cli/verify.rs` 与 `tests/cli/plan.rs` 的可观察结果，见 PR Plan，不在实现里静默改断言。（**本段已被 issue #38 取代**：别名期取消，两条命令直接删除，测试改写经逐条批准，见文首「别名期取消」与 V44。）
 
 用法文本（`cli/args/mod.rs::usage`）在接线 PR 增加一行项目模式，并在 `plan` / `verify` 两行末尾注明「本发布周期的兼容入口，由项目态 `compile` 替换」。`usage_snapshot_should_mention_rules_in_plan_form` 依赖的 `call --plan` 与「内置种子 < 项目发现 < --rules」子串保持不动。
 
@@ -682,7 +684,7 @@ pub fn build(
 ## Key Decisions
 
 1. **只合并静态管线。** `compile` 的项目模式吸收 `verify` 的链路核验和 `plan` 的闭包落盘。`deploy` 与 `call` 保持独立命令。`verify` 今天的内存装库和场景 `call` 不进入 `compile`。`call` 的 `kernel_gaps` 门保留；`--plan` 且计划由 codeweb 生成时，这个门只核对内核目录，不再发现关系。
-2. **`plan` 与 `verify` 先做别名，留一个发布周期。** 用法文本写明替换关系。`tests/cli/plan.rs`、`tests/cli/verify.rs`、`tests/verify_chain.rs` 以及 `src/plan/tests.rs` 里锁着旧 stdout / 旧 `build` 行为的测试是人类测试，改它们是 Ask first，只发生在 PR 4，且 PR 说明逐条列出函数名。设计不假设这些断言可以静默改掉。
+2. **`plan` 与 `verify` 先做别名，留一个发布周期。** 用法文本写明替换关系。`tests/cli/plan.rs`、`tests/cli/verify.rs`、`tests/verify_chain.rs` 以及 `src/plan/tests.rs` 里锁着旧 stdout / 旧 `build` 行为的测试是人类测试，改它们是 Ask first，只发生在 PR 4，且 PR 说明逐条列出函数名。设计不假设这些断言可以静默改掉。（issue #38：维护者豁免别名期与兼容窗口，命令直接删除；人类测试仍走 Ask first 逐条批准后改写为 compile 等价，V44。）
 3. **入口是可重复的 `--entry`，缺省为全部 `[[entry]]`。** 每个入口一份计划。没有项目声明、只给路径时，保持今天的逐文件体检，包括 README 里的 `spinduck compile ../lib/fastaas/exam/...`。零参数 `compile` 仍是用法错，以免改掉 `usage: compile <path>...` 这条已锁契约。显式 `--entry` 不要求名字已经写在 `[[entry]]` 里。
 4. **关系抽取不在 SpinDuck 再写一套 AST 遍历。** 消费本机 codeweb 0.9.7 进程。不把 codeweb 当 crate。D4 的四条阻塞维持不变：无 lib 目标、无 LICENSE、解析器 pin 在 v0.10.0 而 SpinDuck 锁 path 上的 v0.11.x、默认 feature 切不干净。
 5. **机器契约在 `export` 的 json/ndjson 之内，本设计选定 JSON。** v0.9.7 的 ndjson（`NdjsonNodeRecord` / `NdjsonEdgeRecord`）丢掉 `explicit`、`system`、`modes`、`write_kinds`、`file`、`line`。用它就会在 SpinDuck 里重推这些事实。不使用 `trace` 文本，不使用 `store.bincode`。`generator` 写成 `codeweb 0.9.7`。

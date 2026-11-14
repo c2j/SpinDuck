@@ -4,7 +4,9 @@
 //! 脏产物（`--out` 一个字节都不写）、以及语句文本进内核前只被削掉一个结尾分号。
 //! 归一与逐值裁决不在这里测——那是 `snapshot` 单测与 `compare` 契约的事。
 
-use super::{abs_file, cli, cw_graph, plan_in_process, write, EXIT_FAIL, EXIT_OK, EXIT_USAGE};
+use super::{
+    abs_file, cli, compile_project_in_process, cw_graph, write, EXIT_FAIL, EXIT_OK, EXIT_USAGE,
+};
 
 const PROJECT_QUERY: &str =
     "[project]\nname = \"q\"\nkernel = \"1.5.5\"\n\n[paths]\nddl = \"sql/ddl\"\nroutines = \"sql/routines\"\nhome = \".spinduck\"\n";
@@ -27,10 +29,11 @@ pub(crate) fn seeded_db(dir: &std::path::Path) -> std::path::PathBuf {
     write(dir, "sql/routines/10_ins.sql", ROUTINE_INSERT);
     write(dir, "sql/ddl/tables.sql", DDL_T_A);
     let file = abs_file(&dir.join("sql/routines/10_ins.sql"));
-    let (code, out) = plan_in_process(
+    let (code, out) = compile_project_in_process(
         dir,
-        "prc_ins",
+        &["prc_ins"],
         None,
+        false,
         cw_graph(
             serde_json::json!([
                 {"id": 1, "type": "procedure", "name": "prc_ins", "file": file},

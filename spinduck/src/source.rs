@@ -5,8 +5,8 @@
 //! UTF-8 优先是判定不是风格：交付件里 5,130 个文件的字节两种编码都合法，按 GBK 读必成乱码。
 //! 转码只发生在**读入时**，语料文件逐字不动（AGENTS §6 语料纪律）。
 //!
-//! 消费面：`call`/`explain`/`plan`/`call --plan`（经 `cli::read_source_strict`）与
-//! `verify` 的四处文件下发（表 DDL、视图、例程注册、数据集种子）共用这里，两侧不得各有
+//! 消费面：`call`/`explain`/`deploy`/`query`/`compare`（经 `cli::read_source_strict`）与
+//! 部署链路的四处文件下发（表 DDL、视图、例程注册、数据集种子）共用这里，两侧不得各有
 //! 一份判定。唯一例外是 `compile` 体检面：它要"一趟扫完并按错误码分类"，仍走
 //! `crate::cli::read_source` 的有损解码 + `(non-utf8)` 标记（design §3.5 末段的刻意保留）。
 
