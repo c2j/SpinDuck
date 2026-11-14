@@ -298,6 +298,33 @@ mod tests {
         );
     }
 
+    /// Task 3.7 守护：generator 必须是 `codeweb <semver>` 形态且来自链接的
+    /// codeweb 版本——防倒退成硬编码字面量（旧 `const GENERATOR = "codeweb 0.9.7"`
+    /// 正是版本漂移的源头，见 docs/validation.md V27）。
+    #[test]
+    fn should_write_a_semver_generator_from_the_embedded_source() {
+        let src = EmbeddedCodewebSource {
+            auto_analyze: false,
+        };
+        let generator = src.generator();
+        let version = generator
+            .strip_prefix("codeweb ")
+            .unwrap_or_else(|| panic!("generator 必须以 \"codeweb \" 开头: {generator}"));
+        let parts: Vec<&str> = version.split('.').collect();
+        assert_eq!(parts.len(), 3, "semver 三段: {generator}");
+        assert!(
+            parts
+                .iter()
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())),
+            "semver 各段必须是数字: {generator}"
+        );
+        assert_eq!(
+            version,
+            codeweb::embed::version(),
+            "generator 的版本必须等于链接进来的 codeweb 版本"
+        );
+    }
+
     #[test]
     fn should_fail_with_env_30_when_the_project_toml_is_absent() {
         let tmp = tempfile::tempdir().unwrap();

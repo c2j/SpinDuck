@@ -4750,3 +4750,77 @@ purchase_yj, purchase_days, purchase_money`，`ORDER BY 1,2,3,4`）sha256 同为
   其参数表仍为 fixture 体量（2–4 行），不压点查缓存——生产体量那组才压参数表。
 - 不声称 `--batch-commit` 在生产体量上有收益（两侧持平，490 组的 O(N²) flush 可忽略）。
 - 计时为墙钟 / user，未单独剥离 DuckDB SQL 执行与解释器开销的占比。
+
+## V46. 嵌入 codeweb v0.9.9：进程外契约退役与等价实证（2026-11-14）
+
+本条目记录 docs/embeded-codeweb.md / docs/plans/2026-11-14-embedded-codeweb.md 的落地
+证据。**V43 记录的进程外口径（`--codeweb-bin` + stderr 哨兵 + `--version` 词匹配）已
+整体退役**，取代它的是 `codeweb::embed` 结构化 API；V43 的 MISS/REF 结论本身不被本条目
+改写（图语义未变，见 V46.3 等价实证）。
+
+### V46.1 版本对齐与单 parser 证明
+
+- codeweb 侧：`ogsql-parser` git tag `v0.10.0` → `v0.11.0`（= 子模块 pin
+  `13d9baa4358ca9537eb4f753fd2e5cd2d5a2517b`，远端 tag 复核一致）；连带
+  `tree-sitter` 0.24 → 0.25、`tree-sitter-java` 0.23 → 0.23.5（v0.11.0 声明
+  `links = "tree-sitter"`，单副本强制）。`Parser::set_timeout_micros` 在 0.25 弃用，
+  迁移为 `parse_with_options` + 5 秒进度回调，超时行为与错误路径不变。升级前后
+  codeweb 全量测试逐项一致（851/17/7/44/3；`mcp_test` 2 个既有失败未变更）。
+- SpinDuck 侧：`cargo tree -i ogsql-parser --features cli` 恰一个节点：
+  `ogsql-parser v0.11.0 (<worktree>/lib/ogsql-parser)`，消费者为 `codeweb v0.9.9`
+  与 `spinduck v0.1.21`。`[patch."https://github.com/c2j/ogsql-parser"]` 生效
+  （无 git 源副本 = 进程内单份 parser）。
+- 依赖面：`cargo tree --features cli` 中 `ratatui|axum|rmcp|tree-sitter|clap`
+  节点数为 0（codeweb 以 `default-features = false, features = ["analyze"]` 引入，
+  CLI/TUI/serve/MCP/JSP/Java 编译面全部裁掉）。
+
+### V46.2 契约变化（相对 V43）
+
+| 面 | V43（进程外） | 现在（嵌入） |
+|---|---|---|
+| 版本核对 | `codeweb --version` 输出词匹配 `0.9.7` | 编译期 `codeweb::embed::version()` |
+| 新鲜度 | `codeweb diff` stderr 逐字节等于哨兵 | `DiffStatus { store_exists, stale_store_version, added/modified/deleted }` |
+| 取图 | `codeweb export --format json` 管道 | `EmbeddedProject::export_thin_graph() -> ThinGraph` |
+| 错误 | stderr 文本 + 退出码 | `CodeWebError::{StoreNotFound, StoreVersionMismatch}` 等结构化变体 |
+| 降级 | `--codeweb-bin` / `SPINDUCK_CODEWEB` / PATH 三级查找 | 全部删除（无进程可查）；缺失/过期一律 `ENV-0030`，不回退词法闭包 |
+
+计划文件 `generator` 字段：`codeweb 0.9.7` → `codeweb 0.9.9`。这是**机制性变化**而非
+手写迁移——generator 由链接进来的 codeweb 版本决定（`plan::codeweb::embedded_version()`），
+未来随 codeweb 发版自动变化，硬编码字面量（旧 `const GENERATOR`）已删除并有守护测试
+（`should_write_a_semver_generator_from_the_embedded_source`）。同一构建内同输入同输出的
+复现性口径不变；跨构建的字节比较现在要求 codeweb 版本一致。
+
+### V46.3 等价实证（ThinGraph ↔ JSON 1:1）
+
+codeweb 侧两条测试锁定映射不漂移：
+
+- `embed::tests::thin_projection_pins_the_full_variant_mapping_table`：手工构造覆盖
+  全部 Node/Edge 变体的图，断言投影恰好保留 9 类节点 / 7 类边，字段逐项全等
+  （AccessMode 位掩码展开顺序与 JSON `modes` 数组一致；`write_kinds` 排序）；
+- `tests/embed_test.rs::export_thin_graph_matches_the_json_projection_one_to_one`：
+  serve_demo fixture 端到端比对 `export/json.rs::to_json` 与 ThinGraph 的
+  (id, tag) 节点集与 (source, target, type) 边集。
+
+SpinDuck 侧：`parse::tests::should_map_thin_graph_to_the_same_thin_graph_as_the_equivalent_json`
+断言同一逻辑图经 JSON 与经 `from_thin_graph` 产出**逐字段相等**的内部瘦图
+（9 类节点、7 类边、8 种 AccessMode、write_kinds）；`walk.rs` 零改动。
+
+### V46.4 门禁实测（本 worktree）
+
+- 基线（改依赖前）：`cargo test --features cli` 662 passed / 0 failed。
+- Task 3.1（依赖 + patch）：662 不变。
+- Task 3.2（接缝）：665（+3）。
+- Task 3.3+3.4（映射 + 嵌入实现）：674（+4 +5；含真实 tempfile 项目进程内
+  `analyze` 的缺 store / 过期版本 / 源码变动 / 缺 codeweb.toml 四类错误映射）。
+- Task 3.5（调用点替换 + 退役）：669（−4 旧 export 进程测试 −1 桩契约测试
+  +1 缺 toml 场景；cli 契约层 111 → 110 为同一口径迁移，非删断言）。
+- Task 3.7（generator 守护）：+1。
+- `cargo fmt --all -- --check`、`cargo clippy --all-features -- -D warnings` 干净。
+
+### V46.5 不声称
+
+- 不声称嵌入后更快：本条目只给正确性与契约面证据，内存/耗时实测见 Phase 4 条目。
+- 不声称 `--analyze` 在生产体量上的增量分析成本已被测过（Phase 4 记录）。
+- 不声称 Windows/macOS 发版矩阵已覆盖本改动（矩阵现状见 architecture 决策记录 ⑬）。
+- 不声称 codeweb 的 Java/JSP 能力可经嵌入获得：`analyze` 形态明确不含 java/jsp，
+  ThinGraph 投影也跳过 Java/JSP 节点（与 SpinDuck 闭包面一致）。
