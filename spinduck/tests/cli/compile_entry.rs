@@ -1,9 +1,12 @@
-//! `plan`：运行计划生成（design §6.1 / §7 A2）。
+//! 项目态 `compile --entry`：运行计划生成（design §6.1 / §7 A2，issue #38 后唯一计划入口）。
 //!
 //! 契约三件事：干净闭包 → rc=0 且计划落盘；有缺件 → rc=1 且逐条列出；
-//! 用法/目标错 → rc=2 / rc=1。计划文件字节必须可复现（同输入两次跑逐字节相同）。
+//! 目标/项目错 → rc=1。计划文件字节必须可复现（同输入两次跑逐字节相同）。
+//! 原 `plan` 子命令的 11 条契约在此改经 compile 等价入口（10 条改写；
+//! "无目标例程 = 用法错"一条随命令删除——compile 的对应诊断"无入口 = ENV-0030"
+//! 已由 compile_project.rs 的 should_refuse_project_compile_when_the_project_has_no_entry 锁定）。
 
-use super::{abs_file, cli, cw_graph, plan_in_process, write, EXIT_FAIL, EXIT_OK, EXIT_USAGE};
+use super::{abs_file, cli, compile_project_in_process, cw_graph, write, EXIT_FAIL, EXIT_OK};
 
 const PROJECT_PLAN: &str = "[project]\nname = \"p\"\nkernel = \"1.5.5\"\n\n[paths]\nddl = \"sql/ddl\"\nroutines = \"sql/routines\"\nhome = \".spinduck\"\n";
 
@@ -75,10 +78,11 @@ fn should_put_an_expression_called_function_and_its_own_table_in_the_closure() {
     expr_call_project(root, DDL_EMPTY);
     let outer = abs_file(&root.join("sql/routines/10_outer.sql"));
     let hidden = abs_file(&root.join("sql/routines/20_hidden.sql"));
-    let (code, out) = plan_in_process(
+    let (code, out) = compile_project_in_process(
         root,
-        "prc_outer",
+        &["prc_outer"],
         None,
+        false,
         cw_graph(
             serde_json::json!([
                 {"id": 1, "type": "procedure", "name": "prc_outer", "file": outer},
@@ -95,6 +99,10 @@ fn should_put_an_expression_called_function_and_its_own_table_in_the_closure() {
     assert!(
         out.contains("MISS relation:t_hidden <- fnc_hidden"),
         "缺件归属必须是**被调函数**（引用它的那一层），不是外层过程: {out}"
+    );
+    assert!(
+        out.contains("compile: entries=1 missing=1 failed=0 dynamic=0"),
+        "{out}"
     );
     let text = std::fs::read_to_string(tmp.path().join(".spinduck/plan/prc_outer.toml")).unwrap();
     assert!(
@@ -115,10 +123,11 @@ fn should_deploy_the_expression_called_function_when_its_table_is_declared() {
     );
     let outer = abs_file(&root.join("sql/routines/10_outer.sql"));
     let hidden = abs_file(&root.join("sql/routines/20_hidden.sql"));
-    let (code, out) = plan_in_process(
+    let (code, out) = compile_project_in_process(
         root,
-        "prc_outer",
+        &["prc_outer"],
         None,
+        false,
         cw_graph(
             serde_json::json!([
                 {"id": 1, "type": "procedure", "name": "prc_outer", "file": outer},
@@ -135,6 +144,10 @@ fn should_deploy_the_expression_called_function_when_its_table_is_declared() {
     assert!(
         out.contains("plan: target=prc_outer routines=2 tables=1 missing=0"),
         "routines 计**源文件**数（含被调函数那个文件）；tables 同样计文件数: {out}"
+    );
+    assert!(
+        out.contains("compile: entries=1 missing=0 failed=0 dynamic=0"),
+        "{out}"
     );
     let text = std::fs::read_to_string(tmp.path().join(".spinduck/plan/prc_outer.toml")).unwrap();
     assert!(
@@ -155,10 +168,11 @@ fn should_not_report_a_missing_object_for_a_builtin_expression_call() {
     write(tmp.path(), "sql/ddl/tables.sql", DDL_T_A);
     let root = tmp.path();
     let file = abs_file(&root.join("sql/routines/10_builtin.sql"));
-    let (code, out) = plan_in_process(
+    let (code, out) = compile_project_in_process(
         root,
-        "prc_builtin",
+        &["prc_builtin"],
         None,
+        false,
         cw_graph(
             serde_json::json!([
                 {"id": 1, "type": "procedure", "name": "prc_builtin", "file": file},
@@ -184,10 +198,11 @@ fn should_exit_0_and_write_the_plan_file_for_a_clean_closure() {
     let root = tmp.path();
     plan_project(root, DDL_T_A);
     let file = abs_file(&root.join("sql/routines/10_main.sql"));
-    let (code, out) = plan_in_process(
+    let (code, out) = compile_project_in_process(
         root,
-        "prc_main",
+        &["prc_main"],
         None,
+        false,
         cw_graph(
             serde_json::json!([
                 {"id": 1, "type": "procedure", "name": "prc_main", "file": file},
@@ -203,6 +218,10 @@ fn should_exit_0_and_write_the_plan_file_for_a_clean_closure() {
     assert_eq!(code, EXIT_OK, "{out}");
     assert!(
         out.contains("plan: target=prc_main routines=1 tables=1 missing=0"),
+        "{out}"
+    );
+    assert!(
+        out.contains("compile: entries=1 missing=0 failed=0 dynamic=0"),
         "{out}"
     );
 
@@ -232,10 +251,11 @@ fn should_exit_1_and_list_every_missing_object() {
     let root = tmp.path();
     plan_project(root, DDL_EMPTY);
     let file = abs_file(&root.join("sql/routines/10_main.sql"));
-    let (code, out) = plan_in_process(
+    let (code, out) = compile_project_in_process(
         root,
-        "prc_main",
+        &["prc_main"],
         None,
+        false,
         cw_graph(
             serde_json::json!([
                 {"id": 1, "type": "procedure", "name": "prc_main", "file": file},
@@ -254,6 +274,10 @@ fn should_exit_1_and_list_every_missing_object() {
         "{out}"
     );
     assert!(out.contains("MISS relation:t_a <- prc_main"), "{out}");
+    assert!(
+        out.contains("compile: entries=1 missing=1 failed=0 dynamic=0"),
+        "{out}"
+    );
     // 缺件同样进计划文件：deploy 侧读到的必须是同一份真相
     let text = std::fs::read_to_string(tmp.path().join(".spinduck/plan/prc_main.toml")).unwrap();
     assert!(
@@ -279,13 +303,13 @@ fn should_write_byte_identical_plan_files_on_two_runs() {
             {"source": 1, "target": 3, "type": "table_access", "modes": ["read"], "file": file, "line": 1}
         ]),
     );
-    let (code1, out1) = plan_in_process(root, "prc_main", None, json.clone());
+    let (code1, out1) = compile_project_in_process(root, &["prc_main"], None, false, json.clone());
     let first = std::fs::read(root.join(".spinduck/plan/prc_main.toml")).unwrap();
-    let (code2, out2) = plan_in_process(root, "prc_main", None, json);
+    let (code2, out2) = compile_project_in_process(root, &["prc_main"], None, false, json);
     let second = std::fs::read(tmp.path().join(".spinduck/plan/prc_main.toml")).unwrap();
     assert_eq!((code1, code2), (EXIT_OK, EXIT_OK), "{out1}\n{out2}");
     assert_eq!(first, second, "§6.1：同一输入必须逐字节可复现");
-    // 渲染里唯一允许变化的是落盘标注；其余两行必须逐字相同（不带时间戳之类易变字段）
+    // 渲染里唯一允许变化的是落盘标注；其余各行必须逐字相同（不带时间戳之类易变字段）
     assert!(out1.contains("(updated)"), "{out1}");
     assert!(out2.contains("(unchanged)"), "{out2}");
     let strip = |s: &str| s.replace("(updated)", "()").replace("(unchanged)", "()");
@@ -298,10 +322,11 @@ fn should_honor_the_schema_override() {
     let root = tmp.path();
     plan_project(root, DDL_T_A);
     let file = abs_file(&root.join("sql/routines/10_main.sql"));
-    let (code, out) = plan_in_process(
+    let (code, out) = compile_project_in_process(
         root,
-        "prc_main",
+        &["prc_main"],
         Some("BIGFUND"),
+        false,
         cw_graph(
             serde_json::json!([
                 {"id": 1, "type": "procedure", "name": "prc_main", "file": file},
@@ -320,23 +345,16 @@ fn should_honor_the_schema_override() {
 }
 
 #[test]
-fn should_exit_2_with_eng_0010_when_target_routine_is_absent() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (code, out, _) = cli(&["plan", "--dir", &tmp.path().to_string_lossy()]);
-    assert_eq!(code, EXIT_USAGE, "{out}");
-    assert!(out.starts_with("[ENG-0010] usage: plan"), "{out}");
-}
-
-#[test]
 fn should_exit_1_with_biz_0150_when_target_routine_is_not_declared() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     plan_project(root, DDL_T_A);
     let file = abs_file(&root.join("sql/routines/10_main.sql"));
-    let (code, out) = plan_in_process(
+    let (code, out) = compile_project_in_process(
         root,
-        "prc_ghost",
+        &["prc_ghost"],
         None,
+        false,
         cw_graph(
             serde_json::json!([
                 {"id": 1, "type": "procedure", "name": "prc_main", "file": file}
@@ -362,11 +380,12 @@ fn project_without_codeweb(dir: &std::path::Path) {
 }
 
 #[test]
-fn should_exit_1_when_the_real_binary_verify_cannot_find_a_codeweb_project() {
+fn should_exit_1_when_the_real_binary_compile_cannot_find_a_codeweb_project() {
+    // 入口取自 [[entry]]。项目定位失败必须先于二进制解析报出（机器上可以没有 codeweb）。
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     project_without_codeweb(root);
-    let (code, out, err) = cli(&["verify", &root.to_string_lossy()]);
+    let (code, out, err) = cli(&["compile", "--dir", &root.to_string_lossy()]);
     assert_eq!(code, EXIT_FAIL, "{out}");
     assert_eq!(err, "", "诊断走 stdout: {err}");
     assert!(out.contains("[ENV-0030]"), "{out}");
@@ -374,11 +393,18 @@ fn should_exit_1_when_the_real_binary_verify_cannot_find_a_codeweb_project() {
 }
 
 #[test]
-fn should_exit_1_when_the_real_binary_plan_cannot_find_a_codeweb_project() {
+fn should_exit_1_when_compile_with_entry_flag_cannot_find_a_codeweb_project() {
+    // 入口取自 --entry，同一条定位优先级。
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     project_without_codeweb(root);
-    let (code, out, err) = cli(&["plan", "--dir", &root.to_string_lossy(), "pkg_a.prc_x"]);
+    let (code, out, err) = cli(&[
+        "compile",
+        "--dir",
+        &root.to_string_lossy(),
+        "--entry",
+        "pkg_a.prc_x",
+    ]);
     assert_eq!(code, EXIT_FAIL, "{out}");
     assert_eq!(err, "", "诊断走 stdout: {err}");
     assert!(out.contains("[ENV-0030]"), "{out}");

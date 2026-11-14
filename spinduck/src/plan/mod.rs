@@ -1,6 +1,6 @@
 //! 运行计划（design §6.1）：把"一次闭包求值所需的全部对象与文件"落成可复现的清单。
 //!
-//! 计划是**数据**，不是执行结果：`plan` 生成并落盘，`deploy` 消费（A2-3）。
+//! 计划是**数据**，不是执行结果：项目态 `compile` 生成并落盘，`deploy` 消费（A2-3）。
 //! 字节可复现是这里的承诺——同一份输入两次生成必须逐字节相同，所以路径清单一律
 //! 排序去重、段序与字段序固定、不写日期、不写绝对路径。
 
@@ -17,6 +17,7 @@ pub use closure::{build, plan_dir};
 pub(crate) use closure::{kernel_gaps, kernel_gaps_from_refs};
 
 use crate::error::EngineError;
+use crate::project::ProjectConfig;
 use std::path::{Path, PathBuf};
 
 /// 计划 schema 版本（读侧据此拒绝未来形态，不猜字段含义）。
@@ -321,4 +322,31 @@ fn sorted_list(items: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("[{rendered}]")
+}
+
+/// 落盘结果（路径 + 是否改写），标注口径同运行态快照。
+pub(crate) struct PlanWrite {
+    pub(crate) path: PathBuf,
+    pub(crate) changed: bool,
+}
+
+/// 计划落盘：`<home>/plan/<target>.toml`，内容不变则不写（标注 unchanged）。
+pub(crate) fn write_plan(
+    project: &ProjectConfig,
+    plan: &RunPlan,
+) -> Result<PlanWrite, EngineError> {
+    let path = plan_dir(project).join(format!("{}.toml", plan.target));
+    let text = plan.to_toml_string();
+    let dir = path
+        .parent()
+        .ok_or_else(|| EngineError::env(30, format!("非法计划路径 {}", path.display())))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| EngineError::env(30, format!("创建 {}: {e}", dir.display())))?;
+    let previous = std::fs::read_to_string(&path).unwrap_or_default();
+    let changed = previous != text;
+    if changed {
+        std::fs::write(&path, &text)
+            .map_err(|e| EngineError::env(30, format!("写 {}: {e}", path.display())))?;
+    }
+    Ok(PlanWrite { path, changed })
 }

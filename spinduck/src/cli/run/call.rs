@@ -210,7 +210,7 @@ fn call_target_and_sources(
                 .map_err(io_err)?;
                 return Ok(None);
             }
-            let project = crate::cli::verify::locate(&plan.project_root(p))?;
+            let project = crate::project::ProjectConfig::locate(&plan.project_root(p))?;
             let deployment = crate::plan::deploy::resolve(&project, &plan)?;
             let mut files = deployment.routines;
             files.extend(parts.files.iter().cloned());
@@ -351,7 +351,7 @@ mod tests {
              BEGIN RETURN MYNVL(x, y); END;",
         )
         .unwrap();
-        // 计划由 plan_cmd 写出（generator 为 codeweb）。规则仍从项目声明带进 call。
+        // 计划由项目态 compile 写出（generator 为 codeweb）。规则仍从项目声明带进 call。
         std::fs::write(root.join("codeweb.toml"), b"").unwrap();
         let file = root.join("sql/routines/r.sql");
         let file_s = file.to_string_lossy().replace('\\', "/");
@@ -363,7 +363,15 @@ mod tests {
             .unwrap(),
         );
         let mut plan_buf = Vec::new();
-        let plan_code = crate::cli::plan_cmd(Some(root), "fnc_nv", None, &export, &mut plan_buf)
+        let opts = crate::cli::ProjectCompile {
+            dir: Some(root.to_path_buf()),
+            schema: None,
+            entries: vec!["fnc_nv".to_string()],
+            codeweb_bin: None,
+            codeweb_project: None,
+            sync_manifest: false,
+        };
+        let plan_code = crate::cli::compile_project_with_export(opts, &export, &mut plan_buf)
             .unwrap_or_else(|e| panic!("{}", e.message));
         let plan_out = String::from_utf8(plan_buf).unwrap();
         assert_eq!(plan_code, EXIT_OK, "{plan_out}");

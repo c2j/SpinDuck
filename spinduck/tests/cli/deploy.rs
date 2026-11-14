@@ -4,7 +4,9 @@
 //! `--db` 就能在部署好的库上跑真题（`call` 走的是文件里已有的表，不是自己建的）。
 //! 缺件面另两个契约（缺件即拒、缺文件即红）见本文件后半。
 
-use super::{abs_file, cli, cw_graph, plan_in_process, write, EXIT_FAIL, EXIT_OK, EXIT_USAGE};
+use super::{
+    abs_file, cli, compile_project_in_process, cw_graph, write, EXIT_FAIL, EXIT_OK, EXIT_USAGE,
+};
 
 const PROJECT_DEPLOY: &str =
     "[project]\nname = \"d\"\nkernel = \"1.5.5\"\n\n[paths]\nddl = \"sql/ddl\"\nroutines = \"sql/routines\"\nhome = \".spinduck\"\n";
@@ -20,16 +22,17 @@ END;
 
 const DDL_TABLE_AND_SEQ: &str = "CREATE TABLE t_a (id INT);\nCREATE SEQUENCE seq_a START WITH 1;\n";
 
-/// 写出可计划、可部署的最小项目，并跑一次 `plan` 生成计划文件；返回计划路径。
+/// 写出可计划、可部署的最小项目，并跑一次项目态 compile 生成计划文件；返回计划路径。
 fn deployed_plan(dir: &std::path::Path) -> std::path::PathBuf {
     write(dir, "spinduck.toml", PROJECT_DEPLOY);
     write(dir, "sql/routines/10_main.sql", ROUTINE_SEED_COUNT);
     write(dir, "sql/ddl/tables.sql", DDL_TABLE_AND_SEQ);
     let file = abs_file(&dir.join("sql/routines/10_main.sql"));
-    let (code, out) = plan_in_process(
+    let (code, out) = compile_project_in_process(
         dir,
-        "prc_seed_count",
+        &["prc_seed_count"],
         None,
+        false,
         cw_graph(
             serde_json::json!([
                 {"id": 1, "type": "procedure", "name": "prc_seed_count", "file": file},
@@ -178,10 +181,11 @@ fn should_refuse_a_plan_that_still_carries_missing_objects() {
     write(tmp.path(), "sql/routines/10_main.sql", ROUTINE_SEED_COUNT);
     write(tmp.path(), "sql/ddl/tables.sql", "-- 什么都没建\n");
     let file = abs_file(&tmp.path().join("sql/routines/10_main.sql"));
-    let (code, out) = plan_in_process(
+    let (code, out) = compile_project_in_process(
         tmp.path(),
-        "prc_seed_count",
+        &["prc_seed_count"],
         None,
+        false,
         cw_graph(
             serde_json::json!([
                 {"id": 1, "type": "procedure", "name": "prc_seed_count", "file": file},
@@ -221,10 +225,11 @@ fn should_refuse_to_call_a_plan_that_still_carries_missing_objects() {
     write(tmp.path(), "sql/routines/10_main.sql", ROUTINE_SEED_COUNT);
     write(tmp.path(), "sql/ddl/tables.sql", "-- 什么都没建\n");
     let file = abs_file(&tmp.path().join("sql/routines/10_main.sql"));
-    let (code, out) = plan_in_process(
+    let (code, out) = compile_project_in_process(
         tmp.path(),
-        "prc_seed_count",
+        &["prc_seed_count"],
         None,
+        false,
         cw_graph(
             serde_json::json!([
                 {"id": 1, "type": "procedure", "name": "prc_seed_count", "file": file},
@@ -399,10 +404,11 @@ END;
         "CREATE OR REPLACE /*FORCE*/ VIEW v_a AS SELECT 42 AS id;\n",
     );
     let file = abs_file(&tmp.path().join("sql/routines/10_main.sql"));
-    let (code, out) = plan_in_process(
+    let (code, out) = compile_project_in_process(
         tmp.path(),
-        "prc_read_view",
+        &["prc_read_view"],
         None,
+        false,
         cw_graph(
             serde_json::json!([
                 {"id": 1, "type": "procedure", "name": "prc_read_view", "file": file},
@@ -480,10 +486,11 @@ END;
 
     let file = abs_file(&tmp.path().join("sql/routines/10_main.sql"));
     let view = abs_file(&tmp.path().join("sql/ddl/views/1_V_A.sql"));
-    let (code, out) = plan_in_process(
+    let (code, out) = compile_project_in_process(
         tmp.path(),
-        "prc_read_view",
+        &["prc_read_view"],
         None,
+        false,
         cw_graph(
             serde_json::json!([
                 {"id": 1, "type": "procedure", "name": "prc_read_view", "file": file},
