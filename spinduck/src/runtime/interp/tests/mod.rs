@@ -1,6 +1,7 @@
 // 解释器测试模块（自 interp.rs 拆分，行为不变，AGENTS §3）。
 // writebuf/batch_commit 块独立成子模块（§3 规模拆分，第四轮复核应修 ④）。
 mod writebuf;
+mod writebuf_flush;
 use super::*;
 use crate::exec::{BindMap, FakeExecutor, SqlExecutor};
 use crate::ir::compile_stmts;

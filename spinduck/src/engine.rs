@@ -427,6 +427,10 @@ fn format_statements(sql_text: &str) -> Result<Vec<String>, EngineError> {
 /// TraceSink 的空实现（引擎默认；CLI/监控注入真实 sink）。
 pub struct TraceNoopSink;
 impl crate::exec::TraceSink for TraceNoopSink {
+    #[inline]
+    fn is_enabled(&self) -> bool {
+        false
+    }
     fn on_event(&mut self, _event: crate::exec::TraceEvent) {}
 }
 

@@ -35,8 +35,10 @@ pub(super) fn open(
     };
     let stream = env.ex.query(&sql, &binds)?;
     env.frame.open_cursor(cursor, CursorState::open(stream));
-    let schema = env.frame.cursor_schema(cursor);
-    env.sink.on_event(TraceEvent::CursorOpen { sql, schema });
+    if env.sink.is_enabled() {
+        let schema = env.frame.cursor_schema(cursor);
+        env.sink.on_event(TraceEvent::CursorOpen { sql, schema });
+    }
     Ok(())
 }
 
@@ -61,7 +63,9 @@ pub(super) fn fetch(
                 EngineError::invariant(47, "FOR-record fetch requires one INTO target")
             })?;
             assign(env, target, SpinValue::Record(fields))?;
-            env.sink.on_event(TraceEvent::Fetch { row: Some(1) });
+            if env.sink.is_enabled() {
+                env.sink.on_event(TraceEvent::Fetch { row: Some(1) });
+            }
         }
         Some(r) => {
             // 位置对位写槽；INTO 目标多于列 → 报错
@@ -84,10 +88,14 @@ pub(super) fn fetch(
             for (i, target) in targets.iter().enumerate() {
                 assign(env, target, r[i].clone())?;
             }
-            env.sink.on_event(TraceEvent::Fetch { row: Some(1) });
+            if env.sink.is_enabled() {
+                env.sink.on_event(TraceEvent::Fetch { row: Some(1) });
+            }
         }
         None => {
-            env.sink.on_event(TraceEvent::Fetch { row: None });
+            if env.sink.is_enabled() {
+                env.sink.on_event(TraceEvent::Fetch { row: None });
+            }
         }
     }
     Ok(())

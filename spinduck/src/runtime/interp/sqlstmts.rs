@@ -22,11 +22,13 @@ pub(super) fn query(
 ) -> Result<(), EngineError> {
     materialize_fn_sites(sites, env)?;
     let bound = resolve_binds(binds, env.frame)?;
-    env.sink.on_event(TraceEvent::SqlExec {
-        sql: sql.to_string(),
-        binds: bound.clone(),
-        elapsed_us: 0,
-    });
+    if env.sink.is_enabled() {
+        env.sink.on_event(TraceEvent::SqlExec {
+            sql: sql.to_string(),
+            binds: bound.clone(),
+            elapsed_us: 0,
+        });
+    }
     let mut stream = env.ex.query(sql, &bound)?;
     let rows = stream.fetch_many(2);
     write_into(env, into, &rows)
@@ -41,11 +43,13 @@ pub(super) fn exec(
 ) -> Result<(), EngineError> {
     materialize_fn_sites(sites, env)?;
     let bound = resolve_binds(binds, env.frame)?;
-    env.sink.on_event(TraceEvent::SqlExec {
-        sql: sql.to_string(),
-        binds: bound.clone(),
-        elapsed_us: 0,
-    });
+    if env.sink.is_enabled() {
+        env.sink.on_event(TraceEvent::SqlExec {
+            sql: sql.to_string(),
+            binds: bound.clone(),
+            elapsed_us: 0,
+        });
+    }
     env.ex.execute(sql, &bound)?;
     Ok(())
 }
@@ -58,11 +62,13 @@ pub(super) fn exec_dynamic(
 ) -> Result<(), EngineError> {
     let v = eval_expr(env, text_expr)?;
     let (sql, _) = prepare_dynamic_sql(&v.as_str_loose(), env)?;
-    env.sink.on_event(TraceEvent::SqlExec {
-        sql: sql.clone(),
-        binds: BindMap::new(),
-        elapsed_us: 0,
-    });
+    if env.sink.is_enabled() {
+        env.sink.on_event(TraceEvent::SqlExec {
+            sql: sql.clone(),
+            binds: BindMap::new(),
+            elapsed_us: 0,
+        });
+    }
     if into_targets.is_empty() {
         env.ex.execute(&sql, &BindMap::new())?;
         return Ok(());
