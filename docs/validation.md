@@ -4908,3 +4908,21 @@ Up to date. No changes detected.
   见 Task 3.9 记录：GLIBC 上限 2.28 = 策略上限）。
 - 不声称单写者假设之外还有并发保护（`compile --analyze` 双写竞争属未定义行为，
   口径见 architecture §13.5 并发写守卫行）。
+
+### V47.4 依赖面与产物回归（计划 T4.4）
+
+- **lockfile crate 数**：242（v0.1.20，嵌入前）→ **285**（+43）。新增面全部为纯 Rust
+  （petgraph / bincode / bitflags / rayon / walkdir / globset / blake3 / csv / pathdiff /
+  regex / toml / encoding_rs 及其传递项——其中 encoding_rs/regex/toml 在嵌入前已在树内）。
+  无新的 C/C++ 依赖：交叉编译与 glibc 判定都不受影响，证据是产物侧而不是工具承诺。
+- **Linux x86_64 产物**（`cargo zigbuild --target x86_64-unknown-linux-gnu.2.28`）：
+  未压缩 **44.3 MB**（44,319,688 B）；同格式 tar.gz **15.38 MB**（15,381,135 B）
+  vs `v0.1.20` 发布资产 14.21 MB（14,211,155 B），**+8.2%**。
+- **glibc 上限**：`check_max_glibc.py` → 需要 `GLIBC_2.28` = 策略上限（与嵌入前一致）。
+- **构建时长**：clean 的 zigbuild（含 duckdb bundled C++ 交叉编译）**4m18s**（v0.9.9
+  依赖态）；v0.9.10 增量重建 16.2s。嵌入的 codeweb 在 clean 构建上额外贡献约 2–3 分钟
+  （codeweb 自身 `--features full` clean 构建实测 2m51s，analyze-only 更少）。
+- **审计面**：`cargo audit`（CI 同口径四条 zip 豁免）exit 0；codeweb 为 git 依赖属审计
+  盲区（已登记，见 architecture ⑩ 与 ci.yml 注释），新增 2 条 unmaintained 级 warning
+  （`bincode` RUSTSEC-2025-0141、`unsafe-libyaml` RUSTSEC-2024-0449，均非漏洞级，
+  不改变门禁结果）。
