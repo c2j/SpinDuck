@@ -31,6 +31,9 @@ pub fn manifest_text(project: &ProjectConfig) -> Result<String, EngineError> {
     prj.insert("name".into(), project.name.clone().into());
     prj.insert("kernel".into(), project.kernel.clone().into());
     doc.insert("project".into(), prj.into());
+    let mut engine = toml::value::Table::new();
+    engine.insert("set_oriented".into(), project.set_oriented.into());
+    doc.insert("engine".into(), engine.into());
 
     let mut rt = toml::value::Table::new();
     rt.insert("source".into(), path_text(&project.root).into());

@@ -12,6 +12,7 @@ mod control;
 mod dummy;
 mod entry;
 mod expr;
+pub mod set_oriented;
 mod sql;
 mod stmt;
 mod types;

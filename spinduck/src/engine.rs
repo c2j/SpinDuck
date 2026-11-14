@@ -11,6 +11,8 @@ use crate::value::SpinValue;
 use ogsql_parser::ast::Statement;
 use ogsql_parser::token::tokenizer::Tokenizer;
 
+mod set_oriented;
+
 /// 引擎：执行器 + 规则 + 例程目录。
 pub struct Engine {
     pub ex: Box<dyn SqlExecutor>,
@@ -24,6 +26,9 @@ pub struct Engine {
     /// INSERT 攒批合并、COMMIT 吞并，出口统一刷盘由调用 COMMIT 持久化。
     /// 偏差点：失败行跳过发生在刷盘期，不进入 PL 异常处理器（见 writebuf.rs）。
     pub batch_commit: bool,
+    /// 默认关闭的受限静态集合化，不与 batch_commit 叠加。
+    pub set_oriented: bool,
+    set_oriented_reports: Vec<crate::ir::set_oriented::Report>,
     /// 纯标量语句记忆化缓存（`ex` 内的 MemoizingExecutor 与本句柄共享），
     /// 每次顶层调用入口清空，给缓存一个确定的内存上界。
     memo: std::rc::Rc<crate::exec::MemoCache>,
@@ -50,6 +55,8 @@ impl Engine {
             macro_names: std::collections::BTreeSet::new(),
             step_budget: crate::runtime::interp::DEFAULT_STEP_BUDGET,
             batch_commit: false,
+            set_oriented: false,
+            set_oriented_reports: Vec::new(),
             memo,
             lookup,
         }
@@ -340,6 +347,7 @@ impl Engine {
     ) -> Result<CallResult, EngineError> {
         self.memo.clear();
         self.lookup.clear();
+        self.set_oriented_reports.clear();
         let routine = self
             .catalog
             .lookup(name)
@@ -357,18 +365,7 @@ impl Engine {
         // COMMIT；未处理异常统一 ROLLBACK（DuckDB ACID 提供原子性）
         self.ex
             .execute("BEGIN TRANSACTION", &crate::exec::BindMap::new())?;
-        let out = match crate::runtime::run_with_catalog(
-            &routine.prog,
-            &mut frame,
-            self.ex.as_ref(),
-            sink,
-            &self.catalog,
-            0,
-            crate::runtime::RunLimits {
-                budget: self.step_budget,
-                batch_commit: self.batch_commit,
-            },
-        ) {
+        let out = match self.run_selected(&routine, &mut frame, sink) {
             Ok(out) => out,
             Err(mut e) => {
                 // 回滚失败不得静默：并入原错误消息。归域在产生点已定（§5），
