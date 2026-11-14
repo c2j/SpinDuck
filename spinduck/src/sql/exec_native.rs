@@ -154,6 +154,386 @@ impl SqlExecutor for DuckExecutor {
 }
 
 #[cfg(test)]
+mod appender_probes {
+    use super::*;
+
+    fn execute(ex: &DuckExecutor, sql: &str) -> usize {
+        ex.execute(sql, &BindMap::new()).unwrap().rows_affected
+    }
+
+    fn rows(ex: &DuckExecutor, sql: &str) -> Vec<Row> {
+        ex.query(sql, &BindMap::new()).unwrap().fetch_many(10)
+    }
+
+    fn constraint_outcome(
+        definition: &str,
+        values: [Option<i32>; 2],
+        staged: bool,
+    ) -> (String, String) {
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        execute(&ex, "CREATE TABLE parent(id INTEGER PRIMARY KEY)");
+        execute(&ex, "INSERT INTO parent VALUES (1), (10), (20), (30)");
+        execute(&ex, &format!("CREATE TABLE t({definition})"));
+        execute(
+            &ex,
+            "CREATE TEMP TABLE stage AS SELECT id FROM t WHERE FALSE",
+        );
+        execute(&ex, "INSERT INTO t VALUES (1)");
+        execute(&ex, "BEGIN TRANSACTION");
+        execute(&ex, "INSERT INTO t VALUES (10), (20)");
+        let sql = if staged {
+            let mut app = ex.conn.appender("stage").unwrap();
+            for value in values {
+                app.append_row([value]).unwrap();
+            }
+            app.flush().unwrap();
+            "INSERT INTO t SELECT id FROM stage".to_string()
+        } else {
+            let tuples: Vec<_> = values
+                .iter()
+                .map(|v| match v {
+                    Some(n) => format!("({n})"),
+                    None => "(NULL)".to_string(),
+                })
+                .collect();
+            format!("INSERT INTO t VALUES {}", tuples.join(","))
+        };
+        let err = ex.execute(&sql, &BindMap::new()).unwrap_err();
+        assert_eq!(err.code.0, "KERNEL-0010");
+        let replay = ex
+            .execute("INSERT INTO t VALUES (30)", &BindMap::new())
+            .unwrap_err();
+        assert_eq!(replay.code.0, "KERNEL-0010");
+        assert!(
+            replay.message.contains("transaction is aborted"),
+            "{}",
+            replay.message
+        );
+        execute(&ex, "ROLLBACK");
+        assert_eq!(
+            rows(&ex, "SELECT id FROM t ORDER BY id"),
+            vec![vec![SpinValue::Int(1)]]
+        );
+        assert_eq!(rows(&ex, "SELECT id FROM stage"), Vec::<Row>::new());
+        (err.message, replay.message)
+    }
+
+    #[test]
+    fn should_match_sql_constraint_failure_and_rollback_through_staging() {
+        for (definition, values, message) in [
+            (
+                "id INTEGER PRIMARY KEY",
+                [Some(30), Some(1)],
+                "Duplicate key",
+            ),
+            (
+                "id INTEGER NOT NULL",
+                [Some(30), None],
+                "NOT NULL constraint failed",
+            ),
+            (
+                "id INTEGER CHECK(id > 0)",
+                [Some(30), Some(-1)],
+                "CHECK constraint failed",
+            ),
+            (
+                "id INTEGER REFERENCES parent(id)",
+                [Some(30), Some(99)],
+                "foreign key constraint",
+            ),
+        ] {
+            let direct = constraint_outcome(definition, values, false);
+            let staged = constraint_outcome(definition, values, true);
+            assert!(direct.0.contains(message), "{}", direct.0);
+            assert_eq!(direct, staged, "{definition}");
+        }
+    }
+
+    #[test]
+    fn should_match_staged_column_defaults_on_commit_and_rollback() {
+        for finish in ["COMMIT", "ROLLBACK"] {
+            for staged in [false, true] {
+                let ex = DuckExecutor::open_in_memory().unwrap();
+                let binds = BindMap::new();
+                ex.execute("CREATE SEQUENCE ids START 100", &binds).unwrap();
+                ex.execute("CREATE TABLE t(id BIGINT DEFAULT nextval('ids'), amount DECIMAL(18,2), label VARCHAR DEFAULT 'default', flag BOOLEAN DEFAULT TRUE)", &binds).unwrap();
+                ex.execute("BEGIN TRANSACTION", &binds).unwrap();
+                let sql = if staged {
+                    ex.execute(
+                        "CREATE TEMP TABLE stage AS SELECT amount, label FROM t WHERE FALSE",
+                        &binds,
+                    )
+                    .unwrap();
+                    let mut app = ex.conn.appender("stage").unwrap();
+                    for (amount, label) in [
+                        (12345, Value::Null),
+                        (-12345, Value::Text("O'Reilly".into())),
+                    ] {
+                        let values = [
+                            DuckExecutor::to_duck(&SpinValue::Decimal(amount, 18, 3)),
+                            label,
+                        ];
+                        app.append_row(duckdb::appender_params_from_iter(values))
+                            .unwrap();
+                    }
+                    app.flush().unwrap();
+                    "INSERT INTO t(amount, label) SELECT amount, label FROM stage"
+                } else {
+                    "INSERT INTO t(amount, label) VALUES (12.345, NULL), (-12.345, 'O''Reilly')"
+                };
+                assert_eq!(ex.execute(sql, &binds).unwrap().rows_affected, 2);
+                let expected = vec![
+                    vec![
+                        SpinValue::Int(100),
+                        SpinValue::Decimal(1235, 38, 2),
+                        SpinValue::Null,
+                        SpinValue::Bool(true),
+                    ],
+                    vec![
+                        SpinValue::Int(101),
+                        SpinValue::Decimal(-1235, 38, 2),
+                        SpinValue::Str("O'Reilly".into()),
+                        SpinValue::Bool(true),
+                    ],
+                ];
+                assert_eq!(rows(&ex, "SELECT * FROM t ORDER BY id"), expected);
+                execute(&ex, finish);
+                let after = rows(&ex, "SELECT * FROM t ORDER BY id");
+                assert_eq!(after, if finish == "COMMIT" { expected } else { vec![] });
+                assert_eq!(
+                    rows(&ex, "SELECT currval('ids')"),
+                    vec![vec![SpinValue::Int(101)]]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn should_expose_changed_transaction_state_on_staged_conversion_error() {
+        let mut states = Vec::new();
+        for staged in [false, true] {
+            let ex = DuckExecutor::open_in_memory().unwrap();
+            let binds = BindMap::new();
+            ex.execute("CREATE TABLE t(id INTEGER)", &binds).unwrap();
+            ex.execute(
+                "CREATE TEMP TABLE stage AS SELECT id FROM t WHERE FALSE",
+                &binds,
+            )
+            .unwrap();
+            ex.execute("INSERT INTO t VALUES (1)", &binds).unwrap();
+            ex.execute("BEGIN TRANSACTION", &binds).unwrap();
+            ex.execute("INSERT INTO t VALUES (10)", &binds).unwrap();
+            let err = if staged {
+                let mut app = ex.conn.appender("stage").unwrap();
+                app.append_row(["20"]).unwrap();
+                kernel_err(app.append_row(["invalid"]).unwrap_err())
+            } else {
+                ex.execute("INSERT INTO t VALUES ('20'), ('invalid')", &binds)
+                    .unwrap_err()
+            };
+            assert_eq!(err.code.0, "KERNEL-0010");
+            assert!(err.message.contains("Could not convert"), "{}", err.message);
+            states.push(
+                ex.execute("INSERT INTO t VALUES (30)", &binds)
+                    .map(|outcome| outcome.rows_affected)
+                    .map_err(|e| (e.code.0, e.message)),
+            );
+            ex.execute("ROLLBACK", &binds).unwrap();
+            assert_eq!(
+                ex.query("SELECT id FROM t", &binds).unwrap().fetch_many(10),
+                vec![vec![SpinValue::Int(1)]]
+            );
+        }
+        assert_eq!(
+            states[0],
+            Err((
+                "KERNEL-0010".to_string(),
+                "TransactionContext Error: Current transaction is aborted (please ROLLBACK)"
+                    .to_string()
+            ))
+        );
+        assert_eq!(states[1], Ok(1));
+    }
+
+    #[test]
+    fn should_defer_source_typed_staging_conversion_failure_to_target_sql() {
+        let mut failures = Vec::new();
+        for staged in [false, true] {
+            let ex = DuckExecutor::open_in_memory().unwrap();
+            execute(&ex, "CREATE TABLE t(id INTEGER)");
+            execute(&ex, "CREATE TEMP TABLE stage(id VARCHAR)");
+            execute(&ex, "INSERT INTO t VALUES (1)");
+            execute(&ex, "BEGIN TRANSACTION");
+            execute(&ex, "INSERT INTO t VALUES (10)");
+            let sql = if staged {
+                let mut app = ex.conn.appender("stage").unwrap();
+                app.append_rows([["20"], ["invalid"]]).unwrap();
+                app.flush().unwrap();
+                "INSERT INTO t SELECT id FROM stage"
+            } else {
+                "INSERT INTO t VALUES ('20'), ('invalid')"
+            };
+            let err = ex.execute(sql, &BindMap::new()).unwrap_err();
+            assert_eq!(err.code.0, "KERNEL-0010");
+            assert!(
+                err.message
+                    .contains("Could not convert string 'invalid' to INT32"),
+                "{}",
+                err.message
+            );
+            let replay = ex
+                .execute("INSERT INTO t VALUES (30)", &BindMap::new())
+                .unwrap_err();
+            assert_eq!(replay.code.0, "KERNEL-0010");
+            assert!(
+                replay.message.contains("transaction is aborted"),
+                "{}",
+                replay.message
+            );
+            failures.push(replay.message);
+            execute(&ex, "ROLLBACK");
+            assert_eq!(rows(&ex, "SELECT id FROM t"), vec![vec![SpinValue::Int(1)]]);
+            assert_eq!(rows(&ex, "SELECT id FROM stage"), Vec::<Row>::new());
+        }
+        assert_eq!(failures[0], failures[1]);
+    }
+
+    #[test]
+    fn should_preserve_sequence_consumption_on_staged_conversion_failure() {
+        let mut next_ids = Vec::new();
+        for staged in [false, true] {
+            let ex = DuckExecutor::open_in_memory().unwrap();
+            execute(&ex, "CREATE SEQUENCE ids START 100");
+            execute(
+                &ex,
+                "CREATE TABLE t(id BIGINT DEFAULT nextval('ids'), amount INTEGER)",
+            );
+            execute(&ex, "CREATE TEMP TABLE stage(amount VARCHAR)");
+            execute(&ex, "BEGIN TRANSACTION");
+            let sql = if staged {
+                let mut app = ex.conn.appender("stage").unwrap();
+                app.append_rows([["20"], ["invalid"]]).unwrap();
+                app.flush().unwrap();
+                "INSERT INTO t(amount) SELECT amount FROM stage"
+            } else {
+                "INSERT INTO t(amount) VALUES ('20'), ('invalid')"
+            };
+            let err = ex.execute(sql, &BindMap::new()).unwrap_err();
+            assert_eq!(err.code.0, "KERNEL-0010");
+            assert!(
+                err.message
+                    .contains("Could not convert string 'invalid' to INT32"),
+                "{}",
+                err.message
+            );
+            execute(&ex, "ROLLBACK");
+            assert_eq!(rows(&ex, "SELECT * FROM t"), Vec::<Row>::new());
+            next_ids.push(rows(&ex, "SELECT nextval('ids')"));
+        }
+        assert_eq!(next_ids, vec![vec![vec![SpinValue::Int(100)]]; 2]);
+    }
+
+    #[test]
+    fn should_expose_literal_string_error_bypass_with_source_typed_staging() {
+        let mut outcomes = Vec::new();
+        for staged in [false, true] {
+            let ex = DuckExecutor::open_in_memory().unwrap();
+            execute(&ex, "CREATE TABLE t(label VARCHAR)");
+            execute(&ex, "CREATE TEMP TABLE stage(label VARCHAR)");
+            execute(&ex, "BEGIN TRANSACTION");
+            let sql = if staged {
+                let mut app = ex.conn.appender("stage").unwrap();
+                app.append_row(["a\0b"]).unwrap();
+                app.flush().unwrap();
+                "INSERT INTO t SELECT label FROM stage"
+            } else {
+                "INSERT INTO t VALUES ('a\0b')"
+            };
+            outcomes.push(
+                ex.execute(sql, &BindMap::new())
+                    .map(|outcome| outcome.rows_affected)
+                    .map_err(|e| (e.code.0, e.message)),
+            );
+            let expected = if staged {
+                vec![vec![SpinValue::Str("a\0b".into())]]
+            } else {
+                vec![]
+            };
+            assert_eq!(rows(&ex, "SELECT * FROM t"), expected);
+            execute(&ex, "ROLLBACK");
+            assert_eq!(rows(&ex, "SELECT * FROM t"), Vec::<Row>::new());
+        }
+        assert_eq!(
+            outcomes[0],
+            Err((
+                "KERNEL-0010".to_string(),
+                "nul byte found in provided data at position: 24".to_string()
+            ))
+        );
+        assert_eq!(outcomes[1], Ok(1));
+    }
+
+    #[test]
+    fn should_reject_savepoint_for_appender_block_recovery() {
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        let binds = BindMap::new();
+        ex.execute("BEGIN TRANSACTION", &binds).unwrap();
+        let err = ex.execute("SAVEPOINT append_block", &binds).unwrap_err();
+        assert_eq!(err.code.0, "KERNEL-0010");
+        assert!(err.message.contains("syntax error"), "{}", err.message);
+        assert!(err.message.contains("SAVEPOINT"), "{}", err.message);
+        ex.execute("ROLLBACK", &binds).unwrap();
+    }
+
+    #[test]
+    fn should_require_full_rollback_after_appender_constraint_failure() {
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        let binds = BindMap::new();
+        ex.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)", &binds)
+            .unwrap();
+        ex.execute("INSERT INTO t VALUES (1)", &binds).unwrap();
+        ex.execute("BEGIN TRANSACTION", &binds).unwrap();
+        ex.execute("INSERT INTO t VALUES (10)", &binds).unwrap();
+        {
+            let mut appender = ex.conn.appender("t").unwrap();
+            appender.append_row([20]).unwrap();
+            appender.flush().unwrap();
+        }
+        assert_eq!(
+            ex.query("SELECT id FROM t ORDER BY id", &binds)
+                .unwrap()
+                .fetch_many(10),
+            vec![
+                vec![SpinValue::Int(1)],
+                vec![SpinValue::Int(10)],
+                vec![SpinValue::Int(20)]
+            ]
+        );
+        {
+            let mut appender = ex.conn.appender("t").unwrap();
+            appender.append_rows([[30], [1]]).unwrap();
+            let err = kernel_err(appender.flush().unwrap_err());
+            assert_eq!(err.code.0, "KERNEL-0010");
+            assert!(err.message.contains("Duplicate key"), "{}", err.message);
+        }
+        let replay_error = ex.execute("INSERT INTO t VALUES (30)", &binds).unwrap_err();
+        assert_eq!(replay_error.code.0, "KERNEL-0010");
+        assert!(
+            replay_error.message.contains("transaction is aborted"),
+            "{}",
+            replay_error.message
+        );
+        ex.execute("ROLLBACK", &binds).unwrap();
+        assert_eq!(
+            ex.query("SELECT id FROM t ORDER BY id", &binds)
+                .unwrap()
+                .fetch_many(10),
+            vec![vec![SpinValue::Int(1)]]
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::exec::BindMap;
