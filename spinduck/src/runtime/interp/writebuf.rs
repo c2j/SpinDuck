@@ -288,10 +288,10 @@ fn touches_buffered_table(sql: &str, tables: &HashSet<String>) -> bool {
 /// 开关 ON 时：INSERT 攒缓冲（返回 true = 已缓冲，调用方跳过即时下发）；
 /// 其余语句先按表命中刷盘（读自己写），返回 false 走原路径。
 ///
-/// 显式准入条件（复核新增，与「INSERT … SELECT 回落」同一原则——缓冲只能
-/// 替换 `ex.execute`，原路径的其余前置副作用一律不允许被略过）：
-/// fn_sites 为空（非空则 `materialize_fn_sites` 必须在 sqlstmts::exec
-/// 里执行，攒批会跳过它 → sd_fnN 不物化 / 滞留旧元组）。
+/// fn_sites 非空：仅「非嵌套 INSERT VALUES 单值」形态可内联攒批——push 时
+/// 求值例程、把缓存子查询替换为字面量（见 `fnsites_batch`），消除对 sd_fnN
+/// 临时表的依赖后再攒批；嵌套下沉 / INSERT … SELECT 回落即时下发，由
+/// `sqlstmts::exec` 的 `materialize_fn_sites` 物化（语义一字不改）。
 pub(in crate::runtime) fn take_insert(
     env: &mut Env<'_>,
     sql: &str,
@@ -301,22 +301,29 @@ pub(in crate::runtime) fn take_insert(
     let Some(rc) = env.wbuf.clone() else {
         return Ok(false);
     };
-    // fn_sites 非空：下沉物化是 sqlstmts::exec 的执行期副作用，不可缓冲
-    if !fn_sites.is_empty() {
-        flush_if_touches(env, sql)?;
-        return Ok(false);
-    }
     if !is_insert(sql) {
         flush_if_touches(env, sql)?;
         return Ok(false);
     }
+    // fn_sites 非空：先按目标表刷盘（读自己写），再尝试内联；不可内联回落即时。
+    let inlined;
+    let sql = if fn_sites.is_empty() {
+        sql
+    } else {
+        flush_if_touches(env, sql)?;
+        match super::fnsites_batch::inline_fn_sites(env, sql, fn_sites)? {
+            Some(s) => {
+                inlined = s;
+                inlined.as_str()
+            }
+            None => return Ok(false),
+        }
+    };
     // 可缓冲判定前置：只有「INSERT INTO 表 (列) VALUES (标量列表)」形态才攒批；
     // INSERT … SELECT 等不可字面量化的形态回落即时下发（V24 评审阻塞项 2——
     // 该形态是形态覆盖门禁已断言的合法输入，不能当作错误）。
     let lower = sql.to_ascii_lowercase();
     let Some(vpos) = lower.find(" values") else {
-        // 不可缓冲形态（如 INSERT … SELECT）：回落即时下发（评审阻塞项 2——
-        // 该形态是形态覆盖门禁已断言的合法输入，不能当作错误）。
         flush_if_touches(env, sql)?;
         return Ok(false);
     };

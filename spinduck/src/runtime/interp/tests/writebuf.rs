@@ -230,41 +230,62 @@ fn should_fall_back_to_immediate_exec_for_insert_select_when_batch_commit_on() {
     );
 }
 
+/// 注册一个纯函数例程（RETURN p * 2）到目录，供 fn_sites 入批测试求值。
+fn register_double_fn(cat: &mut crate::catalog::RoutineCatalog) {
+    use ogsql_parser::parser::Parser;
+    use ogsql_parser::token::tokenizer::Tokenizer;
+    let sql = "CREATE OR REPLACE FUNCTION fnc_x(p IN NUMBER) RETURN NUMBER IS \
+         BEGIN RETURN p * 2; END;";
+    let st = Parser::new(Tokenizer::new(sql).tokenize().unwrap())
+        .parse()
+        .remove(0);
+    let rules = crate::rules::RuleRegistry::default();
+    for r in crate::catalog::compile_statement_routine(&st, &rules).unwrap() {
+        cat.register(r);
+    }
+}
+
 #[test]
-fn should_fall_back_to_immediate_exec_for_insert_with_fn_sites_when_batch_commit_on() {
-    // 复核阻塞项：带 sqlfn 下沉（fn_sites 非空）的 INSERT 不可攒批——
-    // 攒批路径跳过 sqlstmts::exec，materialize_fn_sites 不执行，
-    // sd_fnN 缓存表要么缺失（KERNEL-0010）要么滞留旧元组（静默写错值）。
-    // 准入条件：fn_sites 为空才可攒，非空必须回落即时下发。
+fn should_batch_insert_with_fn_sites_by_inlining_routine_value_when_batch_commit_on() {
+    // 分支 3（已授权改写原「fn_sites 非空 → 即时回落」守护测试）。
+    // diff 含义：原测试锁定「fn_sites 非空必即时下发 + CREATE OR REPLACE TEMP
+    // TABLE sd_fn0」的 dispatch 机制；本分支刻意改变该机制——非嵌套单值
+    // fn_sites 的 INSERT VALUES 在 push 时直接 call_routine_value 求值、把缓存
+    // 子查询内联为字面量后攒批，不再建 sd_fnN 临时表、不再即时下发。语义等价
+    // （批/即时最终行一致、异常传播 + 回滚、读自己写、嵌套仍正确）由
+    // tests/guard/guard_fnsites_batch.rs 守护证明；嵌套/INSERT…SELECT 仍即时回落。
+    let mut cat = crate::catalog::RoutineCatalog::new();
+    register_double_fn(&mut cat);
+    // distinct 元组查询脚本：单行 (1) → fnc_x(1) = 2
+    let ex = FakeExecutor::with_rows(vec!["c".to_string()], vec![vec![SpinValue::Int(1)]]);
     let site = crate::sql::FnSite {
         table: "sd_fn0".into(),
         name: "fnc_x".into(),
-        args: vec!["v_i".into()],
-        distinct_sql: "SELECT DISTINCT 1 AS sd_v, 1 AS sd_a0".into(),
+        args: vec!["1".into()],
+        distinct_sql: "SELECT 1".into(),
         binds: vec![],
     };
     let fn_insert = IrStmt::SqlExec {
-        sql: "INSERT INTO t (a) VALUES (1)".into(),
+        sql: "INSERT INTO t (a) VALUES ((SELECT sd_v FROM sd_fn0 WHERE sd_a0 IS NOT DISTINCT FROM (1)))"
+            .into(),
         binds: vec![],
         fn_sites: vec![site],
     };
-    let ex = FakeExecutor::default();
-    let mut f = Frame::new();
-    let mut sink = crate::exec::TraceNoopSink;
-    let cat = crate::catalog::RoutineCatalog::new();
-    // 复核建议 5：预置同表缓冲行使回落分支的 flush_if_touches 真实执行，
-    // 并断言顺序（先刷盘 → 再物化 → 再下发 INSERT）
+    // fn_sites INSERT 在前、普通 INSERT 在后：同前缀续攒合并为一条多值语句
+    // （若普通行在前，fn_sites 的读自己写刷盘会先把普通行刷出——见 writebuf 语义②）。
     let prog = IrProg {
         code: vec![
+            fn_insert,
             IrStmt::SqlExec {
                 sql: "INSERT INTO t (a) VALUES ('x')".into(),
                 binds: vec![],
                 fn_sites: vec![],
             },
-            fn_insert,
         ],
         ..IrProg::default()
     };
+    let mut f = Frame::new();
+    let mut sink = crate::exec::TraceNoopSink;
     let out = run_with_catalog(
         &prog,
         &mut f,
@@ -279,21 +300,30 @@ fn should_fall_back_to_immediate_exec_for_insert_with_fn_sites_when_batch_commit
     );
     assert_eq!(out.unwrap(), RunOutcome::Completed);
     let calls = ex.calls();
-    let ins_pos = calls
-        .iter()
-        .position(|(s, _)| s.starts_with("INSERT INTO t"))
-        .expect("带下沉的 INSERT 必须原样即时下发，不得进入缓冲");
-    let mat_pos = calls
-        .iter()
-        .position(|(s, _)| s.contains("CREATE OR REPLACE TEMP TABLE sd_fn0"))
-        .expect("fn_sites 必须先物化（temp table 建立）");
     assert!(
-        ins_pos < mat_pos,
-        "缓冲的 t 行必须先刷盘（calls[0]），再物化 sd_fn0；实际: {calls:?}"
+        !calls
+            .iter()
+            .any(|(s, _)| s.contains("CREATE OR REPLACE TEMP TABLE")),
+        "内联入批直接求值例程，不应创建 sd_fnN 临时表: {calls:?}"
     );
     assert!(
-        calls[0].0.starts_with("INSERT INTO t"),
-        "首条下发必须是刷盘的合并 INSERT，实际: {calls:?}"
+        calls.iter().any(|(s, _)| s == "SELECT 1"),
+        "例程元组查询须在 push 时下发（求值时机与即时路径同）: {calls:?}"
+    );
+    let inserts: Vec<&String> = calls
+        .iter()
+        .filter(|(s, _)| s.starts_with("INSERT INTO t"))
+        .map(|(s, _)| s)
+        .collect();
+    assert_eq!(
+        inserts.len(),
+        1,
+        "fn_sites INSERT 须内联后与普通 INSERT 合并为一条多值语句: {calls:?}"
+    );
+    assert!(
+        inserts[0].contains("(2)") && inserts[0].contains("('x')"),
+        "合并语句须含内联例程值 2 与缓冲行 'x': {}",
+        inserts[0]
     );
 }
 

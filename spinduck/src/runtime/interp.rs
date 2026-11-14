@@ -16,6 +16,7 @@ mod binds;
 mod cursors;
 mod dynamic;
 mod flow;
+mod fnsites_batch;
 mod routine;
 mod sqlstmts;
 mod trace;
