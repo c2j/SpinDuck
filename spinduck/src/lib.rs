@@ -9,7 +9,7 @@ pub mod cli;
 pub mod engine;
 pub mod error;
 pub mod exec;
-pub(crate) mod gate;
+pub mod gate;
 pub mod io;
 pub mod ir;
 pub(crate) mod lookup_cache;
