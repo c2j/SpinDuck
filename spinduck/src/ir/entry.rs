@@ -107,15 +107,27 @@ pub fn compile_routine_with_names(
                     expr: init,
                 });
             }
-            // PRAGMA AUTONOMOUS_TRANSACTION：GaussDB 自治事务，解释器未实现，
-            // DuckDB 亦无对应物——编译期显式拒绝（ENG-0071，设计 V4 §4.4 Gate 2A）。
-            // 其余 PRAGMA 暂无消费语义，维持忽略。
+            // TYPE .. IS TABLE OF / VARRAY：集合类型解释器未实现，编译期显式
+            // 拒绝（ENG-0071，设计 V4 §4.4 Gate 2A）；RECORD/REF CURSOR 暂不涉及。
+            PlDeclaration::Type(
+                ogsql_parser::ast::plpgsql::PlTypeDecl::TableOf { .. }
+                | ogsql_parser::ast::plpgsql::PlTypeDecl::VarrayOf { .. },
+            ) => {
+                return Err(EngineError::invariant(
+                    71,
+                    "TYPE .. IS TABLE OF / VARRAY is not supported",
+                ));
+            }
+            // PRAGMA AUTONOMOUS_TRANSACTION / EXCEPTION_INIT：解释器均未实现
+            // （后者静默丢弃会让 `WHEN <name>` 永不命中）——编译期显式拒绝
+            // （ENG-0071，设计 V4 §4.4 Gate 2A）。其余 PRAGMA 维持忽略。
             PlDeclaration::Pragma { name, .. }
-                if name.eq_ignore_ascii_case("autonomous_transaction") =>
+                if name.eq_ignore_ascii_case("autonomous_transaction")
+                    || name.eq_ignore_ascii_case("exception_init") =>
             {
                 return Err(EngineError::invariant(
                     71,
-                    "PRAGMA AUTONOMOUS_TRANSACTION is not supported",
+                    "PRAGMA AUTONOMOUS_TRANSACTION / EXCEPTION_INIT is not supported",
                 ));
             }
             // RECORD/TYPE/PRAGMA/嵌套例程：v1 不影响帧布局（嵌套例程 M9）

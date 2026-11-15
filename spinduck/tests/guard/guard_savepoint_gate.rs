@@ -81,6 +81,31 @@ fn should_reject_autonomous_transaction_pragma_with_eng_0071() {
 }
 
 #[test]
+fn should_reject_exception_init_pragma_with_eng_0071() {
+    // PRAGMA EXCEPTION_INIT：异常名→SQLSTATE 绑定解释器未实现，静默丢弃会让
+    // 后续 `WHEN <name>` 永远不命中——编译期显式拒绝（ENG-0071）
+    let err = register_err(
+        "CREATE OR REPLACE PROCEDURE prc_ei IS \
+         PRAGMA EXCEPTION_INIT; BEGIN NULL; END;",
+    );
+    assert_eq!(err.code.to_string(), "ENG-0071", "{err:?}");
+}
+
+#[test]
+fn should_reject_collection_type_decl_with_eng_0071() {
+    // TYPE .. IS TABLE OF / VARRAY：集合类型解释器未实现，曾被声明段静默丢弃
+    for decl in [
+        "TYPE t_num IS TABLE OF NUMBER;",
+        "TYPE t_vc IS VARRAY(10) OF VARCHAR2;",
+    ] {
+        let err = register_err(&format!(
+            "CREATE OR REPLACE PROCEDURE prc_ty IS {decl} BEGIN NULL; END;"
+        ));
+        assert_eq!(err.code.to_string(), "ENG-0071", "{decl}: {err:?}");
+    }
+}
+
+#[test]
 fn should_not_reject_savepoint_text_inside_string_literal() {
     // AST-only 判定：字符串字面量中的同名文本不是语句，不得误杀
     let mut eng = engine();
