@@ -1,6 +1,6 @@
 [package]
 name = "spinduck"
-version = "0.1.21"
+version = "0.2.1"
 edition = "2021"
 description = "GaussDB stored-procedure engine on DuckDB kernel"
 license = "MIT OR Apache-2.0"
@@ -47,6 +47,10 @@ toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
+
+[[test]]
+name = "guard_set_oriented"
+path = "tests/guard/guard_set_oriented.rs"
 
 [[test]]
 name = "guard_dummy_fold"

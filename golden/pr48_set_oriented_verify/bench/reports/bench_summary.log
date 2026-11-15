@@ -1,0 +1,19 @@
+=== PR#48 purchase 同形可转换过程 100k 三方基准 ===
+CLI: spinduck 0.1.21  head: f62787d95fa82fb442147809978b0250ea0bb48c  轮数: 3  构建: debug
+数据: 100000 行同源（CSV 转移），源行数 SpinDuck=100000 Reference=100000
+
+方 | 中位墙钟(ms) | 各轮(ms) | 口径
+SpinDuck OFF（解释器游标 RBAR） | 83115.398 | 81864.693 83115.398 84087.997 | CLI call 端到端
+SpinDuck ON（集合化 INSERT...SELECT） | 924.236 | 889.986 949.698 924.236 | CLI call 端到端
+openGauss 原生（plpgsql 游标 RBAR） | 1363.675 | 1363.675 1409.914 1344.844 | 纯函数执行(clock_timestamp)
+
+SpinDuck 固定开销（noop call 中位）: 183.293 ms（进程启动+开 100k 库+注册+事务）
+OFF→ON 加速比: 89.9×（同为 CLI 端到端口径）
+
+数据一致性: 三方目标表排序后逐行比对 = OK
+目标行数: ON=100000 OFF=100000 REF=100000（均 100000）
+ON 判定: SET_ORIENTED prc_copy_purchase_so converted
+
+口径说明: SpinDuck 为 CLI 端到端墙钟（含固定开销 183.293 ms）；参照为纯函数执行。
+ON 墙钟主要由固定开销+落盘提交构成，净集合化执行远小于墙钟（进程内探针 100k 约 50ms 佐证）。
+debug 构建绝对值仅证明方向与量级，非 release 承诺。

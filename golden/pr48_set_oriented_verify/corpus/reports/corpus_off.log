@@ -1,0 +1,8 @@
+### fnc_com_getday
+RETURN 20250716
+### fnc_com_if_deal_date
+RETURN 0
+### fnc_get_purchase_js_days
+RETURN 0
+### pkg_split_trade_step3_sh.prc_trd_deal_purchase
+OUT p_o_succeed = 0

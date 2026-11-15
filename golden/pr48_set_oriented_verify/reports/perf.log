@@ -1,0 +1,47 @@
+warning: field `jobs` is never read
+  --> src/cli/run/io.rs:22:5
+   |
+18 | pub(super) struct MaterializeParts {
+   |                   ---------------- field in this struct
+...
+22 |     jobs: Option<usize>,
+   |     ^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `where_clause`, `mode`, `slice`, and `key` are never read
+  --> src/cli/run/io.rs:46:5
+   |
+42 | pub(super) struct SyncParts {
+   |                   --------- fields in this struct
+...
+46 |     where_clause: Option<String>,
+   |     ^^^^^^^^^^^^
+47 |     mode: Option<String>,
+   |     ^^^^
+48 |     slice: Option<String>,
+   |     ^^^^^
+49 |     key: Option<String>,
+   |     ^^^
+
+warning: `spinduck` (lib) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running tests/zz_pr48_probe.rs (/Users/c2j/Projects/Desktop_Projects/DOTA/SpinDuck/spinduck/target/debug/deps/zz_pr48_probe-0c1aecc38172d473)
+
+running 1 test
+
+=== PR#48 RBAR 消除基准（DuckDB 1.5.5 bundled, in-memory, 单线程调用, debug 构建）===
+规模 | 模式 | 三轮墙钟(ms) | 业务SqlExec | 备注
+     3 | OFF | [2.919833, 2.872625, 2.629667] | 3 | 逐行INSERT
+     3 | ON  | [11.907, 11.804208000000001, 11.837458] | 1 | 含2次元数据查询(不入trace)
+  1000 | OFF | [447.409292, 446.57175, 427.35774999999995] | 1000 | 逐行INSERT
+  1000 | ON  | [11.242834, 11.110750000000001, 11.041875] | 1 | 含2次元数据查询(不入trace)
+ 20000 | OFF | [8833.225042, 8876.507291, 8854.398542] | 20000 | 逐行INSERT
+ 20000 | ON  | [18.210834, 18.513624999999998, 18.193167] | 1 | 含2次元数据查询(不入trace)
+test probe_perf_rbar_elimination has been running for over 60 seconds
+100000 | OFF | [46634.427707999996, 45209.77175, 44493.902125] | 100000 | 逐行INSERT
+100000 | ON  | [48.098875, 49.697958, 52.666790999999996] | 1 | 含2次元数据查询(不入trace)
+test probe_perf_rbar_elimination ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 165.34s
+

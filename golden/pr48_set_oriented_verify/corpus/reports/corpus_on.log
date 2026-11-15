@@ -1,0 +1,12 @@
+### fnc_com_getday
+SET_ORIENTED fnc_com_getday skipped reason=UnsupportedControlFlow
+RETURN 20250716
+### fnc_com_if_deal_date
+SET_ORIENTED fnc_com_if_deal_date skipped reason=UnsupportedControlFlow
+RETURN 0
+### fnc_get_purchase_js_days
+SET_ORIENTED FNC_GET_PURCHASE_JS_DAYS skipped reason=ExceptionScopePresent
+RETURN 0
+### pkg_split_trade_step3_sh.prc_trd_deal_purchase
+SET_ORIENTED pkg_split_trade_step3_sh.prc_trd_deal_purchase skipped reason=ExceptionScopePresent
+OUT p_o_succeed = 0

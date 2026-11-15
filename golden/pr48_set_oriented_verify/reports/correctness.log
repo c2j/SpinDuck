@@ -1,0 +1,91 @@
+warning: field `jobs` is never read
+  --> src/cli/run/io.rs:22:5
+   |
+18 | pub(super) struct MaterializeParts {
+   |                   ---------------- field in this struct
+...
+22 |     jobs: Option<usize>,
+   |     ^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `where_clause`, `mode`, `slice`, and `key` are never read
+  --> src/cli/run/io.rs:46:5
+   |
+42 | pub(super) struct SyncParts {
+   |                   --------- fields in this struct
+...
+46 |     where_clause: Option<String>,
+   |     ^^^^^^^^^^^^
+47 |     mode: Option<String>,
+   |     ^^^^
+48 |     slice: Option<String>,
+   |     ^^^^^
+49 |     key: Option<String>,
+   |     ^^^
+
+warning: `spinduck` (lib) generated 2 warnings
+   Compiling spinduck v0.1.21 (/Users/c2j/Projects/Desktop_Projects/DOTA/SpinDuck-pr48-verify/spinduck)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.24s
+     Running tests/zz_pr48_probe.rs (/Users/c2j/Projects/Desktop_Projects/DOTA/SpinDuck/spinduck/target/debug/deps/zz_pr48_probe-0c1aecc38172d473)
+
+running 4 tests
+PASS [select_expression] -> Skipped(UnprovenExpression)
+CHAR [quoted_mixed_case_columns] 等价 OK，选择=Skipped { reason: UnsupportedWrite }
+PASS [plain_copy] -> Converted
+PASS [select_where] -> Skipped(UnprovenExpression)
+CHAR [quoted_mixed_case_table] 等价 OK，选择=Skipped { reason: UnprovenExpression }
+PASS [mixed_case_unquoted] -> Converted
+PASS [select_alias] -> Skipped(UnprovenExpression)
+CHAR [quoted_insert_columns] 等价 OK，选择=Skipped { reason: UnsupportedWrite }
+test probe_case_sensitivity_edges ... ok
+PASS [quoted_select_columns] -> Converted
+PASS [select_qualified] -> Skipped(UnprovenExpression)
+PASS [insert_column_reordered] -> Converted
+PASS [select_star] -> Skipped(UnprovenExpression)
+PASS [select_order_by] -> Skipped(UnprovenExpression)
+PASS [select_extra_unused_column] -> Converted
+PASS [select_limit] -> Skipped(UnprovenExpression)
+PASS [empty_source] -> Converted
+PASS [select_distinct] -> Skipped(UnprovenExpression)
+PASS [batch_commit_combo] -> Skipped(BatchCommitEnabled)
+test probe_positive_controls ... ok
+PASS [select_join] -> Skipped(UnprovenExpression)
+set_oriented=false: SqlExec=1000 Fetch=1001 rows=Int(1000)
+PASS [insert_expression] -> Skipped(UnsupportedWrite)
+set_oriented=true: SqlExec=1 Fetch=0 rows=Int(1000)
+test probe_trace_roundtrip_counts ... ok
+PASS [insert_literal] -> Skipped(UnsupportedWrite)
+PASS [if_branch_in_loop] -> Skipped(UnsupportedControlFlow)
+PASS [select_into_in_loop] -> Skipped(UnsupportedControlFlow)
+PASS [loop_carried_accumulator] -> Skipped(UnsupportedControlFlow)
+PASS [out_param_assigned_in_loop] -> Skipped(UnsupportedControlFlow)
+PASS [explicit_fetch_into_scalars] -> Skipped(UnsupportedControlFlow)
+PASS [commit_inside_loop] -> Skipped(TransactionBoundaryInsideLoop)
+PASS [call_empty_proc_in_loop] -> Skipped(UnsupportedCall)
+PASS [execute_immediate_in_loop] -> Skipped(DynamicSql)
+PASS [exception_handler_outer] -> Skipped(ExceptionScopePresent)
+PASS [update_instead_of_insert] -> Skipped(UnsupportedWrite)
+PASS [delete_instead_of_insert] -> Skipped(UnsupportedWrite)
+PASS [two_inserts_in_loop] -> Skipped(UnsupportedControlFlow)
+PASS [nested_loop] -> Skipped(UnsupportedControlFlow)
+PASS [source_equals_target] -> Skipped(TargetReadDependency)
+PASS [type_mismatch_int] -> Skipped(UnprovenTargetConstraints)
+PASS [nullable_to_notnull] -> Skipped(UnprovenTargetConstraints)
+PASS [unique_index] -> Skipped(UnprovenTargetConstraints)
+PASS [primary_key] -> Skipped(UnprovenTargetConstraints)
+PASS [check_constraint] -> Skipped(UnprovenTargetConstraints)
+PASS [default_value] -> Skipped(UnprovenTargetConstraints)
+PASS [extra_target_column] -> Skipped(UnprovenTargetConstraints)
+PASS [decimal_columns] -> Skipped(UnknownObjectDependency)
+PASS [date_columns] -> Skipped(UnknownObjectDependency)
+PASS [double_columns] -> Skipped(UnknownObjectDependency)
+PASS [view_source] -> Skipped(UnknownObjectDependency)
+PASS [missing_source] -> Skipped(UnknownObjectDependency)
+PASS [temp_table_source] -> Skipped(UnknownObjectDependency)
+PASS [parameterized_cursor] -> Skipped(UnprovenExpression)
+PASS [record_name_collides_param] -> Skipped(LiveOutState)
+test probe_boundary_matrix ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 2.32s
+

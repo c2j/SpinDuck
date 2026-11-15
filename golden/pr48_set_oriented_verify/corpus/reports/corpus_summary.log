@@ -1,0 +1,11 @@
+=== PR#48 真实语料集合化验证（case_corpus_purchase，纯 CLI，空种子确定性路径）===
+CLI: spinduck 0.1.21  head: f62787d95fa82fb442147809978b0250ea0bb48c
+
+例程 | ON 判定 | 业务输出（ON==OFF）
+fnc_com_getday skipped reason=UnsupportedControlFlow|RETURN 20250716
+fnc_com_if_deal_date skipped reason=UnsupportedControlFlow|RETURN 0
+FNC_GET_PURCHASE_JS_DAYS skipped reason=ExceptionScopePresent|RETURN 0
+pkg_split_trade_step3_sh.prc_trd_deal_purchase skipped reason=ExceptionScopePresent|OUT p_o_succeed = 0
+
+等价性：ON 去 SET_ORIENTED 行后与 OFF 逐字一致（diff 为空）。
+结论：四个语料例程全部 Skipped——PR#48 集合化不在真实生产语料上触发，准入边界保守。

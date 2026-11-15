@@ -1,0 +1,2 @@
+SET_ORIENTED prc_copy_purchase_so converted
+CALL prc_copy_purchase_so OK
