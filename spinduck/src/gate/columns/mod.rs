@@ -8,15 +8,20 @@
 //! - 标识符若命中例程变量名（参数 + DECLARE 变量/记录/游标/嵌套
 //!   例程参数，整条语句级并集），按 PL 变量解释跳过——内嵌 SQL 与
 //!   游标/EXECUTE/FOR 查询共用此口径；
-//! - DML 目标列清单、`%TYPE`/`%ROWTYPE` 锚点、记录字段、三段以上
-//!   限定名、`agg_from` 表函数引用留待后续切片。
+//! - 记录字段、三段以上限定名、`agg_from` 表函数引用、MERGE
+//!   语句不在本切片判定。
 
+mod dml;
 mod expr;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use ogsql_parser::ast::plpgsql::PlDeclaration;
 use ogsql_parser::ast::visitor::{walk_statement, Visitor, VisitorResult};
-use ogsql_parser::ast::{Ident, ObjectName, SelectStatement, SelectTarget, Statement, TableRef};
+use ogsql_parser::ast::{
+    DeleteStatement, Ident, InsertStatement, ObjectName, SelectStatement, SelectTarget, Statement,
+    TableRef, UpdateStatement, WithClause,
+};
 
 use super::schema::{object_key, SchemaSnapshot};
 
@@ -27,7 +32,8 @@ pub struct MissingColumn {
     pub qualifier: Option<String>,
     /// 列名（归一化小写）。
     pub column: String,
-    /// 问题类别：`"missing"` / `"ambiguous"`。
+    /// 问题类别：`"missing"` / `"ambiguous"` / `"missing_table"`
+    /// （`%TYPE`/`%ROWTYPE` 锚点对象不存在）。
     pub problem: &'static str,
 }
 
@@ -148,6 +154,28 @@ impl Visitor for Gate<'_> {
         self.select(sel, &Scope::new(), &CteCols::new());
         VisitorResult::SkipChildren
     }
+
+    fn visit_insert(&mut self, i: &InsertStatement) -> VisitorResult {
+        self.dml_insert(i);
+        VisitorResult::SkipChildren
+    }
+
+    fn visit_update(&mut self, u: &UpdateStatement) -> VisitorResult {
+        self.dml_update(u);
+        VisitorResult::SkipChildren
+    }
+
+    fn visit_delete(&mut self, d: &DeleteStatement) -> VisitorResult {
+        self.dml_delete(d);
+        VisitorResult::SkipChildren
+    }
+
+    fn visit_pl_declaration(&mut self, decl: &PlDeclaration) -> VisitorResult {
+        // %TYPE/%ROWTYPE 锚点校验；返回 Continue 让游标 parsed_query
+        // 等子节点继续走正常 walk（内嵌 SQL 由各 visit_* 钩子覆盖）。
+        self.pl_decl(decl);
+        VisitorResult::Continue
+    }
 }
 
 impl Gate<'_> {
@@ -156,19 +184,7 @@ impl Gate<'_> {
     /// `ctes` = 继承的 CTE 列映射。
     fn select(&mut self, sel: &SelectStatement, parent: &Scope, ctes: &CteCols) {
         // 1. 本层 CTE：名称 → 输出列（显式列清单优先，否则投影推导）。
-        let mut local_ctes = ctes.clone();
-        if let Some(w) = &sel.with {
-            for c in &w.ctes {
-                let cols = if !c.columns.is_empty() {
-                    Cols::Known(c.columns.iter().map(|n| n.to_ascii_lowercase()).collect())
-                } else {
-                    projection_cols(&c.query)
-                        .map(Cols::Known)
-                        .unwrap_or(Cols::Unknown)
-                };
-                local_ctes.insert(c.name.to_ascii_lowercase(), cols);
-            }
-        }
+        let local_ctes = with_ctes(&sel.with, ctes);
         // 2. FROM 作用域
         let local = self.scope_from_refs(&sel.from, &local_ctes);
         let mut vis = local;
@@ -460,6 +476,24 @@ fn view_cols(v: &super::schema::ViewDef) -> Cols {
     }
 }
 
+/// `WITH` 子句 → CTE 列映射（叠加在继承映射上；后者同名遮蔽）。
+fn with_ctes(with: &Option<WithClause>, base: &CteCols) -> CteCols {
+    let mut m = base.clone();
+    if let Some(w) = with {
+        for c in &w.ctes {
+            let cols = if !c.columns.is_empty() {
+                Cols::Known(c.columns.iter().map(|n| n.to_ascii_lowercase()).collect())
+            } else {
+                projection_cols(&c.query)
+                    .map(Cols::Known)
+                    .unwrap_or(Cols::Unknown)
+            };
+            m.insert(c.name.to_ascii_lowercase(), cols);
+        }
+    }
+    m
+}
+
 /// 子查询/CTE 的输出列名：全部投影项带显式别名才可静态确定；
 /// 含 `*` 或无别名表达式 → `None`（Unknown）。
 fn projection_cols(sel: &SelectStatement) -> Option<BTreeSet<String>> {
@@ -607,6 +641,73 @@ mod tests {
         assert_eq!(
             missing(sql, &snap),
             [(None, "bad_col".to_string(), "missing")]
+        );
+    }
+
+    #[test]
+    fn should_flag_insert_column_list_missing() {
+        let snap = snap_of("CREATE TABLE t1(a INT, b INT)");
+        assert_eq!(
+            missing("INSERT INTO t1(nope) SELECT a FROM t1", &snap),
+            [(Some("t1".to_string()), "nope".to_string(), "missing")]
+        );
+        assert!(missing("INSERT INTO t1(a, b) SELECT a, b FROM t1", &snap).is_empty());
+    }
+
+    #[test]
+    fn should_check_update_and_delete_column_scopes() {
+        let snap = snap_of("CREATE TABLE t1(a INT, b INT); CREATE TABLE t2(c INT)");
+        // UPDATE 右值/WHERE/SET 左列
+        assert_eq!(
+            missing("UPDATE t1 SET a = bad_rhs WHERE b = 1", &snap),
+            [(None, "bad_rhs".to_string(), "missing")]
+        );
+        assert_eq!(
+            missing("UPDATE t1 SET nope = 1", &snap),
+            [(None, "nope".to_string(), "missing")]
+        );
+        assert_eq!(
+            missing("DELETE FROM t1 WHERE nope = 1", &snap),
+            [(None, "nope".to_string(), "missing")]
+        );
+        assert!(missing("UPDATE t1 SET a = 1 WHERE b = 2", &snap).is_empty());
+        assert!(missing("DELETE FROM t1 WHERE a = 1", &snap).is_empty());
+    }
+
+    #[test]
+    fn should_check_update_from_scope() {
+        let snap = snap_of("CREATE TABLE t1(a INT); CREATE TABLE t2(b INT)");
+        assert!(missing("UPDATE t1 SET a = t2.b FROM t2", &snap).is_empty());
+        assert_eq!(
+            missing("UPDATE t1 SET a = t2.nope FROM t2", &snap),
+            [(Some("t2".to_string()), "nope".to_string(), "missing")]
+        );
+    }
+
+    #[test]
+    fn should_check_percent_type_and_rowtype_anchors() {
+        let snap = snap_of("CREATE TABLE t1(a INT, b INT)");
+        // %TYPE 列存在 → 放行；列缺失/表缺失 → 上报
+        let ok = "CREATE PROCEDURE p IS v_a t1.a%TYPE; BEGIN NULL; END;";
+        assert!(missing(ok, &snap).is_empty(), "{:?}", missing(ok, &snap));
+        let bad_col = "CREATE PROCEDURE p IS v_a t1.nope%TYPE; BEGIN NULL; END;";
+        assert_eq!(
+            missing(bad_col, &snap),
+            [(Some("t1".to_string()), "nope".to_string(), "missing")]
+        );
+        let bad_tbl = "CREATE PROCEDURE p IS v_a ghost.x%TYPE; BEGIN NULL; END;";
+        assert_eq!(
+            missing(bad_tbl, &snap),
+            [(Some("ghost".to_string()), "x".to_string(), "missing_table")]
+        );
+        let bad_row = "CREATE PROCEDURE p IS r t1%ROWTYPE; v_g ghost%ROWTYPE; BEGIN NULL; END;";
+        assert_eq!(
+            missing(bad_row, &snap),
+            [(
+                Some("ghost".to_string()),
+                "%rowtype".to_string(),
+                "missing_table"
+            )]
         );
     }
 }

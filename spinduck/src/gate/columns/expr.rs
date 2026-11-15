@@ -7,7 +7,12 @@ use super::{Cols, CteCols, Gate, Scope};
 
 impl Gate<'_> {
     /// 列引用判定：`qualifier=None` 非限定，`Some(q)` 限定。
-    fn missing(&mut self, qualifier: Option<String>, column: String, problem: &'static str) {
+    pub(super) fn missing(
+        &mut self,
+        qualifier: Option<String>,
+        column: String,
+        problem: &'static str,
+    ) {
         self.out.push(super::MissingColumn {
             qualifier,
             column,
@@ -26,7 +31,7 @@ impl Gate<'_> {
         }
     }
 
-    fn unqualified(&mut self, col: &str, vis: &Scope) {
+    pub(super) fn unqualified(&mut self, col: &str, vis: &Scope) {
         if self.vars.contains(col) {
             return;
         }
@@ -46,7 +51,7 @@ impl Gate<'_> {
         }
     }
 
-    fn qualified(&mut self, qual: &str, col: &str, vis: &Scope) {
+    pub(super) fn qualified(&mut self, qual: &str, col: &str, vis: &Scope) {
         if self.vars.contains(qual) {
             // record.field 形态：首段为 PL 变量
             return;
