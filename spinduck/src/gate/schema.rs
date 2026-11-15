@@ -10,7 +10,7 @@ use ogsql_parser::ast::{AlterTableAction, DataType, Ident, ObjectName, Statement
 
 /// 限定名归一化：未加引号部分小写，加引号部分保留原样（与 GaussDB
 /// 折叠语义一致；SpinDuck 例程名同口径）。
-fn object_key(name: &ObjectName) -> String {
+pub(crate) fn object_key(name: &ObjectName) -> String {
     name.iter()
         .map(|i: &Ident| {
             if i.quote_style.is_some() {

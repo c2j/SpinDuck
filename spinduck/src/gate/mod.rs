@@ -3,6 +3,7 @@
 //! 编译期显式拒绝（`ENG-0071`）。判定只看 AST，不做文本/关键字匹配，
 //! 字符串字面量与注释中的同名文本不经过此处。
 
+pub mod check;
 pub mod schema;
 
 use crate::error::EngineError;
