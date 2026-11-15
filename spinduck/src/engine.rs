@@ -74,6 +74,11 @@ impl Engine {
             .tokenize()
             .map_err(|e| EngineError::invariant(63, format!("tokenizer: {e}")))?;
         let stmts = ogsql_parser::parser::Parser::new(tokens).parse();
+        // Gate 2A 顶层 DDL 拦截（设计 V4 §4.4）：方言/内核不支持的 DDL 在
+        // 例程登记前显式拒绝，避免随非例程语句被静默放过。
+        for st in &stmts {
+            crate::gate::reject_unsupported_ddl(st)?;
+        }
         let mut names = Vec::new();
         for st in &stmts {
             names.extend(self.register_statement_named(st)?);
