@@ -1,0 +1,22 @@
+=== PR#48 原始 purchase 主过程 100k 边界实证（Part B）===
+CLI: spinduck 0.1.21  head: f62787d95fa82fb442147809978b0250ea0bb48c  构建: debug  step-budget: 100000000
+过程: pkg_split_trade_step3_sh.prc_trd_deal_purchase（真实语料，逐字）
+数据: 100000 行同源种子（命中游标过滤 + F001 资金路径，确定性路径 kind_id='0'）
+
+方 | 墙钟(ms) | 集合化判定 | 目标行数
+SpinDuck OFF（解释器游标 RBAR） | 429535.801 | feature 关，无判定行 | 100000
+SpinDuck ON（set_oriented=true） | 469231.804 | skipped ExceptionScopePresent | 100000
+openGauss 原生参照 | 不可基线 | — | —
+
+数据一致性: ON/OFF 目标表 dat_trd_repurchase 排序后逐行比对 = OK（均 100000 行）
+业务输出: ON 去 SET_ORIENTED 行后与 OFF 逐字一致（diff 为空）。
+
+结论:
+  1) 原始过程含异常域/子调用/多写 → Skipped(ExceptionScopePresent)，集合化不触发。
+  2) Skipped ⇒ ON≡OFF：墙钟同量级（差异为 debug 测量噪声），目标逐行一致，零收益零分歧。
+  3) 判定为编译期 IR 结构分析，与数据量无关——100k 与空种子判定相同。
+  4) 参照限制（V21）: 原始过程须经 CALL，amd64 postmaster 在 procedure CALL 崩溃，
+     故参照无法对完整原始过程基线；Part A 参照用 FUNCTION 不受此限。
+
+口径: SpinDuck 为 CLI call 端到端墙钟（含进程启动+开库+注册+事务固定开销，约 180ms）；
+debug 构建绝对值仅证明方向与量级。单轮测时（100k 单趟约数分钟，多轮成本过高）。

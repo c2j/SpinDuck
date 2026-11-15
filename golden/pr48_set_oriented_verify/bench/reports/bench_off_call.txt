@@ -1,0 +1,1 @@
+CALL prc_copy_purchase_so OK
