@@ -2,19 +2,25 @@
 //! SQL 语句引用的表/视图对象存在性。纯函数、不写诊断文件位置——
 //! 位置与 `BIZ-0152` 归一由编排层（Stage 3A）负责。
 //!
-//! 本切片覆盖：SELECT 的 FROM 表引用树（JOIN/子查询/PIVOT/UNPIVOT/
-//! CTE/集合操作）、INSERT 目标与 SELECT 源、UPDATE/DELETE 的
-//! tables/from/using。表达式内子查询（EXISTS/IN/SOME/标量）与列级
-//! 检查在后续切片接入；`Expr` 级遗漏在接线时必须补齐，不得静默放行。
+//! 遍历复用 `ogsql-parser` 的 `Visitor`/`walk_statement`：覆盖 SELECT
+//! FROM 引用树、INSERT/UPDATE/DELETE 目标与源、表达式内子查询
+//! （EXISTS/IN/标量/SOME）、以及 PL 体内 `SqlStatement` 的内嵌 SQL。
+//! CTE 名采用**整条语句级**集合做遮蔽（V1 近似：不同 SELECT 分支的
+//! 同名 CTE 会相互遮蔽，仅影响"CTE 名与真实缺失表同名"的边角场景，
+//! 已在设计评审中记录待精化）。
 
 use std::collections::BTreeSet;
 
-use ogsql_parser::ast::{ObjectName, Statement, TableRef};
+use ogsql_parser::ast::visitor::{walk_statement, Visitor, VisitorResult};
+use ogsql_parser::ast::{
+    DeleteStatement, InsertStatement, ObjectName, SelectStatement, Spanned, Statement, TableRef,
+    UpdateStatement,
+};
 
 use super::schema::{object_key, SchemaSnapshot};
 
 /// 单个缺失对象诊断（`BIZ-0152` 前的中间形态）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MissingRef {
     /// 归一化限定名（`object_key` 口径）。
     pub object: String,
@@ -22,128 +28,142 @@ pub struct MissingRef {
     pub kind: &'static str,
 }
 
-/// 检查一条顶层 SQL 语句的对象引用；返回全部缺失项（不 fail-fast，
-/// 由调用方聚合排序输出）。
+/// 检查一条顶层语句（含 PL 体内嵌 SQL）的对象引用；返回去重排序后的
+/// 全部缺失项（不 fail-fast，调用方聚合输出）。
 pub fn check_statement(st: &Statement, snap: &SchemaSnapshot) -> Vec<MissingRef> {
-    let mut out = Vec::new();
-    match st {
-        Statement::Select(s) => check_select(s, snap, &mut BTreeSet::new(), &mut out),
-        Statement::Insert(i) => {
-            check_relation_target(&i.table, snap, &mut out);
-            if let ogsql_parser::ast::InsertSource::Select(q) = &i.source {
-                check_select(q, snap, &mut BTreeSet::new(), &mut out);
-            }
-        }
-        Statement::Update(u) => {
-            let ctes = cte_names(u.with.as_ref());
-            for t in u.tables.iter().chain(u.from.iter()) {
-                check_table_ref(t, snap, &ctes, &mut out);
-            }
-        }
-        Statement::Delete(d) => {
-            let ctes = cte_names(d.with.as_ref());
-            for t in d.tables.iter().chain(d.using.iter()) {
-                check_table_ref(t, snap, &ctes, &mut out);
-            }
-        }
-        _ => {}
-    }
-    out
+    // Pass 1：收集整条语句的 CTE 名（供 TableRef 遮蔽判定）
+    let mut ctes = CteNames(BTreeSet::new());
+    walk_statement(&mut ctes, st);
+    // Pass 2：引用检查
+    let mut chk = RefChecker {
+        snap,
+        ctes: &ctes.0,
+        out: Vec::new(),
+    };
+    walk_statement(&mut chk, st);
+    chk.out.sort();
+    chk.out.dedup();
+    chk.out
 }
 
-fn cte_names(with: Option<&ogsql_parser::ast::WithClause>) -> BTreeSet<String> {
-    with.map(|w| w.ctes.iter().map(|c| c.name.to_ascii_lowercase()).collect())
-        .unwrap_or_default()
-}
+/// Pass 1：CTE 名收集器（语句级并集，见模块头注释）。
+struct CteNames(BTreeSet<String>);
 
-fn check_select(
-    sel: &ogsql_parser::ast::SelectStatement,
-    snap: &SchemaSnapshot,
-    outer_ctes: &mut BTreeSet<String>,
-    out: &mut Vec<MissingRef>,
-) {
-    // CTE 名对本层及嵌套子查询可见；先登记全部名字再查各 CTE 体
-    let saved = outer_ctes.clone();
-    outer_ctes.extend(cte_names(sel.with.as_ref()));
-    if let Some(w) = &sel.with {
-        for cte in &w.ctes {
-            check_select(&cte.query, snap, outer_ctes, out);
-        }
-    }
-    for t in &sel.from {
-        check_table_ref(t, snap, outer_ctes, out);
-    }
-    if let Some(op) = &sel.set_operation {
-        match op {
-            ogsql_parser::ast::SetOperation::Union { right, .. }
-            | ogsql_parser::ast::SetOperation::Intersect { right, .. }
-            | ogsql_parser::ast::SetOperation::Except { right, .. } => {
-                check_select(right, snap, outer_ctes, out);
+impl Visitor for CteNames {
+    fn visit_select(&mut self, sel: &SelectStatement) -> VisitorResult {
+        if let Some(w) = &sel.with {
+            for c in &w.ctes {
+                self.0.insert(c.name.to_ascii_lowercase());
             }
         }
+        VisitorResult::Continue
     }
-    *outer_ctes = saved;
 }
 
-fn check_table_ref(
-    tr: &TableRef,
-    snap: &SchemaSnapshot,
-    ctes: &BTreeSet<String>,
-    out: &mut Vec<MissingRef>,
-) {
-    match tr {
-        TableRef::Table { name, .. } => {
-            if !is_cte_or_known(name, snap, ctes) {
-                out.push(MissingRef {
+/// Pass 2：FROM 表引用与 INSERT 目标的存在性检查。
+struct RefChecker<'a> {
+    snap: &'a SchemaSnapshot,
+    ctes: &'a BTreeSet<String>,
+    out: Vec<MissingRef>,
+}
+
+impl RefChecker<'_> {
+    fn known(&self, name: &ObjectName) -> bool {
+        // CTE 名是单段标识符；取 ObjectName 末段小写比较
+        if let Some(last) = name.last() {
+            if self.ctes.contains(&last.value.to_ascii_lowercase()) {
+                return true;
+            }
+        }
+        let key = object_key(name);
+        self.snap.tables.contains_key(&key)
+            || self.snap.views.contains_key(&key)
+            || self.suffix_known(name)
+    }
+
+    /// 单段未限定名的后缀匹配：`FROM t` 命中 `s.t` 形态的已知对象
+    /// （schema 限定歧义留给列检查切片细化）。
+    fn suffix_known(&self, name: &ObjectName) -> bool {
+        if name.len() != 1 {
+            return false;
+        }
+        let want = name[0].value.to_ascii_lowercase();
+        let hit = |k: &String| k.rsplit('.').next() == Some(want.as_str());
+        self.snap.tables.keys().any(hit) || self.snap.views.keys().any(hit)
+    }
+}
+
+impl Visitor for RefChecker<'_> {
+    fn visit_table_ref(&mut self, tr: &TableRef) -> VisitorResult {
+        if let TableRef::Table { name, .. } = tr {
+            if !self.known(name) {
+                self.out.push(MissingRef {
                     object: object_key(name),
                     kind: "table",
                 });
             }
         }
-        TableRef::Subquery { query, .. } => check_select(query, snap, &mut ctes.clone(), out),
-        TableRef::Join { left, right, .. } => {
-            check_table_ref(left, snap, ctes, out);
-            check_table_ref(right, snap, ctes, out);
+        // Continue：walk_table_ref 继续递归 JOIN/子查询/PIVOT 等子节点
+        VisitorResult::Continue
+    }
+
+    fn visit_insert(&mut self, i: &InsertStatement) -> VisitorResult {
+        // INSERT 目标是 ObjectName 而非 TableRef，需单独判存在性
+        // （表或可更新视图均可）。
+        if !self.known(&i.table) {
+            self.out.push(MissingRef {
+                object: object_key(&i.table),
+                kind: "table",
+            });
         }
-        TableRef::Pivot { source, .. } | TableRef::Unpivot { source, .. } => {
-            check_table_ref(source, snap, ctes, out);
+        VisitorResult::Continue
+    }
+
+    // walk_update/walk_delete 不遍历 tables/from/using 的 TableRef
+    // （ogsql-parser visitor 缺口），此处手工补齐；子查询经
+    // Spanned 包装回到 walk_statement 获得完整递归。
+    fn visit_update(&mut self, u: &UpdateStatement) -> VisitorResult {
+        for t in u.tables.iter().chain(u.from.iter()) {
+            self.check_dml_table_ref(t);
         }
-        TableRef::FunctionCall { .. } | TableRef::Values { .. } => {}
+        VisitorResult::Continue
+    }
+
+    fn visit_delete(&mut self, d: &DeleteStatement) -> VisitorResult {
+        for t in d.tables.iter().chain(d.using.iter()) {
+            self.check_dml_table_ref(t);
+        }
+        VisitorResult::Continue
     }
 }
 
-/// INSERT/UPDATE 目标关系：表或可更新视图均可。
-fn check_relation_target(name: &ObjectName, snap: &SchemaSnapshot, out: &mut Vec<MissingRef>) {
-    let key = object_key(name);
-    if snap.tables.contains_key(&key) || snap.views.contains_key(&key) || suffix_known(name, snap) {
-        return;
-    }
-    out.push(MissingRef {
-        object: key,
-        kind: "table",
-    });
-}
-
-fn is_cte_or_known(name: &ObjectName, snap: &SchemaSnapshot, ctes: &BTreeSet<String>) -> bool {
-    // CTE 名是单段标识符；取 ObjectName 末段小写比较
-    if let Some(last) = name.last() {
-        if ctes.contains(&last.value.to_ascii_lowercase()) {
-            return true;
+impl RefChecker<'_> {
+    /// DML 字段内的 TableRef 手工递归（Table/Subquery/Join/Pivot/Unpivot）；
+    /// FunctionCall/Values 内的表达式子查询为已知残留缺口（V1）。
+    fn check_dml_table_ref(&mut self, tr: &TableRef) {
+        match tr {
+            TableRef::Table { name, .. } => {
+                if !self.known(name) {
+                    self.out.push(MissingRef {
+                        object: object_key(name),
+                        kind: "table",
+                    });
+                }
+            }
+            TableRef::Subquery { query, .. } => {
+                let stmt = Statement::Select(Spanned::without_span(query.as_ref().clone()));
+                walk_statement(self, &stmt);
+            }
+            TableRef::Join { left, right, .. } => {
+                self.check_dml_table_ref(left);
+                self.check_dml_table_ref(right);
+            }
+            TableRef::Pivot { source, .. } | TableRef::Unpivot { source, .. } => {
+                self.check_dml_table_ref(source);
+            }
+            TableRef::FunctionCall { .. } | TableRef::Values { .. } => {}
         }
     }
-    let key = object_key(name);
-    snap.tables.contains_key(&key) || snap.views.contains_key(&key) || suffix_known(name, snap)
-}
-
-/// 单段未限定名的后缀匹配：`FROM t` 命中 `s.t` 形态的已知对象
-/// （schema 限定歧义留给列检查切片细化）。
-fn suffix_known(name: &ObjectName, snap: &SchemaSnapshot) -> bool {
-    if name.len() != 1 {
-        return false;
-    }
-    let want = name[0].value.to_ascii_lowercase();
-    let hit = |k: &String| k.rsplit('.').next() == Some(want.as_str());
-    snap.tables.keys().any(hit) || snap.views.keys().any(hit)
 }
 
 #[cfg(test)]
@@ -193,13 +213,19 @@ mod tests {
     }
 
     #[test]
-    fn should_recurse_subquery_and_join() {
+    fn should_recurse_subquery_join_and_expr_subquery() {
         let snap = snap_of("CREATE TABLE t1(a INT)");
         let got = missing(
             "SELECT * FROM (SELECT * FROM deep_missing) s JOIN t1 ON true",
             &snap,
         );
         assert_eq!(got, ["deep_missing"]);
+        // 表达式内子查询（IN/EXISTS）同样覆盖
+        let got = missing(
+            "SELECT * FROM t1 WHERE a IN (SELECT a FROM expr_missing)",
+            &snap,
+        );
+        assert_eq!(got, ["expr_missing"]);
     }
 
     #[test]
@@ -210,8 +236,21 @@ mod tests {
             ["ghost_t"]
         );
         assert_eq!(missing("UPDATE ghost_u SET a = 1", &snap), ["ghost_u"]);
-        assert!(missing("DELETE FROM t1 WHERE a IN (SELECT a FROM ghost_d)", &snap).is_empty());
-        // DELETE 的 USING/子查询表达式内对象留待表达式 walker 切片
+        assert_eq!(
+            missing("DELETE FROM t1 WHERE a IN (SELECT a FROM ghost_d)", &snap),
+            ["ghost_d"]
+        );
+    }
+
+    #[test]
+    fn should_flag_sql_inside_pl_body() {
+        // Gate 1B 核心场景：例程体内嵌 SQL 的缺失对象
+        let snap = snap_of("CREATE TABLE t1(a INT)");
+        let got = missing(
+            "CREATE OR REPLACE PROCEDURE p IS BEGIN INSERT INTO ghost_pl VALUES (1); END;",
+            &snap,
+        );
+        assert_eq!(got, ["ghost_pl"]);
     }
 
     #[test]
