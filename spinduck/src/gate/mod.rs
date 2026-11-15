@@ -4,6 +4,7 @@
 //! 字符串字面量与注释中的同名文本不经过此处。
 
 pub mod check;
+pub mod columns;
 pub mod schema;
 
 use crate::error::EngineError;
