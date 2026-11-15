@@ -12,10 +12,23 @@ impl Compiler {
             // NULL 是空语句（不得产生事务边界）；只有 COMMIT 才是提交标记
             PlStatement::Null => self.code.push(IrStmt::Nop),
             PlStatement::Commit { .. } => self.code.push(IrStmt::TxCommit),
-            PlStatement::Rollback { .. } => self.code.push(IrStmt::TxRollback),
-            PlStatement::Savepoint { .. }
+            PlStatement::Rollback {
+                to_savepoint: None, ..
+            } => self.code.push(IrStmt::TxRollback),
+            // 保存点家族：DuckDB 1.5.5 无 SAVEPOINT，IR 解释器亦未实现。
+            // 严禁静默编为 Nop（SAVEPOINT/RELEASE）或错编为整事务
+            // TxRollback（ROLLBACK TO <name>）——编译期显式拒绝（ENG-0071，
+            // 设计文档 V4 §4.4 Gate 2A；AST 判定，字符串字面量不经过此处）。
+            PlStatement::Rollback { .. }
+            | PlStatement::Savepoint { .. }
             | PlStatement::ReleaseSavepoint { .. }
-            | PlStatement::SetTransaction { .. } => self.code.push(IrStmt::Nop),
+            | PlStatement::SetTransaction { .. } => {
+                return Err(EngineError::invariant(
+                    71,
+                    "SAVEPOINT / ROLLBACK TO <name> / RELEASE SAVEPOINT / SET TRANSACTION \
+                     is not supported (DuckDB 1.5.5 has no savepoints or SET TRANSACTION)",
+                ));
+            }
             PlStatement::Assignment { target, expression } => {
                 let t = self.assign_target(target)?;
                 let e = self.expr(expression)?;

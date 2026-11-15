@@ -107,6 +107,17 @@ pub fn compile_routine_with_names(
                     expr: init,
                 });
             }
+            // PRAGMA AUTONOMOUS_TRANSACTION：GaussDB 自治事务，解释器未实现，
+            // DuckDB 亦无对应物——编译期显式拒绝（ENG-0071，设计 V4 §4.4 Gate 2A）。
+            // 其余 PRAGMA 暂无消费语义，维持忽略。
+            PlDeclaration::Pragma { name, .. }
+                if name.eq_ignore_ascii_case("autonomous_transaction") =>
+            {
+                return Err(EngineError::invariant(
+                    71,
+                    "PRAGMA AUTONOMOUS_TRANSACTION is not supported",
+                ));
+            }
             // RECORD/TYPE/PRAGMA/嵌套例程：v1 不影响帧布局（嵌套例程 M9）
             _ => {}
         }
