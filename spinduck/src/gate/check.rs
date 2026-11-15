@@ -78,7 +78,21 @@ impl RefChecker<'_> {
         let key = object_key(name);
         self.snap.tables.contains_key(&key)
             || self.snap.views.contains_key(&key)
+            || self.engine_provided(name)
             || self.suffix_known(name)
+    }
+
+    /// 引擎自建伪表（`sys_dummy`，口径同 `verify::ENGINE_PROVIDED_TABLES`）
+    /// 与 Oracle 兼容 `dual`：闭包内无 DDL 但运行期存在，不算 Missing。
+    fn engine_provided(&self, name: &ObjectName) -> bool {
+        if name.len() != 1 {
+            return false;
+        }
+        let want = name[0].value.to_ascii_lowercase();
+        want == "dual"
+            || crate::verify::ENGINE_PROVIDED_TABLES
+                .iter()
+                .any(|t| *t == want)
     }
 
     /// 单段未限定名的后缀匹配：`FROM t` 命中 `s.t` 形态的已知对象
@@ -251,6 +265,13 @@ mod tests {
             &snap,
         );
         assert_eq!(got, ["ghost_pl"]);
+    }
+
+    #[test]
+    fn should_accept_engine_provided_and_dual() {
+        let snap = snap_of("CREATE TABLE t1(a INT)");
+        assert!(missing("SELECT * FROM sys_dummy", &snap).is_empty());
+        assert!(missing("SELECT * FROM dual", &snap).is_empty());
     }
 
     #[test]

@@ -225,6 +225,11 @@ fn render_one(plan: &RunPlan, written: &PlanWrite, out: &mut dyn Write) -> Resul
 }
 
 /// 闭包源文件共用一个 Engine。失败不改计划，只在摘要之后按体检的 FAIL 行打出。
+///
+/// Gate 1B/2A（设计 V4 Stage 2–4）：对闭包内例程+表/视图 DDL 文件建
+/// `SchemaSnapshot` 并做对象/列引用检查，发现以 `BIZ-0152` 计入
+/// `failed`；与 `RunPlan[[missing]]` 重复的 relation 缺失去重（闭包
+/// 域已报的不重复报）。Gate 2B（Stub 库 prepare）二期接入。
 fn ir_failures(
     project: &ProjectConfig,
     plans: &[RunPlan],
@@ -233,19 +238,86 @@ fn ir_failures(
         .iter()
         .flat_map(|plan| plan.ddl_routines.iter().map(String::as_str))
         .collect();
-    if rels.is_empty() {
-        return Ok(Vec::new());
-    }
-    let paths: Vec<PathBuf> = rels.iter().map(|rel| project.root.join(rel)).collect();
-    let rules = rules_for_paths(&paths)?;
-    let mut eng = Engine::new(Box::new(NoopExecutor), rules);
     let mut failed = Vec::new();
-    for rel in rels {
-        if let Some(err) = register_file(&mut eng, &project.root.join(rel)) {
-            failed.push((rel.to_string(), err));
+    if !rels.is_empty() {
+        let paths: Vec<PathBuf> = rels.iter().map(|rel| project.root.join(rel)).collect();
+        let rules = rules_for_paths(&paths)?;
+        let mut eng = Engine::new(Box::new(NoopExecutor), rules);
+        for rel in &rels {
+            if let Some(err) = register_file(&mut eng, &project.root.join(rel)) {
+                failed.push((rel.to_string(), err));
+            }
         }
     }
+    failed.extend(gate_failures(project, plans));
+    failed.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(failed)
+}
+
+/// Gate Stage 1–3：闭包内全部 SQL 文件（例程 + 表/视图 DDL）的
+/// 解析、快照与引用检查。读失败的文件跳过（例程文件的读错误已由
+/// register_file 报出；纯 DDL 文件读错误为边角，V1 不单独归因）。
+fn gate_failures(project: &ProjectConfig, plans: &[RunPlan]) -> Vec<(String, EngineError)> {
+    let gate_rels: BTreeSet<&str> = plans
+        .iter()
+        .flat_map(|plan| {
+            plan.ddl_routines
+                .iter()
+                .chain(plan.ddl_tables.iter())
+                .map(String::as_str)
+        })
+        .collect();
+    let files: Vec<crate::gate::pipeline::GateFile> = gate_rels
+        .iter()
+        .filter_map(|rel| {
+            read_source_strict(&project.root.join(rel)).ok().map(|sql| {
+                crate::gate::pipeline::GateFile {
+                    rel: rel.to_string(),
+                    sql,
+                }
+            })
+        })
+        .collect();
+    let run = crate::gate::pipeline::run(&files);
+    let mut out = Vec::new();
+    if let Some((rel, err)) = run.schema_error {
+        out.push((rel, err));
+    }
+    let missing: BTreeSet<&str> = plans
+        .iter()
+        .flat_map(|p| p.missing.iter())
+        .map(|m| m.object.as_str())
+        .collect();
+    for f in run.findings {
+        if covered_by_plan_missing(&f, &missing) {
+            continue;
+        }
+        out.push((
+            f.file.clone(),
+            EngineError::business(152, format!("missing {} object `{}`", f.kind, f.object)),
+        ));
+    }
+    out
+}
+
+/// Gate 1B 对象级发现与 `[[missing]]` 去重：闭包域已报的
+/// `relation:<名>` 不重复报；单段名按后缀口径匹配（与
+/// `check::known` 的 suffix 规则一致）。列级发现（kind 非
+/// `"table"`）不参与去重。
+fn covered_by_plan_missing(
+    f: &crate::gate::pipeline::GateFinding,
+    missing: &BTreeSet<&str>,
+) -> bool {
+    if f.kind != "table" {
+        return false;
+    }
+    missing.iter().any(|m| {
+        let Some(name) = m.strip_prefix("relation:") else {
+            return false;
+        };
+        name == f.object
+            || (!f.object.contains('.') && name.rsplit('.').next() == Some(f.object.as_str()))
+    })
 }
 
 fn register_file(eng: &mut Engine, path: &Path) -> Option<EngineError> {

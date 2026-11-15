@@ -62,7 +62,7 @@ impl SchemaSnapshot {
         Ok(snap)
     }
 
-    fn apply(&mut self, st: &Statement) -> Result<(), EngineError> {
+    pub(crate) fn apply(&mut self, st: &Statement) -> Result<(), EngineError> {
         match st {
             Statement::CreateTable(t) => {
                 let key = object_key(&t.name);

@@ -219,7 +219,8 @@ impl Gate<'_> {
         }
     }
 
-    /// 锚点对象存在性：表/视图（精确键或单段后缀），不含 CTE/序列。
+    /// 锚点对象存在性：表/视图（精确键或单段后缀）+ 引擎自建
+    /// 伪表与 `dual`；不含 CTE/序列。
     fn object_known(&self, name: &ObjectName) -> bool {
         let key = object_key(name);
         if self.snap.tables.contains_key(&key) || self.snap.views.contains_key(&key) {
@@ -227,6 +228,13 @@ impl Gate<'_> {
         }
         if name.len() == 1 {
             let want = name[0].value.to_ascii_lowercase();
+            if want == "dual"
+                || crate::verify::ENGINE_PROVIDED_TABLES
+                    .iter()
+                    .any(|t| *t == want)
+            {
+                return true;
+            }
             let hit = |k: &String| k.rsplit('.').next() == Some(want.as_str());
             return self.snap.tables.keys().any(hit) || self.snap.views.keys().any(hit);
         }

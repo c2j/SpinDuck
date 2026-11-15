@@ -20,9 +20,13 @@ impl Gate<'_> {
         });
     }
 
-    /// 解析一个 ColumnRef（含 `(+)` 变体）。
+    /// 解析一个 ColumnRef（含 `(+)` 变体）。`*`/`t.*` 星号展开
+    /// 不做列判定（展开列集合属别名作用域的另一问题，V1 跳过）。
     fn column_ref(&mut self, name: &ogsql_parser::ast::ObjectName, vis: &Scope) {
         let segs: Vec<String> = name.iter().map(super::ident_seg).collect();
+        if segs.iter().any(|s| s == "*") {
+            return;
+        }
         match segs.len() {
             1 => self.unqualified(&segs[0], vis),
             2 => self.qualified(&segs[0], &segs[1], vis),

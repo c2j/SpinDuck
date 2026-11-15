@@ -5,6 +5,7 @@
 
 pub mod check;
 pub mod columns;
+pub mod pipeline;
 pub mod schema;
 
 use crate::error::EngineError;

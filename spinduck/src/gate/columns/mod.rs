@@ -446,6 +446,21 @@ impl Gate<'_> {
         if let Some(v) = self.snap.views.get(&key) {
             return view_cols(v);
         }
+        // 引擎自建伪表/Oracle dual：存在性成立；列集合不可静态
+        // 确定（sys_dummy 为 CTAS）→ Unknown 不判；dual 按 Oracle
+        // 口径仅 DUMMY 列。
+        if name.len() == 1 {
+            let want = name[0].value.to_ascii_lowercase();
+            if crate::verify::ENGINE_PROVIDED_TABLES
+                .iter()
+                .any(|t| *t == want)
+            {
+                return Cols::Unknown;
+            }
+            if want == "dual" {
+                return Cols::Known(BTreeSet::from(["dummy".to_string()]));
+            }
+        }
         // 单段未限定名后缀匹配（与对象级检查同口径）
         if name.len() == 1 {
             let want = name[0].value.to_ascii_lowercase();
@@ -681,6 +696,20 @@ mod tests {
         assert_eq!(
             missing("UPDATE t1 SET a = t2.nope FROM t2", &snap),
             [(Some("t2".to_string()), "nope".to_string(), "missing")]
+        );
+    }
+
+    #[test]
+    fn should_treat_engine_provided_and_dual_as_known() {
+        let snap = snap_of("CREATE TABLE t1(a INT)");
+        // sys_dummy：存在性成立、列不可静态确定 → 不判
+        assert!(missing("SELECT * FROM sys_dummy", &snap).is_empty());
+        assert!(missing("SELECT x FROM sys_dummy", &snap).is_empty());
+        // dual：Oracle 口径仅 DUMMY 列
+        assert!(missing("SELECT dummy FROM dual", &snap).is_empty());
+        assert_eq!(
+            missing("SELECT nope FROM dual", &snap),
+            [(None, "nope".to_string(), "missing")]
         );
     }
 
