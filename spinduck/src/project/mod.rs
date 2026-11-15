@@ -29,6 +29,8 @@ pub struct ProjectConfig {
     pub name: String,
     /// 目标内核版本（M1 锚定；与规则文件 probe_duckdb 一致性由 rules probe 校验）
     pub kernel: String,
+    /// `[engine].set_oriented`：默认关闭的受限静态集合化。
+    pub set_oriented: bool,
     pub ddl_dir: PathBuf,
     pub routines_dir: PathBuf,
     pub stubs_dirs: Vec<PathBuf>,
@@ -95,6 +97,23 @@ impl ProjectConfig {
     }
 }
 
+fn set_oriented_option(v: &toml::Value) -> Result<bool, EngineError> {
+    let Some(engine) = v.get("engine") else {
+        return Ok(false);
+    };
+    let table = engine
+        .as_table()
+        .ok_or_else(|| EngineError::env(30, "spinduck.toml: [engine] 必须为表"))?;
+    match table.get("set_oriented") {
+        None => Ok(false),
+        Some(toml::Value::Boolean(enabled)) => Ok(*enabled),
+        Some(_) => Err(EngineError::env(
+            30,
+            "spinduck.toml: [engine].set_oriented 必须为布尔值",
+        )),
+    }
+}
+
 fn is_runtime_snapshot(file: &Path) -> bool {
     let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -121,6 +140,17 @@ fn runtime_source(text: &str) -> Option<PathBuf> {
 }
 
 impl ProjectConfig {
+    /// 逐级发现项目，命中声明后不吞掉配置错误。
+    // 门禁与唯一调用方 cli/run/call.rs 一致用 native：gauss 蕴含 native 但不含 cli。
+    #[cfg(feature = "native")]
+    pub(crate) fn discover_strict(start: &Path) -> Result<Option<Self>, EngineError> {
+        start
+            .ancestors()
+            .find(|d| fs::project_file(d).is_some())
+            .map(Self::load)
+            .transpose()
+    }
+
     /// 从 `start` 逐级向上查找项目根（含 `spinduck.toml` 或运行态快照的目录）。
     ///
     /// 用途：CLI 编译/校验语料目录时继承所在项目的规则与入口声明，
@@ -207,6 +237,7 @@ impl ProjectConfig {
         Ok(Self {
             name: name.to_string(),
             kernel: kernel.to_string(),
+            set_oriented: set_oriented_option(&v)?,
             ddl_dir: get_path("ddl", "sql/ddl"),
             routines_dir: get_path("routines", "sql/routines"),
             stubs_dirs,

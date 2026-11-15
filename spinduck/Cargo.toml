@@ -49,6 +49,10 @@ toml = "0.8"
 tempfile = "3"
 
 [[test]]
+name = "guard_set_oriented"
+path = "tests/guard/guard_set_oriented.rs"
+
+[[test]]
 name = "guard_dummy_fold"
 path = "tests/guard/guard_dummy_fold.rs"
 

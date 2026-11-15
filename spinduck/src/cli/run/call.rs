@@ -83,6 +83,7 @@ pub(super) fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, Eng
     let objects = crate::verify::kernel_objects(&ex)?;
     let mut eng = Engine::new(Box::new(ex), rules);
     eng.batch_commit = parts.batch_commit;
+    eng.set_oriented = t.set_oriented;
     // 复核应修 C：大业务（100k 级游标循环）默认预算不够，CLI 放大入口
     if let Some(b) = parts.step_budget {
         eng.step_budget = b;
@@ -107,9 +108,11 @@ pub(super) fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, Eng
         None => None,
     };
     let res = match &mut traced {
-        Some(t) => eng.call_with_sink(&target, &args, t.sink())?,
-        None => eng.call(&target, &args)?,
+        Some(t) => eng.call_with_sink(&target, &args, t.sink()),
+        None => eng.call(&target, &args),
     };
+    render_set_oriented_reports(&eng, out)?;
+    let res = res?;
     if res.outs.is_empty() && res.return_value.is_none() {
         writeln!(out, "CALL {target} OK").map_err(io_err)?;
     } else {
@@ -174,6 +177,7 @@ fn refuse_on_kernel_gaps(
 /// `call` 目标解析产物（F1）：目标例程 + 例程源清单 + 项目规则文件集。
 #[cfg(feature = "native")]
 struct CallTargeting {
+    set_oriented: bool,
     target: String,
     sources: Vec<PathBuf>,
     rules_files: std::collections::BTreeSet<PathBuf>,
@@ -189,6 +193,7 @@ fn call_target_and_sources(
     use crate::cli::args::CallTarget;
     match &parts.target {
         CallTarget::Routine(r) => Ok(Some(CallTargeting {
+            set_oriented: project_set_oriented(&parts.files)?,
             target: r.clone(),
             sources: parts.files.clone(),
             rules_files: discover_rules_files(&parts.files),
@@ -219,6 +224,7 @@ fn call_target_and_sources(
                 .starts_with("codeweb ")
                 .then(|| plan.refs.clone());
             Ok(Some(CallTargeting {
+                set_oriented: project.set_oriented,
                 target: plan.target.clone(),
                 sources: files,
                 rules_files: project.rules_files.iter().cloned().collect(),
@@ -226,6 +232,43 @@ fn call_target_and_sources(
             }))
         }
     }
+}
+
+#[cfg(feature = "native")]
+fn project_set_oriented(files: &[PathBuf]) -> Result<bool, EngineError> {
+    let mut policy = None;
+    for file in files {
+        if let Some(project) = crate::project::ProjectConfig::discover_strict(file)? {
+            if policy.is_some_and(|p| p != project.set_oriented) {
+                return Err(EngineError::env(
+                    30,
+                    "多个项目的 [engine].set_oriented 配置冲突",
+                ));
+            }
+            policy = Some(project.set_oriented);
+        }
+    }
+    Ok(policy.unwrap_or(false))
+}
+
+#[cfg(feature = "native")]
+fn render_set_oriented_reports(
+    eng: &crate::engine::Engine,
+    out: &mut dyn Write,
+) -> Result<(), EngineError> {
+    use crate::ir::set_oriented::Status;
+    for report in eng.set_oriented_reports() {
+        match &report.status {
+            Status::Converted { .. } => writeln!(out, "SET_ORIENTED {} converted", report.routine),
+            Status::Skipped { reason } => writeln!(
+                out,
+                "SET_ORIENTED {} skipped reason={reason:?}",
+                report.routine
+            ),
+        }
+        .map_err(io_err)?;
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "native"))]
