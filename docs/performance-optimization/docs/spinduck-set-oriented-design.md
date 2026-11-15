@@ -441,7 +441,8 @@ SQL 采用 `ogsql-parser` 公共 tokenizer 的完整白名单语法，只收 `SE
 
 - `cargo fmt --all`、`cargo fmt --all -- --check`、`cargo clippy --all-features -- -D warnings`：通过。
 - `cargo test --features cli`：串行重跑全量通过，含本切片新增 16 项测试、现有 6 项 cases_native 和 110 项 CLI 契约测试。第一次运行曾受并行 all-features 构建覆盖同名 CLI 二进制影响，三项无 Gauss 边界测试报错；改为串行后通过，没有调整断言。
-- `cargo audit`：失败在获取 RustSec 公告库的网络连接，尚未产生有效审计结论；没有以忽略公告或跳过代替通过。
+- PR #46 审核阻断修复：`discover_strict` 原标注 `cli` 门禁，唯一调用方 `cli/run/call.rs` 在 `native` 门禁下，`gauss`（蕴含 native、不含 cli）构建报 E0599，CI golden 首跑失败。本地 `cargo check --features gauss --no-default-features` 复现（Red）后将门禁改为 `native`，该检查与 `cargo test --features gauss --no-run` 通过（Green），fmt/clippy/CLI 全量串行复跑通过。`--no-default-features` 构建另有 `verify::deploy::verify_project` 的 E0432，main 基线即存在（V40 已记），不在本切片改动面。
+- `cargo audit`：本地获取 RustSec 公告库网络失败；CI audit job 在 793a334 通过，以 CI 证据为准，没有新增审计豁免。
 - 未执行全量 gauss 参照测试，也未做性能/内存基准；不宣称这两项通过。
 
 **仍未完成**：完整 CFG/数据流证明、全目录/嵌套区域处理、赋值/分支/查询融合、完整 §8.2 反例矩阵、CLI 直接开关、性能与资源基准。purchase/hz 没有转换成功承诺，也未因本切片新增外部参照侧过程 CALL。此处只记录实现范围，不把局部守护通过写成完整首版验收通过。

@@ -141,7 +141,8 @@ fn runtime_source(text: &str) -> Option<PathBuf> {
 
 impl ProjectConfig {
     /// 逐级发现项目，命中声明后不吞掉配置错误。
-    #[cfg(feature = "cli")]
+    // 门禁与唯一调用方 cli/run/call.rs 一致用 native：gauss 蕴含 native 但不含 cli。
+    #[cfg(feature = "native")]
     pub(crate) fn discover_strict(start: &Path) -> Result<Option<Self>, EngineError> {
         start
             .ancestors()
