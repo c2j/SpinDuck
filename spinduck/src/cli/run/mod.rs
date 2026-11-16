@@ -4,10 +4,10 @@
 //! `compile.rs`，`call` 执行面在 `call.rs`，GaussDB 物化/回写在 `io.rs`。本文件只留
 //! `run`/`exec` 派发、退出码与 `io_err`。
 
-mod call;
+pub(crate) mod call;
 mod compile;
 mod compile_project;
-mod io;
+pub(crate) mod io;
 
 use call::{call_cmd, cmd_call};
 use compile::{compile_cmd, explain_cmd};
@@ -46,7 +46,8 @@ pub fn run(argv: &[String], out: &mut dyn Write) -> i32 {
     }
 }
 
-fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError> {
+/// 执行一次已解析的子命令（batch 编排复用：不经 argv 重解析的指令直接走这里）。
+pub(crate) fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError> {
     match cmd {
         Command::Help => {
             write!(out, "{}", usage()).map_err(io_err)?;
@@ -111,6 +112,16 @@ fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError> {
             out: out_path,
         } => crate::cli::query::query_cmd(&db, &sql_file, &out_path, out),
         Command::Compare { a, b, key } => crate::cli::compare::compare_cmd(&a, &b, &key, out),
+        Command::Batch {
+            script,
+            continue_on_error,
+            dry_run,
+        } => Ok(crate::batch::run_batch(
+            &script,
+            continue_on_error,
+            dry_run,
+            out,
+        )),
     }
 }
 

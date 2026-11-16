@@ -35,6 +35,8 @@
 use std::path::{Path, PathBuf};
 
 // crate 根的 `mod` 默认在同目录查找，这里显式指向 `tests/cli/` 下的职责子模块。
+#[path = "cli/batch.rs"]
+mod batch;
 #[path = "cli/call.rs"]
 mod call;
 #[path = "cli/compare.rs"]

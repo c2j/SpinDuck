@@ -4,9 +4,9 @@
 
 pub mod args;
 mod compare;
-mod deploy;
+pub(crate) mod deploy;
 pub mod explain;
-mod query;
+pub(crate) mod query;
 pub mod run;
 mod trace;
 

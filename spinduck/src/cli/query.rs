@@ -20,6 +20,26 @@ pub fn query_cmd(
 ) -> Result<i32, EngineError> {
     let text = crate::cli::read_source_strict(sql_file)?;
     let snap = execute(db, &text)?;
+    write_snapshot(snap, out_path, out)
+}
+
+/// batch 共享连接入口：执行器由调用方池化提供，SQL 文本已读入
+/// （「读 SQL 先于开库」的顺序契约由调用方保持——池连接在 Phase 2 才建立）。
+pub fn query_with_executor(
+    ex: &dyn crate::exec::SqlExecutor,
+    text: &str,
+    out_path: &Path,
+    out: &mut dyn Write,
+) -> Result<i32, EngineError> {
+    let snap = snapshot::capture(ex, text)?;
+    write_snapshot(snap, out_path, out)
+}
+
+fn write_snapshot(
+    snap: Snapshot,
+    out_path: &Path,
+    out: &mut dyn Write,
+) -> Result<i32, EngineError> {
     std::fs::write(out_path, snap.to_json_string())
         .map_err(|e| EngineError::env(30, format!("写 {}: {e}", out_path.display())))?;
     writeln!(
