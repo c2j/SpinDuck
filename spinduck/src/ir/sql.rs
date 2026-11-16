@@ -13,8 +13,28 @@ impl Compiler {
         statement: &ogsql_parser::ast::Statement,
     ) -> Result<(), EngineError> {
         use ogsql_parser::ast::Statement as S;
+        // Gate 2A：Oracle 系批量取数/RETURNING INTO 等构造无对应 DuckDB 语义，
+        // 显式拒绝而非静默改写（`INTO <table>` 对 SELECT 由 SqlQuery.into 承载，
+        // 仅 bulk_collect/into_table 拒绝）。
+        fn reject_pl_fetch_flags(
+            bulk_collect: bool,
+            into_table: bool,
+            returning: bool,
+            into_targets: bool,
+        ) -> Result<(), EngineError> {
+            if bulk_collect || into_table || returning || into_targets {
+                return Err(EngineError::invariant(
+                    71,
+                    "BULK COLLECT / RETURNING INTO / INTO TABLE is not supported",
+                ));
+            }
+            Ok(())
+        }
         match statement {
             S::Select(sel) => {
+                // 仅拒绝显式 BULK COLLECT；`INTO` 在非 PL 上下文会被解析器
+                // 歧义归为 into_table（PG SELECT INTO 语义），属存量行为不拦截
+                reject_pl_fetch_flags(sel.node.bulk_collect, false, false, false)?;
                 let into_targets = sel.into_targets.clone();
                 // 摘除 INTO 后经 formatter 重建 SQL 文本（DuckDB 不支持 INTO 子句）
                 let mut cleaned = sel.node.clone();
@@ -45,6 +65,24 @@ impl Compiler {
                 });
             }
             S::Insert(_) | S::Update(_) | S::Delete(_) | S::Truncate(_) => {
+                // RETURNING / RETURNING INTO / BULK COLLECT：DuckDB 无对应语义，
+                // 由 Gate 2B 的 prepare 兜底前在此显式拒绝
+                let (bulk, returning) = match statement {
+                    S::Insert(i) => (
+                        i.node.bulk_collect,
+                        !i.node.returning.is_empty() || i.node.into_targets.is_some(),
+                    ),
+                    S::Update(u) => (
+                        u.node.bulk_collect,
+                        !u.node.returning.is_empty() || u.node.into_targets.is_some(),
+                    ),
+                    S::Delete(d) => (
+                        d.node.bulk_collect,
+                        !d.node.returning.is_empty() || d.node.into_targets.is_some(),
+                    ),
+                    _ => (false, false),
+                };
+                reject_pl_fetch_flags(bulk, false, returning, false)?;
                 let unit = rewrite_sql(sql_text, &self.vars, &self.rules, &self.routine_names)?;
                 let (sql, binds, fn_sites) = (unit.text, unit.binds, unit.fn_sites);
                 self.code.push(IrStmt::SqlExec {
@@ -52,6 +90,11 @@ impl Compiler {
                     binds,
                     fn_sites,
                 });
+            }
+            // Gate 2A：MERGE INTO 无 DuckDB 1.5.5 对应语义，显式 ENG-0071
+            // （顶层 Statement::Merge 已由 gate/mod.rs 拦截，此处覆盖例程体内嵌入形态）
+            S::Merge(_) => {
+                return Err(EngineError::invariant(71, "MERGE INTO is not supported"));
             }
             other => {
                 return Err(EngineError::invariant(

@@ -75,3 +75,18 @@ fn should_keep_supported_ddl_statements() {
             .unwrap_or_else(|e| panic!("{sql} 必须照常放行: {e:?}"));
     }
 }
+
+#[test]
+fn should_reject_merge_into_with_eng_0071() {
+    // DuckDB 1.5.5 无 MERGE INTO；顶层与嵌入例程体两条路径都必须拒绝
+    assert_ddl_rejected(
+        "MERGE INTO t1 USING s1 ON t1.a = s1.a WHEN MATCHED THEN UPDATE SET t1.b = s1.b",
+    );
+    let err = engine()
+        .register(
+            "CREATE OR REPLACE PROCEDURE prc_m IS BEGIN MERGE INTO t1 USING s1 ON t1.a = s1.a \
+             WHEN MATCHED THEN UPDATE SET t1.b = s1.b; END;",
+        )
+        .expect_err("例程体内 MERGE 必须编译期拒绝");
+    assert_eq!(err.code.to_string(), "ENG-0071", "{err:?}");
+}

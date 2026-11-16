@@ -115,3 +115,23 @@ fn should_not_reject_savepoint_text_inside_string_literal() {
     )
     .expect("字符串字面量中的 SAVEPOINT 不得触发门禁");
 }
+
+#[test]
+fn should_reject_returning_into_and_bulk_collect_with_eng_0071() {
+    // Oracle 批量取数/RETURNING INTO：无 DuckDB 语义，编译期显式拒绝
+    for stmt in [
+        "UPDATE t1 SET a = 1 WHERE id = 1 RETURNING id INTO v_id",
+        "DELETE FROM t1 WHERE id = 1 RETURNING id INTO v_id",
+        "INSERT INTO t1 (a) VALUES (1) RETURNING id INTO v_id",
+        "SELECT a BULK COLLECT INTO v_ids FROM t1",
+    ] {
+        let sql = format!(
+            "CREATE OR REPLACE PROCEDURE prc_r IS \
+             v_id NUMBER; v_ids NUMBER; BEGIN {stmt}; END;"
+        );
+        let err = engine()
+            .register(&sql)
+            .expect_err("RETURNING INTO / BULK COLLECT 必须编译期拒绝");
+        assert_eq!(err.code.to_string(), "ENG-0071", "{stmt}: {err:?}");
+    }
+}
