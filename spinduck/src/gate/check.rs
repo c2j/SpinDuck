@@ -29,8 +29,14 @@ pub struct MissingRef {
 }
 
 /// 检查一条顶层语句（含 PL 体内嵌 SQL）的对象引用；返回去重排序后的
-/// 全部缺失项（不 fail-fast，调用方聚合输出）。
-pub fn check_statement(st: &Statement, snap: &SchemaSnapshot) -> Vec<MissingRef> {
+/// 全部缺失项（不 fail-fast，调用方聚合输出）。`local` 为文件级 PL
+/// 临时表名集合（`CREATE [TEMP] TABLE` 于例程体内声明）：会话级对象
+/// 不进全局快照，同文件内引用视为已知。
+pub fn check_statement(
+    st: &Statement,
+    snap: &SchemaSnapshot,
+    local: &BTreeSet<String>,
+) -> Vec<MissingRef> {
     // Pass 1：收集整条语句的 CTE 名（供 TableRef 遮蔽判定）
     let mut ctes = CteNames(BTreeSet::new());
     walk_statement(&mut ctes, st);
@@ -38,6 +44,7 @@ pub fn check_statement(st: &Statement, snap: &SchemaSnapshot) -> Vec<MissingRef>
     let mut chk = RefChecker {
         snap,
         ctes: &ctes.0,
+        local,
         out: Vec::new(),
     };
     walk_statement(&mut chk, st);
@@ -64,6 +71,8 @@ impl Visitor for CteNames {
 struct RefChecker<'a> {
     snap: &'a SchemaSnapshot,
     ctes: &'a BTreeSet<String>,
+    /// 文件级 PL 临时表（归一化限定名）。
+    local: &'a BTreeSet<String>,
     out: Vec<MissingRef>,
 }
 
@@ -80,6 +89,23 @@ impl RefChecker<'_> {
             || self.snap.views.contains_key(&key)
             || self.engine_provided(name)
             || self.suffix_known(name)
+            || self.local_known(name, &key)
+    }
+
+    /// 文件级 PL 临时表：精确键命中；单段名按末段后缀命中
+    /// （与 `suffix_known` 同口径，覆盖 `FROM tmp` 引用 `s.tmp`）。
+    fn local_known(&self, name: &ObjectName, key: &str) -> bool {
+        if self.local.contains(key) {
+            return true;
+        }
+        if name.len() == 1 {
+            let want = name[0].value.to_ascii_lowercase();
+            return self
+                .local
+                .iter()
+                .any(|k| k.rsplit('.').next() == Some(want.as_str()));
+        }
+        false
     }
 
     /// 引擎自建伪表（`sys_dummy`，口径同 `verify::ENGINE_PROVIDED_TABLES`）
@@ -200,7 +226,7 @@ mod tests {
     }
 
     fn missing(sql: &str, snap: &SchemaSnapshot) -> Vec<String> {
-        check_statement(&stmt_of(sql), snap)
+        check_statement(&stmt_of(sql), snap, &BTreeSet::new())
             .into_iter()
             .map(|m| m.object)
             .collect()
@@ -272,6 +298,26 @@ mod tests {
         let snap = snap_of("CREATE TABLE t1(a INT)");
         assert!(missing("SELECT * FROM sys_dummy", &snap).is_empty());
         assert!(missing("SELECT * FROM dual", &snap).is_empty());
+    }
+
+    #[test]
+    fn should_accept_local_temp_table_refs() {
+        // 例程体内 CREATE TEMP TABLE 声明的会话级对象：同文件引用不报缺失
+        let snap = snap_of("CREATE TABLE t1(a INT)");
+        let local: BTreeSet<String> = ["tmp_t".to_string()].into_iter().collect();
+        let got = check_statement(
+            &stmt_of(
+                "CREATE PROCEDURE p IS BEGIN \
+                 CREATE TEMP TABLE tmp_t AS SELECT a FROM t1; \
+                 INSERT INTO tmp_t SELECT a FROM t1; END;",
+            ),
+            &snap,
+            &local,
+        );
+        assert!(got.is_empty(), "{got:?}");
+        // 不在 local 集合的同名引用仍报缺失
+        let got = check_statement(&stmt_of("SELECT * FROM tmp_t"), &snap, &BTreeSet::new());
+        assert_eq!(got.len(), 1);
     }
 
     #[test]

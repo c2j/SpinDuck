@@ -11,7 +11,7 @@ use crate::error::EngineError;
 use crate::plan::codeweb::{plans_from_source, CodewebSource, EmbeddedCodewebSource};
 use crate::plan::{write_plan, PlanWrite, RunPlan};
 use crate::project::ProjectConfig;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -125,13 +125,21 @@ pub(crate) fn compile_with_source(
     }
     let missing: usize = plans.iter().map(|plan| plan.missing.len()).sum();
     let dynamic: usize = plans.iter().map(|plan| plan.dynamic.len()).sum();
+    // Gate 2B 需要 native 内核；compile 子命令当前由 cli（⊇native）承载，
+    // 此分支为未来非 native 编译路径预留的显式降级标记。
+    let gate2b = if cfg!(feature = "native") {
+        ""
+    } else {
+        " gate2b=skipped(no-native)"
+    };
     writeln!(
         out,
-        "compile: entries={} missing={} failed={} dynamic={}",
+        "compile: entries={} missing={} failed={} dynamic={}{}",
         plans.len(),
         missing,
         failed.len(),
-        dynamic
+        dynamic,
+        gate2b
     )
     .map_err(io_err)?;
     Ok(if missing == 0 && failed.is_empty() {
@@ -239,9 +247,24 @@ fn ir_failures(
         .flat_map(|plan| plan.ddl_routines.iter().map(String::as_str))
         .collect();
     let mut failed = Vec::new();
-    // Gate 2B 输入：本文件新注册例程的改写后 SQL 与下沉临时表名
-    let mut gate_sqls: Vec<(String, String)> = Vec::new();
-    let mut fn_tables: BTreeSet<String> = BTreeSet::new();
+    // Gate 2B 输入：本文件新注册例程的改写后 SQL（逐语句携带
+    // 下沉临时表与按例程归属的 [[missing]] relation 抑制名）
+    let mut gate_sqls: Vec<crate::gate::prepare::PrepareStmt> = Vec::new();
+    // `[[missing]]` 的 relation 按 `from`（引用例程全名）归属收窄：
+    // 只抑制引用方例程的 prepare，不把全计划缺失套到每条语句。
+    let mut missing_by_from: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for p in plans {
+        for m in &p.missing {
+            if let Some(n) = m.object.strip_prefix("relation:") {
+                missing_by_from
+                    .entry(m.from.to_ascii_lowercase())
+                    .or_default()
+                    .insert(n.to_string());
+            }
+        }
+    }
+    // 已失败文件：pipeline 不再重复报同一文件的 Gate 2A 拒绝
+    let mut failed_rels: BTreeSet<String> = BTreeSet::new();
     if !rels.is_empty() {
         let paths: Vec<PathBuf> = rels.iter().map(|rel| project.root.join(rel)).collect();
         let rules = rules_for_paths(&paths)?;
@@ -250,7 +273,10 @@ fn ir_failures(
         for rel in &rels {
             match read_source_strict(&project.root.join(rel)) {
                 Ok(text) => texts.push((rel.to_string(), text)),
-                Err(err) => failed.push((rel.to_string(), err)),
+                Err(err) => {
+                    failed_rels.insert(rel.to_string());
+                    failed.push((rel.to_string(), err));
+                }
             }
         }
         let stamp = crate::ir_cache::CompileGateStamp::compute(&texts, &rules);
@@ -260,6 +286,7 @@ fn ir_failures(
         for (rel, text) in &texts {
             let before: BTreeSet<String> = eng.catalog.names().into_iter().collect();
             if let Err(err) = eng.register(text) {
+                failed_rels.insert(rel.clone());
                 failed.push((rel.clone(), err));
                 continue;
             }
@@ -270,75 +297,124 @@ fn ir_failures(
                 .filter(|n| !before.contains(n))
             {
                 if let Some(r) = eng.catalog.lookup(&name) {
-                    collect_prog_sqls(rel, &r.prog, &mut gate_sqls, &mut fn_tables);
+                    collect_prog_sqls(rel, &name, &r.prog, &missing_by_from, &mut gate_sqls);
                 }
             }
         }
-        let (gate_errs, snapshot) = gate_failures(project, plans);
-        failed.extend(gate_errs);
-        if let Some(snap) = snapshot {
-            // `[[missing]]` 已报的 relation 与 Gate 1B 延迟对象同口径抑制，
-            // 避免 prepare 对同一缺失重复裁决（KERNEL-0011 vs BIZ-0152）
-            for p in plans {
-                for m in &p.missing {
-                    if let Some(n) = m.object.strip_prefix("relation:") {
-                        fn_tables.insert(n.to_string());
-                    }
-                }
-            }
+        let gate = gate_failures(project, plans, &failed_rels);
+        failed.extend(gate.findings);
+        failed.extend(gate.rejected);
+        if let Some(snap) = gate.snapshot {
             failed.extend(crate::gate::prepare::prepare_all(
-                &snap, &rules, &fn_tables, &gate_sqls,
-            ));
+                &snap, &rules, &gate_sqls,
+            )?);
         }
     } else {
-        failed.extend(gate_failures(project, plans).0);
+        let gate = gate_failures(project, plans, &failed_rels);
+        failed.extend(gate.findings);
+        failed.extend(gate.rejected);
     }
     failed.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(failed)
 }
 
-/// 从例程 IR 收集 Gate 2B 输入：静态 SQL 文本（归属文件）与
-/// 例程调用下沉临时表名（不建模对象，prepare 报错命中即抑制）。
+/// 从例程 IR 收集 Gate 2B 输入：全部静态 SQL 文本（含游标
+/// `OpenCursor::Static` 与 `FoldedQuery`）。每条语句携带归属文件、
+/// 绑定、变量类型与专属抑制名（本语句 fn_sites 下沉临时表 +
+/// `[[missing]]` 中由本例程引用的 relation）。
 fn collect_prog_sqls(
     rel: &str,
+    routine: &str,
     prog: &crate::ir::IrProg,
-    sqls: &mut Vec<(String, String)>,
-    fn_tables: &mut BTreeSet<String>,
+    missing_by_from: &BTreeMap<String, BTreeSet<String>>,
+    sqls: &mut Vec<crate::gate::prepare::PrepareStmt>,
 ) {
-    for st in &prog.code {
-        let (sql, sites) = match st {
-            crate::ir::IrStmt::SqlExec { sql, fn_sites, .. }
-            | crate::ir::IrStmt::SqlQuery { sql, fn_sites, .. } => (sql, fn_sites),
-            _ => continue,
-        };
-        sqls.push((rel.to_string(), sql.clone()));
+    use crate::gate::prepare::PrepareStmt;
+    use crate::ir::{CursorSource, IrStmt};
+    let push = |sqls: &mut Vec<PrepareStmt>,
+                sql: &str,
+                binds: &[(String, crate::ir::BindSrc)],
+                sites: &[crate::sql::FnSite]| {
+        let mut skip = missing_by_from
+            .get(&routine.to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_default();
         for s in sites {
-            fn_tables.insert(s.table.clone());
+            skip.insert(s.table.clone());
+        }
+        sqls.push(PrepareStmt {
+            file: rel.to_string(),
+            sql: sql.to_string(),
+            binds: binds.to_vec(),
+            var_types: prog.var_types.clone(),
+            skip,
+        });
+    };
+    for st in &prog.code {
+        match st {
+            IrStmt::SqlExec {
+                sql,
+                binds,
+                fn_sites,
+            } => push(sqls, sql, binds, fn_sites),
+            IrStmt::SqlQuery {
+                sql,
+                binds,
+                fn_sites,
+                ..
+            } => push(sqls, sql, binds, fn_sites),
+            IrStmt::FoldedQuery { sql, .. } => push(sqls, sql, &[], &[]),
+            IrStmt::OpenCursor {
+                source:
+                    CursorSource::Static {
+                        sql,
+                        binds,
+                        fn_sites,
+                    },
+                ..
+            } => push(sqls, sql, binds, fn_sites),
+            _ => {}
         }
     }
 }
 
-/// Gate Stage 1–3：闭包内全部 SQL 文件（例程 + 表/视图 DDL）的
-/// 解析、快照与引用检查。读失败的文件跳过（例程文件的读错误已由
-/// register_file 报出；纯 DDL 文件读错误为边角，V1 不单独归因）。
+/// `gate_failures` 返回值：引用诊断 + Stage 2 快照 + Gate 2A 拒绝。
+struct GateOutcome {
+    findings: Vec<(String, EngineError)>,
+    snapshot: Option<crate::gate::schema::SchemaSnapshot>,
+    rejected: Vec<(String, EngineError)>,
+}
+
+/// Gate Stage 1–4：闭包内全部 SQL 文件（例程 + 表/视图 DDL）的
+/// 解析、Gate 2A 拒绝、快照与引用检查。`exclude` 为 register 已失败
+/// 的文件（同一文件不重复报 Gate 2A）。文件应用顺序 = 计划顺序
+/// （例程在前、DDL 在后，逐计划去重保序）——SchemaSnapshot 的
+/// ALTER/DROP 演化依赖该顺序，字典序会把 ALTER 错排到 CREATE 之前
+/// 造成 ENG-0070 假阳性。快照供 Gate 2B stub 使用。读失败的文件
+/// 跳过（例程文件的读错误已由 register_file 报出；纯 DDL 文件读错误
+/// 为边角，V1 不单独归因）。
 fn gate_failures(
     project: &ProjectConfig,
     plans: &[RunPlan],
-) -> (
-    Vec<(String, EngineError)>,
-    Option<crate::gate::schema::SchemaSnapshot>,
-) {
-    let gate_rels: BTreeSet<&str> = plans
-        .iter()
-        .flat_map(|plan| {
-            plan.ddl_routines
-                .iter()
-                .chain(plan.ddl_tables.iter())
-                .map(String::as_str)
-        })
-        .collect();
+    exclude: &BTreeSet<String>,
+) -> GateOutcome {
+    let mut seen = BTreeSet::new();
+    let mut gate_rels: Vec<&str> = Vec::new();
+    for plan in plans {
+        for rel in plan
+            .ddl_routines
+            .iter()
+            .chain(plan.ddl_tables.iter())
+            .map(String::as_str)
+        {
+            if seen.insert(rel) {
+                gate_rels.push(rel);
+            }
+        }
+    }
     let files: Vec<crate::gate::pipeline::GateFile> = gate_rels
         .iter()
+        .filter(|rel| !exclude.contains(**rel))
         .filter_map(|rel| {
             read_source_strict(&project.root.join(rel)).ok().map(|sql| {
                 crate::gate::pipeline::GateFile {
@@ -352,7 +428,11 @@ fn gate_failures(
     let mut out = Vec::new();
     if let Some((rel, err)) = run.schema_error {
         out.push((rel, err));
-        return (out, None);
+        return GateOutcome {
+            findings: out,
+            snapshot: None,
+            rejected: run.rejected,
+        };
     }
     let missing: BTreeSet<&str> = plans
         .iter()
@@ -368,7 +448,11 @@ fn gate_failures(
             EngineError::business(152, format!("missing {} object `{}`", f.kind, f.object)),
         ));
     }
-    (out, run.snapshot)
+    GateOutcome {
+        findings: out,
+        snapshot: run.snapshot,
+        rejected: run.rejected,
+    }
 }
 
 /// Gate 1B 对象级发现与 `[[missing]]` 去重：闭包域已报的

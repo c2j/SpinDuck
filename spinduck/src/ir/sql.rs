@@ -64,7 +64,9 @@ impl Compiler {
                     fn_sites,
                 });
             }
-            S::Insert(_) | S::Update(_) | S::Delete(_) | S::Truncate(_) => {
+            // MERGE INTO：DuckDB ≥1.4 支持（内核 1.5.5 覆盖），与 DML 同路径
+            // 改写为 SqlExec 交 Gate 2B prepare 校验，不再 Gate 2A 拒绝。
+            S::Insert(_) | S::Update(_) | S::Delete(_) | S::Truncate(_) | S::Merge(_) => {
                 // RETURNING / RETURNING INTO / BULK COLLECT：DuckDB 无对应语义，
                 // 由 Gate 2B 的 prepare 兜底前在此显式拒绝
                 let (bulk, returning) = match statement {
@@ -90,11 +92,6 @@ impl Compiler {
                     binds,
                     fn_sites,
                 });
-            }
-            // Gate 2A：MERGE INTO 无 DuckDB 1.5.5 对应语义，显式 ENG-0071
-            // （顶层 Statement::Merge 已由 gate/mod.rs 拦截，此处覆盖例程体内嵌入形态）
-            S::Merge(_) => {
-                return Err(EngineError::invariant(71, "MERGE INTO is not supported"));
             }
             other => {
                 return Err(EngineError::invariant(

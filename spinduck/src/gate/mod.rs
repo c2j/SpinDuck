@@ -45,7 +45,6 @@ fn denied_kind(st: &Statement) -> Option<&'static str> {
         Statement::Lock(_) => "LOCK TABLE",
         Statement::Do(_) => "DO block",
         Statement::InsertAll(_) | Statement::InsertFirst(_) => "INSERT ALL/FIRST",
-        Statement::Merge(_) => "MERGE INTO",
         Statement::CreateAm(_)
         | Statement::CreateDirectory(_)
         | Statement::CreateNode(_)

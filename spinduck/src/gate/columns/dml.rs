@@ -219,10 +219,13 @@ impl Gate<'_> {
         }
     }
 
-    /// 锚点对象存在性：表/视图（精确键或单段后缀）+ 引擎自建
-    /// 伪表与 `dual`；不含 CTE/序列。
+    /// 锚点对象存在性：表/视图（精确键或单段后缀）+ 文件级 PL
+    /// 临时表 + 引擎自建伪表与 `dual`；不含 CTE/序列。
     fn object_known(&self, name: &ObjectName) -> bool {
         let key = object_key(name);
+        if self.local_table(name, &key) {
+            return true;
+        }
         if self.snap.tables.contains_key(&key) || self.snap.views.contains_key(&key) {
             return true;
         }

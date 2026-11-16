@@ -77,16 +77,15 @@ fn should_keep_supported_ddl_statements() {
 }
 
 #[test]
-fn should_reject_merge_into_with_eng_0071() {
-    // DuckDB 1.5.5 无 MERGE INTO；顶层与嵌入例程体两条路径都必须拒绝
-    assert_ddl_rejected(
-        "MERGE INTO t1 USING s1 ON t1.a = s1.a WHEN MATCHED THEN UPDATE SET t1.b = s1.b",
-    );
-    let err = engine()
-        .register(
-            "CREATE OR REPLACE PROCEDURE prc_m IS BEGIN MERGE INTO t1 USING s1 ON t1.a = s1.a \
-             WHEN MATCHED THEN UPDATE SET t1.b = s1.b; END;",
-        )
-        .expect_err("例程体内 MERGE 必须编译期拒绝");
-    assert_eq!(err.code.to_string(), "ENG-0071", "{err:?}");
+fn should_allow_merge_into() {
+    // DuckDB ≥1.4 支持 MERGE INTO（内核 1.5.5 覆盖）：顶层与例程体内
+    // 嵌入形态都放行，由 Gate 2B prepare 做语义校验，不做 Gate 2A 拒绝。
+    let mut eng = engine();
+    eng.register("MERGE INTO t1 USING s1 ON t1.a = s1.a WHEN MATCHED THEN UPDATE SET t1.b = s1.b")
+        .expect("顶层 MERGE 应放行（register 对非例程语句返回 Ok）");
+    eng.register(
+        "CREATE OR REPLACE PROCEDURE prc_m IS BEGIN MERGE INTO t1 USING s1 ON t1.a = s1.a \
+         WHEN MATCHED THEN UPDATE SET t1.b = s1.b; END;",
+    )
+    .expect("例程体内 MERGE 应编译通过");
 }
