@@ -50,6 +50,9 @@ pub struct GateRun {
     pub schema_error: Option<(String, EngineError)>,
     /// Tokenizer 失败的文件（Gate 1A 词法错误由 register 路径报出）。
     pub parse_failed: Vec<String>,
+    /// Stage 2 产物快照：Gate 2B stub DDL 的输入；`schema_error`
+    /// 为 `Some` 时为 `None`（快照不完整，不可用于 prepare）。
+    pub snapshot: Option<crate::gate::schema::SchemaSnapshot>,
 }
 
 /// 执行 Stage 1–3。`files` 顺序即处理顺序；快照按文件序演化，
@@ -72,6 +75,7 @@ pub fn run(files: &[GateFile]) -> GateRun {
                     findings: Vec::new(),
                     schema_error: Some((rel.to_string(), e)),
                     parse_failed,
+                    snapshot: None,
                 };
             }
         }
@@ -89,6 +93,7 @@ pub fn run(files: &[GateFile]) -> GateRun {
         findings,
         schema_error: None,
         parse_failed,
+        snapshot: Some(snapshot),
     }
 }
 
