@@ -43,12 +43,13 @@ fn usage_err(msg: impl std::fmt::Display) -> EngineError {
 }
 
 /// 整脚本词法解析。`set` 指令的变量在行内累积并供后续行展开。
+/// 物理行先经 [`logical_lines`] 拼接续行（行尾引号外奇数个 `\`），
+/// 再逐逻辑行切词——设计 §2.2 的换行续行契约。
 pub fn parse_script(text: &str) -> Result<ParsedScript, EngineError> {
     let mut vars: BTreeMap<String, String> = BTreeMap::new();
     let mut lines = Vec::new();
     let mut default_db: Option<String> = None;
-    for (idx, raw) in text.lines().enumerate() {
-        let line_no = idx + 1;
+    for (line_no, raw) in logical_lines(text) {
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -108,6 +109,81 @@ pub fn parse_script(text: &str) -> Result<ParsedScript, EngineError> {
         }
     }
     Ok(ParsedScript { lines, default_db })
+}
+
+/// 物理行 → 逻辑行（行号取续行首行的物理行号）。
+/// 续行规则（设计 §2.2）：行尾在**引号外**的奇数个 `\` 把本行与下一物理行
+/// 拼接；`\\`（偶数个）是字面反斜杠不续行；引号未闭合的行不续行
+/// （交给词法层报引号错）。EOF 处残留的续行符按普通字符处理。
+fn logical_lines(text: &str) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut pending: Option<(usize, String)> = None;
+    for (idx, raw) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        let (start, mut logical) = match pending.take() {
+            // 续行拼接处补一个空格：`foo\`+`bar` 不得黏成 `foobar`
+            Some((s, acc)) => {
+                let mut l = acc;
+                l.push(' ');
+                (s, l)
+            }
+            None => (line_no, String::new()),
+        };
+        logical.push_str(raw);
+        match continuation_cut(&logical) {
+            Some(cut) => pending = Some((start, logical[..cut].to_string())),
+            None => out.push((start, logical)),
+        }
+    }
+    if let Some((s, acc)) = pending {
+        // EOF 续行：续行符已在 cut 处摘除，残余按普通行处理
+        out.push((s, acc));
+    }
+    out
+}
+
+/// 若逻辑行以「引号外的奇数个 `\`」结尾，返回该续行反斜杠的字节下标。
+fn continuation_cut(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let (mut i, mut in_s, mut in_d) = (0usize, false, false);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_d {
+            if b == b'\\' {
+                i += 1; // 跳过被转义字符（含 \" 不闭合引号）
+            } else if b == b'"' {
+                in_d = false;
+            }
+        } else if in_s {
+            if b == b'\'' {
+                in_s = false;
+            }
+        } else {
+            match b {
+                b'"' => in_d = true,
+                b'\'' => in_s = true,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    if in_s || in_d {
+        return None;
+    }
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end == 0 || bytes[end - 1] != b'\\' {
+        return None;
+    }
+    let mut bs = 0usize;
+    let mut j = end;
+    while j > 0 && bytes[j - 1] == b'\\' {
+        bs += 1;
+        j -= 1;
+    }
+    (bs % 2 == 1).then_some(end - 1)
 }
 
 /// token 的词法片段：`Lit` = 引号/转义产出的最终文本（不再展开）；
@@ -218,6 +294,7 @@ fn scan_quoted(
             Some('\\') if quote == '"' => match chars.next() {
                 Some('$') => seg.push('$'),
                 Some('\\') => seg.push('\\'),
+                Some('"') => seg.push('"'),
                 Some(other) => {
                     seg.push('\\');
                     seg.push(other);
@@ -335,24 +412,38 @@ fn check_shell_ops(tokens: &[String], line_no: usize) -> Result<(), EngineError>
 
 /// `call` 行的 `str:` 语法糖：非旗标位置 token `str:X` → `'X'`（`parse_literal`
 /// 的单引号形态 → `SpinValue::Str`，保真前导零）。
-/// 旗标值判定：前一个 token 以 `--` 开头（`--file str:x.sql` 不转换）。
+/// 旗标值判定必须与 `parse_call` 的取值规则一致：**吃下一个 token 的旗标**
+/// 才跳过 `str:` 转换；`--batch-commit` 是无值旗标，其后的 token 仍是位置
+/// 参数（PR#51 审核：按 `--` 前缀一刀切会把 `--batch-commit str:x` 的
+/// `str:x` 漏转换、把 `--file` 的值误转）。
+const CALL_VALUE_FLAGS: [&str; 8] = [
+    "--db",
+    "--rules",
+    "--file",
+    "--step-budget",
+    "--trace",
+    "--trace-format",
+    "--trace-level",
+    "--plan",
+];
+
 fn apply_str_sugar(tokens: Vec<String>) -> Vec<String> {
     let mut out = Vec::with_capacity(tokens.len());
-    let mut prev_is_flag = false;
+    let mut prev_is_flag_value = false;
     for t in tokens {
-        if prev_is_flag {
+        if prev_is_flag_value {
             out.push(t);
-            prev_is_flag = false;
+            prev_is_flag_value = false;
             continue;
         }
         if let Some(rest) = t.strip_prefix("str:") {
             if !rest.is_empty() {
                 out.push(format!("'{rest}'"));
-                prev_is_flag = false;
+                prev_is_flag_value = false;
                 continue;
             }
         }
-        prev_is_flag = t.starts_with("--");
+        prev_is_flag_value = CALL_VALUE_FLAGS.contains(&t.as_str());
         out.push(t);
     }
     out
@@ -443,6 +534,16 @@ mod tests {
     }
 
     #[test]
+    fn should_apply_str_sugar_after_valueless_batch_commit_flag() {
+        // PR#51 审核：--batch-commit 不吃下一个 token，其后的 str: 仍是位置实参
+        let got = cmds("call --file f.sql prc_id --batch-commit str:0130000001\n");
+        assert_eq!(got[0][5], "'0130000001'", "{got:?}");
+        // 无值旗标后紧跟吃值旗标：str: 是 --file 的值，不得转换
+        let got2 = cmds("call prc --batch-commit --file str:notes.sql\n");
+        assert_eq!(got2[0][4], "str:notes.sql", "{got2:?}");
+    }
+
+    #[test]
     fn should_track_use_and_global_db() {
         let s = parse_script("use :memory:\n--db other.duckdb\ncall --file f prc\n").unwrap();
         assert_eq!(s.default_db.as_deref(), Some("other.duckdb"));
@@ -463,5 +564,27 @@ mod tests {
         std::env::set_var("SDOUTER", "LEAK");
         let got = cmds("call --file f prc \"pre$SDINNER\"post\n");
         assert_eq!(got[0][4], "pre$SDOUTERpost");
+    }
+
+    #[test]
+    fn should_join_backslash_continuation_lines() {
+        // 设计 §2.2 续行：行尾引号外奇数个 \ 拼接下一物理行
+        let got = cmds("materialize --db w --table t \\\n  --jobs 2\n");
+        assert_eq!(
+            got[0],
+            vec!["materialize", "--db", "w", "--table", "t", "--jobs", "2"]
+        );
+        // 偶数个 \\ 是字面反斜杠，不续行（下一行独立成指令）
+        let got2 = cmds("call --file f prc a\\\\\ncall --file f prc b\n");
+        assert_eq!(got2.len(), 2, "{got2:?}");
+        // 引号内的 \" 不闭合引号：该行引号未闭合，词法层报错而非续行
+        assert!(parse_script("call --file f prc \"x\\\" \ncall --file f prc y\n").is_err());
+    }
+
+    #[test]
+    fn should_unescape_quote_inside_double_quotes() {
+        // 设计 §2.2：双引号内 \" → "（PR#51 审核补齐）
+        let got = cmds("call --file f prc \"a=\\\"b\\\"\"\n");
+        assert_eq!(got[0][4], "a=\"b\"", "{got:?}");
     }
 }

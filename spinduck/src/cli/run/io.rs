@@ -236,36 +236,42 @@ pub(super) fn materialize_cmd(
 #[cfg(feature = "gauss")]
 pub(super) fn sync_cmd(parts: SyncParts, out: &mut dyn Write) -> Result<i32, EngineError> {
     // 顺序契约：GaussDB env 校验/连接先于 DuckDB open——env 缺失时不落空库文件。
-    let mode = crate::io::sync::resolve_mode(
-        parts.mode.as_deref(),
-        parts.slice.as_deref(),
-        parts.key.as_deref(),
-        parts.where_clause.as_deref(),
-    )?;
+    let (mode, mut og) = sync_prepare(&parts)?;
     // 临时 CSV 与目标库同目录（失败诊断现场自包含；成功即删，设计 §4.1）
     let workdir = materialize_workdir(&parts.db);
-    let mut og = open_gauss()?;
     let duck = crate::sql::DuckExecutor::open(&parts.db.to_string_lossy())?;
     sync_write_tail(&parts, &mode, &workdir, &mut og, &duck, out)
 }
 
-/// batch 共享连接入口：DuckDB 连接复用池化句柄（已开库，无新增文件副作用）；
-/// GaussDB 连接仍在本函数内新建，不跨步复用。
+/// `sync` 的 GaussDB 侧前置：`resolve_mode` + 连接 env/建链。
+/// 单步与 batch 共用——**必须先于任何 DuckDB open**（缺 env/坏 mode 不得
+/// 留下空库文件，PR#51 审核）。
 #[cfg(feature = "gauss")]
-pub(crate) fn sync_with_executor(
+pub(crate) fn sync_prepare(
     parts: &SyncParts,
-    duck: &crate::sql::DuckExecutor,
-    out: &mut dyn Write,
-) -> Result<i32, EngineError> {
+) -> Result<(crate::io::sync::SyncMode, crate::io::GaussConn), EngineError> {
     let mode = crate::io::sync::resolve_mode(
         parts.mode.as_deref(),
         parts.slice.as_deref(),
         parts.key.as_deref(),
         parts.where_clause.as_deref(),
     )?;
+    let og = open_gauss()?;
+    Ok((mode, og))
+}
+
+/// batch 共享连接入口：DuckDB 连接复用池化句柄（已开库，无新增文件副作用）；
+/// GaussDB 连接由调用方经 [`sync_prepare`] 先行建好（不跨步复用）。
+#[cfg(feature = "gauss")]
+pub(crate) fn sync_with_executor(
+    parts: &SyncParts,
+    mode: &crate::io::sync::SyncMode,
+    og: &mut crate::io::GaussConn,
+    duck: &crate::sql::DuckExecutor,
+    out: &mut dyn Write,
+) -> Result<i32, EngineError> {
     let workdir = materialize_workdir(&parts.db);
-    let mut og = open_gauss()?;
-    sync_write_tail(parts, &mode, &workdir, &mut og, duck, out)
+    sync_write_tail(parts, mode, &workdir, og, duck, out)
 }
 
 #[cfg(feature = "gauss")]

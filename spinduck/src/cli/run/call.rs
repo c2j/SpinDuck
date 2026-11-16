@@ -211,10 +211,12 @@ pub(crate) fn call_engine(
     use crate::cli::args::parse_literal;
     eng.batch_commit = run.batch_commit;
     eng.set_oriented = prep.set_oriented;
-    // 复核应修 C：大业务（100k 级游标循环）默认预算不够，CLI 放大入口
-    if let Some(b) = run.step_budget {
-        eng.step_budget = b;
-    }
+    // 复核应修 C：大业务（100k 级游标循环）默认预算不够，CLI 放大入口。
+    // 缺省必须写回 DEFAULT——batch 引擎缓存复用同一 Engine，不复位会把
+    // 上一步的 --step-budget 泄漏给本步（放大/收紧都偏离单步 CLI 语义）。
+    eng.step_budget = run
+        .step_budget
+        .unwrap_or(crate::runtime::interp::DEFAULT_STEP_BUDGET);
     if run.register_sources {
         match run.source_texts {
             Some(texts) => {
@@ -623,5 +625,72 @@ mod tests {
         ]);
         assert_eq!(code, EXIT_OK, "{out}");
         assert!(out.contains("OUT p_o = 42"), "{out}");
+    }
+
+    /// PR#51 审核修复守护：batch 引擎缓存复用同一 `Engine`，`call_engine` 必须把
+    /// `step_budget` 缺省写回 `DEFAULT_STEP_BUDGET`——否则上一调用的
+    /// `--step-budget` 泄漏给下一调用（收紧→误报 ENG-0032；放大→护栏失效）。
+    #[cfg(feature = "native")]
+    #[test]
+    fn should_reset_step_budget_to_default_when_reusing_engine() {
+        use super::{call_engine, CallPrepared, CallRun};
+        use crate::engine::Engine;
+        use crate::rules::RuleRegistry;
+        use crate::sql::DuckExecutor;
+        use std::collections::BTreeSet;
+
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        let objects = crate::verify::kernel_objects(&ex).unwrap();
+        let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+        eng.register(
+            "CREATE OR REPLACE FUNCTION f_loop(p IN NUMBER) RETURN NUMBER IS \
+             s NUMBER := 0; \
+             BEGIN \
+               FOR i IN 1..p LOOP s := s + i; END LOOP; \
+               RETURN s; \
+             END;",
+        )
+        .unwrap();
+        let prep = CallPrepared {
+            target: "f_loop".to_string(),
+            sources: Vec::new(),
+            rules: RuleRegistry::default(),
+            set_oriented: false,
+            codeweb_refs: None,
+        };
+        let args = vec!["5".to_string()];
+        let mut out: Vec<u8> = Vec::new();
+        // 第一步：预算 1 → 循环体必超支（ENG-0032），引擎保留 budget=1
+        let e1 = call_engine(
+            &mut eng,
+            &prep,
+            &CallRun {
+                args: &args,
+                batch_commit: false,
+                step_budget: Some(1),
+                register_sources: false,
+                objects: &objects,
+                trace: None,
+            },
+            &mut out,
+        );
+        assert!(e1.is_err(), "预算 1 必须超支: {e1:?}");
+        // 第二步：不带 --step-budget → 必须回到默认预算并成功
+        let code = call_engine(
+            &mut eng,
+            &prep,
+            &CallRun {
+                args: &args,
+                batch_commit: false,
+                step_budget: None,
+                register_sources: false,
+                objects: &BTreeSet::new(),
+                trace: None,
+            },
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(code, EXIT_OK, "{}", String::from_utf8_lossy(&out));
+        assert!(eng.step_budget > 1, "预算未复位: {}", eng.step_budget);
     }
 }

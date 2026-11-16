@@ -233,9 +233,46 @@ fn run_sync(
     out: &mut dyn Write,
 ) -> Result<i32, EngineError> {
     let parts = run::io::cmd_sync(step.cmd.clone());
+    // 顺序契约（PR#51 审核）：resolve_mode + GaussDB env/连接先于 clone_executor
+    // ——缺 env/坏 mode 时不得留下空 .duckdb（与单步 sync_cmd 同序）。
+    let (mode, mut og) = run::io::sync_prepare(&parts)?;
     let dbkey = DbKey::of(&parts.db);
     let ex = session.clone_executor(&dbkey)?;
-    let code = run::io::sync_with_executor(&parts, &ex, out)?;
+    let code = run::io::sync_with_executor(&parts, &mode, &mut og, &ex, out)?;
     session.invalidate_engines_for(&dbkey);
     Ok(code)
+}
+
+#[cfg(all(test, feature = "gauss"))]
+mod tests {
+    use super::*;
+
+    /// PR#51 审核守护：`sync` 的 GaussDB 前置（resolve_mode/env）必须先于
+    /// 任何 DuckDB open——前置失败时库文件不得落盘（与单步 sync_cmd 同序）。
+    #[test]
+    fn should_not_create_db_file_when_sync_precheck_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("w.duckdb");
+        let step = Step {
+            line_no: 1,
+            cmd: Command::Sync {
+                db: db.clone(),
+                table: "t".to_string(),
+                cols: vec!["a".to_string()],
+                where_clause: None,
+                mode: Some("bogus".to_string()), // resolve_mode 即拒，先于 open_gauss
+                slice: None,
+                key: None,
+            },
+        };
+        let mut session = BatchSession::new();
+        let mut out: Vec<u8> = Vec::new();
+        let code = run_steps(&[step], &mut session, false, &mut out);
+        assert_eq!(code, EXIT_FAIL);
+        assert!(
+            !db.exists(),
+            "sync 前置失败不得创建库文件: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
 }

@@ -90,12 +90,21 @@ pub fn preflight(parsed: &ParsedScript) -> Result<Vec<Step>, EngineError> {
                         format!("step {step_no} (`{head}`): 需要 feature `{feat}`"),
                     ));
                 }
-                // `--trace` 冲突只对 `call` 生效（`explain --trace` 是输入不是输出）
+                // `--trace` 冲突只对 `call` 生效（`explain --trace` 是输入不是输出）。
+                // Phase 1 同时拒绝"目标已存在"（PR#51 审核：单步契约是
+                // TraceRun::open create_new → ENV-0016；若拖到 Phase 2 才发现，
+                // 库文件已经落下，--dry-run 也会被误放行）。
                 if let Command::Call { trace: Some(p), .. } = &cmd {
                     if !trace_paths.insert(p.clone()) {
                         return Err(EngineError::env(
                             16,
                             format!("step {step_no}: --trace 目标已存在/重复: {}", p.display()),
+                        ));
+                    }
+                    if p.exists() {
+                        return Err(EngineError::env(
+                            16,
+                            format!("step {step_no}: --trace 目标已存在: {}", p.display()),
                         ));
                     }
                 }
@@ -158,6 +167,22 @@ mod tests {
             "explain --file f.sql --trace t.log prc\ncall --file f prc --trace t.log 1\n"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn should_reject_existing_trace_file_in_phase1() {
+        // PR#51 审核：trace 目标已存在必须在 Phase 1 拒（ENV-0016），
+        // 否则 Phase 2 先建库后 TraceRun::open 才失败，留下空 .duckdb。
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("audit.log");
+        std::fs::write(&log, "old").unwrap();
+        let script = format!("call --file f prc --trace {} 1\n", log.display());
+        let e = steps_of(&script).unwrap_err();
+        assert_eq!(e.code.to_string(), "ENV-0016", "{e}");
+        // 不存在的路径放行（Phase 2 才创建）
+        let ok = tmp.path().join("new.log");
+        let script2 = format!("call --file f prc --trace {} 1\n", ok.display());
+        assert!(steps_of(&script2).is_ok());
     }
 
     #[test]

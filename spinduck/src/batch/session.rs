@@ -57,9 +57,14 @@ impl DbKey {
     }
 }
 
-/// `EngineCache` 键：`(DbKey, 生效规则指纹, 排序后的源内容哈希集)`。
+/// `EngineCache` 键：`(DbKey, 生效规则指纹, 源内容哈希序列)`。
 /// 运行期开关（`batch_commit`/`set_oriented`/`step_budget`）不在键内——
 /// 每次 `call` 前由 `call_engine` 重设（设计 §3.2.1-b）。
+///
+/// **源哈希保序不排序**（PR#51 审核）：注册顺序影响编译——`downshift_names()`/
+/// `routine_names()` 取的是"注册到当前文件之前"的集合，`plan_sites` 只改写
+/// 已在集合里的调用。`--file a --file b` 与 `--file b --file a` 编译产物
+/// 不同，排序去重会让后者错误命中前者的 catalog。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EngineKey {
     db: DbKey,
@@ -68,11 +73,9 @@ pub struct EngineKey {
 }
 
 impl EngineKey {
-    /// `sources` 为源内容哈希集合（内部排序去重——集合语义，与注册顺序无关）。
+    /// `sources` 为源内容哈希**序列**（与 `prep.sources`/`deployment.routines`
+    /// 同序——集合语义不成立，顺序即编译语义）。
     pub fn new(db: DbKey, rules: u64, sources: Vec<u64>) -> Self {
-        let mut sources = sources;
-        sources.sort_unstable();
-        sources.dedup();
         Self { db, rules, sources }
     }
 }
@@ -84,10 +87,11 @@ fn hash_of<T: Hash>(v: &T) -> u64 {
 }
 
 /// 源文件内容哈希（非路径——同路径改内容必须击穿缓存）。
+/// 读失败透传 `read_source_strict` 的错误码（ENV-0010/ENV-0030），
+/// 不复用 ENV-0012（那是 feature 门语义，PR#51 审核）。
 pub fn source_hash(path: &Path) -> Result<u64, EngineError> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| EngineError::env(12, format!("read {}: {e}", path.display())))?;
-    Ok(hash_of(&bytes))
+    let text = crate::cli::read_source_strict(path)?;
+    Ok(hash_of(&text))
 }
 
 /// 生效 `RuleRegistry` 内容指纹（Debug 形态覆盖全部规则字段）。
@@ -181,5 +185,23 @@ impl BatchSession {
                 eng.invalidate_caches();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_treat_source_order_as_part_of_engine_key() {
+        // PR#51 审核：--file 顺序改变编译语义（downshift_names 取注册前集合），
+        // EngineKey 必须保序——同集合不同序不得命中同一缓存项。
+        let db = DbKey::Memory;
+        let a = EngineKey::new(db.clone(), 1, vec![11, 22]);
+        let b = EngineKey::new(db.clone(), 1, vec![22, 11]);
+        assert_ne!(a, b);
+        // 同序同哈希才相等（deploy → call --plan 同键命中不受影响）
+        let c = EngineKey::new(db, 1, vec![11, 22]);
+        assert_eq!(a, c);
     }
 }
