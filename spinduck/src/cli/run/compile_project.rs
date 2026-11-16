@@ -386,17 +386,19 @@ struct GateOutcome {
 }
 
 /// Gate Stage 1–4：闭包内全部 SQL 文件（例程 + 表/视图 DDL）的
-/// 解析、Gate 2A 拒绝、快照与引用检查。`exclude` 为 register 已失败
-/// 的文件（同一文件不重复报 Gate 2A）。文件应用顺序 = 计划顺序
+/// 解析、Gate 2A 拒绝、快照与引用检查。`skip_reject` 为 register
+/// 已失败的文件——其顶层 Gate 2A 拒绝不重复收集，但文件仍参与
+/// 快照与引用检查（例程体编译失败不吞掉同文件有效 DDL，后续
+/// ALTER/DROP 才能看到先定义的 CREATE）。文件应用顺序 = 计划顺序
 /// （例程在前、DDL 在后，逐计划去重保序）——SchemaSnapshot 的
-/// ALTER/DROP 演化依赖该顺序，字典序会把 ALTER 错排到 CREATE 之前
-/// 造成 ENG-0070 假阳性。快照供 Gate 2B stub 使用。读失败的文件
-/// 跳过（例程文件的读错误已由 register_file 报出；纯 DDL 文件读错误
-/// 为边角，V1 不单独归因）。
+/// ALTER/DROP 演化依赖该顺序；ALTER 目标缺失时 pipeline 内部
+/// 延迟重试，不再依赖文件名排序猜测部署序。快照供 Gate 2B
+/// stub 使用。读失败的文件跳过（例程文件的读错误已由 register
+/// 报出；纯 DDL 文件读错误为边角，V1 不单独归因）。
 fn gate_failures(
     project: &ProjectConfig,
     plans: &[RunPlan],
-    exclude: &BTreeSet<String>,
+    skip_reject: &BTreeSet<String>,
 ) -> GateOutcome {
     let mut seen = BTreeSet::new();
     let mut gate_rels: Vec<&str> = Vec::new();
@@ -414,7 +416,6 @@ fn gate_failures(
     }
     let files: Vec<crate::gate::pipeline::GateFile> = gate_rels
         .iter()
-        .filter(|rel| !exclude.contains(**rel))
         .filter_map(|rel| {
             read_source_strict(&project.root.join(rel)).ok().map(|sql| {
                 crate::gate::pipeline::GateFile {
@@ -424,7 +425,7 @@ fn gate_failures(
             })
         })
         .collect();
-    let run = crate::gate::pipeline::run(&files);
+    let run = crate::gate::pipeline::run(&files, skip_reject);
     let mut out = Vec::new();
     if let Some((rel, err)) = run.schema_error {
         out.push((rel, err));

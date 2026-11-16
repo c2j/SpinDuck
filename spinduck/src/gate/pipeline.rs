@@ -10,7 +10,6 @@
 //! 解析失败文件不贡献 Stage 2 符号——其余文件可能因此出现
 //! Missing，这是设计确认的时序语义（先 1A 后建快照）。
 
-use ogsql_parser::ast::visitor::{walk_statement, Visitor, VisitorResult};
 use ogsql_parser::ast::Statement;
 use ogsql_parser::parser::Parser;
 use ogsql_parser::token::tokenizer::Tokenizer;
@@ -59,9 +58,10 @@ pub struct GateRun {
     pub snapshot: Option<crate::gate::schema::SchemaSnapshot>,
 }
 
-/// 执行 Stage 1–4。`files` 顺序即处理顺序；快照按文件序演化，
-/// 输出排序保证确定性。
-pub fn run(files: &[GateFile]) -> GateRun {
+/// 执行 Stage 1–4。`files` 顺序即处理顺序；`skip_reject` 为 register
+/// 已报 Gate 2A 的文件——其顶层拒绝不重复收集，但文件仍参与
+/// 快照构建与引用检查（例程体编译失败不应吞掉同文件有效 DDL）。
+pub fn run(files: &[GateFile], skip_reject: &std::collections::BTreeSet<String>) -> GateRun {
     let mut parsed: Vec<(&str, Vec<Statement>)> = Vec::with_capacity(files.len());
     let mut parse_failed = Vec::new();
     // Stage 1.5：Gate 2A 顶层 DDL 拒绝——纯 DDL 文件不经 eng.register，
@@ -71,9 +71,11 @@ pub fn run(files: &[GateFile]) -> GateRun {
         match Tokenizer::new(&f.sql).tokenize() {
             Ok(tokens) => {
                 let stmts = Parser::new(tokens).parse();
-                for st in &stmts {
-                    if let Err(e) = super::reject_unsupported_ddl(st) {
-                        rejected.push((f.rel.clone(), e));
+                if !skip_reject.contains(&f.rel) {
+                    for st in &stmts {
+                        if let Err(e) = super::reject_unsupported_ddl(st) {
+                            rejected.push((f.rel.clone(), e));
+                        }
                     }
                 }
                 parsed.push((f.rel.as_str(), stmts));
@@ -81,30 +83,35 @@ pub fn run(files: &[GateFile]) -> GateRun {
             Err(_) => parse_failed.push(f.rel.clone()),
         }
     }
-    // Stage 2：逐文件应用 DDL，冲突可归属到具体文件
+    // Stage 2：逐文件应用 DDL，冲突可归属到具体文件。
+    // ALTER 目标尚未出现在快照时延迟到全部 CREATE 应用完再重试——
+    // 计划顺序是 codeweb 闭包的字典序，并非真实部署顺序，
+    // "路径靠前的 ALTER、靠后的 CREATE"不得误报 ENG-0070。
     let mut snapshot = SchemaSnapshot::default();
+    let mut deferred_alters: Vec<(&str, &Statement)> = Vec::new();
     for (rel, stmts) in &parsed {
         for st in stmts {
-            if let Err(e) = snapshot.apply(st) {
-                return GateRun {
-                    findings: Vec::new(),
-                    schema_error: Some((rel.to_string(), e)),
-                    parse_failed,
-                    rejected,
-                    snapshot: None,
-                };
+            if let Statement::AlterTable(a) = st {
+                if !snapshot.tables.contains_key(&object_key(&a.name)) {
+                    deferred_alters.push((*rel, st));
+                    continue;
+                }
             }
+            if let Err(e) = snapshot.apply(st) {
+                return schema_error_run(rel, e, parse_failed, rejected);
+            }
+        }
+    }
+    for (rel, st) in deferred_alters {
+        if let Err(e) = snapshot.apply(st) {
+            return schema_error_run(rel, e, parse_failed, rejected);
         }
     }
     let mut findings = Vec::new();
     for (rel, stmts) in &parsed {
-        // 文件级 PL 临时表集合：`CREATE [TEMP] TABLE .. AS` 可出现在
-        // 例程体内（SqlStatement 下钻），会话级对象不进全局快照，
-        // 但同文件内引用视为已知（列集合延迟到 Gate 2B）。
-        let local = temp_tables(stmts);
         for st in stmts {
-            collect_refs(rel, st, &snapshot, &local, &mut findings);
-            collect_cols(rel, st, &snapshot, &local, &mut findings);
+            collect_refs(rel, st, &snapshot, &mut findings);
+            collect_cols(rel, st, &snapshot, &mut findings);
         }
     }
     findings.sort();
@@ -118,39 +125,23 @@ pub fn run(files: &[GateFile]) -> GateRun {
     }
 }
 
-/// 收集语句树（含 PL 体 `SqlStatement` 下钻）中声明的 TEMP 表名。
-/// `CREATE TEMP TABLE t AS ..` 的列集合不可静态确定，引用方按
-/// "对象已知、列延迟"处理（与全局 CTAS 的 `columns_deferred` 同口径）。
-fn temp_tables(stmts: &[Statement]) -> std::collections::BTreeSet<String> {
-    struct TempNames(std::collections::BTreeSet<String>);
-    impl Visitor for TempNames {
-        fn visit_statement(&mut self, st: &Statement) -> VisitorResult {
-            let key = match st {
-                Statement::CreateTableAs(t) if t.temporary => Some(object_key(&t.name)),
-                Statement::CreateTable(t) if t.temporary => Some(object_key(&t.name)),
-                _ => None,
-            };
-            if let Some(k) = key {
-                self.0.insert(k);
-            }
-            VisitorResult::Continue
-        }
+fn schema_error_run(
+    rel: &str,
+    e: EngineError,
+    parse_failed: Vec<String>,
+    rejected: Vec<(String, EngineError)>,
+) -> GateRun {
+    GateRun {
+        findings: Vec::new(),
+        schema_error: Some((rel.to_string(), e)),
+        parse_failed,
+        rejected,
+        snapshot: None,
     }
-    let mut v = TempNames(std::collections::BTreeSet::new());
-    for st in stmts {
-        walk_statement(&mut v, st);
-    }
-    v.0
 }
 
-fn collect_refs(
-    rel: &str,
-    st: &Statement,
-    snap: &SchemaSnapshot,
-    local: &std::collections::BTreeSet<String>,
-    out: &mut Vec<GateFinding>,
-) {
-    for m in check_statement(st, snap, local) {
+fn collect_refs(rel: &str, st: &Statement, snap: &SchemaSnapshot, out: &mut Vec<GateFinding>) {
+    for m in check_statement(st, snap) {
         out.push(GateFinding {
             file: rel.to_string(),
             object: m.object,
@@ -159,14 +150,8 @@ fn collect_refs(
     }
 }
 
-fn collect_cols(
-    rel: &str,
-    st: &Statement,
-    snap: &SchemaSnapshot,
-    local: &std::collections::BTreeSet<String>,
-    out: &mut Vec<GateFinding>,
-) {
-    for m in check_columns(st, snap, local) {
+fn collect_cols(rel: &str, st: &Statement, snap: &SchemaSnapshot, out: &mut Vec<GateFinding>) {
+    for m in check_columns(st, snap) {
         out.push(GateFinding {
             file: rel.to_string(),
             object: col_object(&m),
@@ -186,6 +171,7 @@ fn col_object(m: &MissingColumn) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn file(rel: &str, sql: &str) -> GateFile {
         GateFile {
@@ -194,9 +180,13 @@ mod tests {
         }
     }
 
+    fn run_all(files: &[GateFile]) -> GateRun {
+        run(files, &BTreeSet::new())
+    }
+
     #[test]
     fn should_report_missing_object_and_column_across_files() {
-        let run = run(&[
+        let run = run_all(&[
             file("ddl/t1.sql", "CREATE TABLE t1(a INT, b INT);"),
             file(
                 "pkg/p1.sql",
@@ -222,7 +212,7 @@ mod tests {
 
     #[test]
     fn should_surface_schema_conflict_as_eng_0070() {
-        let run = run(&[
+        let run = run_all(&[
             file("a.sql", "CREATE TABLE t1(a INT);"),
             file("b.sql", "CREATE TABLE t1(b INT);"),
         ]);
@@ -234,7 +224,7 @@ mod tests {
 
     #[test]
     fn should_skip_unparseable_file_but_keep_others() {
-        let run = run(&[
+        let run = run_all(&[
             file("bad.sql", "INSERT INTO t VALUES ('unterminated"),
             file("ok.sql", "CREATE TABLE t1(a INT);"),
         ]);
@@ -244,12 +234,92 @@ mod tests {
 
     #[test]
     fn should_dedup_repeated_findings() {
-        let run = run(&[file(
+        let run = run_all(&[file(
             "p.sql",
             "CREATE PROCEDURE p IS BEGIN \
              INSERT INTO ghost SELECT * FROM ghost; END;",
         )]);
         let n = run.findings.iter().filter(|f| f.object == "ghost").count();
+        assert_eq!(n, 1, "{:?}", run.findings);
+    }
+
+    #[test]
+    fn should_apply_alter_after_later_create_without_eng_0070() {
+        // 计划顺序是字典序而非部署顺序：ALTER 文件路径靠前、
+        // CREATE 靠后时不得误报 ENG-0070（延迟重试）。
+        let run = run_all(&[
+            file("a_alter.sql", "ALTER TABLE t1 ADD COLUMN c2 INT;"),
+            file("z_create.sql", "CREATE TABLE t1(a INT);"),
+        ]);
+        assert!(run.schema_error.is_none(), "{:?}", run.schema_error);
+        let snap = run.snapshot.expect("快照应产出");
+        assert!(snap.tables["t1"].columns.contains_key("c2"));
+    }
+
+    #[test]
+    fn should_attribute_alter_on_truly_missing_table() {
+        // 延迟重试后仍不存在 → ENG-0070 归属 ALTER 所在文件
+        let run = run_all(&[file("a.sql", "ALTER TABLE ghost ADD COLUMN c INT;")]);
+        let (rel, err) = run.schema_error.expect("应报 ENG-0070");
+        assert_eq!(err.code.to_string(), "ENG-0070", "{err:?}");
+        assert_eq!(rel, "a.sql");
+    }
+
+    #[test]
+    fn should_keep_snapshot_when_file_is_in_skip_reject() {
+        // register 已报 Gate 2A 的文件：顶层拒绝不重复收集，
+        // 但同文件有效 CREATE 仍进快照（供后续 ALTER/DROP 解析）。
+        let mut skip = BTreeSet::new();
+        skip.insert("mixed.sql".to_string());
+        let run = run(
+            &[
+                file(
+                    "mixed.sql",
+                    "CREATE TABLE t1(a INT); CREATE TRIGGER trg BEFORE INSERT ON t1 FOR EACH ROW EXECUTE FUNCTION f();",
+                ),
+                file("b.sql", "ALTER TABLE t1 ADD COLUMN c2 INT;"),
+            ],
+            &skip,
+        );
+        assert!(run.rejected.is_empty(), "{:?}", run.rejected);
+        assert!(run.schema_error.is_none(), "{:?}", run.schema_error);
+        let snap = run.snapshot.expect("快照应产出");
+        assert!(snap.tables["t1"].columns.contains_key("c2"));
+    }
+
+    #[test]
+    fn should_scope_pl_temp_table_by_declaration_order() {
+        // 体内 CREATE TEMP TABLE：声明之后才可见；声明之前的引用仍报缺失；
+        // 同文件另一例程的同名引用不受影响（例程级作用域）。
+        let run = run_all(&[file(
+            "p.sql",
+            "CREATE PROCEDURE p1 IS BEGIN \
+             CREATE TEMP TABLE tmp_a AS SELECT 1 AS x; \
+             INSERT INTO tmp_a SELECT * FROM tmp_a; END; \
+             CREATE PROCEDURE p2 IS BEGIN \
+             INSERT INTO tmp_a VALUES (1); END;",
+        )]);
+        let tmp_refs: Vec<&str> = run
+            .findings
+            .iter()
+            .filter(|f| f.object == "tmp_a")
+            .map(|f| f.kind.as_str())
+            .collect();
+        // p2 的 INSERT 在 p1 的声明之外 → 仍报缺失；p1 内声明后引用不报
+        assert_eq!(tmp_refs, ["table"], "{:?}", run.findings);
+    }
+
+    #[test]
+    fn should_flag_reference_before_temp_declaration() {
+        // 同一例程体内：引用先于声明 → 报缺失（声明后引用不报）
+        let run = run_all(&[file(
+            "p.sql",
+            "CREATE PROCEDURE p IS BEGIN \
+             INSERT INTO tmp_b VALUES (1); \
+             CREATE TEMP TABLE tmp_b AS SELECT 1 AS x; \
+             INSERT INTO tmp_b SELECT * FROM tmp_b; END;",
+        )]);
+        let n = run.findings.iter().filter(|f| f.object == "tmp_b").count();
         assert_eq!(n, 1, "{:?}", run.findings);
     }
 }

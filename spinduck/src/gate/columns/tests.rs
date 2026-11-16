@@ -17,7 +17,7 @@ fn stmt_of(sql: &str) -> Statement {
 }
 
 fn missing(sql: &str, snap: &SchemaSnapshot) -> Vec<(Option<String>, String, &'static str)> {
-    check_columns(&stmt_of(sql), snap, &BTreeSet::new())
+    check_columns(&stmt_of(sql), snap)
         .into_iter()
         .map(|m| (m.qualifier, m.column, m.problem))
         .collect()
@@ -92,11 +92,28 @@ fn should_skip_unknown_view_and_deferred_ctas() {
 
 #[test]
 fn should_skip_columns_of_local_temp_table() {
-    // 文件级 PL 临时表：对象已知、列集合延迟到 Gate 2B
+    // 例程体内声明的局部表：对象已知、列集合延迟到 Gate 2B；
+    // 声明之前的引用不享受该豁免。
     let snap = snap_of("CREATE TABLE t1(a INT)");
-    let local: BTreeSet<String> = ["tmp_pl".to_string()].into_iter().collect();
-    let got = check_columns(&stmt_of("SELECT whatever FROM tmp_pl"), &snap, &local);
+    let got = check_columns(
+        &stmt_of(
+            "CREATE PROCEDURE p IS BEGIN \
+             CREATE TEMP TABLE tmp_pl AS SELECT a FROM t1; \
+             SELECT whatever FROM tmp_pl; END;",
+        ),
+        &snap,
+    );
     assert!(got.is_empty(), "{got:?}");
+    // 声明之前引用 tmp_pl 的列 → 对象缺失归对象级切片，
+    // 列级同样不得把 tmp_pl 当已知（Cols::Unknown 之外不误伤）
+    let got = check_columns(&stmt_of("SELECT whatever FROM tmp_pl"), &snap);
+    // tmp_pl 不在快照 → 对象级会报 missing；列级对未知对象本就 Unknown，
+    // 断言仅锁定"不产生 missing/ambiguous 列诊断"。
+    assert!(
+        got.iter()
+            .all(|m| m.problem != "missing" && m.problem != "ambiguous"),
+        "{got:?}"
+    );
 }
 
 #[test]

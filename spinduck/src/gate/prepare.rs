@@ -30,7 +30,7 @@ const SKIP_OBJECTS: &[&str] = &["sys_dummy", "dual"];
 
 fn quote_ident(name: &str) -> String {
     name.split('.')
-        .map(|p| format!("\"{p}\""))
+        .map(|p| format!("\"{}\"", p.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(".")
 }
@@ -74,14 +74,29 @@ fn duck_type(dt: &DataType, rules: &RuleRegistry) -> String {
     "VARCHAR".to_string()
 }
 
-/// 已知对象 → stub DDL（`BTreeMap` 遍历保证确定性顺序；限定名先补 schema）。
+/// 已知对象 → stub DDL（`BTreeMap` 遍历保证确定性顺序；限定名先补
+/// schema）。schema 来源 = 实际会发出的表 / 已知列视图 / 序列的
+/// 限定名——仅有 `s.v`/`s.seq` 而无 `s` 下表时同样先建 schema。
 pub fn stub_ddl(snap: &SchemaSnapshot, rules: &RuleRegistry) -> Vec<String> {
     let mut out = Vec::new();
     let mut schemas = BTreeSet::new();
-    for name in snap.tables.keys() {
+    let mut note_schema = |name: &str| {
         if let Some((s, _)) = name.split_once('.') {
             schemas.insert(s.to_string());
         }
+    };
+    for (name, def) in &snap.tables {
+        if !(def.columns_deferred || def.columns.is_empty()) {
+            note_schema(name);
+        }
+    }
+    for (name, def) in &snap.views {
+        if matches!(def, ViewDef::Known(_)) {
+            note_schema(name);
+        }
+    }
+    for name in &snap.sequences {
+        note_schema(name);
     }
     for s in schemas {
         out.push(format!("CREATE SCHEMA IF NOT EXISTS \"{s}\""));
@@ -140,22 +155,25 @@ pub fn deferred_names(snap: &SchemaSnapshot) -> BTreeSet<String> {
     out
 }
 
-/// 名字在错误文本中是否以"对象引用"形态出现：限定名整体、
-/// 引号包裹、或两侧为非标识符边界。刻意**不**匹配 `Candidate
-/// bindings` 类候选列回显（那是列级错误，不属于对象缺失）。
+/// `needle` 是否以"标识符边界"出现在 `hay` 中：两侧都不能紧邻
+/// 标识符字符（`[A-Za-z0-9_]`），左界额外拒绝 `.`——`s.tmp` 不得
+/// 命中 `x.s.tmp`，`tmp` 不得命中 `s.tmp`/`tmp_hist`/`dual_acct`。
+fn bounded_contains(hay: &str, needle: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    hay.match_indices(needle).any(|(i, _)| {
+        let before = hay[..i].chars().next_back();
+        let after = hay[i + needle.len()..].chars().next();
+        before.is_none_or(|c| !ident(c) && c != '.') && after.is_none_or(|c| !ident(c))
+    })
+}
+
+/// 名字在错误文本中是否以"对象引用"形态出现：先去掉双引号
+/// （`"s"."t1"` → `s.t1`），再按标识符边界匹配限定名整体或叶子名。
+/// 刻意**不**匹配 `Candidate bindings` 类候选列回显（列级错误，
+/// 不属于对象缺失）。
 fn name_is_object_ref(lower_err: &str, needle: &str) -> bool {
-    if needle.contains('.') && lower_err.contains(needle) {
-        return true;
-    }
-    let leaf = needle.rsplit('.').next().unwrap_or(needle);
-    // "leaf" / 'leaf' / leaf. / .leaf / 空格包围的裸 leaf
-    lower_err.contains(&format!("\"{leaf}\""))
-        || lower_err.contains(&format!("'{leaf}'"))
-        || lower_err.contains(&format!(" {leaf}."))
-        || lower_err.contains(&format!(".{leaf}"))
-        || lower_err
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .any(|tok| tok == leaf)
+    let norm = lower_err.replace('"', "");
+    bounded_contains(&norm, needle)
 }
 
 /// 报错是否为"延迟对象不存在"：必须同时满足 ① 错误主体是对象缺失
@@ -191,20 +209,88 @@ pub struct PrepareStmt {
 /// `$v_*` → `CAST(NULL AS <类型>)` 类型化替换（设计 §4.4.1）：
 /// 已知类型让 Binder 做重载裁决；记录字段与未知类型保留参数形态
 /// （DuckDB 按参数处理，不产生重载假阴性以外的误报）。
+///
+/// 替换按"最长占位符优先 + 右标识符边界 + 跳过字符串/注释"实现：
+/// `$v_v_return_rate` 不得吃掉 `$v_v_return_rate_flag` 的前缀，
+/// 字符串字面量里的 `$v_…` 原样保留。
 fn typed_sql(stmt: &PrepareStmt) -> String {
-    let mut sql = stmt.sql.clone();
-    for (ph, src) in &stmt.binds {
-        let BindSrc::Var(var) = src else {
-            continue;
-        };
-        let Some(ty) = stmt.var_types.get(&var.0.to_ascii_lowercase()) else {
-            continue;
-        };
-        if ph.starts_with("$v_") {
-            sql = sql.replace(ph.as_str(), &format!("CAST(NULL AS {})", ty.duckdb_name()));
+    let mut reps: Vec<(&str, String)> = stmt
+        .binds
+        .iter()
+        .filter_map(|(ph, src)| {
+            let BindSrc::Var(var) = src else {
+                return None;
+            };
+            let ty = stmt.var_types.get(&var.0.to_ascii_lowercase())?;
+            ph.starts_with("$v_")
+                .then(|| (ph.as_str(), format!("CAST(NULL AS {})", ty.duckdb_name())))
+        })
+        .collect();
+    if reps.is_empty() {
+        return stmt.sql.clone();
+    }
+    reps.sort_by_key(|(ph, _)| std::cmp::Reverse(ph.len()));
+    let sql = stmt.sql.as_str();
+    let b = sql.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out = String::with_capacity(sql.len());
+    let mut last = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            // 字符串字面量（'..' / ".." / `..`，'' 双写转义）整段跳过
+            q @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        if i + 1 < b.len() && b[i + 1] == q {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // 行注释 / 块注释整段跳过
+            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            }
+            b'$' => {
+                // 左界：前一字节不得是标识符/`$`（`a$v_b` 不算占位符）
+                let left_ok = i == 0 || (!ident(b[i - 1]) && b[i - 1] != b'$');
+                let hit = left_ok.then(|| {
+                    reps.iter().find(|(ph, _)| {
+                        sql[i..].starts_with(ph)
+                            && sql[i + ph.len()..].chars().next().is_none_or(|c| {
+                                !(c.is_ascii_alphanumeric() || c == '_' || c == '$')
+                            })
+                    })
+                });
+                if let Some(Some((ph, rep))) = hit {
+                    out.push_str(&sql[last..i]);
+                    out.push_str(rep);
+                    i += ph.len();
+                    last = i;
+                    continue;
+                }
+                i += 1;
+            }
+            _ => i += 1,
         }
     }
-    sql
+    out.push_str(&sql[last..]);
+    out
 }
 
 /// Gate 2B 编排（`native`）：建内存 stub 库 → 应用 stub DDL →
@@ -217,13 +303,28 @@ pub fn prepare_all(
     rules: &RuleRegistry,
     sqls: &[PrepareStmt],
 ) -> Result<Vec<(String, EngineError)>, EngineError> {
+    prepare_all_impl(snap, rules, sqls, &[])
+}
+
+/// `prepare_all` 内部实现；`extra_ddl` 为测试注入缝（stub DDL
+/// 失败路径 `ENG-0072` 的守护用例需要一条必失败的 DDL）。
+#[cfg(feature = "native")]
+fn prepare_all_impl(
+    snap: &SchemaSnapshot,
+    rules: &RuleRegistry,
+    sqls: &[PrepareStmt],
+    extra_ddl: &[String],
+) -> Result<Vec<(String, EngineError)>, EngineError> {
     use crate::exec::SqlExecutor;
     use crate::sql::exec_native::{prepare_check, DuckExecutor};
 
     let deferred = deferred_names(snap);
     let ex = DuckExecutor::open_in_memory()
         .map_err(|e| EngineError::kernel(11, format!("gate2b stub db open: {e}")))?;
-    for ddl in stub_ddl(snap, rules) {
+    for ddl in stub_ddl(snap, rules)
+        .into_iter()
+        .chain(extra_ddl.iter().cloned())
+    {
         ex.execute(&ddl, &crate::exec::BindMap::new())
             .map_err(|e| {
                 EngineError::invariant(72, format!("gate2b stub ddl failed: {ddl}: {e}"))
@@ -232,10 +333,12 @@ pub fn prepare_all(
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     for stmt in sqls {
-        if !seen.insert(stmt.sql.clone()) {
+        let sql = typed_sql(stmt);
+        // 去重键 = 类型化后 SQL + 本语句 skip：同文本不同类型/抑制名
+        // 的语句必须分别裁决，不能让先到的成功语句吞掉后者。
+        if !seen.insert((sql.clone(), stmt.skip.clone())) {
             continue;
         }
-        let sql = typed_sql(stmt);
         if let Err(e) = prepare_check(ex.connection(), &sql) {
             let mut names = deferred.clone();
             names.extend(stmt.skip.iter().cloned());
@@ -296,6 +399,23 @@ mod tests {
     }
 
     #[test]
+    fn should_emit_schema_for_qualified_view_and_sequence_only() {
+        // 仅有 s.v / s.seq、无 s 下表时也必须先 CREATE SCHEMA
+        let snap = snap_of("CREATE VIEW s.v1(x) AS SELECT 1; CREATE SEQUENCE s.seq1;");
+        let ddl = stub_ddl(&snap, &RuleRegistry::default());
+        assert_eq!(ddl[0], "CREATE SCHEMA IF NOT EXISTS \"s\"", "{ddl:?}");
+        assert!(
+            ddl.iter().any(|d| d.contains("CREATE VIEW \"s\".\"v1\"")),
+            "{ddl:?}"
+        );
+        assert!(
+            ddl.iter()
+                .any(|d| d.contains("CREATE SEQUENCE \"s\".\"seq1\"")),
+            "{ddl:?}"
+        );
+    }
+
+    #[test]
     fn should_map_custom_type_via_rules() {
         let snap = snap_of("CREATE TABLE t1(a NUMBER(10,2), b VARCHAR2(20))");
         let mut rules = RuleRegistry::default();
@@ -344,6 +464,28 @@ mod tests {
     }
 
     #[test]
+    fn should_not_suppress_near_miss_object_names() {
+        // 词边界：延迟名 dual/tmp 不得命中 dual_acct/tmp_hist/s.tmp_hist
+        let names: BTreeSet<String> =
+            ["dual".to_string(), "tmp".to_string(), "s.tmp".to_string()].into();
+        for err in [
+            "Catalog Error: Table with name ods.dual_acct does not exist!",
+            "Catalog Error: Table with name s.tmp_hist does not exist!",
+            "Catalog Error: Table with name tmp2 does not exist!",
+        ] {
+            assert!(!mentions(err, &names), "{err}");
+        }
+        // 精确命中（含限定名与引号形态）→ 抑制
+        for err in [
+            "Catalog Error: Table with name tmp does not exist!",
+            "Catalog Error: Table with name \"s\".\"tmp\" does not exist!",
+            "Catalog Error: Table with name s.tmp does not exist!",
+        ] {
+            assert!(mentions(err, &names), "{err}");
+        }
+    }
+
+    #[test]
     fn should_type_placeholder_vars() {
         let stmt = PrepareStmt {
             file: "f".into(),
@@ -362,6 +504,42 @@ mod tests {
         assert!(sql.contains("CAST(NULL AS DATE)"), "{sql}");
         assert!(sql.contains("CAST(NULL AS INTEGER)"), "{sql}");
         assert!(!sql.contains("$v_d"), "{sql}");
+    }
+
+    #[test]
+    fn should_not_corrupt_prefix_placeholders_or_literals() {
+        // $v_v_return_rate 是 $v_v_return_rate_flag 的前缀：最长优先 +
+        // 右标识符边界，两个占位符必须各自完整替换；字符串里的不动。
+        let stmt = PrepareStmt {
+            file: "f".into(),
+            sql: "SELECT $v_v_return_rate, $v_v_return_rate_flag, '$v_v_return_rate' FROM t".into(),
+            binds: vec![
+                (
+                    "$v_v_return_rate".into(),
+                    BindSrc::Var(VarName("v_return_rate".into())),
+                ),
+                (
+                    "$v_v_return_rate_flag".into(),
+                    BindSrc::Var(VarName("v_return_rate_flag".into())),
+                ),
+            ],
+            var_types: BTreeMap::from([
+                (
+                    "v_return_rate".to_string(),
+                    SpinType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                ),
+                ("v_return_rate_flag".to_string(), SpinType::Bool),
+            ]),
+            skip: BTreeSet::new(),
+        };
+        let sql = typed_sql(&stmt);
+        assert_eq!(
+            sql, "SELECT CAST(NULL AS DECIMAL), CAST(NULL AS BOOLEAN), '$v_v_return_rate' FROM t",
+            "{sql}"
+        );
     }
 
     #[cfg(feature = "native")]
@@ -424,5 +602,37 @@ mod tests {
         let out = prepare_all(&snap, &rules, &sqls).unwrap();
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].1.code.to_string(), "KERNEL-0011");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn should_judge_same_sql_with_different_types_and_skip() {
+        // 同文本不同 var_types：DATE 的 round 重载错误必须上报，
+        // 不能被先到的"通过"语句去重吞掉；skip 不同同理。
+        let snap = snap_of("CREATE TABLE t1(a INT)");
+        let rules = RuleRegistry::default();
+        let mk = |ty: SpinType, skip: &[&str]| PrepareStmt {
+            file: "f".into(),
+            sql: "SELECT round($v_d, 'MM') FROM t1".into(),
+            binds: vec![("$v_d".into(), BindSrc::Var(VarName("d".into())))],
+            var_types: BTreeMap::from([("d".to_string(), ty)]),
+            skip: skip.iter().map(|s| s.to_string()).collect(),
+        };
+        let sqls = vec![mk(SpinType::Int, &[]), mk(SpinType::Date, &[])];
+        let out = prepare_all(&snap, &rules, &sqls).unwrap();
+        // Int 版 prepare 通过；Date 版 KERNEL-0011——去重不得跨类型合并
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].1.code.to_string(), "KERNEL-0011");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn should_fail_stub_ddl_as_eng_0072() {
+        // stub DDL 执行失败 = 引擎侧缺陷 ENG-0072，Err 上抛而非空通过
+        let snap = snap_of("CREATE TABLE t1(a INT)");
+        let rules = RuleRegistry::default();
+        let err = prepare_all_impl(&snap, &rules, &[], &["THIS IS NOT VALID SQL".to_string()])
+            .unwrap_err();
+        assert_eq!(err.code.to_string(), "ENG-0072", "{err:?}");
     }
 }

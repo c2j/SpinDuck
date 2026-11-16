@@ -69,3 +69,15 @@ pub(crate) fn reject_unsupported_ddl(st: &Statement) -> Result<(), EngineError> 
         None => Ok(()),
     }
 }
+
+/// 语句声明的表对象名（`CreateTable`/`CreateTableAs`，含例程体内
+/// `SqlStatement` 下钻形态）：Gate 1B 将其视为本语句局部声明，
+/// 对象已知、列集合延迟到 Gate 2B。顶层永久表与全局快照同名时
+/// 语义一致，重复登记无害。
+pub(crate) fn declared_table_key(st: &Statement) -> Option<String> {
+    match st {
+        Statement::CreateTable(t) => Some(schema::object_key(&t.name)),
+        Statement::CreateTableAs(t) => Some(schema::object_key(&t.name)),
+        _ => None,
+    }
+}

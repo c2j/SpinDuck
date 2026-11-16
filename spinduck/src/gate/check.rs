@@ -29,14 +29,11 @@ pub struct MissingRef {
 }
 
 /// 检查一条顶层语句（含 PL 体内嵌 SQL）的对象引用；返回去重排序后的
-/// 全部缺失项（不 fail-fast，调用方聚合输出）。`local` 为文件级 PL
-/// 临时表名集合（`CREATE [TEMP] TABLE` 于例程体内声明）：会话级对象
-/// 不进全局快照，同文件内引用视为已知。
-pub fn check_statement(
-    st: &Statement,
-    snap: &SchemaSnapshot,
-    local: &BTreeSet<String>,
-) -> Vec<MissingRef> {
+/// 全部缺失项（不 fail-fast，调用方聚合输出）。例程体内
+/// `CREATE [TEMP] TABLE` 声明的会话级对象按"单语句作用域 + 声明顺序"
+/// 处理：walk 到声明语句才纳入本地集合，声明之前的引用与其他语句
+/// （含同文件另一例程）不受影响；列集合延迟到 Gate 2B。
+pub fn check_statement(st: &Statement, snap: &SchemaSnapshot) -> Vec<MissingRef> {
     // Pass 1：收集整条语句的 CTE 名（供 TableRef 遮蔽判定）
     let mut ctes = CteNames(BTreeSet::new());
     walk_statement(&mut ctes, st);
@@ -44,7 +41,7 @@ pub fn check_statement(
     let mut chk = RefChecker {
         snap,
         ctes: &ctes.0,
-        local,
+        local: BTreeSet::new(),
         out: Vec::new(),
     };
     walk_statement(&mut chk, st);
@@ -71,8 +68,9 @@ impl Visitor for CteNames {
 struct RefChecker<'a> {
     snap: &'a SchemaSnapshot,
     ctes: &'a BTreeSet<String>,
-    /// 文件级 PL 临时表（归一化限定名）。
-    local: &'a BTreeSet<String>,
+    /// 本语句内已声明的局部表（归一化限定名）：walk 顺序累积，
+    /// 声明之后的引用视为已知，声明之前/其他语句不受影响。
+    local: BTreeSet<String>,
     out: Vec<MissingRef>,
 }
 
@@ -89,23 +87,13 @@ impl RefChecker<'_> {
             || self.snap.views.contains_key(&key)
             || self.engine_provided(name)
             || self.suffix_known(name)
-            || self.local_known(name, &key)
+            || self.local_known(&key)
     }
 
-    /// 文件级 PL 临时表：精确键命中；单段名按末段后缀命中
-    /// （与 `suffix_known` 同口径，覆盖 `FROM tmp` 引用 `s.tmp`）。
-    fn local_known(&self, name: &ObjectName, key: &str) -> bool {
-        if self.local.contains(key) {
-            return true;
-        }
-        if name.len() == 1 {
-            let want = name[0].value.to_ascii_lowercase();
-            return self
-                .local
-                .iter()
-                .any(|k| k.rsplit('.').next() == Some(want.as_str()));
-        }
-        false
+    /// 局部表判定：仅精确键命中——局部名基本为单段未限定名，
+    /// 后缀匹配会让无关同叶对象被误当已知。
+    fn local_known(&self, key: &str) -> bool {
+        self.local.contains(key)
     }
 
     /// 引擎自建伪表（`sys_dummy`，口径同 `verify::ENGINE_PROVIDED_TABLES`）
@@ -134,6 +122,15 @@ impl RefChecker<'_> {
 }
 
 impl Visitor for RefChecker<'_> {
+    fn visit_statement(&mut self, st: &Statement) -> VisitorResult {
+        // 例程体内（SqlStatement 下钻）与顶层的 CREATE [TEMP] TABLE：
+        // 声明名按 walk 顺序纳入本地集合，供其后引用判定。
+        if let Some(key) = super::declared_table_key(st) {
+            self.local.insert(key);
+        }
+        VisitorResult::Continue
+    }
+
     fn visit_table_ref(&mut self, tr: &TableRef) -> VisitorResult {
         if let TableRef::Table { name, .. } = tr {
             if !self.known(name) {
@@ -226,7 +223,7 @@ mod tests {
     }
 
     fn missing(sql: &str, snap: &SchemaSnapshot) -> Vec<String> {
-        check_statement(&stmt_of(sql), snap, &BTreeSet::new())
+        check_statement(&stmt_of(sql), snap)
             .into_iter()
             .map(|m| m.object)
             .collect()
@@ -301,10 +298,10 @@ mod tests {
     }
 
     #[test]
-    fn should_accept_local_temp_table_refs() {
-        // 例程体内 CREATE TEMP TABLE 声明的会话级对象：同文件引用不报缺失
+    fn should_scope_local_table_by_declaration_order() {
+        // 例程体内 CREATE TEMP TABLE：声明之后的引用不报缺失；
+        // 声明之前的引用仍报；其他语句不继承本语句的局部声明。
         let snap = snap_of("CREATE TABLE t1(a INT)");
-        let local: BTreeSet<String> = ["tmp_t".to_string()].into_iter().collect();
         let got = check_statement(
             &stmt_of(
                 "CREATE PROCEDURE p IS BEGIN \
@@ -312,12 +309,21 @@ mod tests {
                  INSERT INTO tmp_t SELECT a FROM t1; END;",
             ),
             &snap,
-            &local,
         );
         assert!(got.is_empty(), "{got:?}");
-        // 不在 local 集合的同名引用仍报缺失
-        let got = check_statement(&stmt_of("SELECT * FROM tmp_t"), &snap, &BTreeSet::new());
+        // 独立语句引用同名表 → 缺失
+        let got = check_statement(&stmt_of("SELECT * FROM tmp_t"), &snap);
         assert_eq!(got.len(), 1);
+        // 声明之前的引用 → 缺失
+        let got = check_statement(
+            &stmt_of(
+                "CREATE PROCEDURE p IS BEGIN \
+                 INSERT INTO tmp_t VALUES (1); \
+                 CREATE TEMP TABLE tmp_t AS SELECT a FROM t1; END;",
+            ),
+            &snap,
+        );
+        assert_eq!(got.len(), 1, "{got:?}");
     }
 
     #[test]

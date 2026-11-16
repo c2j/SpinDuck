@@ -62,13 +62,10 @@ type Scope = Vec<ScopeEntry>;
 type CteCols = BTreeMap<String, Cols>;
 
 /// 检查一条顶层语句（含 PL 体内嵌 SQL、游标/FOR/EXECUTE 解析查询）
-/// 的列引用；返回去重排序结果。`local` 为文件级 PL 临时表名集合：
-/// 对象视为已知、列集合不可静态确定（`Cols::Unknown`，延迟 Gate 2B）。
-pub fn check_columns(
-    st: &Statement,
-    snap: &SchemaSnapshot,
-    local: &BTreeSet<String>,
-) -> Vec<MissingColumn> {
+/// 的列引用；返回去重排序结果。例程体内 `CREATE [TEMP] TABLE`
+/// 声明的会话级对象按"单语句作用域 + 声明顺序"累积（walk 到声明
+/// 才可见）：对象视为已知、列集合 `Cols::Unknown` 延迟 Gate 2B。
+pub fn check_columns(st: &Statement, snap: &SchemaSnapshot) -> Vec<MissingColumn> {
     // Pass 1：收集例程变量名（参数 + DECLARE 变量/记录/游标/嵌套例程
     // 参数），供标识符消歧。超集收集是安全方向（只少报不误报）。
     let mut vars = PlNames::default();
@@ -76,7 +73,7 @@ pub fn check_columns(
     let mut gate = Gate {
         snap,
         vars: &vars.0,
-        local,
+        local: BTreeSet::new(),
         out: Vec::new(),
     };
     walk_statement(&mut gate, st);
@@ -154,12 +151,22 @@ impl Visitor for PlNames {
 struct Gate<'a> {
     snap: &'a SchemaSnapshot,
     vars: &'a BTreeSet<String>,
-    /// 文件级 PL 临时表（归一化限定名）。
-    local: &'a BTreeSet<String>,
+    /// 本语句内已声明的局部表（归一化限定名）：walk 顺序累积，
+    /// 声明之后的引用视为 `Cols::Unknown`（列延迟 Gate 2B）。
+    local: BTreeSet<String>,
     out: Vec<MissingColumn>,
 }
 
 impl Visitor for Gate<'_> {
+    fn visit_statement(&mut self, st: &Statement) -> VisitorResult {
+        // 例程体内（SqlStatement 下钻）与顶层的 CREATE [TEMP] TABLE：
+        // 声明名按 walk 顺序纳入本地集合，供其后引用判定。
+        if let Some(key) = super::declared_table_key(st) {
+            self.local.insert(key);
+        }
+        VisitorResult::Continue
+    }
+
     fn visit_select(&mut self, sel: &SelectStatement) -> VisitorResult {
         // select() 自行递归全部子查询；SkipChildren 防止 walk 重复进入。
         self.select(sel, &Scope::new(), &CteCols::new());
@@ -226,13 +233,10 @@ impl Gate<'_> {
                 return Cols::Known(BTreeSet::from(["dummy".to_string()]));
             }
         }
-        // 单段未限定名后缀匹配（与对象级检查同口径）
+        // 单段未限定名后缀匹配（与对象级检查同口径；局部表仅精确键）
         if name.len() == 1 {
             let want = name[0].value.to_ascii_lowercase();
             let hit = |k: &String| k.rsplit('.').next() == Some(want.as_str());
-            if self.local.iter().any(hit) {
-                return Cols::Unknown;
-            }
             if let Some(k) = self.snap.tables.keys().find(|k| hit(k)) {
                 return table_cols(&self.snap.tables[k]);
             }
@@ -243,19 +247,10 @@ impl Gate<'_> {
         Cols::Unknown
     }
 
-    /// 文件级 PL 临时表判定：精确键或单段末段后缀命中。
-    fn local_table(&self, name: &ObjectName, key: &str) -> bool {
-        if self.local.contains(key) {
-            return true;
-        }
-        if name.len() == 1 {
-            let want = name[0].value.to_ascii_lowercase();
-            return self
-                .local
-                .iter()
-                .any(|k| k.rsplit('.').next() == Some(want.as_str()));
-        }
-        false
+    /// 局部表判定：仅精确键命中（与对象级 `local_known` 同口径，
+    /// 后缀匹配会让无关同叶对象被误当已知）。
+    fn local_table(&self, _name: &ObjectName, key: &str) -> bool {
+        self.local.contains(key)
     }
 }
 
