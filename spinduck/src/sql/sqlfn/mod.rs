@@ -27,7 +27,7 @@ use crate::ir::BindSrc;
 pub const MAX_TUPLES: usize = 100_000;
 
 /// 一个去重后的调用点及其下沉计划。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FnSite {
     /// 缓存表名（运行期 `CREATE OR REPLACE TEMP TABLE`）
     pub table: String,

@@ -5,7 +5,7 @@ use crate::value::SpinValue;
 
 /// SQL 绑定源：帧变量 / 记录字段（§3.2 消歧——记录变量限定字段可出现在
 /// 下发 SQL 文本，如 `INSERT ... VALUES (r_get_purchase.fee, ...)`）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BindSrc {
     /// 裸变量
     Var(VarName),
@@ -28,22 +28,22 @@ impl BindSrc {
 }
 
 /// 变量名 Newtype（AGENTS §5 边界类型纪律）。
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct VarName(pub String);
 
 /// 标签 Newtype。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Label(pub String);
 
 /// 赋值目标：变量 / 记录字段（编译期按帧作用域消歧，设计 §3.2）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum AssignTarget {
     Var(VarName),
     Field { rec: VarName, field: String },
 }
 
 /// 表达式 IR（AST 的可求值子集；SQL 侧表达式经改写后下沉，不出现在此）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum IrExpr {
     Const(SpinValue),
     Var(VarName),
@@ -102,13 +102,13 @@ impl IrExpr {
 }
 
 /// 编译期生成的标量 SQL 与按名绑定源。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScalarSql {
     pub sql: String,
     pub binds: Vec<(String, BindSrc)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BinOp {
     Add,
     Sub,
@@ -126,7 +126,7 @@ pub enum BinOp {
 }
 
 /// 指令（PC 为编译后索引；标签在代码生成期解析）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum IrStmt {
     Nop,
     Assign {
@@ -217,14 +217,14 @@ pub enum IrStmt {
 }
 
 /// 单个处理器：条件列表 + 主体指令区间 [body_start, body_end)。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrapEntry {
     pub conds: Vec<String>,
     pub body_start: usize,
     pub body_end: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum CursorSource {
     /// 静态游标：声明段 parsed_query 经改写管线后的文本与绑定
     Static {
@@ -241,7 +241,7 @@ pub enum CursorSource {
 pub(crate) type CompiledCursorSql = (String, Vec<(String, BindSrc)>, Vec<crate::sql::FnSite>);
 
 /// 编译产物：线性指令序列。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct IrProg {
     pub code: Vec<IrStmt>,
     /// 已映射的标量声明（小写变量名 → 类型）。`%ROWTYPE` 与映射表外的类型名不在此。

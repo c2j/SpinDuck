@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 /// 引擎内部类型（与 DuckDB LogicalType 一一映射，映射值来自规则数据）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SpinType {
     Decimal { precision: u8, scale: u8 },
     Int,

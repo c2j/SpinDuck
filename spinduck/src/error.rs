@@ -3,7 +3,7 @@
 use std::fmt;
 
 /// 错误码 Newtype（AGENTS.md §4：`ENG-####` / `KERNEL-####` / `BIZ-####` / `ENV-####`）。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ErrorCode(pub String);
 
 impl ErrorCode {
@@ -28,7 +28,7 @@ impl fmt::Display for ErrorCode {
 }
 
 /// 故障域（产生点标注，禁止上层改判）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FaultDomain {
     Engine,
     Kernel,
@@ -37,7 +37,7 @@ pub enum FaultDomain {
 }
 
 /// 引擎错误：域 + 错误码 + 消息。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EngineError {
     pub domain: FaultDomain,
     pub code: ErrorCode,

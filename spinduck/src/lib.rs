@@ -12,6 +12,7 @@ pub mod exec;
 pub mod gate;
 pub mod io;
 pub mod ir;
+pub mod ir_cache;
 pub(crate) mod lookup_cache;
 pub mod norm;
 pub mod plan;

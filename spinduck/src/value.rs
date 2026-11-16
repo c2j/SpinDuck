@@ -4,7 +4,7 @@ use crate::error::EngineError;
 use crate::types::SpinType;
 
 /// PL 值（本文件不依赖 DuckDB API，保证单元测试纯净；转换在 exec 层完成）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SpinValue {
     Null,
     Bool(bool),

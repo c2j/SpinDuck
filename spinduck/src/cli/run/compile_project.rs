@@ -13,7 +13,7 @@ use crate::plan::{write_plan, PlanWrite, RunPlan};
 use crate::project::ProjectConfig;
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// `compile` 的项目旗标。路径模式不走这里。
 pub struct ProjectCompile {
@@ -245,11 +245,22 @@ fn ir_failures(
     if !rels.is_empty() {
         let paths: Vec<PathBuf> = rels.iter().map(|rel| project.root.join(rel)).collect();
         let rules = rules_for_paths(&paths)?;
-        let mut eng = Engine::new(Box::new(NoopExecutor), rules.clone());
+        // 预读全部源文本：IR 缓存 stamp 需要全量输入，注册也复用同一份文本
+        let mut texts: Vec<(String, String)> = Vec::with_capacity(rels.len());
         for rel in &rels {
+            match read_source_strict(&project.root.join(rel)) {
+                Ok(text) => texts.push((rel.to_string(), text)),
+                Err(err) => failed.push((rel.to_string(), err)),
+            }
+        }
+        let stamp = crate::ir_cache::CompileGateStamp::compute(&texts, &rules);
+        let cache_dir = project.root.join(&project.home_dir).join("ir-cache");
+        let mut eng = Engine::new(Box::new(NoopExecutor), rules.clone());
+        eng.ir_cache = Some(crate::ir_cache::IrCache::open(&cache_dir, &stamp));
+        for (rel, text) in &texts {
             let before: BTreeSet<String> = eng.catalog.names().into_iter().collect();
-            if let Some(err) = register_file(&mut eng, &project.root.join(rel)) {
-                failed.push((rel.to_string(), err));
+            if let Err(err) = eng.register(text) {
+                failed.push((rel.clone(), err));
                 continue;
             }
             for name in eng
@@ -378,11 +389,4 @@ fn covered_by_plan_missing(
         name == f.object
             || (!f.object.contains('.') && name.rsplit('.').next() == Some(f.object.as_str()))
     })
-}
-
-fn register_file(eng: &mut Engine, path: &Path) -> Option<EngineError> {
-    match read_source_strict(path) {
-        Ok(text) => eng.register(&text).err(),
-        Err(err) => Some(err),
-    }
 }
