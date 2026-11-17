@@ -20,6 +20,7 @@ pub use entry::EntryConfig;
 pub use manifest::{manifest_text, sync_runtime_manifest, ManifestSync, SNAPSHOT_FILE};
 
 use crate::error::EngineError;
+use crate::ir::set_oriented::SetOrientedMode;
 use crate::project::fs::{cfg_err, list_dir_suffix, read_text, sql_files};
 use std::path::{Path, PathBuf};
 
@@ -30,7 +31,7 @@ pub struct ProjectConfig {
     /// 目标内核版本（M1 锚定；与规则文件 probe_duckdb 一致性由 rules probe 校验）
     pub kernel: String,
     /// `[engine].set_oriented`：默认关闭的受限静态集合化。
-    pub set_oriented: bool,
+    pub set_oriented: SetOrientedMode,
     pub ddl_dir: PathBuf,
     pub routines_dir: PathBuf,
     pub stubs_dirs: Vec<PathBuf>,
@@ -97,21 +98,25 @@ impl ProjectConfig {
     }
 }
 
-fn set_oriented_option(v: &toml::Value) -> Result<bool, EngineError> {
+fn set_oriented_option(v: &toml::Value) -> Result<SetOrientedMode, EngineError> {
     let Some(engine) = v.get("engine") else {
-        return Ok(false);
+        return Ok(SetOrientedMode::Off);
     };
     let table = engine
         .as_table()
         .ok_or_else(|| EngineError::env(30, "spinduck.toml: [engine] 必须为表"))?;
-    match table.get("set_oriented") {
-        None => Ok(false),
-        Some(toml::Value::Boolean(enabled)) => Ok(*enabled),
-        Some(_) => Err(EngineError::env(
+    let mode = match table.get("set_oriented") {
+        None => Some(SetOrientedMode::Off),
+        Some(toml::Value::Boolean(enabled)) => Some((*enabled).into()),
+        Some(toml::Value::String(name)) => SetOrientedMode::from_name(name),
+        Some(_) => None,
+    };
+    mode.ok_or_else(|| {
+        EngineError::env(
             30,
-            "spinduck.toml: [engine].set_oriented 必须为布尔值",
-        )),
-    }
+            "spinduck.toml: [engine].set_oriented 必须为布尔值或 off/strict/batch-atomic",
+        )
+    })
 }
 
 fn is_runtime_snapshot(file: &Path) -> bool {

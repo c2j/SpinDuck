@@ -7,42 +7,18 @@
 //! 门禁口径（AGENTS §4.1 内核集成层禁止"跳过即绿"，与 gauss_e2e 同规格）：
 //! - **feature 级**：不打开 `gauss-sha256` 时本文件收集 0 个测试（`0 passed`），
 //!   如实显示"未纳入本次运行"——这是唯一的"不跑"入口；
-//! - **env 级**：打开 feature 即视为要求执行，缺 `SPINDUCK_OG_SHA256_PW_FILE`/
-//!   `SPINDUCK_OG_SHA256_HOST`、口令文件读不到、或实例连不上都**显式变红**。
-//!
-//! 复现（compose 自带 `gaussdb-sha256` 服务，口令由容器 env 落进 0400 文件，
-//! 不经命令行、不入库；compose 本身要 `GS_PASSWORD` 插值，先 `cp .env.example .env`
-//! 或在同一条 shell 里导出，否则报 "GS_PASSWORD must be set"）：
-//! ```text
-//! docker compose -f golden/gaussdb-docker/docker-compose.yml up -d gaussdb-sha256
-//! umask 077 && docker inspect sd-og-sha256 \
-//!   --format '{{range .Config.Env}}{{println .}}{{end}}' \
-//!   | sed -n 's/^GS_PASSWORD=//p' > /tmp/sd_sha256_pw    # 0400，用后删除
-//! SPINDUCK_OG_SHA256_PW_FILE=/tmp/sd_sha256_pw \
-//!   cargo test --features gauss-sha256 --test gauss_sha256
-//! ```
+//! - **env 级**：缺 `SPINDUCK_OG_SHA256_PASSWORD` / `SPINDUCK_OG_SHA256_HOST`
+//!   或实例连不上都显式变红；口令仅从容器安全注入子进程环境，不落盘。
 
 #![cfg(feature = "gauss-sha256")]
 
 use spinduck_core::io::GaussConn;
 
-/// 口令只从文件读（0400），避免出现在进程命令行与 shell 历史里。
-fn password(path: &str) -> String {
-    let raw = std::fs::read_to_string(path).expect("读取 sha256 口令文件失败");
-    raw.trim_end_matches('\n').to_string()
-}
-
 /// 两级门控后的连接。缺配置**直接红**，与 gauss_e2e"缺容器必红"同口径（AGENTS §4.1
 /// 禁止"跳过即绿"）；不想跑这一层就不要开 `gauss-sha256` feature（第 3 级门控）。
 fn sha256_conn() -> GaussConn {
-    let pw_file = std::env::var("SPINDUCK_OG_SHA256_PW_FILE").unwrap_or_else(|_| {
-        panic!(
-            "本探针需要默认 sha256 口径实例：\n\
-             docker compose -f golden/gaussdb-docker/docker-compose.yml up -d gaussdb-sha256\n\
-             然后把容器 env 里的口令落到 0400 文件，并设 SPINDUCK_OG_SHA256_PW_FILE=/tmp/sd_sha256_pw\n\
-             （不需要本层时，用不带 gauss-sha256 feature 的命令，而不是让这里假绿）"
-        )
-    });
+    let password = std::env::var("SPINDUCK_OG_SHA256_PASSWORD")
+        .expect("必须从本地 sha256 测试容器注入 SPINDUCK_OG_SHA256_PASSWORD（口令不落盘）");
     GaussConn::connect_parts(
         &std::env::var("SPINDUCK_OG_SHA256_HOST")
             .expect("必须提供 SPINDUCK_OG_SHA256_HOST（默认 127.0.0.1）"),
@@ -51,7 +27,7 @@ fn sha256_conn() -> GaussConn {
             .and_then(|p| p.parse().ok())
             .unwrap_or(5434),
         &std::env::var("SPINDUCK_OG_SHA256_USER").unwrap_or_else(|_| "gaussdb".into()),
-        &password(&pw_file),
+        &password,
         &std::env::var("SPINDUCK_OG_SHA256_DB").unwrap_or_else(|_| "postgres".into()),
     )
     .expect("连接默认 sha256 口径的 openGauss 实例（已配置即必须连上，否则为失败）")

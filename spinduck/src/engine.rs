@@ -4,7 +4,7 @@
 use crate::catalog::{compile_statement_routine_with_names, CallResult, RoutineCatalog};
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
-use crate::ir::{compile_routine_with_names, IrProg, VarName};
+use crate::ir::VarName;
 use crate::rules::RuleRegistry;
 use crate::runtime::{Frame, RunOutcome};
 use crate::value::SpinValue;
@@ -37,7 +37,7 @@ pub struct Engine {
     /// 偏差点：失败行跳过发生在刷盘期，不进入 PL 异常处理器（见 writebuf.rs）。
     pub batch_commit: bool,
     /// 默认关闭的受限静态集合化，不与 batch_commit 叠加。
-    pub set_oriented: bool,
+    pub set_oriented: crate::ir::set_oriented::SetOrientedMode,
     set_oriented_reports: Vec<crate::ir::set_oriented::Report>,
     /// 纯标量语句记忆化缓存（`ex` 内的 MemoizingExecutor 与本句柄共享），
     /// 每次顶层调用入口清空，给缓存一个确定的内存上界。
@@ -51,6 +51,9 @@ pub struct Engine {
     /// batch 编译产物缓存（`engine::batch_hooks`）：`None` = 逐次编译（单步 CLI 现状）。
     /// 命中时跳过 tokenize/parse/IR 编译，直接重放 `CompiledRoutine`。
     compiled_cache: Option<std::rc::Rc<std::cell::RefCell<batch_hooks::CompiledRoutineCache>>>,
+    /// 编译期 codeweb 结构快照（零 DuckDB 生成）；调用期做规范化指纹漂移复核。
+    schema_snapshot: Option<crate::ir::set_oriented::metadata::SchemaSnapshot>,
+    set_oriented_plans: Option<crate::ir::set_oriented::CompiledPlans>,
 }
 
 pub struct CallResultExt {
@@ -72,13 +75,38 @@ impl Engine {
             macro_names: std::collections::BTreeSet::new(),
             step_budget: crate::runtime::interp::DEFAULT_STEP_BUDGET,
             batch_commit: false,
-            set_oriented: false,
+            set_oriented: crate::ir::set_oriented::SetOrientedMode::Off,
             set_oriented_reports: Vec::new(),
             memo,
             lookup,
             ir_cache: None,
             compiled_cache: None,
+            schema_snapshot: None,
+            set_oriented_plans: None,
         }
+    }
+
+    /// 接收静态目录并按源顺序安装宏，不重新编译例程。
+    pub fn from_compiled(
+        ex: Box<dyn SqlExecutor>,
+        compiled: crate::catalog::CompiledCatalog,
+    ) -> Result<Self, EngineError> {
+        let mut engine = Self::new(ex, compiled.catalog.sql_rules().clone());
+        for sql in &compiled.macro_sql {
+            engine.ex.execute(sql, &crate::exec::BindMap::new())?;
+        }
+        engine.catalog = compiled.catalog;
+        engine.macro_names = compiled.macro_names;
+        Ok(engine)
+    }
+
+    /// 挂载编译期结构快照；集合化入口据此复核运行期结构漂移（设计 §4.1）。
+    pub fn attach_schema_snapshot(
+        &mut self,
+        snapshot: crate::ir::set_oriented::metadata::SchemaSnapshot,
+    ) {
+        self.schema_snapshot = Some(snapshot);
+        self.set_oriented_plans = None;
     }
 
     /// 解析 SQL 文本并注册其中的例程（CREATE PROCEDURE/FUNCTION/PACKAGE BODY）。
@@ -166,31 +194,11 @@ impl Engine {
         &mut self,
         r: &crate::catalog::CompiledRoutine,
     ) -> Result<bool, EngineError> {
-        use crate::catalog::{ParamMode, RoutineKind};
-        if r.kind != RoutineKind::Function
-            || r.name.contains('.')
-            || r.params.iter().any(|p| p.mode != ParamMode::In)
-        {
-            return Ok(false);
-        }
-        let Some(expr) = r.prog.single_return_expr() else {
+        let Some(ddl) =
+            crate::catalog::sql_macro::render(r, &self.rules, &self.catalog, &self.macro_names)
+        else {
             return Ok(false);
         };
-        let Some(body) = crate::sql::expr_to_sql(expr, &self.rules) else {
-            return Ok(false);
-        };
-        let params = r
-            .params
-            .iter()
-            .map(|p| p.name.to_ascii_lowercase())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let ddl = format!(
-            "CREATE OR REPLACE MACRO {}({}) AS ({})",
-            r.name.to_ascii_lowercase(),
-            params,
-            body
-        );
         self.ex.execute(&ddl, &crate::exec::BindMap::new())?;
         Ok(true)
     }
@@ -241,82 +249,15 @@ impl Engine {
                     .join(".");
                 let mut names: Vec<String> = Vec::new();
                 for item in &pb.items {
-                    // items 的变体名与 spec 对称：Procedure/Function
-                    if let ogsql_parser::ast::PackageItem::Procedure(p) = item {
-                        let full = format!(
-                            "{}.{}",
-                            pkg.to_ascii_lowercase(),
-                            p.name.join(".").to_ascii_lowercase()
-                        );
-                        let mut prog = match &p.block {
-                            Some(b) => {
-                                let extra: Vec<String> = p
-                                    .parameters
-                                    .iter()
-                                    .map(|pp| pp.name.to_ascii_lowercase())
-                                    .collect();
-                                compile_routine_with_names(
-                                    b,
-                                    &extra,
-                                    &self.rules,
-                                    &self.catalog.routine_names(),
-                                )?
-                            }
-                            None => IrProg::default(),
-                        };
-                        let params = p
-                            .parameters
-                            .iter()
-                            .map(|pp| crate::catalog::map_param(pp, &self.rules))
-                            .collect::<Result<Vec<_>, EngineError>>()?;
-                        crate::catalog::remember_param_types(&mut prog, &params);
-                        names.push(full.clone());
-                        let cr = crate::catalog::CompiledRoutine {
-                            name: full,
-                            kind: crate::catalog::RoutineKind::Procedure,
-                            params,
-                            prog,
-                        };
-                        sink.push(cr.clone());
-                        self.catalog.register(cr);
-                    }
-                    if let ogsql_parser::ast::PackageItem::Function(f) = item {
-                        let full = format!(
-                            "{}.{}",
-                            pkg.to_ascii_lowercase(),
-                            f.name.join(".").to_ascii_lowercase()
-                        );
-                        let mut prog = match &f.block {
-                            Some(b) => {
-                                let extra: Vec<String> = f
-                                    .parameters
-                                    .iter()
-                                    .map(|pp| pp.name.to_ascii_lowercase())
-                                    .collect();
-                                compile_routine_with_names(
-                                    b,
-                                    &extra,
-                                    &self.rules,
-                                    &self.catalog.routine_names(),
-                                )?
-                            }
-                            None => IrProg::default(),
-                        };
-                        let params = f
-                            .parameters
-                            .iter()
-                            .map(|pp| crate::catalog::map_param(pp, &self.rules))
-                            .collect::<Result<Vec<_>, EngineError>>()?;
-                        crate::catalog::remember_param_types(&mut prog, &params);
-                        names.push(full.clone());
-                        let cr = crate::catalog::CompiledRoutine {
-                            name: full,
-                            kind: crate::catalog::RoutineKind::Function,
-                            params,
-                            prog,
-                        };
-                        sink.push(cr.clone());
-                        self.catalog.register(cr);
+                    if let Some(routine) = crate::catalog::source::compile_package_item(
+                        &pkg,
+                        item,
+                        &self.rules,
+                        &self.catalog.routine_names(),
+                    )? {
+                        names.push(routine.name.clone());
+                        sink.push(routine.clone());
+                        self.catalog.register(routine);
                     }
                 }
                 Ok(names)

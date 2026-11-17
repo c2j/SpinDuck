@@ -64,6 +64,7 @@ fn static_sql(st: &IrStmt) -> Option<&str> {
         | IrStmt::Raise { .. }
         | IrStmt::Return { .. }
         | IrStmt::TxCommit
+        | IrStmt::TxCommitIfWritten
         | IrStmt::TxRollback
         | IrStmt::Perform { .. }
         | IrStmt::Fetch { .. }
@@ -112,6 +113,7 @@ fn describe(st: &IrStmt) -> (&'static str, String) {
                 .unwrap_or_else(|| "null".to_string()),
         ),
         IrStmt::TxCommit => ("tx_commit", String::new()),
+        IrStmt::TxCommitIfWritten => ("tx_commit_if_written", String::new()),
         IrStmt::TxRollback => ("tx_rollback", String::new()),
         IrStmt::SqlQuery { sql, into, .. } => (
             "sql_query",
@@ -239,6 +241,14 @@ fn expr_text(e: &IrExpr) -> String {
             "{}({}) [sql]",
             name,
             args.iter().map(expr_text).collect::<Vec<_>>().join(", ")
+        ),
+        IrExpr::Lookup { args, default, .. } => format!(
+            "lookup({}) [else {}]",
+            args.iter()
+                .map(|(_, a)| expr_text(a))
+                .collect::<Vec<_>>()
+                .join(", "),
+            expr_text(default)
         ),
     }
 }

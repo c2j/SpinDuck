@@ -76,6 +76,11 @@ pub fn eval(e: &IrExpr, env: &mut EvalEnv<'_>) -> Result<SpinValue, EngineError>
             args,
             prepared,
         } => eval_funccall(name, args, prepared, env),
+        // Lookup 仅由集合化内联产生并渲染为批写 SQL，绝不进入解释器求值。
+        IrExpr::Lookup { .. } => Err(EngineError::invariant(
+            65,
+            "Lookup expression is not interpretable (set-oriented batch only)",
+        )),
     }
 }
 
@@ -263,6 +268,32 @@ mod tests {
 
     fn ev(op: BinOp, l: SpinValue, r: SpinValue) -> SpinValue {
         eval_bin(op, &l, &r).unwrap()
+    }
+
+    #[test]
+    fn should_reject_lookup_expression_in_interpreter() {
+        // ENG-0065 探针：Lookup 仅由集合化批写渲染，绝不进入解释器求值；
+        // 误入须报不变量错误而非静默求值（AGENTS §5 新错误码挂探针）。
+        use crate::exec::{FakeExecutor, TraceNoopSink};
+        use crate::runtime::frame::Frame;
+        let frame = Frame::new();
+        let ex = FakeExecutor::default();
+        let cat = crate::catalog::RoutineCatalog::new();
+        let mut sink = TraceNoopSink;
+        let mut env = EvalEnv {
+            frame: &frame,
+            ex: &ex,
+            cat: &cat,
+            depth: 0,
+            sink: &mut sink,
+        };
+        let e = IrExpr::Lookup {
+            query: "SELECT x FROM t WHERE id = $v_p".into(),
+            args: vec![("$v_p".into(), IrExpr::Const(SpinValue::Int(1)))],
+            default: Box::new(IrExpr::Const(SpinValue::Str("0".into()))),
+        };
+        let err = eval(&e, &mut env).unwrap_err();
+        assert_eq!(err.code.to_string(), "ENG-0065");
     }
 
     #[test]

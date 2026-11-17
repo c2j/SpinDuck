@@ -49,7 +49,10 @@ pub fn expr_to_sql(e: &IrExpr, rules: &RuleRegistry) -> Option<String> {
         // 记录字段、游标属性依赖运行期帧状态，SQL 文本无对应物；
         // SqlFn（@变换标记）在宏登记场景无内核变换可用 → 拒绝宏化（PL 上下文
         // 由解释器 SqlFn 下沉路径承担）
-        IrExpr::Field { .. } | IrExpr::CursorAttr { .. } | IrExpr::SqlFn { .. } => None,
+        IrExpr::Field { .. }
+        | IrExpr::CursorAttr { .. }
+        | IrExpr::SqlFn { .. }
+        | IrExpr::Lookup { .. } => None,
     }
 }
 
@@ -203,6 +206,124 @@ fn render_binds(e: &IrExpr, binds: &mut Vec<(String, crate::ir::BindSrc)>) -> Op
                 Some(format!("{}({})", name.to_ascii_lowercase(), inner))
             }
         }
+        IrExpr::CursorAttr { .. } | IrExpr::Lookup { .. } => None,
+    }
+}
+
+/// 渲染 IR 表达式为 DuckDB 就绪标量 SQL 并收集按名绑定源（集合化跨例程内联
+/// 专用，设计 §4.3 A7）。与 [`expr_to_sql_binds`] 的差异：`SqlFn`/`FuncCall`
+/// 复用编译期 `prepared` 变换（`@to_date`→`strptime`、`@to_char`→`strftime`
+/// 等日期算术映射），而非裸函数名。游标属性等帧态节点返回 `None`。
+pub fn expr_to_scalar_sql_binds(e: &IrExpr) -> Option<(String, Vec<(String, crate::ir::BindSrc)>)> {
+    let mut binds = Vec::new();
+    let text = render_scalar(e, &mut binds)?;
+    Some((text, binds))
+}
+
+fn render_scalar(e: &IrExpr, binds: &mut Vec<(String, crate::ir::BindSrc)>) -> Option<String> {
+    use crate::ir::BindSrc;
+    match e {
+        IrExpr::Const(v) => const_to_sql(v),
+        IrExpr::Var(v) => {
+            let ph = BindSrc::placeholder(&v.0, None);
+            binds.push((ph.clone(), BindSrc::Var(v.clone())));
+            Some(ph)
+        }
+        IrExpr::Field { rec, field } => {
+            let ph = BindSrc::placeholder(&rec.0, Some(field));
+            binds.push((
+                ph.clone(),
+                BindSrc::Field {
+                    rec: rec.clone(),
+                    field: field.to_ascii_lowercase(),
+                },
+            ));
+            Some(ph)
+        }
+        IrExpr::Bin { op, l, r } => {
+            let ls = render_scalar(l, binds)?;
+            let rs = render_scalar(r, binds)?;
+            // PL Concat（§4.6）：双侧 NULL→NULL、单侧 NULL 视作空串；DuckDB
+            // `||` 单侧 NULL 即 NULL，故用 concat()（跳 NULL）+ 双 NULL CASE。
+            if *op == BinOp::Concat {
+                return Some(format!(
+                    "CASE WHEN ({ls}) IS NULL AND ({rs}) IS NULL THEN NULL ELSE concat({ls}, {rs}) END"
+                ));
+            }
+            if matches!(op, BinOp::Add | BinOp::Sub) {
+                let dateish = |x: &str| x.contains("strptime(") || x.contains("to_date(");
+                let plain_num = |x: &str| x.starts_with("$v_") || x.parse::<i128>().is_ok();
+                let as_days = |x: &str| {
+                    if x.starts_with("$v_") {
+                        format!("to_days(CAST({x} AS INTEGER))")
+                    } else {
+                        format!("to_days({x})")
+                    }
+                };
+                if dateish(&ls) && plain_num(&rs) {
+                    return Some(format!("({ls} {} {})", bin_op_sql(*op), as_days(&rs)));
+                }
+                if *op == BinOp::Add && plain_num(&ls) && dateish(&rs) {
+                    return Some(format!("({} + {rs})", as_days(&ls)));
+                }
+            }
+            Some(format!("({ls} {} {rs})", bin_op_sql(*op)))
+        }
+        IrExpr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => render_case(operand.as_deref(), whens, else_expr.as_deref(), |e| {
+            render_scalar(e, binds)
+        }),
+        IrExpr::Not(x) => Some(format!("(NOT {})", render_scalar(x, binds)?)),
+        IrExpr::IsNull(x) => Some(format!("({} IS NULL)", render_scalar(x, binds)?)),
+        IrExpr::SqlFn { name, args, .. } => {
+            // 从（可能已内联替换的）实参重新施加 @变换：prepared 在函数编译期
+            // 固化了形参占位符，内联后必须按实参重渲染，避免残留形参绑定。
+            let mut parts = Vec::with_capacity(args.len());
+            for a in args {
+                parts.push(render_scalar(a, binds)?);
+            }
+            let sql = format!("SELECT {}({})", name.to_ascii_lowercase(), parts.join(", "));
+            let transformed = crate::sql::apply_ast_transforms(&sql).ok()?;
+            Some(transformed.strip_prefix("SELECT ")?.to_string())
+        }
+        IrExpr::FuncCall { args, prepared, .. } => {
+            let sql = prepared.as_ref().ok()?;
+            let mut text = sql.strip_prefix("SELECT ")?.to_string();
+            // 高序号优先替换，避免 `$p1` 误伤 `$p10`；实参渲染产物只含 `$v_`。
+            for (i, a) in args.iter().enumerate().rev() {
+                let rendered = render_scalar(a, binds)?;
+                text = text.replace(&format!("$p{i}"), &rendered);
+            }
+            Some(text)
+        }
+        IrExpr::Lookup {
+            query,
+            args,
+            default,
+        } => {
+            // 占位符→实参渲染产物（收集 $v_ 绑定）；长占位符优先替换防前缀误伤。
+            let mut rendered: Vec<(String, String)> = Vec::with_capacity(args.len());
+            for (ph, a) in args {
+                rendered.push((ph.clone(), render_scalar(a, binds)?));
+            }
+            rendered.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+            let mut inner = query.clone();
+            for (ph, text) in &rendered {
+                inner = inner.replace(ph, text);
+            }
+            let def = render_scalar(default, binds)?;
+            // 异常优先级（WHEN OTHERS）：0/>1 行→default，恰 1 行→值（含 NULL）。
+            // 单聚合子查询恒返一行（无 GROUP BY），避免 DuckDB 对门控标量子查询
+            // 仍求值多行而报 scalar_subquery_error_on_multiple_rows；派生表列别名
+            // 把单列重命名为 sd_lk_val，COUNT(*)=1 时 MIN 取该值（NULL 保留）。
+            Some(format!(
+                "(SELECT CASE WHEN COUNT(*) = 1 THEN MIN(sd_lk_val) ELSE {def} END \
+                 FROM ({inner}) AS sd_lk(sd_lk_val))"
+            ))
+        }
         IrExpr::CursorAttr { .. } => None,
     }
 }
@@ -312,5 +433,77 @@ mod tests {
             field: "cjsl".to_string(),
         };
         assert_eq!(expr_to_sql(&field, &rules), None);
+    }
+
+    fn scalar(e: &IrExpr) -> (String, Vec<(String, crate::ir::BindSrc)>) {
+        expr_to_scalar_sql_binds(e).expect("renderable")
+    }
+
+    #[test]
+    fn should_render_scalar_with_named_binds_for_var_and_field() {
+        let (text, binds) = scalar(&bin(
+            BinOp::Concat,
+            var("x"),
+            IrExpr::Field {
+                rec: VarName("r".to_string()),
+                field: "cjsl".to_string(),
+            },
+        ));
+        assert_eq!(
+            text,
+            "CASE WHEN ($v_x) IS NULL AND ($v_r__cjsl) IS NULL THEN NULL ELSE concat($v_x, $v_r__cjsl) END"
+        );
+        assert_eq!(binds.len(), 2);
+        assert_eq!(
+            binds[0].1,
+            crate::ir::BindSrc::Var(VarName("x".to_string()))
+        );
+        assert_eq!(
+            binds[1].1,
+            crate::ir::BindSrc::Field {
+                rec: VarName("r".to_string()),
+                field: "cjsl".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn should_render_scalar_sqlfn_using_prepared_date_transform() {
+        // @to_date 经编译期变换为 strptime；内联渲染必须复用 prepared 而非裸名。
+        let sql = crate::sql::apply_ast_transforms("SELECT @to_date($v_d, 'YYYYMMDD')")
+            .expect("transform");
+        let prepared = crate::ir::ScalarSql {
+            sql,
+            binds: vec![(
+                "$v_d".to_string(),
+                crate::ir::BindSrc::Var(VarName("d".to_string())),
+            )],
+        };
+        let date = IrExpr::SqlFn {
+            name: "@to_date".to_string(),
+            args: vec![var("d"), IrExpr::Const(SpinValue::Str("YYYYMMDD".into()))],
+            prepared: Ok(prepared),
+        };
+        let e = bin(BinOp::Add, date, IrExpr::Const(SpinValue::Int(1)));
+        let (text, _) = scalar(&e);
+        assert!(text.contains("strptime("), "got {text}");
+        assert!(text.contains("to_days(1)"), "got {text}");
+        assert!(!text.contains("@to_date"), "got {text}");
+    }
+
+    #[test]
+    fn should_render_scalar_funccall_substituting_positional_placeholders() {
+        let e = IrExpr::FuncCall {
+            name: "substr".to_string(),
+            args: vec![
+                var("s"),
+                IrExpr::Const(SpinValue::Int(3)),
+                IrExpr::Const(SpinValue::Int(3)),
+            ],
+            prepared: crate::sql::apply_ast_transforms("SELECT substr($p0, $p1, $p2)"),
+        };
+        let (text, binds) = scalar(&e);
+        assert_eq!(text, "substr($v_s, 3, 3)");
+        assert_eq!(binds.len(), 1);
     }
 }

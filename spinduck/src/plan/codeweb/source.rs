@@ -72,6 +72,19 @@ impl CodewebSource for EmbeddedCodewebSource {
     }
 }
 
+/// 从 codeweb 项目导出编译期结构快照（设计 §4.1）：只读配置 SQL 源，
+/// 不读图存储、不连接内核。根由调用方经 [`super::plans::codeweb_project_root`]
+/// 定位，与取图同口径。
+pub fn schema_snapshot(
+    codeweb_root: &Path,
+    rules: &crate::rules::RuleRegistry,
+) -> Result<crate::ir::set_oriented::metadata::SchemaSnapshot, EngineError> {
+    let proj =
+        codeweb::embed::EmbeddedProject::open_exact(codeweb_root).map_err(map_codeweb_err)?;
+    let export = proj.export_table_schemas().map_err(map_codeweb_err)?;
+    Ok(crate::ir::set_oriented::metadata::SchemaSnapshot::from_codeweb(&export, rules))
+}
+
 /// diff 不新鲜的诊断文本：缺 store / 版本过期 / 变动文件数，各给可执行的下一步。
 fn format_diff_detail(diff: &codeweb::embed::DiffStatus) -> String {
     if !diff.store_exists {

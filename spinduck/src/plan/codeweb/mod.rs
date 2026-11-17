@@ -14,8 +14,9 @@ mod walk;
 use std::path::Path;
 
 pub use parse::{parse_codeweb_json, parse_codeweb_reader, CodewebGraph};
+pub(crate) use plans::codeweb_project_root;
 pub use plans::plans_from_source;
-pub use source::{CodewebSource, EmbeddedCodewebSource, JsonCodewebSource};
+pub use source::{schema_snapshot, CodewebSource, EmbeddedCodewebSource, JsonCodewebSource};
 pub use walk::closure_from_graph;
 
 /// 链接进来的 codeweb 版本：计划 `generator` 的唯一来源（消除硬编码版本漂移）。

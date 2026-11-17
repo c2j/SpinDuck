@@ -4,6 +4,18 @@ use super::*;
 use crate::exec::FakeExecutor;
 use std::cell::Cell;
 
+#[test]
+fn should_forward_deep_cte_without_point_lookup_parsing() {
+    let inner_sql = format!("{}1{}", "abs(".repeat(100), ")".repeat(100));
+    let sql = format!("/* guard */ WITH g AS (SELECT {inner_sql} AS n) SELECT n FROM g");
+    let expected = vec![vec![SpinValue::Int(1)]];
+    let (inner, calls) = Rec::new(expected.clone());
+    let executor = cache(Box::new(inner));
+    let actual = executor.query(&sql, &BindMap::new()).unwrap().fetch_many(2);
+    assert_eq!(actual, expected);
+    assert_eq!(*calls.borrow(), vec![sql]);
+}
+
 pub(super) const PURCHASE: &str = "SELECT coalesce(t.purchase_days, 1) FROM par_sys_purchase AS t \
      WHERE $v_p_i_date BETWEEN t.inure_begin_date AND t.inure_end_date \
      AND t.security_id = $v_r_get_purchase__security_id";

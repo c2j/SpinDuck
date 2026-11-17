@@ -124,6 +124,14 @@ pub(super) fn recognize(sql: &str) -> Option<Plan> {
 
 fn parse_select(sql: &str) -> Option<SelectStatement> {
     let tokens = Tokenizer::new(sql).tokenize().ok()?;
+    let first = tokens.first()?;
+    // CTE 必被 is_plain 拒绝；提前排除，避免无收益地深度解析守卫表达式。
+    if sql
+        .get(first.span.start..first.span.end)?
+        .eq_ignore_ascii_case("with")
+    {
+        return None;
+    }
     let stmts = Parser::new(tokens).parse();
     if stmts.len() != 1 {
         return None;

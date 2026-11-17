@@ -85,6 +85,16 @@ pub enum IrExpr {
         cursor: VarName,
         kind: CursorAttrKind,
     },
+    /// 函数内查找（§4.3 A7 LookupExpr）：trap 包裹的 SELECT INTO + WHEN OTHERS
+    /// 兜底，关系化为计数门控相关子查询（0/>1 行→default，恰 1 行→值含 NULL）。
+    /// `query` 为含 `$v_` 占位符的 SELECT 模板；`args` 将占位符映射到实参表达式
+    /// （内联后为记录字段/常量）；`default` 为异常兜底表达式。仅集合化批写投影
+    /// 渲染（render_scalar），解释器与宏注册路径一律拒绝。
+    Lookup {
+        query: String,
+        args: Vec<(String, IrExpr)>,
+        default: Box<IrExpr>,
+    },
 }
 
 impl IrExpr {
@@ -151,6 +161,9 @@ pub enum IrStmt {
     },
     /// 事务边界标记（§3.5 延迟事务，顶层统一执行）
     TxCommit,
+    /// 条件提交：仅当最近一次直发写入影响行数 > 0 才提交（集合化出口专用；
+    /// 空游标零行写入不得切换事务快照，设计 §4.5）。编译器不产生此指令。
+    TxCommitIfWritten,
     TxRollback,
     /// SELECT [INTO ...]（行数语义：0→NO_DATA_FOUND，≥2→TOO_MANY_ROWS）
     SqlQuery {

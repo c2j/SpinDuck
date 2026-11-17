@@ -1371,10 +1371,11 @@ duckdb 类型；⑥ fastaas 子模块保留现状（私有项目）。
 > 包规格（spec）合法地不产出例程名，护栏显式豁免。
 > ⑨ **回滚失败的归域**：`Engine::call` 统一 ROLLBACK 失败时并入原错误消息，
 > 主因保持原域与原错误码（§5 禁止在调用上层事后改判），不得改写为 KERNEL。
-> ⑩ **CI 审计豁免**：`zip 6.0.0` 的四条公告（RUSTSEC-2026-0367/0368/0369/0429）来自
-> `libduckdb-sys` 的 **build-dependency**（`bundled` 解压缩包用），不进运行时产物；
-> 升级它即违反 §1 内核版本锚定（`duckdb = "=1.10505.0"`），故 CI 显式 `--ignore` 四条，
-> 内核升级 PR（V6 门禁）必须复评该清单。
+> ⑩ **CI 审计豁免**：`zip 6.0.0` 的七条公告（RUSTSEC-2026-0367/0368/0369/0429
+> 及 2026 年新发布的 0548/0547/0545）来自 `libduckdb-sys` 的 **build-dependency**
+> （`bundled` 解压缩包用），不进运行时产物；升级它即违反 §1 内核版本锚定
+> （`duckdb = "=1.10505.0"`），故 CI 显式 `--ignore` 七条，内核升级 PR（V6 门禁）
+> 必须复评该清单。
 > 同类的**审计盲区**（非豁免）：嵌入的 `codeweb` 是 git 依赖（`c2j/codeweb @ tag
 > v0.9.10`），不在 crates.io advisory 面内；tag 升级必须人工复核其依赖面变化与
 > ThinGraph 投影等价测试（validation V47.1/V47.3），复评节奏同 ⑫ 的 rev 纪律。

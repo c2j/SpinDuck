@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// 规则注册表：种子 + 项目覆盖叠加。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleRegistry {
     /// `[types]`：GaussDB 类型名 → DuckDB 类型族名
     pub types: BTreeMap<String, String>,

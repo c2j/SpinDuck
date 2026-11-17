@@ -90,6 +90,7 @@ fn walk_code(code: &[IrStmt], w: &mut Walk) {
             | IrStmt::PushTrap { .. }
             | IrStmt::Jump(_)
             | IrStmt::TxCommit
+            | IrStmt::TxCommitIfWritten
             | IrStmt::TxRollback
             | IrStmt::CloseCursor { .. }
             | IrStmt::Fetch { .. }
@@ -174,6 +175,17 @@ fn walk_expr(expr: &IrExpr, w: &mut Walk) {
                 stack.extend(args.iter());
             }
             IrExpr::SqlFn { args, .. } => stack.extend(args.iter()),
+            IrExpr::Lookup {
+                query,
+                args,
+                default,
+            } => {
+                w.texts.push(query.clone());
+                for (_, a) in args {
+                    stack.push(a);
+                }
+                stack.push(default);
+            }
         }
     }
 }
