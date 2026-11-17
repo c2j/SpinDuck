@@ -5023,3 +5023,65 @@ Up to date. No changes detected.
   盲区（已登记，见 architecture ⑩ 与 ci.yml 注释），新增 2 条 unmaintained 级 warning
   （`bincode` RUSTSEC-2025-0141、`unsafe-libyaml` RUSTSEC-2024-0449，均非漏洞级，
   不改变门禁结果）。
+
+## V49. `batch` 同进程编排实测：runbook 同案例的功能一致性与墙钟收益（2026-11-17）
+
+机制见 `docs/spinduck-batch-sdsh-design.md` 与 runbook §5。**结论**：同一案例
+（`case_corpus_purchase` 生产体量库 `bench.duckdb`，137 MiB）下，batch 脚本与手工
+逐进程执行**功能输出逐值一致**，墙钟约 **−14%**（4.00 s → 3.45 s，省约 0.55 s）。
+收益来源是编排开销而非例程执行本身——例程体耗时两侧相同。
+
+### 案例与口径
+
+- 项目：`/tmp/spinduck-purchase-v43`（`golden/case_corpus_purchase` 的 codeweb 副本，
+  sql/rules/spinduck.toml 与仓内逐字节一致）；计划取 `.spinduck/plan/` 下
+  `prc_trd_deal_purchase`（V45 同入口）。
+- 库：`/tmp/spinduck-perf/bench.duckdb`（V42 同库，143,667,200 B；`par_fund_seat`
+  620,630 行等），每次计时前复制独立副本（`materialize` 纯追加口径，重跑必清）。
+- 步骤（两臂逐字相同）：`call --plan prc_trd_deal_purchase '20250715' null
+  --batch-commit --step-budget 200000` ×2 → `query`（`dat_trd_repurchase` 计数/合计）
+  → `compare`。**去掉了 `materialize`/`sync`**（需 GaussDB 数据面，本地 bench 库已含
+  物化结果，重复物化会追加重复行）与 `deploy`（bench 库已部署，非幂等不可重跑）。
+- 计划文件手工剔除了 `[[missing]]` 段：`fnc_com_get_seat_para` 是语料外部依赖
+  （compile-gate 2026-11-16/17 才开始登记 missing，此前 V45 同计划可跑）。
+- 二进制：`cargo build --release --locked --features cli,gauss`，v0.2.1 本 worktree。
+
+### 实测（墙钟秒，热页缓存，预热 1 次后各 3 次）
+
+| 臂 | 计时 1 | 计时 2 | 计时 3 | 均值 |
+|---|---:|---:|---:|---:|
+| 逐进程（4 次 spawn） | 3.807 | 4.109 | 4.125 | 4.00 |
+| `batch case.sdsh`（1 进程） | 3.378 | 3.622 | 3.352 | 3.45 |
+
+分解：单次 `call` ≈ 1.45 s（例程执行为主）、`query` ≈ 0.20 s（含开库）、
+`compare`/`version` ≈ 0.01 s。逐进程臂的 4 次开库+spawn 约占 0.8 s，batch 收敛为
+1 次；第二个 `call` 在 batch 内命中 `EngineCache`（同键跳过 register/编译），
+逐进程臂每次都走完整注册（ir-cache 摊薄了重编译成本）。
+
+### 功能一致性
+
+两臂各自输出 `OUT p_o_succeed = 0` ×2，`query` 快照 `rows=1/1 diffs=0`，
+`dat_trd_repurchase` 计数/合计均为 `490 / 4900000.000`（例程对同键重跑幂等）。
+
+### 观察到的边界（如实登记）
+
+- **第二步换例程时出现返回值分歧**：`call --plan`（计划形态）后接
+  `call --file … fnc_get_purchase_js_days '20250715' '0130000001'`，batch 内
+  （EngineCache 命中、复用引擎）返回 `90`，逐进程（全新引擎）返回 `0`。
+  基线口径下 `90` 是种子数据的正确值；bench 库生产体量 `par_sys_purchase` 下
+  逐进程路径落入 `WHEN OTHERS`（疑似 SELECT INTO 多行/点查索引时序差异）。
+  **同一 EngineKey 命中复用与全新注册在该例程上产出不同结果**——属引擎缓存
+  语义问题而非 batch 编排问题（单步 CLI 两次调用也各自全新引擎，永远拿到 `0`），
+  但 batch 让"复用引擎"成为可观测路径，需单独评估是否为缺陷。本次性能案例
+  因此改用同计划二次调用（EngineCache 命中路径，输出两臂一致）。
+- **预期提升的上限**：本案例例程执行占绝对大头，batch 只能削编排开销
+  （约一成出头）。收益随"步数多、单步轻"放大：多 entry `call`、小库 `:memory:`
+  流程、省 `--file` 重复编译的场景收益更高；`materialize`/`sync` 每步仍各自建
+  GaussDB 短连接（V1 不池化），这些步的收益仅为 DuckDB 连接复用。
+
+### 不声称
+
+- 不声称 `materialize`/`sync`/`deploy` 步的实测收益（本次未跑 GaussDB 数据面）。
+- 不声称比例可外推到其他体量：137 MiB 库上开库约 0.2 s，库越小固定开销占比越高、
+  batch 相对收益越大；例程越重收益越小。
+- 不声称上述 `90`/`0` 分歧已定性（疑似 lookup/prepare 缓存时序，未定位根因）。

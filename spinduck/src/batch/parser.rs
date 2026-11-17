@@ -327,6 +327,7 @@ fn scan_quoted(
 /// `$` 后的变量名读入 `seg`（`${...}` 或 `$IDENT`）。
 fn collect_var_name(chars: &mut std::iter::Peekable<std::str::Chars>, seg: &mut String) {
     if chars.peek() == Some(&'{') {
+        chars.next();
         seg.push('{');
         for c in chars.by_ref() {
             seg.push(c);
@@ -504,6 +505,18 @@ mod tests {
         assert_eq!(got[0][4], "bcrq=$SDV");
         let got2 = cmds("call --file f.sql prc \"bcrq=$SDV\"\n");
         assert_eq!(got2[0][4], "bcrq=EXPANDED");
+    }
+
+    #[test]
+    fn should_expand_braced_var_in_double_quotes() {
+        // 回归守护：collect_var_name 曾把字面 '{' 与迭代器里未消费的 '{'
+        // 各 push 一次，产出 `${{D}` → expand_vars 取到 name="{D" 误报 ENV-0017。
+        std::env::set_var("SDBRACE", "20250715");
+        let got = cmds("call --file f.sql prc \"${SDBRACE}\" x\n");
+        assert_eq!(got[0][4], "20250715", "{got:?}");
+        // set 变量同样走这条路
+        let got2 = cmds("set D = 7\ncall --file f.sql prc \"a${D}b\" x\n");
+        assert_eq!(got2[0][4], "a7b", "{got2:?}");
     }
 
     #[test]
