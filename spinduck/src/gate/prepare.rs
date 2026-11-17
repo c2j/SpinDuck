@@ -23,6 +23,10 @@ use crate::ir::BindSrc;
 use crate::rules::RuleRegistry;
 use crate::types::SpinType;
 
+mod ddl;
+#[cfg(test)]
+mod tests;
+
 /// 伪表/引擎内建对象：不参与 stub 建模，引用它们的"不存在"类报错抑制。
 const SKIP_OBJECTS: &[&str] = &["sys_dummy", "dual"];
 
@@ -168,19 +172,39 @@ pub struct PrepareStmt {
     pub ddl_exec: Option<DdlExec>,
 }
 
+/// 局部 DDL 的执行属性（来自 `IrProg.local_ddl`）。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LocalDdl {
+    /// 引号形态限定名（`"s"."t"`）。
+    pub name: String,
+    /// `CREATE TEMP TABLE`：stub 中建 temp 影子表。
+    pub temporary: bool,
+    /// `IF NOT EXISTS`：命中已有对象时 CREATE 为空操作。
+    pub if_not_exists: bool,
+}
+
 /// 例程体内局部 DDL 的 stub 执行形态（对应 `IrProg.local_ddl`）。
-/// 各变体携带引号形态限定名（`"s"."t"`）：`DropLocal` 仅对本连接
-/// 中**成功建表**的名字执行，避免 CREATE 失败（如与全局表重名）后
-/// 误删 stub 全局表。
+/// `DropLocal` 仅对本连接中**成功建表**的名字执行，避免 CREATE 失败
+/// （如与全局表重名）后误删 stub 全局表。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DdlExec {
     /// `CREATE [TEMP] TABLE name (cols)`：直接执行。
-    CreateTable(String),
-    /// `CREATE [TEMP] TABLE name AS <select>`：追加 `LIMIT 0` 执行。
-    CreateTableAs(String),
+    CreateTable(LocalDdl),
+    /// `CREATE [TEMP] TABLE name AS <select>`：包成子查询追加 `LIMIT 0`。
+    CreateTableAs(LocalDdl),
     /// 例程收尾 `DROP TABLE IF EXISTS name`：清理局部表，防止泄漏到
     /// 同 stub 库的后续例程（`sql` 字段携带 DROP 文本）。
     DropLocal(String),
+}
+
+impl DdlExec {
+    /// CREATE 形态的局部 DDL 属性；DropLocal 返回 `None`。
+    fn local_ddl(&self) -> Option<&LocalDdl> {
+        match self {
+            DdlExec::CreateTable(d) | DdlExec::CreateTableAs(d) => Some(d),
+            DdlExec::DropLocal(_) => None,
+        }
+    }
 }
 
 /// `$v_*` → `CAST(NULL AS <类型>)` 类型化替换（设计 §4.4.1）：
@@ -332,14 +356,42 @@ fn prepare_all_impl(
                     continue;
                 }
             }
+            // 非临时 `IF NOT EXISTS` 且同名对象已可解析 → CREATE 为空
+            // 操作：不执行、不记 created——收尾 DROP 绝不能删掉既有
+            // （全局 stub）表，后续例程对它的引用必须仍解析得到。
+            if let Some(ddl) = kind.local_ddl() {
+                if ddl.if_not_exists
+                    && !ddl.temporary
+                    && prepare_check(
+                        ex.connection(),
+                        &format!("SELECT * FROM {} LIMIT 0", ddl.name),
+                    )
+                    .is_ok()
+                {
+                    continue;
+                }
+            }
             let exec_sql = match kind {
-                DdlExec::CreateTableAs(_) => format!(
-                    "{} LIMIT 0",
-                    sql.trim_end_matches(|c: char| c == ';' || c.is_whitespace())
-                ),
+                DdlExec::CreateTableAs(_) => match ddl::ctas_limit0_sql(&sql) {
+                    Some(s) => s,
+                    None => {
+                        out.push((
+                            stmt.file.clone(),
+                            EngineError::kernel(11, "gate2b local ctas: cannot locate AS clause"),
+                        ));
+                        continue;
+                    }
+                },
                 DdlExec::CreateTable(_) | DdlExec::DropLocal(_) => sql.clone(),
             };
-            if let Err(e) = ex.execute(&exec_sql, &crate::exec::BindMap::new()) {
+            // 残留 `$v_*`（%TYPE/记录字段/映射表外类型）绑 NULL：
+            // execute 要求全部参数有值，不能像 prepare_check 那样
+            // 容忍未绑定参数；已知类型已在 typed_sql 替换为 CAST。
+            let mut binds = crate::exec::BindMap::new();
+            for ph in ddl::residual_placeholders(&exec_sql) {
+                binds.insert(ph, crate::value::SpinValue::Null);
+            }
+            if let Err(e) = ex.execute(&exec_sql, &binds) {
                 let mut names = deferred.clone();
                 names.extend(stmt.skip.iter().cloned());
                 if mentions(&e.to_string(), &names) {
@@ -352,8 +404,8 @@ fn prepare_all_impl(
             } else {
                 epoch += 1;
                 match kind {
-                    DdlExec::CreateTable(name) | DdlExec::CreateTableAs(name) => {
-                        created.insert(name.clone());
+                    DdlExec::CreateTable(d) | DdlExec::CreateTableAs(d) => {
+                        created.insert(d.name.clone());
                     }
                     DdlExec::DropLocal(name) => {
                         created.remove(name);
@@ -383,430 +435,4 @@ pub fn prepare_all(
     _sqls: &[PrepareStmt],
 ) -> Result<Vec<(String, EngineError)>, EngineError> {
     Ok(Vec::new())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ir::VarName;
-    use ogsql_parser::ast::Statement;
-    use ogsql_parser::parser::Parser;
-    use ogsql_parser::token::tokenizer::Tokenizer;
-
-    fn snap_of(sql: &str) -> SchemaSnapshot {
-        let toks = Tokenizer::new(sql).tokenize().unwrap();
-        let stmts: Vec<Statement> = Parser::new(toks).parse();
-        SchemaSnapshot::from_statements(&stmts).unwrap()
-    }
-
-    #[test]
-    fn should_emit_stub_ddl_for_known_objects_only() {
-        let snap = snap_of(
-            "CREATE TABLE s.t1(a INT, b VARCHAR2(10)); \
-             CREATE VIEW v1(x, y) AS SELECT a, b FROM s.t1; \
-             CREATE VIEW v2 AS SELECT a FROM s.t1; \
-             CREATE SEQUENCE seq1; \
-             CREATE TABLE tmp AS SELECT a FROM s.t1;",
-        );
-        let rules = RuleRegistry::default();
-        let ddl = stub_ddl(&snap, &rules);
-        assert!(ddl.iter().any(|d| d == "CREATE SCHEMA IF NOT EXISTS \"s\""));
-        assert!(ddl.iter().any(|d| d.contains("CREATE TABLE \"s\".\"t1\"")));
-        assert!(ddl
-            .iter()
-            .any(|d| d.contains("CREATE VIEW \"v1\" (\"x\", \"y\")")));
-        assert!(ddl.iter().any(|d| d.contains("CREATE SEQUENCE \"seq1\"")));
-        // CTAS 延迟表与未知视图不建模
-        assert!(!ddl.iter().any(|d| d.contains("\"tmp\"")));
-        assert!(!ddl.iter().any(|d| d.contains("\"v2\"")));
-    }
-
-    #[test]
-    fn should_emit_schema_for_qualified_view_and_sequence_only() {
-        // 仅有 s.v / s.seq、无 s 下表时也必须先 CREATE SCHEMA
-        let snap = snap_of("CREATE VIEW s.v1(x) AS SELECT 1; CREATE SEQUENCE s.seq1;");
-        let ddl = stub_ddl(&snap, &RuleRegistry::default());
-        assert_eq!(ddl[0], "CREATE SCHEMA IF NOT EXISTS \"s\"", "{ddl:?}");
-        assert!(
-            ddl.iter().any(|d| d.contains("CREATE VIEW \"s\".\"v1\"")),
-            "{ddl:?}"
-        );
-        assert!(
-            ddl.iter()
-                .any(|d| d.contains("CREATE SEQUENCE \"s\".\"seq1\"")),
-            "{ddl:?}"
-        );
-    }
-
-    #[test]
-    fn should_map_custom_type_via_rules() {
-        let snap = snap_of("CREATE TABLE t1(a NUMBER(10,2), b VARCHAR2(20))");
-        let mut rules = RuleRegistry::default();
-        rules.types.insert("NUMBER".into(), "DECIMAL".into());
-        rules.types.insert("VARCHAR2".into(), "VARCHAR".into());
-        let ddl = stub_ddl(&snap, &rules);
-        assert_eq!(ddl.len(), 1);
-        assert!(ddl[0].contains("\"a\" DECIMAL"), "{ddl:?}");
-        assert!(ddl[0].contains("\"b\" VARCHAR"), "{ddl:?}");
-    }
-
-    #[test]
-    fn should_include_deferred_and_unknown_names() {
-        let snap = snap_of(
-            "CREATE TABLE t1(a INT); CREATE TABLE tmp AS SELECT a FROM t1; \
-             CREATE VIEW vu AS SELECT a FROM t1;",
-        );
-        let names = deferred_names(&snap);
-        assert!(names.contains("tmp"));
-        assert!(names.contains("vu"));
-        assert!(names.contains("sys_dummy"));
-        assert!(names.contains("dual"));
-        assert!(!names.contains("t1"));
-    }
-
-    #[test]
-    fn should_only_suppress_object_missing_errors() {
-        let names: BTreeSet<String> = ["tmp".to_string(), "missing_t".to_string()].into();
-        // 对象不存在且点名延迟对象 → 抑制
-        assert!(mentions(
-            "Catalog Error: Table with name tmp does not exist!",
-            &names
-        ));
-        // 列级错误即使回显里出现延迟表名 → 不抑制
-        assert!(!mentions(
-            "Binder Error: Referenced column \"tmp\" not found in FROM clause!",
-            &names
-        ));
-        // 候选列回显含同名 → 不抑制
-        assert!(!mentions("Candidate bindings: \"t1\".\"tmp\"", &names));
-        // 不点名任何延迟对象 → 不抑制
-        assert!(!mentions(
-            "Catalog Error: Table with name other_t does not exist!",
-            &names
-        ));
-    }
-
-    #[test]
-    fn should_not_suppress_near_miss_object_names() {
-        // 词边界：延迟名 dual/tmp 不得命中 dual_acct/tmp_hist/s.tmp_hist
-        let names: BTreeSet<String> =
-            ["dual".to_string(), "tmp".to_string(), "s.tmp".to_string()].into();
-        for err in [
-            "Catalog Error: Table with name ods.dual_acct does not exist!",
-            "Catalog Error: Table with name s.tmp_hist does not exist!",
-            "Catalog Error: Table with name tmp2 does not exist!",
-        ] {
-            assert!(!mentions(err, &names), "{err}");
-        }
-        // 精确命中（含限定名与引号形态）→ 抑制
-        for err in [
-            "Catalog Error: Table with name tmp does not exist!",
-            "Catalog Error: Table with name \"s\".\"tmp\" does not exist!",
-            "Catalog Error: Table with name s.tmp does not exist!",
-        ] {
-            assert!(mentions(err, &names), "{err}");
-        }
-    }
-
-    #[test]
-    fn should_type_placeholder_vars() {
-        let stmt = PrepareStmt {
-            file: "f".into(),
-            sql: "SELECT * FROM t WHERE d = $v_d AND n = $v_n".into(),
-            binds: vec![
-                ("$v_d".into(), BindSrc::Var(VarName("d".into()))),
-                ("$v_n".into(), BindSrc::Var(VarName("n".into()))),
-            ],
-            var_types: BTreeMap::from([
-                ("d".to_string(), SpinType::Date),
-                ("n".to_string(), SpinType::Int),
-            ]),
-            skip: BTreeSet::new(),
-            ddl_exec: None,
-        };
-        let sql = typed_sql(&stmt);
-        assert!(sql.contains("CAST(NULL AS DATE)"), "{sql}");
-        assert!(sql.contains("CAST(NULL AS INTEGER)"), "{sql}");
-        assert!(!sql.contains("$v_d"), "{sql}");
-    }
-
-    #[test]
-    fn should_not_corrupt_prefix_placeholders_or_literals() {
-        // $v_v_return_rate 是 $v_v_return_rate_flag 的前缀：最长优先 +
-        // 右标识符边界，两个占位符必须各自完整替换；字符串里的不动。
-        let stmt = PrepareStmt {
-            file: "f".into(),
-            sql: "SELECT $v_v_return_rate, $v_v_return_rate_flag, '$v_v_return_rate' FROM t".into(),
-            binds: vec![
-                (
-                    "$v_v_return_rate".into(),
-                    BindSrc::Var(VarName("v_return_rate".into())),
-                ),
-                (
-                    "$v_v_return_rate_flag".into(),
-                    BindSrc::Var(VarName("v_return_rate_flag".into())),
-                ),
-            ],
-            var_types: BTreeMap::from([
-                (
-                    "v_return_rate".to_string(),
-                    SpinType::Decimal {
-                        precision: 10,
-                        scale: 2,
-                    },
-                ),
-                ("v_return_rate_flag".to_string(), SpinType::Bool),
-            ]),
-            skip: BTreeSet::new(),
-            ddl_exec: None,
-        };
-        let sql = typed_sql(&stmt);
-        assert_eq!(
-            sql, "SELECT CAST(NULL AS DECIMAL), CAST(NULL AS BOOLEAN), '$v_v_return_rate' FROM t",
-            "{sql}"
-        );
-    }
-
-    #[cfg(feature = "native")]
-    #[test]
-    fn should_prepare_clean_sql_and_suppress_deferred_errors() {
-        let snap =
-            snap_of("CREATE TABLE t1(a INT, b VARCHAR); CREATE TABLE tmp AS SELECT a FROM t1;");
-        let rules = RuleRegistry::default();
-        let mk = |sql: &str, skip: &[&str]| PrepareStmt {
-            file: "f1".to_string(),
-            sql: sql.to_string(),
-            binds: Vec::new(),
-            var_types: BTreeMap::new(),
-            skip: skip.iter().map(|s| s.to_string()).collect(),
-            ddl_exec: None,
-        };
-        let sqls = vec![
-            mk("SELECT a FROM t1", &[]),
-            mk("SELECT nope FROM t1", &[]),
-            mk("SELECT a FROM tmp", &[]),
-            mk("SELECT a FROM __sd_fn_tmp", &["__sd_fn_tmp"]),
-        ];
-        let out = prepare_all(&snap, &rules, &sqls).unwrap();
-        // 仅真实缺列报 KERNEL-0011；延迟表与下沉临时表的"不存在"错误被抑制
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert_eq!(out[0].0, "f1");
-        assert_eq!(out[0].1.code.to_string(), "KERNEL-0011");
-    }
-
-    #[cfg(feature = "native")]
-    #[test]
-    fn should_prepare_schema_qualified_stub_table() {
-        let snap = snap_of("CREATE TABLE s.t1(a INT)");
-        let rules = RuleRegistry::default();
-        let sqls = vec![PrepareStmt {
-            file: "f".into(),
-            sql: "SELECT a FROM s.t1".into(),
-            binds: Vec::new(),
-            var_types: BTreeMap::new(),
-            skip: BTreeSet::new(),
-            ddl_exec: None,
-        }];
-        // schema 已建 → prepare 通过；若漏建 schema 会报 KERNEL-0011
-        let out = prepare_all(&snap, &rules, &sqls).unwrap();
-        assert!(out.is_empty(), "{out:?}");
-    }
-
-    #[cfg(feature = "native")]
-    #[test]
-    fn should_catch_typed_placeholder_overload_error() {
-        // $v_d 类型化为 DATE 后，round(date,'MM') 这类重载错误能被 Binder 捕获；
-        // 不替换时 DuckDB 把 $v_d 当参数，prepare 不报错（漏报）。
-        let snap = snap_of("CREATE TABLE t1(a INT)");
-        let rules = RuleRegistry::default();
-        let sqls = vec![PrepareStmt {
-            file: "f".into(),
-            sql: "SELECT round($v_d, 'MM') FROM t1".into(),
-            binds: vec![("$v_d".into(), BindSrc::Var(VarName("d".into())))],
-            var_types: BTreeMap::from([("d".to_string(), SpinType::Date)]),
-            skip: BTreeSet::new(),
-            ddl_exec: None,
-        }];
-        let out = prepare_all(&snap, &rules, &sqls).unwrap();
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert_eq!(out[0].1.code.to_string(), "KERNEL-0011");
-    }
-
-    #[cfg(feature = "native")]
-    #[test]
-    fn should_judge_same_sql_with_different_types_and_skip() {
-        // 同文本不同 var_types：DATE 的 round 重载错误必须上报，
-        // 不能被先到的"通过"语句去重吞掉；skip 不同同理。
-        let snap = snap_of("CREATE TABLE t1(a INT)");
-        let rules = RuleRegistry::default();
-        let mk = |ty: SpinType, skip: &[&str]| PrepareStmt {
-            file: "f".into(),
-            sql: "SELECT round($v_d, 'MM') FROM t1".into(),
-            binds: vec![("$v_d".into(), BindSrc::Var(VarName("d".into())))],
-            var_types: BTreeMap::from([("d".to_string(), ty)]),
-            skip: skip.iter().map(|s| s.to_string()).collect(),
-            ddl_exec: None,
-        };
-        let sqls = vec![mk(SpinType::Int, &[]), mk(SpinType::Date, &[])];
-        let out = prepare_all(&snap, &rules, &sqls).unwrap();
-        // Int 版 prepare 通过；Date 版 KERNEL-0011——去重不得跨类型合并
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert_eq!(out[0].1.code.to_string(), "KERNEL-0011");
-    }
-
-    #[cfg(feature = "native")]
-    fn ddl_stmt(sql: &str, kind: DdlExec) -> PrepareStmt {
-        PrepareStmt {
-            file: "f".into(),
-            sql: sql.to_string(),
-            binds: Vec::new(),
-            var_types: BTreeMap::new(),
-            skip: BTreeSet::new(),
-            ddl_exec: Some(kind),
-        }
-    }
-
-    #[cfg(feature = "native")]
-    fn ddl_create(sql: &str, name: &str, ctas: bool) -> PrepareStmt {
-        ddl_stmt(
-            sql,
-            if ctas {
-                DdlExec::CreateTableAs(name.to_string())
-            } else {
-                DdlExec::CreateTable(name.to_string())
-            },
-        )
-    }
-
-    #[cfg(feature = "native")]
-    fn ddl_drop(name: &str) -> PrepareStmt {
-        ddl_stmt(
-            &format!("DROP TABLE IF EXISTS {name}"),
-            DdlExec::DropLocal(name.to_string()),
-        )
-    }
-
-    #[cfg(feature = "native")]
-    #[test]
-    fn should_execute_local_ddl_and_check_real_columns() {
-        // 例程体内 CREATE TEMP TABLE 在 stub 库真实建表：后续语句的
-        // 列检查以它为准（缺列 → KERNEL-0011，不再一律延迟豁免）。
-        let snap = snap_of("CREATE TABLE t1(a INT)");
-        let rules = RuleRegistry::default();
-        let sqls = vec![
-            ddl_create("CREATE TEMP TABLE tmp(a INTEGER)", "\"tmp\"", false),
-            PrepareStmt {
-                file: "f".into(),
-                sql: "SELECT b FROM tmp".into(),
-                binds: Vec::new(),
-                var_types: BTreeMap::new(),
-                skip: BTreeSet::new(),
-                ddl_exec: None,
-            },
-        ];
-        let out = prepare_all(&snap, &rules, &sqls).unwrap();
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert_eq!(out[0].1.code.to_string(), "KERNEL-0011");
-    }
-
-    #[cfg(feature = "native")]
-    #[test]
-    fn should_execute_ctas_local_ddl_with_limit0() {
-        // CTAS 追加 LIMIT 0 执行：只为 binder 发现列，不物化数据。
-        let snap = snap_of("CREATE TABLE t1(a INT, b VARCHAR)");
-        let rules = RuleRegistry::default();
-        let sqls = vec![
-            ddl_create(
-                "CREATE TEMP TABLE t2 AS SELECT a, b FROM t1",
-                "\"t2\"",
-                true,
-            ),
-            PrepareStmt {
-                file: "f".into(),
-                sql: "SELECT a FROM t2".into(),
-                binds: Vec::new(),
-                var_types: BTreeMap::new(),
-                skip: BTreeSet::new(),
-                ddl_exec: None,
-            },
-            PrepareStmt {
-                file: "f".into(),
-                sql: "SELECT z FROM t2".into(),
-                binds: Vec::new(),
-                var_types: BTreeMap::new(),
-                skip: BTreeSet::new(),
-                ddl_exec: None,
-            },
-        ];
-        let out = prepare_all(&snap, &rules, &sqls).unwrap();
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert_eq!(out[0].1.code.to_string(), "KERNEL-0011");
-    }
-
-    #[cfg(feature = "native")]
-    #[test]
-    fn should_isolate_local_tables_between_routines() {
-        // 例程 A 的 tmp(a) 收尾 DROP 后，例程 B 的 tmp(b) 不得冲突；
-        // 同文本 `SELECT b FROM tmp` 在两个 catalog epoch 下必须分别
-        // 裁决——epoch 去重防止 B 版被 A 版吞掉。
-        let snap = snap_of("CREATE TABLE t1(a INT)");
-        let rules = RuleRegistry::default();
-        let q = |sql: &str| PrepareStmt {
-            file: "f".into(),
-            sql: sql.to_string(),
-            binds: Vec::new(),
-            var_types: BTreeMap::new(),
-            skip: BTreeSet::new(),
-            ddl_exec: None,
-        };
-        let sqls = vec![
-            ddl_create("CREATE TEMP TABLE tmp(a INTEGER)", "\"tmp\"", false),
-            q("SELECT b FROM tmp"), // A 版：缺列 → KERNEL-0011
-            ddl_drop("\"tmp\""),
-            ddl_create("CREATE TEMP TABLE tmp(b INTEGER)", "\"tmp\"", false),
-            q("SELECT b FROM tmp"), // B 版：列存在 → 通过
-            ddl_drop("\"tmp\""),
-        ];
-        let out = prepare_all(&snap, &rules, &sqls).unwrap();
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert_eq!(out[0].1.code.to_string(), "KERNEL-0011");
-    }
-
-    #[cfg(feature = "native")]
-    #[test]
-    fn should_drop_temp_table_not_global_on_name_collision() {
-        // 全局 tmp(g) 与例程局部 TEMP tmp(l) 同名：收尾 DROP 必须删
-        // temp 影子表，不能误删 stub 全局表——否则后续例程对全局
-        // tmp 的引用会假报 "does not exist"。
-        let snap = snap_of("CREATE TABLE tmp(g INT)");
-        let rules = RuleRegistry::default();
-        let q = |sql: &str| PrepareStmt {
-            file: "f".into(),
-            sql: sql.to_string(),
-            binds: Vec::new(),
-            var_types: BTreeMap::new(),
-            skip: BTreeSet::new(),
-            ddl_exec: None,
-        };
-        let sqls = vec![
-            ddl_create("CREATE TEMP TABLE tmp(l INTEGER)", "\"tmp\"", false),
-            ddl_drop("\"tmp\""),
-            q("SELECT g FROM tmp"), // 全局列 → 通过（证明全局表未被误删）
-            q("SELECT l FROM tmp"), // 局部列已随 temp 消失 → KERNEL-0011
-        ];
-        let out = prepare_all(&snap, &rules, &sqls).unwrap();
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert_eq!(out[0].1.code.to_string(), "KERNEL-0011");
-    }
-
-    #[cfg(feature = "native")]
-    #[test]
-    fn should_fail_stub_ddl_as_eng_0072() {
-        // stub DDL 执行失败 = 引擎侧缺陷 ENG-0072，Err 上抛而非空通过
-        let snap = snap_of("CREATE TABLE t1(a INT)");
-        let rules = RuleRegistry::default();
-        let err = prepare_all_impl(&snap, &rules, &[], &["THIS IS NOT VALID SQL".to_string()])
-            .unwrap_err();
-        assert_eq!(err.code.to_string(), "ENG-0072", "{err:?}");
-    }
 }

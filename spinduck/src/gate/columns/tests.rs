@@ -117,6 +117,30 @@ fn should_skip_columns_of_local_temp_table() {
 }
 
 #[test]
+fn should_isolate_local_table_columns_between_package_routines() {
+    // 包体例程作用域隔离：p1 声明的局部 tmp 不泄漏到 p2——p2 的
+    // `SELECT l FROM tmp` 必须按全局 tmp(g) 判定，l 缺失要报；
+    // 泄漏时 tmp 被当 Cols::Unknown 而漏报。
+    let snap = snap_of("CREATE TABLE tmp(g INT)");
+    let got = check_columns(
+        &stmt_of(
+            "CREATE PACKAGE BODY pkg AS \
+             PROCEDURE p1 IS BEGIN CREATE TEMP TABLE tmp(l INT); END; \
+             PROCEDURE p2 IS BEGIN SELECT l FROM tmp; END; \
+             END pkg",
+        ),
+        &snap,
+    );
+    assert_eq!(
+        got.iter()
+            .map(|m| (m.qualifier.clone(), m.column.clone(), m.problem))
+            .collect::<Vec<_>>(),
+        [(None, "l".to_string(), "missing")],
+        "{got:?}"
+    );
+}
+
+#[test]
 fn should_not_flag_pl_variable_as_column() {
     // 例程参数/变量在内嵌 SQL 中不算列引用
     let snap = snap_of("CREATE TABLE t1(a INT)");

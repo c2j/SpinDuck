@@ -329,7 +329,7 @@ fn collect_prog_sqls(
     missing_by_from: &BTreeMap<String, BTreeSet<String>>,
     sqls: &mut Vec<crate::gate::prepare::PrepareStmt>,
 ) {
-    use crate::gate::prepare::{DdlExec, PrepareStmt};
+    use crate::gate::prepare::{DdlExec, LocalDdl, PrepareStmt};
     use crate::ir::{CursorSource, IrStmt};
     // 例程体内局部 DDL（`CREATE [TEMP] TABLE`/`CTAS`）按 `code` 下标
     // 标记：对应 PrepareStmt 走 stub 库执行而非 prepare，建出的表
@@ -338,10 +338,15 @@ fn collect_prog_sqls(
         .local_ddl
         .iter()
         .map(|d| {
+            let ddl = LocalDdl {
+                name: d.name.clone(),
+                temporary: d.temporary,
+                if_not_exists: d.if_not_exists,
+            };
             let kind = if d.ctas {
-                DdlExec::CreateTableAs(d.name.clone())
+                DdlExec::CreateTableAs(ddl)
             } else {
-                DdlExec::CreateTable(d.name.clone())
+                DdlExec::CreateTable(ddl)
             };
             (d.index, kind)
         })

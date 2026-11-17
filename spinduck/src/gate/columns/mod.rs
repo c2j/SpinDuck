@@ -19,11 +19,13 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ogsql_parser::ast::plpgsql::PlDeclaration;
-use ogsql_parser::ast::visitor::{walk_statement, Visitor, VisitorResult};
+use ogsql_parser::ast::plpgsql::{PlBlock, PlDeclaration};
+use ogsql_parser::ast::visitor::{
+    walk_pl_block, walk_pl_type_decl, walk_statement, Visitor, VisitorResult,
+};
 use ogsql_parser::ast::{
-    DeleteStatement, Ident, InsertStatement, ObjectName, SelectStatement, SelectTarget, Statement,
-    UpdateStatement, WithClause,
+    DeleteStatement, Ident, InsertStatement, ObjectName, PackageItem, SelectStatement,
+    SelectTarget, Statement, UpdateStatement, WithClause,
 };
 
 use super::schema::{object_key, SchemaSnapshot};
@@ -159,6 +161,23 @@ struct Gate<'a> {
 
 impl Visitor for Gate<'_> {
     fn visit_statement(&mut self, st: &Statement) -> VisitorResult {
+        // 包体/包说明：逐例程作用域遍历（局部表不跨 procedure/function
+        // 泄漏），自行接管 items 遍历后 SkipChildren 防止 walk 重入。
+        match st {
+            Statement::CreatePackage(s) => {
+                if self.package_items(&s.items) == VisitorResult::Stop {
+                    return VisitorResult::Stop;
+                }
+                return VisitorResult::SkipChildren;
+            }
+            Statement::CreatePackageBody(s) => {
+                if self.package_items(&s.items) == VisitorResult::Stop {
+                    return VisitorResult::Stop;
+                }
+                return VisitorResult::SkipChildren;
+            }
+            _ => {}
+        }
         // 例程体内（SqlStatement 下钻）与顶层的 CREATE [TEMP] TABLE：
         // 声明名按 walk 顺序纳入本地集合，供其后引用判定。
         if let Some(key) = super::declared_table_key(st) {
@@ -192,11 +211,55 @@ impl Visitor for Gate<'_> {
         // %TYPE/%ROWTYPE 锚点校验；返回 Continue 让游标 parsed_query
         // 等子节点继续走正常 walk（内嵌 SQL 由各 visit_* 钩子覆盖）。
         self.pl_decl(decl);
+        // DECLARE 段嵌套例程是独立例程作用域：局部表不泄漏到外层；
+        // 手工 walk 后 SkipChildren 防止 walk_pl_declaration 重复进入。
+        let block = match decl {
+            PlDeclaration::NestedProcedure(p) => p.block.as_ref(),
+            PlDeclaration::NestedFunction(f) => f.block.as_ref(),
+            _ => None,
+        };
+        if let Some(block) = block {
+            if self.scoped_block(block) == VisitorResult::Stop {
+                return VisitorResult::Stop;
+            }
+            return VisitorResult::SkipChildren;
+        }
         VisitorResult::Continue
     }
 }
 
 impl Gate<'_> {
+    /// 在独立 `local` 作用域内 walk 一个例程块，结束后恢复外层集合。
+    fn scoped_block(&mut self, block: &PlBlock) -> VisitorResult {
+        let saved = std::mem::take(&mut self.local);
+        let r = walk_pl_block(self, block);
+        self.local = saved;
+        r
+    }
+
+    /// 包项逐例程遍历：procedure/function 的块走独立 local 作用域；
+    /// Type 项走 `walk_pl_type_decl`（与 walk_statement 同口径）。
+    fn package_items(&mut self, items: &[PackageItem]) -> VisitorResult {
+        for item in items {
+            let block = match item {
+                PackageItem::Procedure(p) => p.block.as_ref(),
+                PackageItem::Function(f) => f.block.as_ref(),
+                _ => None,
+            };
+            if let Some(block) = block {
+                if self.scoped_block(block) == VisitorResult::Stop {
+                    return VisitorResult::Stop;
+                }
+            }
+            if let PackageItem::Type(t) = item {
+                if walk_pl_type_decl(self, t) == VisitorResult::Stop {
+                    return VisitorResult::Stop;
+                }
+            }
+        }
+        VisitorResult::Continue
+    }
+
     /// 对象名 → 列集合。解析顺序：CTE → 文件级 PL 临时表 → 快照精确键
     /// → 快照后缀（单段名命中 `schema.obj`）。对象不存在返回
     /// `Cols::Unknown`（存在性归 Gate 1B 对象级切片，此处只关心列）。

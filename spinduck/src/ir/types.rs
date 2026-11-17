@@ -254,6 +254,13 @@ pub struct LocalDdlStmt {
     /// 清理用；旧缓存条目缺省为空串（跳过清理，不影响正确性）。
     #[serde(default)]
     pub name: String,
+    /// `CREATE TEMP TABLE`：stub 中建 temp 影子表，DROP 只解析影子不动全局。
+    #[serde(default)]
+    pub temporary: bool,
+    /// `IF NOT EXISTS`：命中已有对象时 CREATE 为空操作，不得记入
+    /// 可 DROP 名单（防止收尾误删全局 stub 表）。
+    #[serde(default)]
+    pub if_not_exists: bool,
 }
 
 /// 编译产物：线性指令序列。

@@ -125,6 +125,8 @@ impl Compiler {
                     index: idx,
                     ctas: true,
                     name: quote_object_name(&t.name),
+                    temporary: t.temporary,
+                    if_not_exists: t.if_not_exists,
                 });
             }
             S::CreateTable(t) => {
@@ -139,6 +141,8 @@ impl Compiler {
                     index: idx,
                     ctas: false,
                     name: quote_object_name(&t.name),
+                    temporary: t.temporary,
+                    if_not_exists: t.if_not_exists,
                 });
             }
             other => {

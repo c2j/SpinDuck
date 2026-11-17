@@ -11,10 +11,13 @@
 
 use std::collections::BTreeSet;
 
-use ogsql_parser::ast::visitor::{walk_statement, Visitor, VisitorResult};
+use ogsql_parser::ast::plpgsql::{PlBlock, PlDeclaration};
+use ogsql_parser::ast::visitor::{
+    walk_pl_block, walk_pl_type_decl, walk_statement, Visitor, VisitorResult,
+};
 use ogsql_parser::ast::{
-    DeleteStatement, InsertStatement, ObjectName, SelectStatement, Spanned, Statement, TableRef,
-    UpdateStatement,
+    DeleteStatement, InsertStatement, ObjectName, PackageItem, SelectStatement, Spanned, Statement,
+    TableRef, UpdateStatement,
 };
 
 use super::schema::{object_key, SchemaSnapshot};
@@ -123,10 +126,45 @@ impl RefChecker<'_> {
 
 impl Visitor for RefChecker<'_> {
     fn visit_statement(&mut self, st: &Statement) -> VisitorResult {
+        // 包体/包说明：逐例程作用域遍历（局部表不跨 procedure/function
+        // 泄漏），自行接管 items 遍历后 SkipChildren 防止 walk 重入。
+        match st {
+            Statement::CreatePackage(s) => {
+                if self.package_items(&s.items) == VisitorResult::Stop {
+                    return VisitorResult::Stop;
+                }
+                return VisitorResult::SkipChildren;
+            }
+            Statement::CreatePackageBody(s) => {
+                if self.package_items(&s.items) == VisitorResult::Stop {
+                    return VisitorResult::Stop;
+                }
+                return VisitorResult::SkipChildren;
+            }
+            _ => {}
+        }
         // 例程体内（SqlStatement 下钻）与顶层的 CREATE [TEMP] TABLE：
         // 声明名按 walk 顺序纳入本地集合，供其后引用判定。
         if let Some(key) = super::declared_table_key(st) {
             self.local.insert(key);
+        }
+        VisitorResult::Continue
+    }
+
+    fn visit_pl_declaration(&mut self, decl: &PlDeclaration) -> VisitorResult {
+        // DECLARE 段嵌套例程（NestedProcedure/NestedFunction）是独立
+        // 例程作用域：局部表不泄漏到外层；手工 walk 后 SkipChildren
+        // 防止 walk_pl_declaration 重复进入。
+        let block = match decl {
+            PlDeclaration::NestedProcedure(p) => p.block.as_ref(),
+            PlDeclaration::NestedFunction(f) => f.block.as_ref(),
+            _ => None,
+        };
+        if let Some(block) = block {
+            if self.scoped_block(block) == VisitorResult::Stop {
+                return VisitorResult::Stop;
+            }
+            return VisitorResult::SkipChildren;
         }
         VisitorResult::Continue
     }
@@ -175,6 +213,37 @@ impl Visitor for RefChecker<'_> {
 }
 
 impl RefChecker<'_> {
+    /// 在独立 `local` 作用域内 walk 一个例程块，结束后恢复外层集合。
+    fn scoped_block(&mut self, block: &PlBlock) -> VisitorResult {
+        let saved = std::mem::take(&mut self.local);
+        let r = walk_pl_block(self, block);
+        self.local = saved;
+        r
+    }
+
+    /// 包项逐例程遍历：procedure/function 的块走独立 local 作用域；
+    /// Type 项走 `walk_pl_type_decl`（与 walk_statement 同口径）。
+    fn package_items(&mut self, items: &[PackageItem]) -> VisitorResult {
+        for item in items {
+            let block = match item {
+                PackageItem::Procedure(p) => p.block.as_ref(),
+                PackageItem::Function(f) => f.block.as_ref(),
+                _ => None,
+            };
+            if let Some(block) = block {
+                if self.scoped_block(block) == VisitorResult::Stop {
+                    return VisitorResult::Stop;
+                }
+            }
+            if let PackageItem::Type(t) = item {
+                if walk_pl_type_decl(self, t) == VisitorResult::Stop {
+                    return VisitorResult::Stop;
+                }
+            }
+        }
+        VisitorResult::Continue
+    }
+
     /// DML 字段内的 TableRef 手工递归（Table/Subquery/Join/Pivot/Unpivot）；
     /// FunctionCall/Values 内的表达式子查询为已知残留缺口（V1）。
     fn check_dml_table_ref(&mut self, tr: &TableRef) {
@@ -324,6 +393,41 @@ mod tests {
             &snap,
         );
         assert_eq!(got.len(), 1, "{got:?}");
+    }
+
+    #[test]
+    fn should_isolate_local_tables_between_package_routines() {
+        // 包体内每个 procedure/function 是独立例程：p1 声明的 tmp
+        // 不得泄漏到 p2——p2 的 INSERT INTO tmp 仍报 BIZ-0152 缺失。
+        let snap = snap_of("CREATE TABLE t1(a INT)");
+        let got = check_statement(
+            &stmt_of(
+                "CREATE PACKAGE BODY pkg AS \
+                 PROCEDURE p1 IS BEGIN CREATE TEMP TABLE tmp(x INT); END; \
+                 PROCEDURE p2 IS BEGIN INSERT INTO tmp VALUES (1); END; \
+                 END pkg",
+            ),
+            &snap,
+        );
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].object, "tmp");
+    }
+
+    #[test]
+    fn should_isolate_local_tables_of_nested_routine() {
+        // DECLARE 段嵌套例程同样是独立作用域：嵌套例程内声明的
+        // tmp 不泄漏到外层例程体。
+        let snap = snap_of("CREATE TABLE t1(a INT)");
+        let got = check_statement(
+            &stmt_of(
+                "CREATE PROCEDURE outer_p IS \
+                 DECLARE PROCEDURE inner_p IS BEGIN CREATE TEMP TABLE tmp(x INT); END; \
+                 BEGIN INSERT INTO tmp VALUES (1); END",
+            ),
+            &snap,
+        );
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].object, "tmp");
     }
 
     #[test]
