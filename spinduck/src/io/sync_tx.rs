@@ -134,8 +134,12 @@ impl GaussConn {
                 sc.replace('\'', "''")
             ));
         }
+        // A 模式 '' 即 NULL：`coalesce(column_default,'')` 会把"无默认值"塌成 NULL，
+        // 驱动侧 None 使整列被 filter_map 丢弃 → ENV-0021 恒红（实测 V-synctune）。
+        // 改用 CASE 产出 'Y'/'N' 文本，三态语义不依赖空串哨兵。
         let sql = format!(
-            "SELECT column_name, is_nullable, coalesce(column_default, '') \
+            "SELECT column_name, is_nullable, \
+             CASE WHEN column_default IS NOT NULL THEN 'Y' ELSE 'N' END \
              FROM information_schema.columns WHERE {cond}"
         );
         let (_, rows) = self.fetch_rows(&sql)?;
@@ -150,7 +154,7 @@ impl GaussConn {
                     (Some(n), Some(nul), Some(def)) => Some(TargetCol {
                         name: n.to_string(),
                         not_null: nul.eq_ignore_ascii_case("NO"),
-                        has_default: !def.is_empty(),
+                        has_default: def.eq_ignore_ascii_case("y"),
                     }),
                     _ => None,
                 }
@@ -172,24 +176,49 @@ impl GaussConn {
         Ok(())
     }
 
-    /// G4：目标 key 须有唯一约束/PK 覆盖（pg_constraint，fail-closed）。
+    /// G4：目标 key 须有唯一约束/索引覆盖（pg_index，fail-closed）。
+    /// 覆盖 `CREATE UNIQUE INDEX` 裸索引（无 pg_constraint 记录）与 PK/UNIQUE
+    /// 约束索引；`indisvalid` 排除构建中索引，`indpred`/`indexprs` 排除部分索引
+    /// 与表达式索引（均不能保证键列唯一）。openGauss 不支持 FROM 项引用前置表
+    /// 的 SRF（原 `unnest(conkey)` 写法报 invalid reference），且 conkey::text
+    /// 带 `{}` 花括号使 `string_to_array(...,' ')` 切不出正确 attnum——
+    /// 改走 indkey::text（空格分隔无花括号）+ ANY 匹配。
     fn guard_unique_index(&mut self, table: &str, keys: &[String]) -> Result<(), EngineError> {
-        let bare = table.split('.').next_back().unwrap_or(table);
+        let (schema, bare) = crate::io::sync::split_schema(table);
         let t = bare.replace('\'', "''");
+        let mut cond = format!("lower(t.relname) = lower('{t}')");
+        if let Some(sc) = schema {
+            cond.push_str(&format!(
+                " AND lower(n.nspname) = lower('{}')",
+                sc.replace('\'', "''")
+            ));
+        }
         let sql = format!(
-            "SELECT coalesce(string_agg(a.attname, ',' ORDER BY a.attnum), '') \
-             FROM pg_constraint con \
-             JOIN pg_class rel ON rel.oid = con.conrelid \
-             CROSS JOIN unnest(string_to_array(con.conkey::text, ' ')::int[]) k \
-             JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k \
-             WHERE con.contype IN ('p', 'u') AND lower(rel.relname) = lower('{t}') \
-             GROUP BY con.oid"
+            "SELECT string_agg(a.attname, ',' ORDER BY a.attnum), i.indnatts, count(*) \
+             FROM pg_index i \
+             JOIN pg_class t ON t.oid = i.indrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             JOIN pg_attribute a ON a.attrelid = t.oid \
+               AND a.attnum = ANY (string_to_array(i.indkey::text, ' ')::int[]) \
+             WHERE i.indisunique AND i.indisvalid \
+               AND i.indpred IS NULL AND i.indexprs IS NULL \
+               AND {cond} \
+             GROUP BY i.indexrelid, i.indnatts"
         );
         let (_, rows) = self.fetch_rows(&sql)?;
         let constraints: Vec<Vec<String>> = rows
             .iter()
             .filter_map(|r| {
-                r.first().and_then(|o| o.as_deref()).map(|s| {
+                // indnatts != matched：索引含表达式/INCLUDE 列，键列覆盖不完整，跳过
+                let (cols, natts, matched) = (r.first(), r.get(1), r.get(2));
+                let complete = match (natts, matched) {
+                    (Some(n), Some(m)) => n == m,
+                    _ => false,
+                };
+                if !complete {
+                    return None;
+                }
+                cols.and_then(|o| o.as_deref()).map(|s| {
                     s.split(',')
                         .map(|c| c.trim().to_string())
                         .filter(|c| !c.is_empty())
@@ -465,7 +494,7 @@ mod tests {
             2,
             "post 仅 UPDATE+INSERT，DROP 不得计入行数"
         );
-        assert!(plan.post_sql[0].starts_with("UPDATE t_out SET b = tmp.b"));
+        assert!(plan.post_sql[0].starts_with("UPDATE t_out AS tgt SET b = tmp.b"));
         assert!(plan.post_sql[1].starts_with("INSERT INTO t_out"));
         assert_eq!(plan.finalize_sql.as_deref(), Some("DROP TABLE sd_sync_tmp"));
     }

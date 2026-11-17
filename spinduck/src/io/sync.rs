@@ -289,8 +289,10 @@ pub fn build_upsert_statements(table: &str, cols: &[String], keys: &[String]) ->
         .filter(|c| !keys.iter().any(|k| k.eq_ignore_ascii_case(c)))
         .map(|c| format!("{c} = tmp.{c}"))
         .collect();
+    // 目标侧必须带别名：裸键列在 UPDATE…FROM 下与 tmp 同名列 ambiguous（42702，
+    // PG 系语义同样报错——此前该 SQL 从未被真实执行过）。
     let update = format!(
-        "UPDATE {table} SET {} FROM {TMP_TABLE} tmp WHERE {}",
+        "UPDATE {table} AS tgt SET {} FROM {TMP_TABLE} tmp WHERE {}",
         sets.join(", "),
         key_pred(keys)
     );
@@ -308,10 +310,10 @@ pub fn build_upsert_statements(table: &str, cols: &[String], keys: &[String]) ->
     UpsertStatements { update, insert }
 }
 
-/// 键等值谓词（两侧同别名口径）。
+/// 键等值谓词（目标侧别名 tgt，消除与 tmp 同名列的歧义）。
 fn key_pred(keys: &[String]) -> String {
     keys.iter()
-        .map(|k| format!("tmp.{k} = {k}"))
+        .map(|k| format!("tmp.{k} = tgt.{k}"))
         .collect::<Vec<_>>()
         .join(" AND ")
 }
@@ -633,7 +635,7 @@ mod tests {
         let UpsertStatements { update, insert } = build_upsert_statements("t_out", &cols, &keys);
         assert_eq!(
             update,
-            "UPDATE t_out SET b = tmp.b, c = tmp.c FROM sd_sync_tmp tmp WHERE tmp.a = a"
+            "UPDATE t_out AS tgt SET b = tmp.b, c = tmp.c FROM sd_sync_tmp tmp WHERE tmp.a = tgt.a"
         );
         assert!(insert.starts_with("INSERT INTO t_out (a, b, c) SELECT tmp.a, tmp.b, tmp.c"));
         assert!(insert.contains("WHERE NOT EXISTS (SELECT 1 FROM t_out x WHERE tmp.a = x.a)"));
