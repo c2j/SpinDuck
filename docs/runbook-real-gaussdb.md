@@ -329,6 +329,11 @@ sync --table dat_trd_repurchase --cols purchase_no,fund_code,bcrq \
 - 注意：`materialize`/`sync` 每步仍各自建 GaussDB 短连接（V1 不跨步池化）；
   `deploy` 非幂等——重跑 batch 前先删本地库（§7）；没有 `--trace-dir` 自动
   分配，trace 路径要在脚本里逐条写死。
+- 实测量级（V49，同案例生产体量库）：功能输出逐值一致，墙钟约 **−14%**
+  （4.00 s → 3.45 s）——收益全部来自编排开销（少 3 次开库/spawn、同闭包
+  `call` 命中引擎缓存），例程执行本身两侧相同；步越多、单步越轻收益越大，
+  `materialize`/`sync` 步因不池化 GaussDB 连接收益有限。口径与边界见
+  `docs/validation.md` V49。
 
 ## 6. 逐值裁决
 
