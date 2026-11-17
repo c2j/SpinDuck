@@ -265,11 +265,14 @@ pub fn schema_violations(target: &[TargetCol], cols: &[String]) -> Vec<String> {
     v
 }
 
-/// G4 纯判定：是否存在唯一约束/PK 的列集覆盖 upsert key（大小写不敏感）。
+/// G4 纯判定：是否存在唯一约束/索引的列集被 upsert key 完全覆盖（大小写不敏感）。
+/// 方向为「索引列集 ⊆ keys」：key 是索引列超集仍唯一（多余键列只会更唯一），
+/// 而 key 是索引列真子集（复合键只传部分列）会放行 1 对 N 的 UPDATE...FROM。
 pub fn has_unique_covering(constraints: &[Vec<String>], keys: &[String]) -> bool {
     constraints.iter().any(|c| {
-        keys.iter()
-            .all(|k| c.iter().any(|cc| cc.eq_ignore_ascii_case(k)))
+        !c.is_empty()
+            && c.iter()
+                .all(|cc| keys.iter().any(|k| k.eq_ignore_ascii_case(cc)))
     })
 }
 
@@ -289,8 +292,10 @@ pub fn build_upsert_statements(table: &str, cols: &[String], keys: &[String]) ->
         .filter(|c| !keys.iter().any(|k| k.eq_ignore_ascii_case(c)))
         .map(|c| format!("{c} = tmp.{c}"))
         .collect();
+    // 目标侧必须带别名：裸键列在 UPDATE…FROM 下与 tmp 同名列 ambiguous（42702，
+    // PG 系语义同样报错——此前该 SQL 从未被真实执行过）。
     let update = format!(
-        "UPDATE {table} SET {} FROM {TMP_TABLE} tmp WHERE {}",
+        "UPDATE {table} AS tgt SET {} FROM {TMP_TABLE} tmp WHERE {}",
         sets.join(", "),
         key_pred(keys)
     );
@@ -308,10 +313,10 @@ pub fn build_upsert_statements(table: &str, cols: &[String], keys: &[String]) ->
     UpsertStatements { update, insert }
 }
 
-/// 键等值谓词（两侧同别名口径）。
+/// 键等值谓词（目标侧别名 tgt，消除与 tmp 同名列的歧义）。
 fn key_pred(keys: &[String]) -> String {
     keys.iter()
-        .map(|k| format!("tmp.{k} = {k}"))
+        .map(|k| format!("tmp.{k} = tgt.{k}"))
         .collect::<Vec<_>>()
         .join(" AND ")
 }
@@ -627,13 +632,27 @@ mod tests {
     }
 
     #[test]
+    fn should_cover_composite_key_partially_or_fully() {
+        // 复合唯一索引 (x,y)：key 只传 x 是真子集 → 1 对 N 放行风险，必须拒；
+        // key 传 (x,y,z) 超集 → 仍唯一，必须放行。
+        let constraints = vec![vec!["x".to_string(), "y".to_string()]];
+        assert!(!has_unique_covering(&constraints, &["x".into()]));
+        assert!(has_unique_covering(
+            &constraints,
+            &["x".into(), "y".into(), "z".into()]
+        ));
+        // 空索引列集不构成覆盖（防御空约束行）。
+        assert!(!has_unique_covering(&[Vec::new()], &["x".into()]));
+    }
+
+    #[test]
     fn should_build_upsert_statements_with_key_predicate() {
         let cols = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let keys = vec!["a".to_string()];
         let UpsertStatements { update, insert } = build_upsert_statements("t_out", &cols, &keys);
         assert_eq!(
             update,
-            "UPDATE t_out SET b = tmp.b, c = tmp.c FROM sd_sync_tmp tmp WHERE tmp.a = a"
+            "UPDATE t_out AS tgt SET b = tmp.b, c = tmp.c FROM sd_sync_tmp tmp WHERE tmp.a = tgt.a"
         );
         assert!(insert.starts_with("INSERT INTO t_out (a, b, c) SELECT tmp.a, tmp.b, tmp.c"));
         assert!(insert.contains("WHERE NOT EXISTS (SELECT 1 FROM t_out x WHERE tmp.a = x.a)"));

@@ -1,6 +1,8 @@
 # sync 回写改进设计（部分回写 + 模式化 + 快路径）
 
-> 状态：**已实现（feat/sync-writeback），GaussDB 容器 E2E 待补**。参照实现：fastaas `prototype-1.7/dota-scheduler/
+> 状态：**已实现（feat/sync-writeback），openGauss 5.0.0 A 模式容器 E2E 已补齐
+> （`tests/gauss_sync_e2e.rs`，实测见 validation V50 / golden/sync-perf/）**。
+> 参照实现：fastaas `prototype-1.7/dota-scheduler/
 > dota-adapter/src/main/java/com/dota/commit`（回写框架五层拆解见 §2）。
 > 本文只承载机制设计：实证数字落地后更新 `docs/validation.md`，机制描述在实现
 > 合入时同步 `docs/architecture.md` §13.2——三者不互相越界（AGENTS §3）。
@@ -101,8 +103,10 @@ COPY {t} ({cols}) FROM STDIN (FORMAT csv)      ← 单事务
   文档标注；不额外转义）。
 - 临时文件放项目 run 目录（§11 运行态布局），命名 `.spinduck-sync-{table}-{pid}.csv`，
   成功删除、失败保留并在错误消息带路径——与物化 §3.1 同一套纪律。
-- 旧逐行路径保留为快路径失败时的回落（快路径失败原因并入最终错误消息，
-  不静默），回落行为与 V26 完全一致。
+- 旧逐行路径仅作为**入库前失败**的回落（快路径失败原因并入最终错误消息，
+  不静默）。COPY 已提交后的失败（清理 CSV、行数核对）不回落——append 无事务，
+  回落会在无唯一约束目标上静默双写；slice/upsert 经事务回滚后目标干净，
+  仍可安全回落（`FastPathFailure.loaded` 门禁，V50.2）。
 
 ### 4.2 `--mode slice`：部分回写 + 幂等重跑
 
@@ -213,8 +217,9 @@ upsert `UPDATE+INSERT == staging` 交叉校验（DROP 移出计数）。
 
 登记待后续（不阻断合入）：
 
-1. G1/G4 元数据 SQL 未对真实 openGauss 执行过——E2E 守护补齐前，G4 若因
-   `string_to_array` 口径不支持而恒红，属 fail-closed 方向，修 SQL 即可。
+1. ~~G1/G4 元数据 SQL 未对真实 openGauss 执行过~~ **已闭环（V50）**：A 模式
+   `''`=NULL 塌缩、`unnest(conkey)` 方言非法、`conkey::text` 花括号、裸唯一
+   索引漏检四处缺陷全部实测复现并修复，`gauss_sync_e2e` 全绿。
 2. 回滚失败（`let _ = self.exec("ROLLBACK")`）吞错后仍继续回落——应终止回落。
 3. 回落与快路径读取同一张本地表，两次尝试可能读到不同快照——可复用快路径
    保留的 CSV 作为回落数据源。

@@ -5085,3 +5085,63 @@ Up to date. No changes detected.
 - 不声称比例可外推到其他体量：137 MiB 库上开库约 0.2 s，库越小固定开销占比越高、
   batch 相对收益越大；例程越重收益越小。
 - 不声称上述 `90`/`0` 分歧已定性（疑似 lookup/prepare 缓存时序，未定位根因）。
+
+## V50. sync 回写真机实测：守卫族三处阻断缺陷修复 + 性能基线（2026-11-17，PR #53）
+
+环境：`golden/gaussdb-docker` compose（openGauss 5.0.0，Oracle A 模式，4GB/512MB
+shared_buffers），被测基线 `b3766eb`。复现资产与全部实测数字归档
+`golden/sync-perf/`（脚本 + `results/README.md`）。
+
+### V50.1 阻断缺陷（修复前 sync 全模式不可用）
+
+守卫族自 feat/sync-writeback 合入以来从未对真实 openGauss 执行过，三处缺陷叠加：
+
+1. **G1 schema 守卫恒红 ENV-0021**：`coalesce(column_default,'')` 在 A 模式下
+   `''` 即 NULL，无默认值列被 `filter_map` 整行丢弃 → append/slice/upsert 全灭。
+   修法：`CASE WHEN column_default IS NOT NULL THEN 'Y' ELSE 'N' END`。
+2. **G4 唯一索引守卫 SQL 非法/覆盖不全**：`CROSS JOIN unnest(conkey)` 报
+   `invalid reference to FROM-clause entry`；`conkey::text` 输出 `{1}` 花括号使
+   `string_to_array(...,' ')` 切不出 attnum；只查 `pg_constraint` 致裸
+   `CREATE UNIQUE INDEX` 不可见。修法：`pg_index` + `indkey::text`（空格分隔）
+   + `indisvalid`，排除 `indpred`/`indexprs`，`matched==indnatts` 兜底。
+3. **upsert UPDATE 列名歧义 42702**：`WHERE tmp.k = k` 裸列在目标表与 staging
+   表间 ambiguous（PG 系语义同样报错——此前从未被真实执行）。修法：
+   `UPDATE {t} AS tgt … WHERE tmp.k = tgt.k`。
+
+### V50.2 评审复审修订（同 PR 第二轮）
+
+- `has_unique_covering` 覆盖方向修正为「索引列集 ⊆ keys」：复合主键只传部分键
+  原会假绿放行 1 对 N UPDATE；key 为索引超集仍放行（单测锁定两方向）。
+- 快路径失败语义对齐 materialize.rs：新增 `FastPathFailure { err, loaded }`，
+  COPY 入库成功后的失败（清理 CSV/行数核对）标记 `loaded`——append 无事务，
+  此时回落逐行会在无唯一约束目标上静默双写，改为直接报错；事务模式
+  ROLLBACK 后 `loaded=false` 仍可安全回落。
+- 逐行回落补齐 `finalize_sql`（DROP staging，此前 upsert 回落后遗留
+  `sd_sync_tmp` 会让下次 upsert 建表失败）与 upsert `UPDATE+INSERT==staging`
+  交叉校验。
+- 裸表名 schema 消解：G1/G4 均按 search_path 只认 `pg_table_is_visible` 命中的
+  表，防跨 schema 同名表混列/混索引（e2e 双 schema 同名表实测）。
+
+### V50.3 E2E 门禁
+
+`tests/gauss_sync_e2e.rs`（env 门控，缺容器显式 panic，同 gauss_e2e 口径），
+修复前 6/7 红（ENV-0021），修复后全绿。覆盖：append 撞 PK 原子回滚（断言错误域
+非守卫期 + 冲突行/新行均未留下）、upsert PK/复合键/裸唯一索引/次级唯一冲突
+回滚/幂等重跑、无约束表 ENV-0022、staging 重复键与 NULL 键 BIZ-0103、
+slice 幂等、search_path 消解、DECIMAL/DATE/TIMESTAMP/'' 宽类型保真。
+
+### V50.4 性能基线（详见 golden/sync-perf/results/README.md）
+
+- append 1M 行端到端 ~1.08s ≈ **93 万行/s**（设计目标 ≥40 万，超额）；
+- upsert 端到端 1M staging/1M 目标 ~5.4s；服务端分解 COPY ingest ~0.35s、
+  UPDATE ~2.2s、INSERT NOT EXISTS ~1.5s；
+- 规模效应：5M 目标 S=20 万时默认 Merge Join 2.81s vs 强制 Nested Loop
+  0.85s（**~3.3×**）——成本模型在中间区间系统性偏向全表扫，优化方向为
+  `S < reltuples/10` 时事务内 `SET LOCAL enable_hashjoin/mergejoin=off`。
+
+### V50.5 不声称
+
+- 不声称 upsert join 策略分流已实现（本 PR 只修正确性，优化策略见 §5 留档待做）；
+- 不声称并发 slice/upsert 竞态已覆盖（无并发 e2e）；
+- 不声称 CLI `batch` 串联路径的 sync 实测（复用同一 `sync_write` 接缝，
+  未单独压测）。

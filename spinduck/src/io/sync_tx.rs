@@ -20,6 +20,14 @@ struct RunCtx {
     fast: bool,
 }
 
+/// 快路径失败：`loaded` 表示目标侧可能已写入（append 的 COPY 已提交、
+/// 或入库后清理/行数核对失败）。此时禁止回落逐行——无唯一约束的目标会
+/// 静默双写。事务模式（slice/upsert）经 ROLLBACK 后恒为 false。
+struct FastPathFailure {
+    err: EngineError,
+    loaded: bool,
+}
+
 /// 单次回写的执行计划：COPY 目标 + 事务前后置 SQL（设计 §4.2/§4.3）。
 struct WritePlan {
     /// 显式事务骨架（slice/upsert 需要；append 单语句天然原子）。
@@ -106,14 +114,27 @@ impl GaussConn {
         };
         let rows = match self.run(duck, table, cols, mode, fast_ctx) {
             Ok(n) => n,
-            Err(fast_err) => {
+            // 入库后失败（loaded）：目标可能已写入，回落逐行会双写——直接报错
+            Err(fast) if fast.loaded => {
+                return Err(EngineError::env(
+                    20,
+                    format!(
+                        "快路径已入库后失败（{}），目标可能已写入，不回落逐行以免双写",
+                        fast.err
+                    ),
+                ));
+            }
+            Err(fast) => {
                 let row_ctx = RunCtx {
                     select_sql,
                     workdir: None,
                     fast: false,
                 };
                 self.run(duck, table, cols, mode, row_ctx).map_err(|e| {
-                    EngineError::env(20, format!("快路径失败（{fast_err}），逐行回落亦失败：{e}"))
+                    EngineError::env(
+                        20,
+                        format!("快路径失败（{}），逐行回落亦失败：{}", fast.err, e.err),
+                    )
                 })?
             }
         };
@@ -133,9 +154,26 @@ impl GaussConn {
                 " AND lower(table_schema) = lower('{}')",
                 sc.replace('\'', "''")
             ));
+        } else {
+            // 裸表名按 search_path 解析：只认 pg_table_is_visible 命中的
+            // schema，防跨 schema 同名表把两套列清单混进守卫判定。
+            cond.push_str(&format!(
+                " AND lower(table_schema) = lower(COALESCE((\
+                   SELECT n.nspname FROM pg_class c \
+                   JOIN pg_namespace n ON n.oid = c.relnamespace \
+                   WHERE lower(c.relname) = lower('{}') \
+                     AND c.relkind IN ('r','p','f') \
+                     AND pg_table_is_visible(c.oid) LIMIT 1\
+                 ), ''))",
+                bare.replace('\'', "''")
+            ));
         }
+        // A 模式 '' 即 NULL：`coalesce(column_default,'')` 会把"无默认值"塌成 NULL，
+        // 驱动侧 None 使整列被 filter_map 丢弃 → ENV-0021 恒红（实测 V-synctune）。
+        // 改用 CASE 产出 'Y'/'N' 文本，三态语义不依赖空串哨兵。
         let sql = format!(
-            "SELECT column_name, is_nullable, coalesce(column_default, '') \
+            "SELECT column_name, is_nullable, \
+             CASE WHEN column_default IS NOT NULL THEN 'Y' ELSE 'N' END \
              FROM information_schema.columns WHERE {cond}"
         );
         let (_, rows) = self.fetch_rows(&sql)?;
@@ -150,7 +188,7 @@ impl GaussConn {
                     (Some(n), Some(nul), Some(def)) => Some(TargetCol {
                         name: n.to_string(),
                         not_null: nul.eq_ignore_ascii_case("NO"),
-                        has_default: !def.is_empty(),
+                        has_default: def.eq_ignore_ascii_case("y"),
                     }),
                     _ => None,
                 }
@@ -172,24 +210,53 @@ impl GaussConn {
         Ok(())
     }
 
-    /// G4：目标 key 须有唯一约束/PK 覆盖（pg_constraint，fail-closed）。
+    /// G4：目标 key 须有唯一约束/索引覆盖（pg_index，fail-closed）。
+    /// 覆盖 `CREATE UNIQUE INDEX` 裸索引（无 pg_constraint 记录）与 PK/UNIQUE
+    /// 约束索引；`indisvalid` 排除构建中索引，`indpred`/`indexprs` 排除部分索引
+    /// 与表达式索引（均不能保证键列唯一）。openGauss 不支持 FROM 项引用前置表
+    /// 的 SRF（原 `unnest(conkey)` 写法报 invalid reference），且 conkey::text
+    /// 带 `{}` 花括号使 `string_to_array(...,' ')` 切不出正确 attnum——
+    /// 改走 indkey::text（空格分隔无花括号）+ ANY 匹配。
     fn guard_unique_index(&mut self, table: &str, keys: &[String]) -> Result<(), EngineError> {
-        let bare = table.split('.').next_back().unwrap_or(table);
+        let (schema, bare) = crate::io::sync::split_schema(table);
         let t = bare.replace('\'', "''");
+        let mut cond = format!("lower(t.relname) = lower('{t}')");
+        if let Some(sc) = schema {
+            cond.push_str(&format!(
+                " AND lower(n.nspname) = lower('{}')",
+                sc.replace('\'', "''")
+            ));
+        } else {
+            // 裸表名只认 search_path 解析到的那一张（pg_table_is_visible 取首个
+            // 命中），与 COPY/UPDATE 的未限定名消解口径一致。
+            cond.push_str(" AND pg_table_is_visible(t.oid)");
+        }
         let sql = format!(
-            "SELECT coalesce(string_agg(a.attname, ',' ORDER BY a.attnum), '') \
-             FROM pg_constraint con \
-             JOIN pg_class rel ON rel.oid = con.conrelid \
-             CROSS JOIN unnest(string_to_array(con.conkey::text, ' ')::int[]) k \
-             JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k \
-             WHERE con.contype IN ('p', 'u') AND lower(rel.relname) = lower('{t}') \
-             GROUP BY con.oid"
+            "SELECT string_agg(a.attname, ',' ORDER BY a.attnum), i.indnatts, count(*) \
+             FROM pg_index i \
+             JOIN pg_class t ON t.oid = i.indrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             JOIN pg_attribute a ON a.attrelid = t.oid \
+               AND a.attnum = ANY (string_to_array(i.indkey::text, ' ')::int[]) \
+             WHERE i.indisunique AND i.indisvalid \
+               AND i.indpred IS NULL AND i.indexprs IS NULL \
+               AND {cond} \
+             GROUP BY i.indexrelid, i.indnatts"
         );
         let (_, rows) = self.fetch_rows(&sql)?;
         let constraints: Vec<Vec<String>> = rows
             .iter()
             .filter_map(|r| {
-                r.first().and_then(|o| o.as_deref()).map(|s| {
+                // indnatts != matched：索引含表达式/INCLUDE 列，键列覆盖不完整，跳过
+                let (cols, natts, matched) = (r.first(), r.get(1), r.get(2));
+                let complete = match (natts, matched) {
+                    (Some(n), Some(m)) => n == m,
+                    _ => false,
+                };
+                if !complete {
+                    return None;
+                }
+                cols.and_then(|o| o.as_deref()).map(|s| {
                     s.split(',')
                         .map(|c| c.trim().to_string())
                         .filter(|c| !c.is_empty())
@@ -217,10 +284,11 @@ impl GaussConn {
         cols: &[String],
         mode: &SyncMode,
         ctx: RunCtx,
-    ) -> Result<usize, EngineError> {
+    ) -> Result<usize, FastPathFailure> {
         let plan = WritePlan::new(table, cols, mode);
         if plan.tx {
-            self.exec("BEGIN")?;
+            self.exec("BEGIN")
+                .map_err(|err| FastPathFailure { err, loaded: false })?;
         }
         let result = if ctx.fast {
             self.run_fast(
@@ -233,11 +301,21 @@ impl GaussConn {
             )
         } else {
             self.run_rows(duck, &ctx.select_sql, &plan, cols, mode)
+                .map_err(|err| FastPathFailure { err, loaded: false })
         };
+        // finalize（upsert 的 DROP staging）两条路径同权执行；失败同样走回滚
+        let result = result.and_then(|n| {
+            if let Some(fin) = &plan.finalize_sql {
+                self.exec(fin)
+                    .map_err(|err| FastPathFailure { err, loaded: false })?;
+            }
+            Ok(n)
+        });
         match result {
             Ok(n) => {
                 if plan.tx {
-                    self.exec("COMMIT")?;
+                    self.exec("COMMIT")
+                        .map_err(|err| FastPathFailure { err, loaded: false })?;
                 }
                 Ok(n)
             }
@@ -245,13 +323,19 @@ impl GaussConn {
                 if plan.tx {
                     let _ = self.exec("ROLLBACK");
                 }
-                Err(e)
+                // 事务模式回滚后目标必然干净；仅 append 快路径的入库后失败
+                // 才可能带着已提交写入返回。
+                Err(FastPathFailure {
+                    loaded: if plan.tx { false } else { e.loaded },
+                    ..e
+                })
             }
         }
     }
 
     /// 快路径：DuckDB 内核导出 CSV → GaussDB copy_in 流式灌入（零逐行编码）。
     /// 成功即删临时 CSV，失败保留供诊断（与物化 §3.1 同纪律）。
+    /// `loaded` 只在 COPY 入库成功之后置真——此前失败目标必然零写入。
     fn run_fast(
         &mut self,
         duck: &dyn SqlExecutor,
@@ -260,41 +344,62 @@ impl GaussConn {
         cols: &[String],
         workdir: Option<&Path>,
         mode: &SyncMode,
-    ) -> Result<usize, EngineError> {
-        let workdir = workdir.ok_or_else(|| EngineError::env(20, "快路径缺工作目录"))?;
+    ) -> Result<usize, FastPathFailure> {
+        let fail = |err: EngineError, loaded: bool| FastPathFailure { err, loaded };
+        let workdir = workdir.ok_or_else(|| FastPathFailure {
+            err: EngineError::env(20, "快路径缺工作目录"),
+            loaded: false,
+        })?;
         // V26 同款纪律：服务端 copied 必须与本地行数相等（快路径不豁免）
         let count_sql = format!("SELECT count(*) FROM ({select_sql})");
-        let local_n = crate::io::sync::scalar_count(&mut duck.query(&count_sql, &BindMap::new())?)?;
-        let csv = self.export_csv(duck, select_sql, workdir, mode)?;
+        let local_n = crate::io::sync::scalar_count(
+            &mut duck
+                .query(&count_sql, &BindMap::new())
+                .map_err(|err| fail(err, false))?,
+        )
+        .map_err(|err| fail(err, false))?;
+        let csv = self
+            .export_csv(duck, select_sql, workdir, mode)
+            .map_err(|err| fail(err, false))?;
         for sql in &plan.pre_sql {
-            self.exec(sql)?;
+            self.exec(sql).map_err(|err| fail(err, false))?;
         }
-        let copied = self.copy_file_to_target(&csv, &plan.copy_target, cols)?;
+        let copied = self
+            .copy_file_to_target(&csv, &plan.copy_target, cols)
+            .map_err(|err| fail(err, false))?;
+        // 此后失败均发生在入库之后：append 无事务，目标已含本批写入
         let mut post_rows = 0u64;
         for sql in &plan.post_sql {
-            post_rows += self.exec(sql)?;
+            post_rows += self.exec(sql).map_err(|err| fail(err, true))?;
         }
-        if let Some(fin) = &plan.finalize_sql {
-            self.exec(fin)?;
-        }
-        std::fs::remove_file(&csv)
-            .map_err(|e| EngineError::env(20, format!("清理临时 CSV {}: {e}", csv.display())))?;
+        std::fs::remove_file(&csv).map_err(|e| {
+            fail(
+                EngineError::env(20, format!("清理临时 CSV {}: {e}", csv.display())),
+                true,
+            )
+        })?;
         match mode {
             SyncMode::Upsert { .. } => {
                 if post_rows as i64 != copied as i64 {
-                    return Err(EngineError::env(
-                        20,
-                        format!(
-                            "upsert 行数不一致：staging {copied} 行，UPDATE+INSERT {post_rows} 行"
+                    return Err(fail(
+                        EngineError::env(
+                            20,
+                            format!(
+                                "upsert 行数不一致：staging {copied} 行，UPDATE+INSERT {post_rows} 行"
+                            ),
                         ),
+                        true,
                     ));
                 }
             }
             _ => {
                 if copied as i64 != local_n {
-                    return Err(EngineError::env(
-                        20,
-                        format!("快路径行数不一致：本地 {local_n} 行，服务端 {copied} 行"),
+                    return Err(fail(
+                        EngineError::env(
+                            20,
+                            format!("快路径行数不一致：本地 {local_n} 行，服务端 {copied} 行"),
+                        ),
+                        true,
                     ));
                 }
             }
@@ -367,6 +472,12 @@ impl GaussConn {
         let mut post_rows = 0u64;
         for sql in &plan.post_sql {
             post_rows += self.exec(sql)?;
+        }
+        if matches!(mode, SyncMode::Upsert { .. }) && post_rows as i64 != written as i64 {
+            return Err(EngineError::env(
+                20,
+                format!("upsert 行数不一致：staging {written} 行，UPDATE+INSERT {post_rows} 行"),
+            ));
         }
         let rows = match mode {
             SyncMode::Upsert { .. } => post_rows as usize,
@@ -465,7 +576,7 @@ mod tests {
             2,
             "post 仅 UPDATE+INSERT，DROP 不得计入行数"
         );
-        assert!(plan.post_sql[0].starts_with("UPDATE t_out SET b = tmp.b"));
+        assert!(plan.post_sql[0].starts_with("UPDATE t_out AS tgt SET b = tmp.b"));
         assert!(plan.post_sql[1].starts_with("INSERT INTO t_out"));
         assert_eq!(plan.finalize_sql.as_deref(), Some("DROP TABLE sd_sync_tmp"));
     }
