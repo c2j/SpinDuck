@@ -26,6 +26,12 @@ const PARSER_PIN: &str = "ogsql-parser=0.11";
 /// duckdb crate 依赖 pin（对应 DuckDB 1.5.5；内核升级 = V6 门禁）。
 const KERNEL_PIN: &str = "duckdb=1.10505.0";
 
+/// IR 序列化形状版本：`IrProg`/`LocalDdlStmt` 等字段增删必须 bump。
+/// 旧 `<stamp>.json` 文件名随之失效——serde(default) 会把缺字段读成
+/// 默认值（如 `if_not_exists`/`temporary` 缺省 false → 误 DROP 全局
+/// stub 表），不能让旧形状条目在新语义下命中。
+const IR_SCHEMA_VERSION: &str = "ir-v1";
+
 /// FNV-1a 64：稳定、无依赖的变更检测哈希（非安全用途）。
 fn fnv(parts: &[&str]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -75,9 +81,15 @@ impl CompileGateStamp {
 
     /// stamp 的稳定键（缓存文件名分量）。
     pub fn key(&self) -> String {
+        self.key_for_version(IR_SCHEMA_VERSION)
+    }
+
+    /// 指定 IR 形状版本的键（测试用：模拟旧版无版本分量的文件名）。
+    fn key_for_version(&self, ir_version: &str) -> String {
         let mut parts: Vec<String> = vec![
             PARSER_PIN.to_string(),
             KERNEL_PIN.to_string(),
+            ir_version.to_string(),
             format!("{:x}", self.rules),
         ];
         for (rel, digest) in &self.sources {
@@ -225,6 +237,49 @@ mod tests {
         std::fs::write(&path, b"not-a-json-blob").unwrap();
         let cache = IrCache::open(dir.path(), &stamp);
         assert!(cache.get("any").is_none());
+    }
+
+    #[test]
+    fn should_not_hit_cache_written_under_old_ir_schema() {
+        // 旧版缓存文件名不含 IR 形状版本分量：磁盘上上一版
+        // `<stamp>.json`（LocalDdlStmt 缺 if_not_exists/temporary，
+        // serde(default) 会读成 false → 误 DROP 全局 stub 表）
+        // 在当前 stamp 下必须 miss。
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = CompileGateStamp::compute(&[], &rules());
+
+        // 手工构造"旧格式"条目：序列化后剥掉新字段，模拟旧版 JSON。
+        let mut old_prog = prog();
+        old_prog.local_ddl = vec![crate::ir::LocalDdlStmt {
+            index: 0,
+            ctas: false,
+            name: "t".to_string(),
+            temporary: false,
+            if_not_exists: true,
+        }];
+        let mut old_routine = routine("f");
+        old_routine.prog = old_prog;
+        let map: CacheMap = BTreeMap::from([(IrCache::key_for("c", "t"), vec![old_routine])]);
+        let text = String::from_utf8(serde_json::to_vec(&map).unwrap()).unwrap();
+        let old_json = text.replace(",\"temporary\":false,\"if_not_exists\":true", "");
+        assert_ne!(text, old_json, "fixture 必须真正剥掉新字段");
+
+        // 写到旧版文件名（无 IR 形状版本分量）下。
+        let old_key = stamp.key_for_version("unversioned");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join(format!("{old_key}.json")),
+            old_json.as_bytes(),
+        )
+        .unwrap();
+
+        // 旧文件本身可解析（证明 miss 不是因为文件损坏）。
+        let on_disk: CacheMap = serde_json::from_str(&old_json).expect("旧格式 JSON 应可反序列化");
+        assert!(on_disk.contains_key(&IrCache::key_for("c", "t")));
+
+        // 当前 stamp 打开 → 不同文件名 → 必然 miss。
+        let cache = IrCache::open(dir.path(), &stamp);
+        assert!(cache.get(&IrCache::key_for("c", "t")).is_none());
     }
 
     #[test]

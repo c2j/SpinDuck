@@ -1,7 +1,6 @@
 //! Gate 2B prepare 编排单元测试（自 `prepare.rs` 拆分，AGENTS §3）。
 
 use super::*;
-use super::*;
 use crate::ir::VarName;
 use ogsql_parser::ast::Statement;
 use ogsql_parser::parser::Parser;
