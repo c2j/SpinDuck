@@ -56,11 +56,11 @@ pub(crate) fn prefix_is_clean(prog: &IrProg, open_pc: usize) -> Result<(), SkipR
 pub(crate) fn reject_prefix_effects(prog: &IrProg, open_pc: usize) -> Result<(), SkipReason> {
     let handlers = exit_only_handlers(prog, open_pc)?;
     let in_handler = |pc: usize| handlers.iter().any(|(s, e)| pc >= *s && pc < *e);
-    for pc in 0..open_pc {
+    for (pc, stmt) in prog.code[..open_pc].iter().enumerate() {
         if in_handler(pc) {
             continue;
         }
-        match &prog.code[pc] {
+        match stmt {
             IrStmt::PushTrap { .. } | IrStmt::PopTrap => {}
             IrStmt::CallRoutine { .. } => return Err(SkipReason::UnsupportedCall),
             IrStmt::Raise { .. } => return Err(SkipReason::ExceptionScopePresent),
