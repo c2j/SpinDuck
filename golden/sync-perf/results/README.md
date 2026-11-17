@@ -75,7 +75,7 @@ f=100%≈4.7s —— 成本随**命中行数**增长，稠密更新最贵。
 cd golden/gaussdb-docker && docker compose up -d   # 或直连真实例
 export SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
        SPINDUCK_OG_USER=gaussdb SPINDUCK_OG_PASSWORD=… SPINDUCK_OG_DB=postgres
-export SPINDUCK_GSQL_DOCKER=1   # 容器内 gsql（本机直连则不设，用本机 gsql+PGPASSWORD）
+export SPINDUCK_GSQL_DOCKER=1   # 容器内 gsql（本机直连则不设，用本机 gsql）
 
 cd ../sync-perf/scripts
 ./gsql.sh < setup_tables.sql     # 建三种形态目标表 + 性能表
@@ -85,15 +85,18 @@ cd ../sync-perf/scripts
 
 # 端到端（spinduck CLI，--features gauss,cli 构建）
 cargo build --release --locked --features gauss,cli --manifest-path ../../spinduck/Cargo.toml
-# 本地 staging 按模式分文件（互不覆盖，可单独执行）：
-spinduck query --db perf.duckdb --sql-file local_seed_append.sql     # append 基准
-spinduck query --db perf.duckdb --sql-file local_seed_upsert.sql     # upsert f=50%（1M 目标）
-spinduck query --db perf.duckdb --sql-file local_seed_upsert_5m.sql  # upsert（5M 目标）
-spinduck query --db perf.duckdb --sql-file local_seed_matrix.sql     # 正确性矩阵小样例
-spinduck sync --db perf.duckdb --table sd_perf_pk --cols id,v,w                 # append
-spinduck sync --db perf.duckdb --table sd_perf_pk --cols id,v,w --mode upsert --key id
+# 本地 staging 按模式分文件 + 分 duckdb 文件（互不覆盖，可同跑也可单跑）：
+spinduck query --db perf-append.duckdb   --sql-file local_seed_append.sql     # append 基准（100 万全新 id）
+spinduck query --db perf-upsert.duckdb  --sql-file local_seed_upsert.sql     # upsert f=50%（1M 目标）
+spinduck query --db perf-upsert5m.duckdb --sql-file local_seed_upsert_5m.sql # upsert（5M 目标）
+spinduck query --db perf-matrix.duckdb  --sql-file local_seed_matrix.sql     # 正确性矩阵小样例
+# 注意：sd_perf_pk 在 append/upsert 两个种子里是不同数据集，必须各自用对应
+# duckdb 文件执行 sync，混用会把 upsert 种子当成 append 输入。
+spinduck sync --db perf-append.duckdb --table sd_perf_pk --cols id,v,w                 # append
+spinduck sync --db perf-upsert.duckdb --table sd_perf_pk --cols id,v,w --mode upsert --key id
 ```
 
 正确性矩阵由 `spinduck/tests/gauss_sync_e2e.rs` 常驻覆盖（env 门控，缺容器显式失败）。
-口令纪律：`gsql.sh` 本机分支走 `PGPASSWORD`、容器分支经 `docker -e` 注入
-`GS_PASSWORD`，argv 与文件均不出现口令。
+口令纪律：`gsql.sh` 统一走 `gsql -2` stdin pipeline（gsql 不识别
+PGPASSWORD/.pgpass，实测）；容器分支口令经 `docker -e GSQL_PW` 注入环境，
+argv 与文件均不出现口令值。

@@ -1,5 +1,6 @@
 //! sync 回写端到端（openGauss 容器实测）：守卫族 + 三模式冲突处理。
-//! 门控：feature gauss + 环境变量 SPINDUCK_OG_HOST（缺省跳过——跳过不等于通过）。
+//! 门控：feature gauss + 环境变量 SPINDUCK_OG_HOST；缺省或容器连不上即 panic
+//! （`require_og`，跳过不等于通过——同 gauss_e2e 契约）。
 //!
 //! 容器环境同 `gauss_e2e.rs`：
 //!   docker compose -f golden/gaussdb-docker/docker-compose.yml up -d
