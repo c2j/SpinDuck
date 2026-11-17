@@ -1,10 +1,10 @@
 # sync 回写验证实测结果（2026-11-17，openGauss 5.0.0 A 模式容器）
 
 环境：`golden/gaussdb-docker` compose 实例（4GB 内存 / 512MB shared_buffers），
-SpinDuck `b3766eb` + 本目录修复补丁，release 构建 `--features gauss,cli`。
+SpinDuck `b3766eb` + 本目录修复，release 构建 `--features gauss,cli`。
 命令面：`spinduck sync --db <duckdb> --table <t> --cols id,v,w [--mode …]`。
 
-## 1. 阻断缺陷（修复前全模式不可用，修复后 e2e 7/7 绿）
+## 1. 阻断缺陷（修复前全模式不可用，修复后 e2e 全绿）
 
 | 缺陷 | 位置 | 现象 | 修法 |
 |---|---|---|---|
@@ -12,12 +12,28 @@ SpinDuck `b3766eb` + 本目录修复补丁，release 构建 `--features gauss,cl
 | G4 守卫 SQL 非法/覆盖不全 | `guard_unique_index` | `unnest(conkey)` 报 invalid reference；`conkey::text`=`{1}` 花括号切不动；裸 `CREATE UNIQUE INDEX`（无 pg_constraint）不可见 | 改 `pg_index` + `indkey::text` + `indisvalid`，排除 `indpred`/`indexprs` |
 | upsert UPDATE 列名歧义 | `io/sync.rs::build_upsert_statements` | `WHERE tmp.k = k` 裸列 ambiguous → 42702（PG 系同样报错，死代码） | `UPDATE {t} AS tgt … WHERE tmp.k = tgt.k` |
 
-## 2. 冲突处理矩阵（修复后，`tests/gauss_sync_e2e.rs` 7/7）
+## 1b. 评审复审修订（PR #53 review）
 
-- PK 表 upsert：UPDATE+INSERT 混合正确、重跑幂等、行数交叉校验通过；
-- append 撞 PK：COPY 单语句原子失败、目标零部分写入；
-- 无约束表 upsert：ENV-0022 fail-closed 零写入；裸唯一索引表：放行；
-- staging key 重复/NULL：BIZ-0103；slice：DELETE+COPY 同事务幂等。
+| 项 | 修法 |
+|---|---|
+| G4 覆盖方向反转 | `has_unique_covering` 改为「索引列集 ⊆ keys」：复合键只传部分列 → ENV-0022；key 为索引超集仍放行 |
+| 快路径入库后失败仍回落 | `FastPathFailure { err, loaded }`（对齐 materialize.rs）：COPY 入库成功后的失败（清理 CSV/行数核对）标记 `loaded`，append 不回落逐行防双写；事务模式 ROLLBACK 后恒 false 仍可回落 |
+| 逐行回落缺 finalize/交叉校验 | `finalize_sql`（DROP staging）上移至 `run()` 两路径同权执行；`run_rows` 补 upsert `UPDATE+INSERT == staging` 校验 |
+| 裸表名跨 schema 混判 | G1/G4 裸表名均按 search_path 消解：G1 用 `pg_table_is_visible` 子查询定 schema，G4 加 `pg_table_is_visible(t.oid)` |
+| e2e 缺容器假跳过 | 改 `require_og()`/`fixture()` panic（同 gauss_e2e「跳过不等于通过」契约） |
+
+## 2. 冲突处理矩阵（`tests/gauss_sync_e2e.rs`，env 门控同 gauss_e2e）
+
+- PK 表 upsert：UPDATE+INSERT 混合正确、**重跑幂等**、行数交叉校验通过；
+- 复合主键：全键 (id,grp) 放行、部分键 id → ENV-0022；
+- 裸 `CREATE UNIQUE INDEX`（无 pg_constraint）：放行；
+- 无约束表 upsert：ENV-0022 fail-closed 零写入；
+- staging key 重复 / **含 NULL**：BIZ-0103；
+- append 撞 PK：COPY 单语句原子失败、目标零部分写入（断言错误域非守卫期 + 冲突行/新行均未留下）；
+- upsert 撞**次级唯一索引**（UNIQUE(w) 冲突）：整事务回滚，UPDATE/INSERT 均不留半提交；
+- slice：DELETE+COPY 同事务幂等重跑；
+- 裸表名 search_path 消解：同名表分处两 schema，守卫只认可见那张（G1 随路径切换正确放行/拒绝）；
+- 宽类型保真：DECIMAL/DATE/TIMESTAMP 经 CSV 中转不失真；A 模式 `''`→NULL 方言语义锁定。
 
 ## 3. append 吞吐（真实 sync 路径）
 
@@ -50,7 +66,8 @@ f=100%≈4.7s —— 成本随**命中行数**增长，稠密更新最贵。
 - Hash/Merge 成本 ∝ **目标行数**（seq scan ~0.3µs/行 + hash 构建，10M+ 或溢出 work_mem）；
 - Nested Loop ~3–6µs/staging 行探测，与目标规模无关；
 - 计划器只在 staging 极小（~1 万行）时自动选 NL；中间区间 cost model 系统性偏向全表扫；
-- 经验分界：**S < 目标 reltuples/10 走 NL**（1M 目标临界 ~10 万；5M 目标 S=20 万 NL 已快 3.3×）。
+- 经验分界：**S < 目标 reltuples/10 走 NL**（1M 目标临界 ~10 万；5M 目标 S=20 万 NL 已快 3.3×）；
+- `nl_vs_hash.sql` 另含 ANALYZE 临时表对照（C）与 `IS DISTINCT FROM` 低变更率对照（D）。
 
 ## 6. 复现步骤
 
@@ -58,19 +75,25 @@ f=100%≈4.7s —— 成本随**命中行数**增长，稠密更新最贵。
 cd golden/gaussdb-docker && docker compose up -d   # 或直连真实例
 export SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
        SPINDUCK_OG_USER=gaussdb SPINDUCK_OG_PASSWORD=… SPINDUCK_OG_DB=postgres
-export SPINDUCK_GSQL_DOCKER=1   # 容器内 gsql（本机直连则不设，用本机 gsql）
+export SPINDUCK_GSQL_DOCKER=1   # 容器内 gsql（本机直连则不设，用本机 gsql+PGPASSWORD）
 
 cd ../sync-perf/scripts
 ./gsql.sh < setup_tables.sql     # 建三种形态目标表 + 性能表
 ./gsql.sh < seed_perf.sql        # 灌 1M / 5M 目标数据（\timing 可见耗时）
 ./sweep_upsert.sh sd_perf_pk 10000000   # 密度×规模分解扫描（每轮自动清理）
-./gsql.sh < nl_vs_hash.sql       # 计划器对照（需 sd_perf_pk5）
+./gsql.sh < nl_vs_hash.sql       # 计划器对照 A/B/C/D（需 sd_perf_pk5）
 
 # 端到端（spinduck CLI，--features gauss,cli 构建）
 cargo build --release --locked --features gauss,cli --manifest-path ../../spinduck/Cargo.toml
-# 本地 staging 见 local_seed.sql（经 spinduck query 落 DuckDB）
+# 本地 staging 按模式分文件（互不覆盖，可单独执行）：
+spinduck query --db perf.duckdb --sql-file local_seed_append.sql     # append 基准
+spinduck query --db perf.duckdb --sql-file local_seed_upsert.sql     # upsert f=50%（1M 目标）
+spinduck query --db perf.duckdb --sql-file local_seed_upsert_5m.sql  # upsert（5M 目标）
+spinduck query --db perf.duckdb --sql-file local_seed_matrix.sql     # 正确性矩阵小样例
 spinduck sync --db perf.duckdb --table sd_perf_pk --cols id,v,w                 # append
 spinduck sync --db perf.duckdb --table sd_perf_pk --cols id,v,w --mode upsert --key id
 ```
 
-正确性矩阵由 `spinduck/tests/gauss_sync_e2e.rs` 常驻覆盖（env 门控，同 gauss_e2e 口径）。
+正确性矩阵由 `spinduck/tests/gauss_sync_e2e.rs` 常驻覆盖（env 门控，缺容器显式失败）。
+口令纪律：`gsql.sh` 本机分支走 `PGPASSWORD`、容器分支经 `docker -e` 注入
+`GS_PASSWORD`，argv 与文件均不出现口令。

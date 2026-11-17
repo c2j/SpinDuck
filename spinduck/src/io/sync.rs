@@ -265,11 +265,14 @@ pub fn schema_violations(target: &[TargetCol], cols: &[String]) -> Vec<String> {
     v
 }
 
-/// G4 纯判定：是否存在唯一约束/PK 的列集覆盖 upsert key（大小写不敏感）。
+/// G4 纯判定：是否存在唯一约束/索引的列集被 upsert key 完全覆盖（大小写不敏感）。
+/// 方向为「索引列集 ⊆ keys」：key 是索引列超集仍唯一（多余键列只会更唯一），
+/// 而 key 是索引列真子集（复合键只传部分列）会放行 1 对 N 的 UPDATE...FROM。
 pub fn has_unique_covering(constraints: &[Vec<String>], keys: &[String]) -> bool {
     constraints.iter().any(|c| {
-        keys.iter()
-            .all(|k| c.iter().any(|cc| cc.eq_ignore_ascii_case(k)))
+        !c.is_empty()
+            && c.iter()
+                .all(|cc| keys.iter().any(|k| k.eq_ignore_ascii_case(cc)))
     })
 }
 
@@ -626,6 +629,20 @@ mod tests {
             &constraints,
             &["x".into(), "z".into()]
         ));
+    }
+
+    #[test]
+    fn should_cover_composite_key_partially_or_fully() {
+        // 复合唯一索引 (x,y)：key 只传 x 是真子集 → 1 对 N 放行风险，必须拒；
+        // key 传 (x,y,z) 超集 → 仍唯一，必须放行。
+        let constraints = vec![vec!["x".to_string(), "y".to_string()]];
+        assert!(!has_unique_covering(&constraints, &["x".into()]));
+        assert!(has_unique_covering(
+            &constraints,
+            &["x".into(), "y".into(), "z".into()]
+        ));
+        // 空索引列集不构成覆盖（防御空约束行）。
+        assert!(!has_unique_covering(&[Vec::new()], &["x".into()]));
     }
 
     #[test]

@@ -20,6 +20,14 @@ struct RunCtx {
     fast: bool,
 }
 
+/// 快路径失败：`loaded` 表示目标侧可能已写入（append 的 COPY 已提交、
+/// 或入库后清理/行数核对失败）。此时禁止回落逐行——无唯一约束的目标会
+/// 静默双写。事务模式（slice/upsert）经 ROLLBACK 后恒为 false。
+struct FastPathFailure {
+    err: EngineError,
+    loaded: bool,
+}
+
 /// 单次回写的执行计划：COPY 目标 + 事务前后置 SQL（设计 §4.2/§4.3）。
 struct WritePlan {
     /// 显式事务骨架（slice/upsert 需要；append 单语句天然原子）。
@@ -106,14 +114,27 @@ impl GaussConn {
         };
         let rows = match self.run(duck, table, cols, mode, fast_ctx) {
             Ok(n) => n,
-            Err(fast_err) => {
+            // 入库后失败（loaded）：目标可能已写入，回落逐行会双写——直接报错
+            Err(fast) if fast.loaded => {
+                return Err(EngineError::env(
+                    20,
+                    format!(
+                        "快路径已入库后失败（{}），目标可能已写入，不回落逐行以免双写",
+                        fast.err
+                    ),
+                ));
+            }
+            Err(fast) => {
                 let row_ctx = RunCtx {
                     select_sql,
                     workdir: None,
                     fast: false,
                 };
                 self.run(duck, table, cols, mode, row_ctx).map_err(|e| {
-                    EngineError::env(20, format!("快路径失败（{fast_err}），逐行回落亦失败：{e}"))
+                    EngineError::env(
+                        20,
+                        format!("快路径失败（{}），逐行回落亦失败：{}", fast.err, e.err),
+                    )
                 })?
             }
         };
@@ -132,6 +153,19 @@ impl GaussConn {
             cond.push_str(&format!(
                 " AND lower(table_schema) = lower('{}')",
                 sc.replace('\'', "''")
+            ));
+        } else {
+            // 裸表名按 search_path 解析：只认 pg_table_is_visible 命中的
+            // schema，防跨 schema 同名表把两套列清单混进守卫判定。
+            cond.push_str(&format!(
+                " AND lower(table_schema) = lower(COALESCE((\
+                   SELECT n.nspname FROM pg_class c \
+                   JOIN pg_namespace n ON n.oid = c.relnamespace \
+                   WHERE lower(c.relname) = lower('{}') \
+                     AND c.relkind IN ('r','p','f') \
+                     AND pg_table_is_visible(c.oid) LIMIT 1\
+                 ), ''))",
+                bare.replace('\'', "''")
             ));
         }
         // A 模式 '' 即 NULL：`coalesce(column_default,'')` 会把"无默认值"塌成 NULL，
@@ -192,6 +226,10 @@ impl GaussConn {
                 " AND lower(n.nspname) = lower('{}')",
                 sc.replace('\'', "''")
             ));
+        } else {
+            // 裸表名只认 search_path 解析到的那一张（pg_table_is_visible 取首个
+            // 命中），与 COPY/UPDATE 的未限定名消解口径一致。
+            cond.push_str(" AND pg_table_is_visible(t.oid)");
         }
         let sql = format!(
             "SELECT string_agg(a.attname, ',' ORDER BY a.attnum), i.indnatts, count(*) \
@@ -246,10 +284,11 @@ impl GaussConn {
         cols: &[String],
         mode: &SyncMode,
         ctx: RunCtx,
-    ) -> Result<usize, EngineError> {
+    ) -> Result<usize, FastPathFailure> {
         let plan = WritePlan::new(table, cols, mode);
         if plan.tx {
-            self.exec("BEGIN")?;
+            self.exec("BEGIN")
+                .map_err(|err| FastPathFailure { err, loaded: false })?;
         }
         let result = if ctx.fast {
             self.run_fast(
@@ -262,11 +301,21 @@ impl GaussConn {
             )
         } else {
             self.run_rows(duck, &ctx.select_sql, &plan, cols, mode)
+                .map_err(|err| FastPathFailure { err, loaded: false })
         };
+        // finalize（upsert 的 DROP staging）两条路径同权执行；失败同样走回滚
+        let result = result.and_then(|n| {
+            if let Some(fin) = &plan.finalize_sql {
+                self.exec(fin)
+                    .map_err(|err| FastPathFailure { err, loaded: false })?;
+            }
+            Ok(n)
+        });
         match result {
             Ok(n) => {
                 if plan.tx {
-                    self.exec("COMMIT")?;
+                    self.exec("COMMIT")
+                        .map_err(|err| FastPathFailure { err, loaded: false })?;
                 }
                 Ok(n)
             }
@@ -274,13 +323,19 @@ impl GaussConn {
                 if plan.tx {
                     let _ = self.exec("ROLLBACK");
                 }
-                Err(e)
+                // 事务模式回滚后目标必然干净；仅 append 快路径的入库后失败
+                // 才可能带着已提交写入返回。
+                Err(FastPathFailure {
+                    loaded: if plan.tx { false } else { e.loaded },
+                    ..e
+                })
             }
         }
     }
 
     /// 快路径：DuckDB 内核导出 CSV → GaussDB copy_in 流式灌入（零逐行编码）。
     /// 成功即删临时 CSV，失败保留供诊断（与物化 §3.1 同纪律）。
+    /// `loaded` 只在 COPY 入库成功之后置真——此前失败目标必然零写入。
     fn run_fast(
         &mut self,
         duck: &dyn SqlExecutor,
@@ -289,41 +344,62 @@ impl GaussConn {
         cols: &[String],
         workdir: Option<&Path>,
         mode: &SyncMode,
-    ) -> Result<usize, EngineError> {
-        let workdir = workdir.ok_or_else(|| EngineError::env(20, "快路径缺工作目录"))?;
+    ) -> Result<usize, FastPathFailure> {
+        let fail = |err: EngineError, loaded: bool| FastPathFailure { err, loaded };
+        let workdir = workdir.ok_or_else(|| FastPathFailure {
+            err: EngineError::env(20, "快路径缺工作目录"),
+            loaded: false,
+        })?;
         // V26 同款纪律：服务端 copied 必须与本地行数相等（快路径不豁免）
         let count_sql = format!("SELECT count(*) FROM ({select_sql})");
-        let local_n = crate::io::sync::scalar_count(&mut duck.query(&count_sql, &BindMap::new())?)?;
-        let csv = self.export_csv(duck, select_sql, workdir, mode)?;
+        let local_n = crate::io::sync::scalar_count(
+            &mut duck
+                .query(&count_sql, &BindMap::new())
+                .map_err(|err| fail(err, false))?,
+        )
+        .map_err(|err| fail(err, false))?;
+        let csv = self
+            .export_csv(duck, select_sql, workdir, mode)
+            .map_err(|err| fail(err, false))?;
         for sql in &plan.pre_sql {
-            self.exec(sql)?;
+            self.exec(sql).map_err(|err| fail(err, false))?;
         }
-        let copied = self.copy_file_to_target(&csv, &plan.copy_target, cols)?;
+        let copied = self
+            .copy_file_to_target(&csv, &plan.copy_target, cols)
+            .map_err(|err| fail(err, false))?;
+        // 此后失败均发生在入库之后：append 无事务，目标已含本批写入
         let mut post_rows = 0u64;
         for sql in &plan.post_sql {
-            post_rows += self.exec(sql)?;
+            post_rows += self.exec(sql).map_err(|err| fail(err, true))?;
         }
-        if let Some(fin) = &plan.finalize_sql {
-            self.exec(fin)?;
-        }
-        std::fs::remove_file(&csv)
-            .map_err(|e| EngineError::env(20, format!("清理临时 CSV {}: {e}", csv.display())))?;
+        std::fs::remove_file(&csv).map_err(|e| {
+            fail(
+                EngineError::env(20, format!("清理临时 CSV {}: {e}", csv.display())),
+                true,
+            )
+        })?;
         match mode {
             SyncMode::Upsert { .. } => {
                 if post_rows as i64 != copied as i64 {
-                    return Err(EngineError::env(
-                        20,
-                        format!(
-                            "upsert 行数不一致：staging {copied} 行，UPDATE+INSERT {post_rows} 行"
+                    return Err(fail(
+                        EngineError::env(
+                            20,
+                            format!(
+                                "upsert 行数不一致：staging {copied} 行，UPDATE+INSERT {post_rows} 行"
+                            ),
                         ),
+                        true,
                     ));
                 }
             }
             _ => {
                 if copied as i64 != local_n {
-                    return Err(EngineError::env(
-                        20,
-                        format!("快路径行数不一致：本地 {local_n} 行，服务端 {copied} 行"),
+                    return Err(fail(
+                        EngineError::env(
+                            20,
+                            format!("快路径行数不一致：本地 {local_n} 行，服务端 {copied} 行"),
+                        ),
+                        true,
                     ));
                 }
             }
@@ -396,6 +472,12 @@ impl GaussConn {
         let mut post_rows = 0u64;
         for sql in &plan.post_sql {
             post_rows += self.exec(sql)?;
+        }
+        if matches!(mode, SyncMode::Upsert { .. }) && post_rows as i64 != written as i64 {
+            return Err(EngineError::env(
+                20,
+                format!("upsert 行数不一致：staging {written} 行，UPDATE+INSERT {post_rows} 行"),
+            ));
         }
         let rows = match mode {
             SyncMode::Upsert { .. } => post_rows as usize,
