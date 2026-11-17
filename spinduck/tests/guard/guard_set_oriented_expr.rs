@@ -45,6 +45,19 @@ fn rows(eng: &Engine) -> Vec<Vec<SpinValue>> {
         .fetch_many(10)
 }
 
+/// 原生 SQL `0/0` 经 TRY_CAST 写进 VARCHAR 的拼法随平台不同（"nan"/"-nan"）；
+/// inf / 2.0 / NULL 三行逐字锁定。
+fn assert_varchar_div_rows(got: &[Vec<SpinValue>]) {
+    assert_eq!(got.len(), 4, "{got:?}");
+    assert_eq!(got[0], vec![SpinValue::Str("inf".into())]);
+    assert!(
+        matches!(&got[1][0], SpinValue::Str(v) if v == "nan" || v == "-nan"),
+        "0/0 row must be nan or -nan: {got:?}"
+    );
+    assert_eq!(got[2], vec![SpinValue::Str("2.0".into())]);
+    assert_eq!(got[3], vec![SpinValue::Null]);
+}
+
 #[path = "set_oriented_expr_concat.rs"]
 mod concat;
 #[path = "set_oriented_expr_decimal.rs"]
@@ -83,20 +96,21 @@ fn should_convert_guarded_native_division_into_decimal_with_column_guard() {
 #[test]
 fn should_keep_inf_nan_rows_when_guarded_division_targets_varchar() {
     // TRY_CAST(inf/nan AS VARCHAR) 非空 → 合法行不得被守卫误删。
+    // 0/0 行的 nan/-nan 拼法随平台不同：Off 先跑做形状检查，
+    // BatchAtomic 必须与同次运行的 Off 逐行一致（含 NaN 符号）。
+    let mut off = engine("CREATE TABLE target_rows(val VARCHAR)");
+    seed(&off, "(1, 0), (0, 0), (6, 3), (NULL, 0)");
+    off.register(GUARDED_DIV).unwrap();
+    off.call("copy_div", &[]).unwrap();
+    let expected = rows(&off);
+    assert_varchar_div_rows(&expected);
+
     let mut eng = engine("CREATE TABLE target_rows(val VARCHAR)");
     seed(&eng, "(1, 0), (0, 0), (6, 3), (NULL, 0)");
     eng.register(GUARDED_DIV).unwrap();
     eng.set_oriented = SetOrientedMode::BatchAtomic;
     eng.call("copy_div", &[]).unwrap();
-    assert_eq!(
-        rows(&eng),
-        vec![
-            vec![SpinValue::Str("inf".into())],
-            vec![SpinValue::Str("nan".into())],
-            vec![SpinValue::Str("2.0".into())],
-            vec![SpinValue::Null],
-        ]
-    );
+    assert_eq!(rows(&eng), expected);
     assert!(
         matches!(
             eng.set_oriented_reports()[0].status,
