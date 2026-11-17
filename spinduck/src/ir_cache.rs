@@ -159,6 +159,7 @@ mod tests {
                 value: Some(crate::ir::IrExpr::Const(SpinValue::Int(1))),
             }],
             var_types: BTreeMap::from([("v_x".to_string(), SpinType::Int)]),
+            local_ddl: Vec::new(),
         }
     }
 

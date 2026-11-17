@@ -240,12 +240,31 @@ pub enum CursorSource {
 /// 静态游标声明编译产物：(SQL 文本, 绑定表, SQL 上下文调用下沉计划)。
 pub(crate) type CompiledCursorSql = (String, Vec<(String, BindSrc)>, Vec<crate::sql::FnSite>);
 
+/// 例程体内局部 DDL（`CREATE [TEMP] TABLE` / `CREATE TABLE AS`）
+/// 编译产物的标记：对应 `code[index]` 的 `SqlExec` 在 Gate 2B
+/// stub 库中**执行**（CTAS 追加 `LIMIT 0`），使后续引用获得真实
+/// 列检查而非一律延迟。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LocalDdlStmt {
+    /// `code` 中对应 `SqlExec` 的下标。
+    pub index: usize,
+    /// `true` = CTAS（执行时追加 `LIMIT 0`）；`false` = 普通 CREATE TABLE。
+    pub ctas: bool,
+    /// 引号形态限定名（`"s"."t"`），Gate 2B 例程收尾 `DROP TABLE IF EXISTS`
+    /// 清理用；旧缓存条目缺省为空串（跳过清理，不影响正确性）。
+    #[serde(default)]
+    pub name: String,
+}
+
 /// 编译产物：线性指令序列。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct IrProg {
     pub code: Vec<IrStmt>,
     /// 已映射的标量声明（小写变量名 → 类型）。`%ROWTYPE` 与映射表外的类型名不在此。
     pub var_types: std::collections::BTreeMap<String, crate::types::SpinType>,
+    /// 例程体内局部 DDL 语句标记（按 `code` 下标关联；Gate 2B stub 执行）。
+    #[serde(default)]
+    pub local_ddl: Vec<LocalDdlStmt>,
 }
 
 impl IrProg {

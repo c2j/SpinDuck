@@ -28,6 +28,7 @@ pub fn compile_stmts_with(
     c.resolve_fixups()?;
     Ok(IrProg {
         code: c.code,
+        local_ddl: c.local_ddl,
         ..IrProg::default()
     })
 }
@@ -144,6 +145,7 @@ pub fn compile_routine_with_names(
     Ok(IrProg {
         code: c.code,
         var_types,
+        local_ddl: c.local_ddl,
     })
 }
 /// 预扫描：赋值目标 + PL 表达式中的 PlVariable 引用（不进入 SQL 语句内部）。

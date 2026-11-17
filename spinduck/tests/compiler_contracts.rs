@@ -276,6 +276,47 @@ fn should_compile_block_with_declarations_and_rules() {
 }
 
 #[test]
+fn should_mark_body_local_ddl_for_gate2b() {
+    // 例程体内 CREATE [TEMP] TABLE / CTAS 不再 ENG-0043：编译为
+    // SqlExec 并在 local_ddl 标记（index/ctas/name），Gate 2B 据此在
+    // stub 库执行建表，后续引用获得真实列检查。
+    let text = "CREATE OR REPLACE PROCEDURE p_ddl IS BEGIN \
+                CREATE TEMP TABLE tmp_ddl(a NUMBER, b VARCHAR2(10)); \
+                CREATE TEMP TABLE tmp_ctas AS SELECT a FROM tmp_ddl; \
+                INSERT INTO tmp_ddl VALUES (1, 'x'); \
+                END;";
+    let tokens = ogsql_parser::token::tokenizer::Tokenizer::new(text)
+        .tokenize()
+        .unwrap();
+    let stmts = ogsql_parser::parser::Parser::new(tokens).parse();
+    let block = match &stmts[0] {
+        ogsql_parser::ast::Statement::CreateProcedure(cs) => cs.block.as_ref().unwrap(),
+        other => panic!("unexpected {other:?}"),
+    };
+    let prog = compile_block_with(block, &RuleRegistry::default()).unwrap();
+    assert_eq!(prog.local_ddl.len(), 2, "{:?}", prog.local_ddl);
+    let (create, ctas) = (&prog.local_ddl[0], &prog.local_ddl[1]);
+    assert!(!create.ctas);
+    assert_eq!(create.name, "\"tmp_ddl\"");
+    assert!(ctas.ctas);
+    assert_eq!(ctas.name, "\"tmp_ctas\"");
+    for d in [create, ctas] {
+        assert!(
+            matches!(
+                prog.code[d.index],
+                spinduck_core::ir::IrStmt::SqlExec { .. }
+            ),
+            "{:?}",
+            prog.code[d.index]
+        );
+    }
+    if let spinduck_core::ir::IrStmt::SqlExec { sql, .. } = &prog.code[create.index] {
+        assert!(sql.contains("CREATE TEMP TABLE"), "{sql}");
+        assert!(sql.contains("\"a\""), "{sql}");
+    }
+}
+
+#[test]
 fn should_reject_unsupported_statements_explicitly() {
     let mut eng = engine();
     let e = eng

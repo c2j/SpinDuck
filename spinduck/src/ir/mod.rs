@@ -25,6 +25,6 @@ pub use entry::{
 pub(crate) use expr::{ident0, ident1, ident_path, parse_decimal_literal};
 pub(crate) use types::CompiledCursorSql;
 pub use types::{
-    AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, Label, ScalarSql,
-    TrapEntry, VarName,
+    AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, Label, LocalDdlStmt,
+    ScalarSql, TrapEntry, VarName,
 };

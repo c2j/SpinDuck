@@ -17,8 +17,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use ogsql_parser::ast::DataType;
-
 use crate::error::EngineError;
 use crate::gate::schema::{SchemaSnapshot, ViewDef};
 use crate::ir::BindSrc;
@@ -33,45 +31,6 @@ fn quote_ident(name: &str) -> String {
         .map(|p| format!("\"{}\"", p.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(".")
-}
-
-/// `DataType` → DuckDB 类型名；`Custom` 经 `[types]` 规则解析，
-/// 解析不出回退 `VARCHAR`（stub 只要求 binder 可绑定，不要求精确）。
-fn duck_type(dt: &DataType, rules: &RuleRegistry) -> String {
-    let std = match dt {
-        DataType::Boolean => Some("BOOLEAN"),
-        DataType::TinyInt(_) | DataType::SmallInt(_) | DataType::Integer(_) => Some("INTEGER"),
-        DataType::BigInt(_) | DataType::BigSerial => Some("BIGINT"),
-        DataType::Real | DataType::Float(_) | DataType::Double => Some("DOUBLE"),
-        DataType::BinaryFloat | DataType::BinaryDouble => Some("DOUBLE"),
-        DataType::Numeric(_, _) => Some("DECIMAL"),
-        DataType::Char(_) | DataType::Varchar(_) | DataType::Text => Some("VARCHAR"),
-        DataType::Bytea => Some("BLOB"),
-        DataType::Timestamp(_, _) | DataType::Timestamptz(_) => Some("TIMESTAMP"),
-        DataType::Date => Some("DATE"),
-        DataType::Time(_, _) => Some("TIME"),
-        DataType::Interval(_) => Some("INTERVAL"),
-        DataType::Json | DataType::Jsonb => Some("JSON"),
-        DataType::Uuid => Some("UUID"),
-        DataType::Bit(_) | DataType::Varbit(_) => Some("BIT"),
-        DataType::Serial | DataType::SmallSerial => Some("INTEGER"),
-        DataType::Array(_) => Some("VARCHAR[]"),
-        _ => None,
-    };
-    if let Some(t) = std {
-        return t.to_string();
-    }
-    if let DataType::Custom(name, _) = dt {
-        let raw = name
-            .iter()
-            .map(|i| i.value.clone())
-            .collect::<Vec<_>>()
-            .join(".");
-        if let Some(st) = rules.spin_type(&raw) {
-            return st.duckdb_name().to_string();
-        }
-    }
-    "VARCHAR".to_string()
 }
 
 /// 已知对象 → stub DDL（`BTreeMap` 遍历保证确定性顺序；限定名先补
@@ -108,7 +67,7 @@ pub fn stub_ddl(snap: &SchemaSnapshot, rules: &RuleRegistry) -> Vec<String> {
         let cols = def
             .columns
             .iter()
-            .map(|(c, dt)| format!("\"{c}\" {}", duck_type(dt, rules)))
+            .map(|(c, dt)| format!("\"{c}\" {}", crate::types::duckdb_type_name(dt, rules)))
             .collect::<Vec<_>>()
             .join(", ");
         out.push(format!("CREATE TABLE {} ({cols})", quote_ident(name)));
@@ -163,7 +122,7 @@ fn bounded_contains(hay: &str, needle: &str) -> bool {
     hay.match_indices(needle).any(|(i, _)| {
         let before = hay[..i].chars().next_back();
         let after = hay[i + needle.len()..].chars().next();
-        before.is_none_or(|c| !ident(c) && c != '.') && after.is_none_or(|c| !ident(c))
+        before.is_none_or(|c| !ident(c) && c != '.') && after.is_none_or(|c| !ident(c) && c != '.')
     })
 }
 
@@ -204,6 +163,24 @@ pub struct PrepareStmt {
     /// `[[missing]]` 中**由本例程引用**的 relation（按 `MissingObject.from`
     /// 归属收窄，不把全计划缺失套到每条语句）。
     pub skip: BTreeSet<String>,
+    /// 例程体内局部 DDL：`Some` 时在 stub 库**执行**而非 prepare——
+    /// `CreateTableAs` 追加 `LIMIT 0`，建出的表供后续语句真实列检查。
+    pub ddl_exec: Option<DdlExec>,
+}
+
+/// 例程体内局部 DDL 的 stub 执行形态（对应 `IrProg.local_ddl`）。
+/// 各变体携带引号形态限定名（`"s"."t"`）：`DropLocal` 仅对本连接
+/// 中**成功建表**的名字执行，避免 CREATE 失败（如与全局表重名）后
+/// 误删 stub 全局表。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DdlExec {
+    /// `CREATE [TEMP] TABLE name (cols)`：直接执行。
+    CreateTable(String),
+    /// `CREATE [TEMP] TABLE name AS <select>`：追加 `LIMIT 0` 执行。
+    CreateTableAs(String),
+    /// 例程收尾 `DROP TABLE IF EXISTS name`：清理局部表，防止泄漏到
+    /// 同 stub 库的后续例程（`sql` 字段携带 DROP 文本）。
+    DropLocal(String),
 }
 
 /// `$v_*` → `CAST(NULL AS <类型>)` 类型化替换（设计 §4.4.1）：
@@ -332,11 +309,57 @@ fn prepare_all_impl(
     }
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
+    // catalog epoch：每条局部 DDL 成功执行后递增。去重键必须含 epoch——
+    // 同文本 SQL 在不同局部表状态下（例程 A 的 tmp(a) vs 例程 B 的
+    // tmp(b)）必须分别裁决，否则后者被先到者的去重吞掉。
+    let mut epoch = 0u64;
+    // 本连接中成功建表的局部表名：DropLocal 只对它们生效。
+    let mut created: BTreeSet<String> = BTreeSet::new();
     for stmt in sqls {
         let sql = typed_sql(stmt);
-        // 去重键 = 类型化后 SQL + 本语句 skip：同文本不同类型/抑制名
-        // 的语句必须分别裁决，不能让先到的成功语句吞掉后者。
-        if !seen.insert((sql.clone(), stmt.skip.clone())) {
+        // 去重键 = 类型化后 SQL + 本语句 skip + 执行形态 + catalog 版本：
+        // 同文本不同类型/抑制名/DDL 形态/表结构的语句必须分别裁决。
+        if !seen.insert((sql.clone(), stmt.skip.clone(), stmt.ddl_exec.clone(), epoch)) {
+            continue;
+        }
+        if let Some(kind) = &stmt.ddl_exec {
+            // 局部 DDL：stub 库执行建表，后续语句获得真实列检查；
+            // 失败走与 prepare 相同的延迟对象抑制，否则 KERNEL-0011。
+            // DropLocal 仅在对应 CREATE 成功过时执行——CREATE 失败
+            // （如与全局表重名）时绝不能误删 stub 全局表。
+            if let DdlExec::DropLocal(name) = kind {
+                if !created.contains(name) {
+                    continue;
+                }
+            }
+            let exec_sql = match kind {
+                DdlExec::CreateTableAs(_) => format!(
+                    "{} LIMIT 0",
+                    sql.trim_end_matches(|c: char| c == ';' || c.is_whitespace())
+                ),
+                DdlExec::CreateTable(_) | DdlExec::DropLocal(_) => sql.clone(),
+            };
+            if let Err(e) = ex.execute(&exec_sql, &crate::exec::BindMap::new()) {
+                let mut names = deferred.clone();
+                names.extend(stmt.skip.iter().cloned());
+                if mentions(&e.to_string(), &names) {
+                    continue;
+                }
+                out.push((
+                    stmt.file.clone(),
+                    EngineError::kernel(11, format!("gate2b local ddl: {e}")),
+                ));
+            } else {
+                epoch += 1;
+                match kind {
+                    DdlExec::CreateTable(name) | DdlExec::CreateTableAs(name) => {
+                        created.insert(name.clone());
+                    }
+                    DdlExec::DropLocal(name) => {
+                        created.remove(name);
+                    }
+                }
+            }
             continue;
         }
         if let Err(e) = prepare_check(ex.connection(), &sql) {
@@ -499,6 +522,7 @@ mod tests {
                 ("n".to_string(), SpinType::Int),
             ]),
             skip: BTreeSet::new(),
+            ddl_exec: None,
         };
         let sql = typed_sql(&stmt);
         assert!(sql.contains("CAST(NULL AS DATE)"), "{sql}");
@@ -534,6 +558,7 @@ mod tests {
                 ("v_return_rate_flag".to_string(), SpinType::Bool),
             ]),
             skip: BTreeSet::new(),
+            ddl_exec: None,
         };
         let sql = typed_sql(&stmt);
         assert_eq!(
@@ -554,6 +579,7 @@ mod tests {
             binds: Vec::new(),
             var_types: BTreeMap::new(),
             skip: skip.iter().map(|s| s.to_string()).collect(),
+            ddl_exec: None,
         };
         let sqls = vec![
             mk("SELECT a FROM t1", &[]),
@@ -579,6 +605,7 @@ mod tests {
             binds: Vec::new(),
             var_types: BTreeMap::new(),
             skip: BTreeSet::new(),
+            ddl_exec: None,
         }];
         // schema 已建 → prepare 通过；若漏建 schema 会报 KERNEL-0011
         let out = prepare_all(&snap, &rules, &sqls).unwrap();
@@ -598,6 +625,7 @@ mod tests {
             binds: vec![("$v_d".into(), BindSrc::Var(VarName("d".into())))],
             var_types: BTreeMap::from([("d".to_string(), SpinType::Date)]),
             skip: BTreeSet::new(),
+            ddl_exec: None,
         }];
         let out = prepare_all(&snap, &rules, &sqls).unwrap();
         assert_eq!(out.len(), 1, "{out:?}");
@@ -617,10 +645,156 @@ mod tests {
             binds: vec![("$v_d".into(), BindSrc::Var(VarName("d".into())))],
             var_types: BTreeMap::from([("d".to_string(), ty)]),
             skip: skip.iter().map(|s| s.to_string()).collect(),
+            ddl_exec: None,
         };
         let sqls = vec![mk(SpinType::Int, &[]), mk(SpinType::Date, &[])];
         let out = prepare_all(&snap, &rules, &sqls).unwrap();
         // Int 版 prepare 通过；Date 版 KERNEL-0011——去重不得跨类型合并
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].1.code.to_string(), "KERNEL-0011");
+    }
+
+    #[cfg(feature = "native")]
+    fn ddl_stmt(sql: &str, kind: DdlExec) -> PrepareStmt {
+        PrepareStmt {
+            file: "f".into(),
+            sql: sql.to_string(),
+            binds: Vec::new(),
+            var_types: BTreeMap::new(),
+            skip: BTreeSet::new(),
+            ddl_exec: Some(kind),
+        }
+    }
+
+    #[cfg(feature = "native")]
+    fn ddl_create(sql: &str, name: &str, ctas: bool) -> PrepareStmt {
+        ddl_stmt(
+            sql,
+            if ctas {
+                DdlExec::CreateTableAs(name.to_string())
+            } else {
+                DdlExec::CreateTable(name.to_string())
+            },
+        )
+    }
+
+    #[cfg(feature = "native")]
+    fn ddl_drop(name: &str) -> PrepareStmt {
+        ddl_stmt(
+            &format!("DROP TABLE IF EXISTS {name}"),
+            DdlExec::DropLocal(name.to_string()),
+        )
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn should_execute_local_ddl_and_check_real_columns() {
+        // 例程体内 CREATE TEMP TABLE 在 stub 库真实建表：后续语句的
+        // 列检查以它为准（缺列 → KERNEL-0011，不再一律延迟豁免）。
+        let snap = snap_of("CREATE TABLE t1(a INT)");
+        let rules = RuleRegistry::default();
+        let sqls = vec![
+            ddl_create("CREATE TEMP TABLE tmp(a INTEGER)", "\"tmp\"", false),
+            PrepareStmt {
+                file: "f".into(),
+                sql: "SELECT b FROM tmp".into(),
+                binds: Vec::new(),
+                var_types: BTreeMap::new(),
+                skip: BTreeSet::new(),
+                ddl_exec: None,
+            },
+        ];
+        let out = prepare_all(&snap, &rules, &sqls).unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].1.code.to_string(), "KERNEL-0011");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn should_execute_ctas_local_ddl_with_limit0() {
+        // CTAS 追加 LIMIT 0 执行：只为 binder 发现列，不物化数据。
+        let snap = snap_of("CREATE TABLE t1(a INT, b VARCHAR)");
+        let rules = RuleRegistry::default();
+        let sqls = vec![
+            ddl_create(
+                "CREATE TEMP TABLE t2 AS SELECT a, b FROM t1",
+                "\"t2\"",
+                true,
+            ),
+            PrepareStmt {
+                file: "f".into(),
+                sql: "SELECT a FROM t2".into(),
+                binds: Vec::new(),
+                var_types: BTreeMap::new(),
+                skip: BTreeSet::new(),
+                ddl_exec: None,
+            },
+            PrepareStmt {
+                file: "f".into(),
+                sql: "SELECT z FROM t2".into(),
+                binds: Vec::new(),
+                var_types: BTreeMap::new(),
+                skip: BTreeSet::new(),
+                ddl_exec: None,
+            },
+        ];
+        let out = prepare_all(&snap, &rules, &sqls).unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].1.code.to_string(), "KERNEL-0011");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn should_isolate_local_tables_between_routines() {
+        // 例程 A 的 tmp(a) 收尾 DROP 后，例程 B 的 tmp(b) 不得冲突；
+        // 同文本 `SELECT b FROM tmp` 在两个 catalog epoch 下必须分别
+        // 裁决——epoch 去重防止 B 版被 A 版吞掉。
+        let snap = snap_of("CREATE TABLE t1(a INT)");
+        let rules = RuleRegistry::default();
+        let q = |sql: &str| PrepareStmt {
+            file: "f".into(),
+            sql: sql.to_string(),
+            binds: Vec::new(),
+            var_types: BTreeMap::new(),
+            skip: BTreeSet::new(),
+            ddl_exec: None,
+        };
+        let sqls = vec![
+            ddl_create("CREATE TEMP TABLE tmp(a INTEGER)", "\"tmp\"", false),
+            q("SELECT b FROM tmp"), // A 版：缺列 → KERNEL-0011
+            ddl_drop("\"tmp\""),
+            ddl_create("CREATE TEMP TABLE tmp(b INTEGER)", "\"tmp\"", false),
+            q("SELECT b FROM tmp"), // B 版：列存在 → 通过
+            ddl_drop("\"tmp\""),
+        ];
+        let out = prepare_all(&snap, &rules, &sqls).unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].1.code.to_string(), "KERNEL-0011");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn should_drop_temp_table_not_global_on_name_collision() {
+        // 全局 tmp(g) 与例程局部 TEMP tmp(l) 同名：收尾 DROP 必须删
+        // temp 影子表，不能误删 stub 全局表——否则后续例程对全局
+        // tmp 的引用会假报 "does not exist"。
+        let snap = snap_of("CREATE TABLE tmp(g INT)");
+        let rules = RuleRegistry::default();
+        let q = |sql: &str| PrepareStmt {
+            file: "f".into(),
+            sql: sql.to_string(),
+            binds: Vec::new(),
+            var_types: BTreeMap::new(),
+            skip: BTreeSet::new(),
+            ddl_exec: None,
+        };
+        let sqls = vec![
+            ddl_create("CREATE TEMP TABLE tmp(l INTEGER)", "\"tmp\"", false),
+            ddl_drop("\"tmp\""),
+            q("SELECT g FROM tmp"), // 全局列 → 通过（证明全局表未被误删）
+            q("SELECT l FROM tmp"), // 局部列已随 temp 消失 → KERNEL-0011
+        ];
+        let out = prepare_all(&snap, &rules, &sqls).unwrap();
         assert_eq!(out.len(), 1, "{out:?}");
         assert_eq!(out[0].1.code.to_string(), "KERNEL-0011");
     }

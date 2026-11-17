@@ -329,12 +329,28 @@ fn collect_prog_sqls(
     missing_by_from: &BTreeMap<String, BTreeSet<String>>,
     sqls: &mut Vec<crate::gate::prepare::PrepareStmt>,
 ) {
-    use crate::gate::prepare::PrepareStmt;
+    use crate::gate::prepare::{DdlExec, PrepareStmt};
     use crate::ir::{CursorSource, IrStmt};
+    // 例程体内局部 DDL（`CREATE [TEMP] TABLE`/`CTAS`）按 `code` 下标
+    // 标记：对应 PrepareStmt 走 stub 库执行而非 prepare，建出的表
+    // 供后续语句真实列检查。
+    let ddl_kind: BTreeMap<usize, DdlExec> = prog
+        .local_ddl
+        .iter()
+        .map(|d| {
+            let kind = if d.ctas {
+                DdlExec::CreateTableAs(d.name.clone())
+            } else {
+                DdlExec::CreateTable(d.name.clone())
+            };
+            (d.index, kind)
+        })
+        .collect();
     let push = |sqls: &mut Vec<PrepareStmt>,
                 sql: &str,
                 binds: &[(String, crate::ir::BindSrc)],
-                sites: &[crate::sql::FnSite]| {
+                sites: &[crate::sql::FnSite],
+                ddl_exec: Option<DdlExec>| {
         let mut skip = missing_by_from
             .get(&routine.to_ascii_lowercase())
             .cloned()
@@ -348,22 +364,24 @@ fn collect_prog_sqls(
             binds: binds.to_vec(),
             var_types: prog.var_types.clone(),
             skip,
+            ddl_exec,
         });
     };
-    for st in &prog.code {
+    for (idx, st) in prog.code.iter().enumerate() {
+        let ddl = ddl_kind.get(&idx).cloned();
         match st {
             IrStmt::SqlExec {
                 sql,
                 binds,
                 fn_sites,
-            } => push(sqls, sql, binds, fn_sites),
+            } => push(sqls, sql, binds, fn_sites, ddl),
             IrStmt::SqlQuery {
                 sql,
                 binds,
                 fn_sites,
                 ..
-            } => push(sqls, sql, binds, fn_sites),
-            IrStmt::FoldedQuery { sql, .. } => push(sqls, sql, &[], &[]),
+            } => push(sqls, sql, binds, fn_sites, None),
+            IrStmt::FoldedQuery { sql, .. } => push(sqls, sql, &[], &[], None),
             IrStmt::OpenCursor {
                 source:
                     CursorSource::Static {
@@ -372,9 +390,25 @@ fn collect_prog_sqls(
                         fn_sites,
                     },
                 ..
-            } => push(sqls, sql, binds, fn_sites),
+            } => push(sqls, sql, binds, fn_sites, None),
             _ => {}
         }
+    }
+    // 例程收尾清理局部表：stub 库是全文件共享连接，不 drop 会让
+    // routine A 的局部表泄漏进 routine B 的名字解析（Gate 1B 按
+    // 例程隔离声明，2B 必须同口径）。`name` 为空 = 旧缓存条目，跳过。
+    for d in &prog.local_ddl {
+        if d.name.is_empty() {
+            continue;
+        }
+        sqls.push(PrepareStmt {
+            file: rel.to_string(),
+            sql: format!("DROP TABLE IF EXISTS {}", d.name),
+            binds: Vec::new(),
+            var_types: prog.var_types.clone(),
+            skip: BTreeSet::new(),
+            ddl_exec: Some(DdlExec::DropLocal(d.name.clone())),
+        });
     }
 }
 
