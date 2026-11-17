@@ -20,7 +20,8 @@
 | 本地执行（部署→调用→查证） | ✅ CLI | `deploy` / `call` / `query` / `compare` |
 | 参照侧行结果采集 | ⚠️ **手工** | 用 `gsql`/任意 SQL 客户端在实例上跑，结果誊成 `cases/baselines/expected.json` |
 | 两侧自动比对（黄金层） | ✅ 测试层 | `cargo test --features gauss`（对四个 golden 用例自动跑两侧） |
-| `run <plan>` 一条龙编排 | ❌ 未落地 | 属 design A5/A6 待实例项，见 §6 |
+| 多步编排（deploy→物化→call→query→sync） | ✅ CLI | `batch <script.sdsh>`（`.sdsh` 脚本，同进程顺序执行，见 §5） |
+| `run <plan>` 一条龙编排 | ❌ 未落地 | 属 design A5/A6 待实例项，见 §7 |
 
 口令与连接信息**只走环境变量**（`SPINDUCK_OG_*`），不进 argv、不进计划文件、不入库
 （architecture §10.4）。今天代码实际读取的变量只有五个：
@@ -230,7 +231,106 @@ target/release/spinduck query run/local.duckdb \
   --sql-file cases/queries/q.sql --out run/local.json
 ```
 
-## 5. 逐值裁决
+## 5. `batch`：`.sdsh` 脚本同进程编排（可选）
+
+§3–§4 与 §6 的每一步都是独立进程：每条 `call` 都重开库、重读源码重编译、重建维表索引，
+参数写错要到前几步落盘之后才暴露。`spinduck batch <script.sdsh>` 把多步指令收进
+**同一个进程**按序执行，并把"先全量预检、后逐步执行"做成硬契约。设计与取舍见
+`docs/spinduck-batch-sdsh-design.md`；本节只写操作口径。
+
+### 5.1 命令面与退出码
+
+```bash
+target/release/spinduck batch cases/daily_purchase.sdsh
+target/release/spinduck batch run.sdsh --dry-run             # 只预检，零副作用
+target/release/spinduck batch run.sdsh --continue-on-error  # 步失败继续跑，批级仍退 1
+```
+
+命令行只有三个面：脚本路径 + `--continue-on-error` + `--dry-run`。**库默认值不在
+命令行给**——在脚本里用 `use` / 顶格 `--db` 行声明（§5.2）。
+
+退出码：`0` 全部成功（`--dry-run` 预检通过也是 0）；`1` 任一步失败（含
+`--continue-on-error` 下仅一失败）；`batch` 自身用法错（缺脚本、重复旗标、未知
+旗标）走全局契约退 `2`。**脚本内部**的词法/预检/执行错误一律 `[CODE] msg` 打
+stdout、退 `1`，stderr 保持为空。
+
+### 5.2 `.sdsh` 脚本语法
+
+封闭指令集，不是 Bash 子集：
+
+- **指令行** = 单步 CLI 去掉程序名：`deploy` / `materialize` / `sync` / `query` /
+  `call` / `compile` / `explain` / `rules probe` / `compare` / `version` 原样可用；
+  `batch`、`help`（含 `--help`/`-h` 首词）与裸词 Shell 算符
+  （`| > >> < << && || ; &`）一律拒。算符判定在 token 层——`--where "a;b"`、
+  `--slice 'k=a|b'` 的引号内容是数据不是算符。
+- **注释**：trim 后行首 `#` 的整行；**没有行内注释**——参数里的 `#` 是数据。
+- **续行**：行尾引号外**奇数个** `\` 紧贴换行才续行（`\` 与换行之间夹空白不续行；
+  `\\` 是字面反斜杠）；注释/空行会终结进行中的续行；EOF 处孤立 `\` 报 `ENG-0010`。
+- **引号**：`"..."` 剥引号并展开 `$VAR`/`${VAR}`（支持 `\"` `\\` `\$` 转义）；
+  `'...'` 剥引号且**完全字面**——`'bcrq=$BIZ_DATE'` 原样透传给 `sync --slice`
+  在运行期按 env 解析。裸词同样展开变量。
+- **变量**：`set KEY [=] VALUE`（`=` 可选；值 = 其后全部 token 经引号处理后以
+  单空格连接）写入脚本局部表，**不污染进程环境**。展开顺序 `vars` → 进程环境，
+  两者皆无即 `ENV-0017` 预检拒跑——不会把 `$VAR` 字面量漏进 SQL 或实参。
+  要传字面 `$` 用 `\$VAR`（裸词转义）或单引号包裹。
+- **默认库**：`use <库>` 或顶格 `--db <库>` 行按序更新后续指令的默认库；
+  `deploy`/`materialize`/`sync`/`query`/`call` 缺 `--db` 时自动注入当前默认库
+  （行内显式 `--db` 优先）。**全程未设默认库**：`call` 省略 `--db` = 每步独立
+  匿名 `:memory:`（与单步 CLI 一致）；其余四指令缺 `--db` 报 `ENG-0010`。
+  `use :memory:` 是**显式共享**内存库——前步 `query` 建的表后续 `call` 可见。
+- **`str:` 语法糖**：只在 `call` 行的位置实参上生效，`str:0130000001` ≡
+  `'0130000001'`（`parse_literal` 保真前导零）；旗标值不转换，其他子命令不转换。
+  裸写 `0130000001` 会被推断成整数、丢前导零——与 §4 `call` 实参口径相同。
+
+### 5.3 端到端示例
+
+```sdsh
+# daily_purchase.sdsh —— §2–§6 全流程收进一个进程
+set BIZ_DATE = 20250715
+
+use run/local.duckdb
+# （顶格 --db run/local.duckdb 写法等价；注意 .sdsh 没有行内注释，# 必须独占一行）
+
+deploy .spinduck/plan/prc_trd_deal_purchase.toml
+materialize --table dat_trd_purchase_src,par_fund_partner --jobs 8
+
+call --plan .spinduck/plan/prc_trd_deal_purchase.toml \
+     --batch-commit --step-budget 200000 "str:${BIZ_DATE}" str:0130000001
+call --plan .spinduck/plan/prc_trd_hz_byfund.toml "'${BIZ_DATE}'"
+
+query --sql-file cases/queries/check_repurchase.sql --out run/local.json
+compare cases/baselines/expected.json run/local.json --key purchase_no
+sync --table dat_trd_repurchase --cols purchase_no,fund_code,bcrq \
+     --mode slice --slice "bcrq=${BIZ_DATE}"
+```
+
+脚本含 `materialize`/`sync` 需要 `gauss` feature 构建（`--features gauss`，
+§1 同款）；含 `deploy`/`query`/`call` 需要 `native`（`cli` 蕴含）。缺 feature
+时**预检即拒**（`ENV-0012`），一条都不执行。
+
+### 5.4 两阶段契约与缓存语义
+
+- **Phase 1 预检（不碰库）**：词法/变量展开 → 逐行 `cli::args::parse`（`--db`
+  注入在 parse **之前**）→ feature 门禁 → `call --trace` 冲突检查（同一路径
+  出现两次、或目标文件已存在 → `ENV-0016`）。预检失败 = **零副作用**：不建
+  `.duckdb`、不建 trace 日志、不写 `--out`。`--dry-run` 走到这里返回 0 并打印
+  `batch: dry-run steps=N default_db=<...>`。
+- **Phase 2 执行**：同一库只开一条 canonical 连接，引擎各持克隆连接；`deploy`
+  与后续同闭包 `call --plan` 命中引擎缓存（跳过重复编译）；`deploy` /
+  `materialize` / `query` / `sync` 任一写步后，该库的引擎 memo/lookup 缓存自动
+  失效（`--continue-on-error` 下失败也失效）。
+- **trace**：脚本里给 `call` 显式 `--trace <f>` 与单步契约相同——路径必须全批
+  唯一且不存在；审计事件的进程字段自动带 `stepNN:` 前缀，同名例程可按步区分。
+
+### 5.5 与手工逐步的取舍
+
+- 适合：固定流水线（deploy→物化→多 entry call→快照裁决→回写）、想把参数错误
+  挡在第一步执行之前。
+- 注意：`materialize`/`sync` 每步仍各自建 GaussDB 短连接（V1 不跨步池化）；
+  `deploy` 非幂等——重跑 batch 前先删本地库（§7）；没有 `--trace-dir` 自动
+  分配，trace 路径要在脚本里逐条写死。
+
+## 6. 逐值裁决
 
 ```bash
 target/release/spinduck compare cases/baselines/expected.json run/local.json --key <键列,...>
@@ -248,7 +348,7 @@ target/release/spinduck compare cases/baselines/expected.json run/local.json --k
 - 归一不解析数字：`00123` ≠ `123`（文本保真承诺）；`NUMBER` 的 scale 渲染差
   （`0.0000` vs `0`）不算差异。
 
-## 6. 收尾与已知边界
+## 7. 收尾与已知边界
 
 - **一次只执行一条 SQL**：`query` 按 `'…'`/`"…"`/`--`/`/* */` 安全切句，多于一条
   即 `ENV-0031` 且一个 `--out` 字节都不写——这是对"DuckDB prepare 会把多句都执行、
@@ -259,10 +359,11 @@ target/release/spinduck compare cases/baselines/expected.json run/local.json --k
   （`run/local.duckdb*`），真实例不受影响。
 - **待实例项**（落地后本文相应小节会改为自动命令）：`run <plan>` 端到端编排、
   参照侧自动采集、§6.4 破坏性门禁（role 开关）、A3 COPY OUT 流式、A4 回写门禁。
-  当前口径登记见 `docs/validation.md` V27–V36 与 `docs/design-production-gaussdb.md`
-  §6.2 各阶段判定。
+  多步 `.sdsh` 编排已由 `batch` 承接（§5），但它不替代 `run <plan>` 的单计划
+  一条龙语义。当前口径登记见 `docs/validation.md` V27–V36 与
+  `docs/design-production-gaussdb.md` §6.2 各阶段判定。
 
-## 7. 故障速查
+## 8. 故障速查
 
 | 症状 | 域/码 | 第一排查点 |
 |---|---|---|
@@ -275,3 +376,7 @@ target/release/spinduck compare cases/baselines/expected.json run/local.json --k
 | `--key 列 x 不在快照 schema 里` | ENV-0031 | 键名写错或参照侧缺该列；先修基线/查询，不要去掉 `--key` |
 | `审计日志 … 已存在：--trace 拒绝覆盖` | ENV-0016 | 上一轮的日志还在原地，本次一条都没跑：换新路径（`run/trace-<时间戳>.log`）再跑，别"先删后跑"——删掉的那份正是可比对的两轮证据 |
 | `trace log …` 且不是"已存在" | ENV-0012 | `run/` 目录不存在或不可写；日志与 sidecar 都不该出现半成品，先修目录再重跑 |
+| `batch: …未定义变量 $X` | ENV-0017 | `.sdsh` 引用了 vars 与进程环境都没有的变量：补 `set` 或导出环境变量；要字面 `$` 改用 `'…$X…'`/`\$X`（§5.2） |
+| `sdsh: …` / `step N (…)` 且码是 ENG-0010 | ENG-0010 | 脚本词法/用法：引号未闭合、行尾孤立 `\`、裸词 shell 算符、嵌套 `batch`/`help`、未设默认库时 `deploy` 等缺 `--db`；报错在预检期、一条都没执行（§5.4） |
+| `需要 feature 'gauss'` / `'native'` | ENV-0012 | batch 二进制没带对应 feature 编译：含 `materialize`/`sync` 要 `--features gauss`，执行类指令要 `native`（`cli` 蕴含）（§5.3） |
+| `--trace 目标已存在/重复` | ENV-0016 | 脚本里两条 `call` 共用了 trace 路径，或目标文件已存在；换新路径重跑——预检期即拒，不会留半成品库（§5.4） |
