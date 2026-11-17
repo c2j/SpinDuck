@@ -9,6 +9,10 @@ use crate::value::{coerce_for_slot, SpinValue};
 use ogsql_parser::ast::Statement;
 use std::collections::BTreeMap;
 
+pub(crate) mod source;
+pub(crate) mod sql_macro;
+pub use source::{compile_sources, CompiledCatalog};
+
 /// 参数模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ParamMode {
@@ -131,6 +135,7 @@ pub struct CallResult {
 #[derive(Debug, Default, Clone)]
 pub struct RoutineCatalog {
     routines: BTreeMap<String, CompiledRoutine>,
+    revision: std::sync::Arc<()>,
     /// SQL 方言规则（函数表 + patterns 开关）：动态 SQL 运行期改写与静态语句
     /// 同口径，函数表一律由本注册表派生（单一事实源，不得并存第二份表）
     sql_rules: crate::rules::RuleRegistry,
@@ -144,6 +149,11 @@ impl RoutineCatalog {
     /// 注入完整规则注册表（patterns 开关；动态路径同口径）。
     pub fn set_sql_rules(&mut self, rules: crate::rules::RuleRegistry) {
         self.sql_rules = rules;
+        self.revision = std::sync::Arc::new(());
+    }
+
+    pub(crate) fn revision(&self) -> &std::sync::Arc<()> {
+        &self.revision
     }
 
     /// 完整规则注册表（动态路径 patterns/函数同口径）。
@@ -158,6 +168,7 @@ impl RoutineCatalog {
 
     pub fn register(&mut self, r: CompiledRoutine) {
         self.routines.insert(r.name.to_ascii_lowercase(), r);
+        self.revision = std::sync::Arc::new(());
     }
 
     pub fn lookup(&self, name: &str) -> Option<&CompiledRoutine> {

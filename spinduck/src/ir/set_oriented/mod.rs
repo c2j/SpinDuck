@@ -1,16 +1,77 @@
-//! 受限静态游标搬运集合化；原始 IR 不变，每次调用在同一事务内重新证明。
+//! 受限静态游标集合化；保留原始 IR，离线候选在调用入口同事务复核。
 
+mod analyze;
+mod candidate;
+mod defaults;
+pub use candidate::{compile_set_oriented_plans, CandidatePlan, CompiledPlans, SchemaProvider};
+mod catalog_summary;
+mod copy;
+mod dead;
+mod entry;
+mod expr;
+mod filter;
+mod generate;
+use generate::generate;
+mod lookup;
+pub mod metadata;
+mod region;
+mod resolve;
+mod route;
 mod schema;
 mod shape;
 
-use super::{AssignTarget, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, VarName};
+pub(crate) use entry::{entry_ok, suffix_prog, ConversionPlan};
+
+use super::{AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, VarName};
 use crate::catalog::CompiledRoutine;
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
-use crate::runtime::cursor::CursorAttrKind;
+use analyze::analyze_region;
+
+/// 集合化语义契约；所有模式均只执行已证明的转换。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SetOrientedMode {
+    /// 保持原始解释路径及步数预算语义。
+    #[default]
+    Off,
+    /// 保持提交、值、错误域与异常回滚边界。
+    Strict,
+    /// 授权合并尾提交及依赖表入口单快照，不承诺崩溃时逐行部分持久化。
+    BatchAtomic,
+}
+
+impl SetOrientedMode {
+    /// 配置及命令行的规范模式名。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Strict => "strict",
+            Self::BatchAtomic => "batch-atomic",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "off" => Some(Self::Off),
+            "strict" => Some(Self::Strict),
+            "batch-atomic" => Some(Self::BatchAtomic),
+            _ => None,
+        }
+    }
+}
+
+impl From<bool> for SetOrientedMode {
+    fn from(enabled: bool) -> Self {
+        if enabled {
+            Self::Strict
+        } else {
+            Self::Off
+        }
+    }
+}
 
 /// 未获得集合化证明的原因。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     UnsupportedControlFlow,
     ExceptionScopePresent,
@@ -22,7 +83,25 @@ pub enum SkipReason {
     UnknownObjectDependency,
     UnprovenExpression,
     UnprovenTargetConstraints,
+    /// Strict 下受跳行 trap 保护的区域无法证明写入全量：内核报错经
+    /// reset_session 撤销前序未提交写入，过滤坏行与原回滚效果不等价。
+    UnprovenRollbackScope,
+    /// INSERT 表达式无法在 4 层证明中覆盖类型/精度/NULL/异常集等价。
+    UnprovenWriteCompleteness,
+    /// 省略的目标列含非常量/不确定默认值（序列、时间戳等），批写施加的
+    /// 默认与逐行写不可证同值（设计 §4.1 A3）。
+    NonDeterministicDefault,
+    /// 区域入口 sys_dummy 存在性或恰 1 行不变量被前缀/运行期破坏。
+    UnprovenSysDummyInvariant,
+    /// 查找/游标查询自身无法证明全定义（非基数运行时错不可排除）。
+    UnprovenQueryTotalness,
+    /// 有序 Top-1 排序键无 PK/UNIQUE，入口按组并列一致性检查发现
+    /// 异值并列（含 NULL 与值并列），首行选择存在真实歧义。
+    AmbiguousTop1Tie,
     UnsupportedCall,
+    /// 语句残留非空 fn_sites：运行期物化有副作用（distinct_sql/临时表/
+    /// MAX_TUPLES），Converted 计划绝不原样穿透（设计 §4.2）。
+    UnresolvedFnSite,
     DynamicSql,
 }
 
@@ -40,64 +119,215 @@ pub struct Report {
     pub status: Status,
 }
 
-struct CopyLoop<'a> {
-    query: &'a str,
-    insert: &'a str,
-    binds: &'a [(String, BindSrc)],
-    record: &'a VarName,
+/// 下沉算子：PL 除法（整数 `//`）与拼接（双 NULL CASE）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SinkOp {
+    Div,
+    Concat,
 }
 
-pub(crate) fn optimize(
+struct CopyLoop<'a> {
+    pub(super) query: &'a str,
+    pub(super) insert: &'a str,
+    pub(super) binds: &'a [(String, BindSrc)],
+    /// 游标查询自身的绑定（WHERE 引用形参等），须随批写 SQL 一并携带。
+    pub(super) query_binds: &'a [(String, BindSrc)],
+    /// 变量类型表：过滤式无抛错证明裁决绑定值域（Varchar↔str / 数值↔num）。
+    pub(super) var_types: &'a std::collections::BTreeMap<String, crate::types::SpinType>,
+    pub(super) record: &'a VarName,
+    /// BatchAtomic × trap：授权以列级守卫过滤坏行（跳行语义等价）。
+    pub(super) allow_filter: bool,
+    /// PL 表达式下沉：变量 → (算子, 左字段, 右字段)，仅字段/字段形态。
+    pub(super) sinks: Vec<(VarName, SinkOp, String, String)>,
+    /// 兜底型循环不变查找（§4.4 B1）：聚合标量子查询替代 SELECT INTO。
+    pub(super) lookups: Vec<lookup::LookupQuery>,
+    /// IF 路由（§4.3）：(查找变量, 常量 SQL)，入口守卫证明 THEN 不可达。
+    pub(super) route: Option<(VarName, String)>,
+    /// PureExpr 常量折叠（§4.3 A7）：赋值变量 → 常量；仅用于静态剪枝
+    /// 与出口活跃证明，不参与批写投影。
+    pub(super) folded: Vec<(VarName, crate::value::SpinValue)>,
+    /// 纯函数符号内联（§4.3 A7）：赋值变量 → 内联 IrExpr，参与批写投影渲染。
+    pub(super) inlined: Vec<(VarName, IrExpr)>,
+    /// 覆盖赋值前已求值的表达式仍须通过入口守卫，不能随死值消除错误。
+    pub(super) inline_checks: Vec<(VarName, IrExpr)>,
+    pub(super) varchar_inputs: Vec<IrExpr>,
+    /// 仅记录赋值前的跳行查找；后续查找不能屏蔽先前的裸表达式错误。
+    pub(super) inline_preconditions: std::collections::BTreeMap<String, Vec<VarName>>,
+    /// 死存储消除（§5 清单 g）：全程序无读取变量的常量赋值，整体跳过。
+    pub(super) dead: Vec<VarName>,
+}
+
+/// 一次调用选择所需的引擎上下文（模式、开关、编译期证据）。
+pub(crate) struct OptimizeCtx<'a> {
+    pub mode: SetOrientedMode,
+    pub batch_commit: bool,
+    pub rules: &'a crate::rules::RuleRegistry,
+    pub snapshot: Option<&'a metadata::SchemaSnapshot>,
+    pub catalog: &'a crate::catalog::RoutineCatalog,
+}
+
+/// 结构准入 + SQL 生成（前缀执行前的只读证明面）；入口守卫与续跑产物
+/// 由 [`entry`] 在前缀执行完毕后消费（设计 §4.5-2 五步状态机）。
+pub(crate) fn plan(
     routine: &CompiledRoutine,
     ex: &dyn SqlExecutor,
-    batch: bool,
-) -> Result<(IrProg, Report), EngineError> {
-    let selected = if batch {
-        Err(SkipReason::BatchCommitEnabled)
-    } else {
-        match analyze(&routine.prog) {
-            Ok(region)
-                if routine
-                    .params
-                    .iter()
-                    .any(|p| p.name.eq_ignore_ascii_case(&region.record.0)) =>
-            {
-                Err(SkipReason::LiveOutState)
-            }
-            Ok(region) => generate(&region, ex)?,
-            Err(reason) => Err(reason),
-        }
-    };
-    let (prog, status) = match selected {
-        Ok(sql) => (
-            IrProg {
-                code: vec![IrStmt::SqlExec {
-                    sql: sql.clone(),
-                    binds: Vec::new(),
-                    fn_sites: Vec::new(),
-                }],
-                var_types: routine.prog.var_types.clone(),
-                local_ddl: Vec::new(),
-            },
-            Status::Converted { sql },
-        ),
-        Err(reason) => (routine.prog.clone(), Status::Skipped { reason }),
-    };
-    Ok((
-        prog,
-        Report {
-            routine: routine.name.clone(),
-            status,
-        },
-    ))
+    ctx: &OptimizeCtx<'_>,
+) -> Result<Result<entry::ConversionPlan, SkipReason>, EngineError> {
+    plan_from(routine, &schema::Source::Runtime(ex), ctx)
 }
 
-fn reject_effects(code: &[IrStmt]) -> Result<(), SkipReason> {
+fn plan_from(
+    routine: &CompiledRoutine,
+    source: &schema::Source<'_>,
+    ctx: &OptimizeCtx<'_>,
+) -> Result<Result<entry::ConversionPlan, SkipReason>, EngineError> {
+    let mode = ctx.mode;
+    let selected = if ctx.batch_commit {
+        Err(SkipReason::BatchCommitEnabled)
+    } else {
+        match v2_admit(&routine.prog, mode, ctx.catalog) {
+            Err(reason) => Err(reason),
+            Ok(region) => {
+                if !source.sys_dummy_ok()? {
+                    Err(SkipReason::UnknownObjectDependency)
+                } else if routine
+                    .params
+                    .iter()
+                    .any(|p| p.name.eq_ignore_ascii_case(&region.record.0))
+                {
+                    Err(SkipReason::LiveOutState)
+                } else {
+                    match analyze_region(&routine.prog, &region, mode, ctx.catalog) {
+                        Err(reason) => Err(reason),
+                        Ok((mut copy, tail, has_trap)) => {
+                            // 下沉/查找变量若是 OUT/INOUT 形参，出口写回不可消除
+                            let live_param = |v: &VarName| {
+                                routine
+                                    .params
+                                    .iter()
+                                    .any(|p| p.name.eq_ignore_ascii_case(&v.0))
+                            };
+                            if copy.sinks.iter().any(|(v, _, _, _)| live_param(v))
+                                || copy.lookups.iter().any(|l| live_param(&l.var))
+                                || copy.folded.iter().any(|(v, _)| live_param(v))
+                                || copy.inlined.iter().any(|(v, _)| live_param(v))
+                                || copy.dead.iter().any(live_param)
+                            {
+                                Err(SkipReason::LiveOutState)
+                            } else {
+                                match generate(&mut copy, source, ctx, &region, tail)? {
+                                    Err(reason) => {
+                                        Err(rollback_scope_reason(mode, has_trap, reason))
+                                    }
+                                    Ok(p) => Ok(p),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    Ok(selected)
+}
+
+/// V2 准入前置：区域抽取 + 前缀干净度 + 效果准入 + Trap 体限制 + 写集 + 读写不交 + 出口活跃。
+fn v2_admit(
+    prog: &IrProg,
+    mode: SetOrientedMode,
+    catalog: &crate::catalog::RoutineCatalog,
+) -> Result<region::CursorRegion, SkipReason> {
+    let region = region::extract(prog)?;
+    region::reject_prefix_effects(prog, region.open_pc)?;
+    reject_outer_effects(&prog.code[region.close_pc + 1..])?;
+    if mode == SetOrientedMode::BatchAtomic {
+        region::prefix_is_clean(prog, region.open_pc)?;
+    }
+    region::admit_effects(prog, &region, mode, catalog)?;
+    region::trap_bodies_admissible(prog, &region, catalog)?;
+    region::write_set(prog, &region, catalog)?;
+    region::reads_writes_disjoint(prog, &region, catalog)?;
+    region::live_out_check(prog, &region)?;
+    Ok(region)
+}
+
+/// Strict × 跳行 trap：写入全量证明失败时，内核报错经 reset_session 撤销
+/// 前序未提交写入，坏行过滤与原回滚效果不等价（设计 §4.5 第 1 项）。
+/// 结构性原因（对象缺失/读写同表）保留原诊断，不属回滚域问题。
+fn rollback_scope_reason(mode: SetOrientedMode, has_trap: bool, reason: SkipReason) -> SkipReason {
+    if mode == SetOrientedMode::Strict
+        && has_trap
+        && matches!(
+            reason,
+            SkipReason::UnsupportedWrite
+                | SkipReason::UnprovenExpression
+                | SkipReason::UnprovenTargetConstraints
+                | SkipReason::UnprovenWriteCompleteness
+        )
+    {
+        return SkipReason::UnprovenRollbackScope;
+    }
+    reason
+}
+
+/// 单遍、引号感知的 `$v_*` 占位符替换：SQL 字符串字面量与双引号标识符
+/// 内部不替换，替换文本不再重扫（防同名字面量文本污染与级联替换，§4.6 值等价）。
+/// `repls` 需按占位符长度降序，长名优先避免 `$v_x` 误伤 `$v_x__f`。
+fn substitute_binds(text: &str, repls: &[(String, String)]) -> String {
+    fn ident_tail(rest: &str) -> bool {
+        rest.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut quote = None;
+    while let Some(ch) = rest.chars().next() {
+        match quote {
+            Some(q) => {
+                out.push(ch);
+                rest = &rest[ch.len_utf8()..];
+                if ch == q {
+                    if rest.starts_with(q) {
+                        out.push(q);
+                        rest = &rest[q.len_utf8()..];
+                    } else {
+                        quote = None;
+                    }
+                }
+            }
+            None => {
+                if ch == '\'' || ch == '"' {
+                    quote = Some(ch);
+                    out.push(ch);
+                    rest = &rest[1..];
+                } else if ch == '$' {
+                    match repls.iter().find(|(ph, _)| {
+                        rest.starts_with(ph.as_str()) && !ident_tail(&rest[ph.len()..])
+                    }) {
+                        Some((ph, r)) => {
+                            out.push_str(r);
+                            rest = &rest[ph.len()..];
+                        }
+                        None => {
+                            out.push(ch);
+                            rest = &rest[1..];
+                        }
+                    }
+                } else {
+                    out.push(ch);
+                    rest = &rest[ch.len_utf8()..];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 前缀/后缀效果扫描：允许事务边界，拒绝异常/调用/动态 SQL。
+fn reject_outer_effects(code: &[IrStmt]) -> Result<(), SkipReason> {
     for stmt in code {
         match stmt {
-            IrStmt::TxCommit | IrStmt::TxRollback => {
-                return Err(SkipReason::TransactionBoundaryInsideLoop)
-            }
             IrStmt::PushTrap { .. } | IrStmt::PopTrap | IrStmt::Raise { .. } => {
                 return Err(SkipReason::ExceptionScopePresent)
             }
@@ -107,143 +337,8 @@ fn reject_effects(code: &[IrStmt]) -> Result<(), SkipReason> {
                 source: CursorSource::Dynamic { .. },
                 ..
             } => return Err(SkipReason::DynamicSql),
-            // 余下指令只在完整的闭合区域模式内获得资格。
             _ => {}
         }
     }
     Ok(())
-}
-
-fn analyze(prog: &IrProg) -> Result<CopyLoop<'_>, SkipReason> {
-    reject_effects(&prog.code)?;
-    let [IrStmt::OpenCursor {
-        cursor,
-        source:
-            CursorSource::Static {
-                sql: query,
-                binds: query_binds,
-                fn_sites: query_sites,
-            },
-    }, IrStmt::Fetch {
-        cursor: fetched,
-        targets,
-        record: true,
-    }, IrStmt::JumpIf {
-        cond:
-            IrExpr::CursorAttr {
-                cursor: tested,
-                kind: CursorAttrKind::NotFound,
-            },
-        to,
-    }, IrStmt::SqlExec {
-        sql: insert,
-        binds,
-        fn_sites,
-    }, IrStmt::Jump(1), IrStmt::CloseCursor { cursor: closed }] = prog.code.as_slice()
-    else {
-        return Err(SkipReason::UnsupportedControlFlow);
-    };
-    let [AssignTarget::Var(record)] = targets.as_slice() else {
-        return Err(SkipReason::LiveOutState);
-    };
-    if cursor != fetched || cursor != tested || cursor != closed || *to != 6 {
-        return Err(SkipReason::UnsupportedControlFlow);
-    }
-    if !query_sites.is_empty() || !fn_sites.is_empty() {
-        return Err(SkipReason::UnsupportedCall);
-    }
-    if !query_binds.is_empty() || prog.var_types.contains_key(&record.0) {
-        return Err(SkipReason::UnprovenExpression);
-    }
-    Ok(CopyLoop {
-        query,
-        insert,
-        binds,
-        record,
-    })
-}
-
-fn generate(
-    region: &CopyLoop<'_>,
-    ex: &dyn SqlExecutor,
-) -> Result<Result<String, SkipReason>, EngineError> {
-    let shape = shape::select(region.query)
-        .and_then(|select| shape::insert(region.insert).map(|insert| (select, insert)));
-    let (select, insert) = match shape {
-        Ok(shape) => shape,
-        Err(reason) => return Ok(Err(reason)),
-    };
-    if select.table == insert.table {
-        return Ok(Err(SkipReason::TargetReadDependency));
-    }
-    let Some(source) = schema::load(ex, &select.table)? else {
-        return Ok(Err(SkipReason::UnknownObjectDependency));
-    };
-    let Some(target) = schema::load(ex, &insert.table)? else {
-        return Ok(Err(SkipReason::UnprovenTargetConstraints));
-    };
-    Ok(copy_sql(region, &select, &insert, &source, &target))
-}
-
-fn copy_sql(
-    region: &CopyLoop<'_>,
-    select: &shape::Select,
-    insert: &shape::Insert,
-    source: &schema::Table,
-    target: &schema::Table,
-) -> Result<String, SkipReason> {
-    if insert.columns.len() != target.columns.len()
-        || insert.parameters.len() != insert.columns.len()
-        || region.binds.len() != insert.parameters.len()
-    {
-        return Err(SkipReason::UnprovenTargetConstraints);
-    }
-    let mut projections = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    for (name, parameter) in insert.columns.iter().zip(&insert.parameters) {
-        if !seen.insert(&name.0) {
-            return Err(SkipReason::UnprovenTargetConstraints);
-        }
-        let Some((_, BindSrc::Field { rec, field })) =
-            region.binds.iter().find(|(p, _)| p == parameter)
-        else {
-            return Err(SkipReason::UnprovenExpression);
-        };
-        let field = shape::Name(field.clone());
-        if rec != region.record || select.columns.iter().filter(|c| **c == field).count() != 1 {
-            return Err(SkipReason::UnprovenExpression);
-        }
-        let from = source.columns.iter().find(|c| c.name == field);
-        let to = target.columns.iter().find(|c| c.name == *name);
-        let (Some(from), Some(to)) = (from, to) else {
-            return Err(SkipReason::UnknownObjectDependency);
-        };
-        if from.kind != to.kind || (from.nullable && !to.nullable) {
-            return Err(SkipReason::UnprovenTargetConstraints);
-        }
-        projections.push(format!("sd_cur.{}", field.sql()));
-    }
-    if select
-        .columns
-        .iter()
-        .any(|n| !source.columns.iter().any(|c| c.name == *n))
-    {
-        return Err(SkipReason::UnknownObjectDependency);
-    }
-    Ok(format!(
-        "WITH sd_cur AS (SELECT {} FROM {}) INSERT INTO {} ({}) SELECT {} FROM sd_cur",
-        render(&select.columns),
-        source.qualified,
-        target.qualified,
-        render(&insert.columns),
-        projections.join(", ")
-    ))
-}
-
-fn render(names: &[shape::Name]) -> String {
-    names
-        .iter()
-        .map(shape::Name::sql)
-        .collect::<Vec<_>>()
-        .join(", ")
 }

@@ -40,7 +40,7 @@ pub(super) fn exec(
     sql: &str,
     binds: &[(String, BindSrc)],
     sites: &[crate::sql::FnSite],
-) -> Result<(), EngineError> {
+) -> Result<usize, EngineError> {
     materialize_fn_sites(sites, env)?;
     let bound = resolve_binds(binds, env.frame)?;
     if env.sink.is_enabled() {
@@ -50,8 +50,7 @@ pub(super) fn exec(
             elapsed_us: 0,
         });
     }
-    env.ex.execute(sql, &bound)?;
-    Ok(())
+    Ok(env.ex.execute(sql, &bound)?.rows_affected)
 }
 
 /// EXECUTE IMMEDIATE（可选 INTO：与静态 SELECT INTO 同语义）。

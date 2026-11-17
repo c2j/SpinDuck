@@ -110,6 +110,8 @@ pub enum Command {
         args: Vec<String>,
         /// 合并 COMMIT 开关（V26，默认关；见 writebuf.rs 语义边界）。
         batch_commit: bool,
+        /// 集合化契约覆盖；None 使用项目配置。
+        set_oriented: Option<crate::ir::set_oriented::SetOrientedMode>,
         /// 步数预算覆盖（复核应修 C：默认预算跑不动 100k 级游标循环，
         /// 大业务经此入口放大；None = 用引擎默认值）。
         step_budget: Option<u64>,
@@ -251,7 +253,13 @@ pub fn usage() -> &'static str {
      \x20      [--trace <f> [--trace-format <text|jsonl>] [--trace-level <stmt|sql|bind|all>]] <routine> [args...]\n\
      \x20 call --plan <计划.toml> [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>]\n\
      \x20      [--trace <f> [--trace-format <text|jsonl>] [--trace-level <stmt|sql|bind|all>]] [args...]\n\
+     \x20      [--set-oriented[=off|strict|batch-atomic]]（两种 call 形态均可用）\n\
      \x20                                注册例程并调用；计划面自带目标与源清单，缺件即红\n\
+     \x20                                集合化默认 off；裸 --set-oriented 为 strict，覆盖项目配置；\n\
+     \x20                                batch-atomic 授权合并循环尾提交、放宽崩溃部分持久化，\n\
+     \x20                                并将依赖表读取冻结为区域入口单快照；未证明安全仍回退；\n\
+     \x20                                与 --batch-commit 同用时跳过集合化；step_budget 按实际 IR 计数，\n\
+     \x20                                优化不保证与 off 同点超限（预算充足时才适用等价契约）\n\
      \x20                                （args: 整数/小数/'串'/null；--plan 下位置参数全是实参；\n\
      \x20                                  规则口径：内置种子 < 项目发现 < --rules；\n\
      \x20                                  --trace 把审计日志逐行落盘（默认 text），sidecar <日志>.sql\n\

@@ -79,15 +79,19 @@ jobs:
       # 内核锚定（AGENTS §1：duckdb = "=1.10505.0"）带来的构建期依赖：
       # zip 6.0.0 是 libduckdb-sys 的 build-dependency（bundled 解压缩包用），
       # 不进运行时产物，也无法在不违反内核版本锚定的前提下漂浮升级。
-      # 四条公告均为该构建期 zip 的解压/符号链接边界缺陷 → 显式忽略并留档
+      # 七条公告均为该构建期 zip 的解压/符号链接/解码边界缺陷 → 显式忽略并留档
       # （决策与复评节奏见 docs/architecture.md「审计豁免」；内核升级 PR 时复评）。
+      # 0548/0547/0545 为 2026 年新发布公告，与原四条同一触达面，复评口径相同。
       - name: cargo audit（构建期 zip 豁免清单）
         run: |
           cargo audit \
             --ignore RUSTSEC-2026-0367 \
             --ignore RUSTSEC-2026-0368 \
             --ignore RUSTSEC-2026-0369 \
-            --ignore RUSTSEC-2026-0429
+            --ignore RUSTSEC-2026-0429 \
+            --ignore RUSTSEC-2026-0548 \
+            --ignore RUSTSEC-2026-0547 \
+            --ignore RUSTSEC-2026-0545
       # 审计盲区（非豁免，是覆盖不到）：codeweb 是 git 依赖
       # （c2j/codeweb @ tag v0.9.10，嵌入取图，见 docs/embeded-codeweb.md），
       # 不在 crates.io advisory 面内，cargo audit 不产出它的公告；tag 升级必须

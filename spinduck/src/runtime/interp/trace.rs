@@ -21,6 +21,8 @@ fn variant_name(st: &IrStmt) -> &'static str {
         IrStmt::Raise { .. } => "Raise",
         IrStmt::Return { .. } => "Return",
         IrStmt::TxCommit => "TxCommit",
+        // 条件提交实际执行时按 TxCommit 埋点（interp 主循环显式发出）
+        IrStmt::TxCommitIfWritten => "TxCommitIfWritten",
         IrStmt::TxRollback => "TxRollback",
         IrStmt::SqlQuery { .. } | IrStmt::FoldedQuery { .. } => "SqlQuery",
         IrStmt::SqlExec { .. } => "SqlExec",

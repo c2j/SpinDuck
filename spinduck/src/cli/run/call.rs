@@ -11,6 +11,8 @@ use super::{io_err, EXIT_FAIL, EXIT_OK};
 use crate::cli::args::Command;
 use crate::error::EngineError;
 #[cfg(feature = "native")]
+use crate::ir::set_oriented::SetOrientedMode;
+#[cfg(feature = "native")]
 use crate::rules::RuleRegistry;
 use std::io::Write;
 use std::path::PathBuf;
@@ -25,6 +27,7 @@ pub(crate) fn cmd_call(cmd: Command) -> CallParts {
             target,
             args,
             batch_commit,
+            set_oriented,
             step_budget,
             trace,
             trace_format,
@@ -36,6 +39,7 @@ pub(crate) fn cmd_call(cmd: Command) -> CallParts {
             target,
             args,
             batch_commit,
+            set_oriented,
             step_budget,
             trace,
             trace_format,
@@ -52,6 +56,7 @@ pub(crate) struct CallParts {
     target: crate::cli::args::CallTarget,
     args: Vec<String>,
     batch_commit: bool,
+    set_oriented: Option<crate::ir::set_oriented::SetOrientedMode>,
     step_budget: Option<u64>,
     trace: Option<PathBuf>,
     trace_format: crate::trace::TraceFormat,
@@ -91,6 +96,17 @@ pub(super) fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, Eng
     let Some(prep) = prepare_call(&parts, out)? else {
         return Ok(EXIT_FAIL);
     };
+    // 离线候选编译（codeweb 计划 + 集合化开启）：先编译、后开库；
+    // 编译产物经 Engine::from_compiled 直接进入 catalog，不走 register。
+    let compiled = match &prep.snapshot_root {
+        Some(root) => Some(compile_offline(
+            root,
+            &prep.sources,
+            &prep.rules,
+            prep.set_oriented,
+        )?),
+        None => None,
+    };
     let ex = match &parts.db {
         Some(p) => crate::sql::DuckExecutor::open(&p.to_string_lossy())?,
         None => crate::sql::DuckExecutor::open_in_memory()?,
@@ -112,8 +128,19 @@ pub(super) fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, Eng
         let dir = project.root.join(&project.home_dir).join("ir-cache");
         Some(crate::ir_cache::IrCache::open(&dir, &stamp))
     });
-    let mut eng = Engine::new(Box::new(ex), prep.rules.clone());
-    eng.ir_cache = ir_cache;
+    let register_sources = compiled.is_none();
+    let mut eng = match compiled {
+        Some((catalog, plans)) => {
+            let mut eng = Engine::from_compiled(Box::new(ex), catalog)?;
+            eng.attach_set_oriented_plans(plans);
+            eng
+        }
+        None => {
+            let mut eng = Engine::new(Box::new(ex), prep.rules.clone());
+            eng.ir_cache = ir_cache;
+            eng
+        }
+    };
     let trace = parts.trace.as_ref().map(|p| CallTraceSpec {
         path: p.clone(),
         format: parts.trace_format,
@@ -127,7 +154,7 @@ pub(super) fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, Eng
             args: &parts.args,
             batch_commit: parts.batch_commit,
             step_budget: parts.step_budget,
-            register_sources: true,
+            register_sources,
             source_texts: Some(&texts),
             objects: &objects,
             trace,
@@ -143,8 +170,10 @@ pub(crate) struct CallPrepared {
     pub target: String,
     pub sources: Vec<PathBuf>,
     pub rules: RuleRegistry,
-    pub set_oriented: bool,
+    pub set_oriented: SetOrientedMode,
     pub codeweb_refs: Option<Vec<crate::plan::PlanRef>>,
+    /// 编译期快照的 codeweb 项目根；仅 codeweb 计划且集合化开启时导出。
+    pub snapshot_root: Option<PathBuf>,
 }
 
 #[cfg(feature = "native")]
@@ -168,8 +197,9 @@ pub(crate) fn prepare_call(
         target: t.target,
         sources: t.sources,
         rules,
-        set_oriented: t.set_oriented,
+        set_oriented: parts.set_oriented.unwrap_or(t.set_oriented),
         codeweb_refs: t.codeweb_refs,
+        snapshot_root: t.snapshot_root,
     }))
 }
 
@@ -272,6 +302,31 @@ pub(crate) fn call_engine(
     Ok(EXIT_OK)
 }
 
+#[cfg(feature = "native")]
+fn compile_offline(
+    root: &std::path::Path,
+    sources: &[PathBuf],
+    rules: &RuleRegistry,
+    mode: SetOrientedMode,
+) -> Result<
+    (
+        crate::catalog::CompiledCatalog,
+        crate::ir::set_oriented::CompiledPlans,
+    ),
+    EngineError,
+> {
+    let snapshot = crate::plan::codeweb::schema_snapshot(root, rules)?;
+    let texts = sources
+        .iter()
+        .map(|path| crate::cli::read_source_strict(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let sources: Vec<_> = texts.iter().map(String::as_str).collect();
+    let compiled = crate::catalog::compile_sources(&sources, rules.clone())?;
+    let plans =
+        crate::ir::set_oriented::compile_set_oriented_plans(&compiled.catalog, &snapshot, mode)?;
+    Ok((compiled, plans))
+}
+
 /// 执行面的缺件门（design D5）：目标闭包里内核没有的对象 ⇒ 列清单并拒绝。
 ///
 /// 裸 `call` 与旧计划仍走词法 `walk_chain`。`--plan` 且 `generator` 以 `codeweb ` 开头时
@@ -320,12 +375,14 @@ fn refuse_on_kernel_gaps(
 /// `call` 目标解析产物（F1）：目标例程 + 例程源清单 + 项目规则文件集。
 #[cfg(feature = "native")]
 struct CallTargeting {
-    set_oriented: bool,
+    set_oriented: SetOrientedMode,
     target: String,
     sources: Vec<PathBuf>,
     rules_files: std::collections::BTreeSet<PathBuf>,
     /// `Some` 仅当 `--plan` 且 generator 以 `codeweb ` 开头。
     codeweb_refs: Option<Vec<crate::plan::PlanRef>>,
+    /// 编译期快照的 codeweb 项目根；仅 codeweb 计划且集合化开启时导出。
+    snapshot_root: Option<PathBuf>,
 }
 
 #[cfg(feature = "native")]
@@ -341,6 +398,7 @@ fn call_target_and_sources(
             sources: parts.files.clone(),
             rules_files: discover_rules_files(&parts.files),
             codeweb_refs: None,
+            snapshot_root: None,
         })),
         CallTarget::Plan(p) => {
             let text = crate::cli::read_source_strict(p)?;
@@ -366,19 +424,27 @@ fn call_target_and_sources(
                 .generator
                 .starts_with("codeweb ")
                 .then(|| plan.refs.clone());
+            // Off 不优化，也就不需要快照参照面——不新增失败模式，stdout 契约不变。
+            let mode = parts.set_oriented.unwrap_or(project.set_oriented);
+            let snapshot_root = if codeweb_refs.is_some() && mode != SetOrientedMode::Off {
+                Some(crate::plan::codeweb::codeweb_project_root(&project)?)
+            } else {
+                None
+            };
             Ok(Some(CallTargeting {
                 set_oriented: project.set_oriented,
                 target: plan.target.clone(),
                 sources: files,
                 rules_files: project.rules_files.iter().cloned().collect(),
                 codeweb_refs,
+                snapshot_root,
             }))
         }
     }
 }
 
 #[cfg(feature = "native")]
-fn project_set_oriented(files: &[PathBuf]) -> Result<bool, EngineError> {
+fn project_set_oriented(files: &[PathBuf]) -> Result<SetOrientedMode, EngineError> {
     let mut policy = None;
     for file in files {
         if let Some(project) = crate::project::ProjectConfig::discover_strict(file)? {
@@ -391,7 +457,7 @@ fn project_set_oriented(files: &[PathBuf]) -> Result<bool, EngineError> {
             policy = Some(project.set_oriented);
         }
     }
-    Ok(policy.unwrap_or(false))
+    Ok(policy.unwrap_or_default())
 }
 
 #[cfg(feature = "native")]
@@ -635,6 +701,7 @@ mod tests {
     fn should_reset_step_budget_to_default_when_reusing_engine() {
         use super::{call_engine, CallPrepared, CallRun};
         use crate::engine::Engine;
+        use crate::ir::set_oriented::SetOrientedMode;
         use crate::rules::RuleRegistry;
         use crate::sql::DuckExecutor;
         use std::collections::BTreeSet;
@@ -655,8 +722,9 @@ mod tests {
             target: "f_loop".to_string(),
             sources: Vec::new(),
             rules: RuleRegistry::default(),
-            set_oriented: false,
+            set_oriented: SetOrientedMode::Off,
             codeweb_refs: None,
+            snapshot_root: None,
         };
         let args = vec!["5".to_string()];
         let mut out: Vec<u8> = Vec::new();

@@ -30,6 +30,8 @@ use trace::spinduck_trace_event;
 pub enum RunOutcome {
     Completed,
     Returned(Option<SpinValue>),
+    /// 到达 `RunLimits::stop_pc` 边界（集合化入口状态机：前缀执行完毕）。
+    Stopped,
 }
 
 /// 解释器步数预算默认值：防死循环护栏（ENG-0032）。
@@ -73,6 +75,16 @@ pub struct RunLimits {
     pub batch_commit: bool,
 }
 
+/// 执行区间（集合化入口状态机，设计 §4.5-2）：起始 pc 与边界 pc。
+/// 独立于 `RunLimits`，避免破坏既有构造点。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunSpan {
+    /// 起始 pc（fallback 从区域入口续跑，不重放前缀）。
+    pub start_pc: usize,
+    /// 边界 pc：到达即返回 `Stopped`（不执行该处指令、不计步）。
+    pub stop_pc: Option<usize>,
+}
+
 impl Default for RunLimits {
     fn default() -> Self {
         Self {
@@ -80,6 +92,13 @@ impl Default for RunLimits {
             batch_commit: false,
         }
     }
+}
+
+/// 一次运行的调参 + 区间组合（避免运行入口参数超限）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunControl {
+    pub limits: RunLimits,
+    pub span: RunSpan,
 }
 
 /// 带例程目录与深度的运行（M6：CALL/FuncCall 例程直调）。
@@ -95,8 +114,35 @@ pub fn run_with_catalog(
     depth: usize,
     limits: RunLimits,
 ) -> Result<RunOutcome, EngineError> {
+    run_spanned(
+        prog,
+        frame,
+        ex,
+        sink,
+        cat,
+        depth,
+        RunControl {
+            limits,
+            span: RunSpan::default(),
+        },
+    )
+}
+
+/// 带区间边界的运行（集合化入口状态机，设计 §4.5-2）：到达 `span.stop_pc`
+/// 返回 `Stopped` 交引擎做入口守卫裁决；`span.start_pc` 用于 fallback 续跑。
+pub fn run_spanned(
+    prog: &IrProg,
+    frame: &mut Frame,
+    ex: &dyn SqlExecutor,
+    sink: &mut dyn TraceSink,
+    cat: &crate::catalog::RoutineCatalog,
+    depth: usize,
+    control: RunControl,
+) -> Result<RunOutcome, EngineError> {
+    let limits = control.limits;
+    let span = control.span;
     let mut traps: Vec<TrapFrame> = Vec::new();
-    let mut pc = 0usize;
+    let mut pc = span.start_pc;
     let mut steps = 0u64;
     let mut env = Env {
         frame,
@@ -112,10 +158,17 @@ pub fn run_with_catalog(
             None
         },
         current_error: None,
+        last_write_rows: 0,
         var_types: &prog.var_types,
     };
     loop {
-        match run_inner(prog, &mut env, &mut traps, &mut pc, &mut steps) {
+        let driven = match span.stop_pc {
+            None => run_inner(prog, &mut env, &mut traps, &mut pc, &mut steps),
+            Some(stop) => {
+                run_inner_spanned(prog, &mut env, &mut traps, &mut pc, &mut steps, Some(stop))
+            }
+        };
+        match driven {
             Ok(out) => {
                 // 出口统一刷盘：缓冲 INSERT 在同一事务内下发，随 engine.call 的
                 // 最终 COMMIT 一起持久化；失败则错误正常上抛（触发外层 ROLLBACK）
@@ -185,6 +238,8 @@ pub(super) struct Env<'a> {
     pub(super) wbuf: writebuf::WBufOpt,
     /// 进入异常处理器体时写入的当前错误——裸 `RAISE;` 的重抛源。
     pub current_error: Option<EngineError>,
+    /// 最近一次直发 SqlExec 的影响行数（`TxCommitIfWritten` 的条件面）。
+    pub last_write_rows: usize,
     /// 当前例程已映射的标量声明（写入 `VARCHAR` 槽时转换）。
     pub var_types: &'a BTreeMap<String, SpinType>,
 }
@@ -197,7 +252,22 @@ fn run_inner(
     pc: &mut usize,
     steps: &mut u64,
 ) -> Result<RunOutcome, EngineError> {
+    run_inner_spanned(prog, env, traps, pc, steps, None)
+}
+
+/// 带边界 pc 的内层驱动：到达 `stop_pc` 返回 `Stopped`（不执行、不计步）。
+fn run_inner_spanned(
+    prog: &IrProg,
+    env: &mut Env<'_>,
+    traps: &mut Vec<TrapFrame>,
+    pc: &mut usize,
+    steps: &mut u64,
+    stop_pc: Option<usize>,
+) -> Result<RunOutcome, EngineError> {
     loop {
+        if stop_pc == Some(*pc) {
+            return Ok(RunOutcome::Stopped);
+        }
         *steps += 1;
         if *steps > env.budget {
             return Err(EngineError::invariant(
@@ -214,7 +284,7 @@ fn run_inner(
             // 程序尾部：隐式完成（无 RETURN 的过程）
             None => return Ok(RunOutcome::Completed),
         };
-        if env.sink.is_enabled() {
+        if env.sink.is_enabled() && !matches!(st, IrStmt::TxCommitIfWritten) {
             env.sink.on_event(spinduck_trace_event(st));
         }
         match st {
@@ -224,6 +294,18 @@ fn run_inner(
                 // 合并开关 ON：COMMIT 吞并（持久化延迟到调用出口统一提交）
                 if env.wbuf.is_none() {
                     flow::tx(env, true)?;
+                }
+                *pc += 1;
+            }
+            // 零行写入不提交（不切换事务快照、不产生 trace 事件，设计 §4.5）
+            IrStmt::TxCommitIfWritten => {
+                if env.last_write_rows > 0 {
+                    if env.sink.is_enabled() {
+                        env.sink.on_event(spinduck_trace_event(&IrStmt::TxCommit));
+                    }
+                    if env.wbuf.is_none() {
+                        flow::tx(env, true)?;
+                    }
                 }
                 *pc += 1;
             }
@@ -269,7 +351,7 @@ fn run_inner(
             } => {
                 let buffered = writebuf::take_insert(env, sql, binds, fn_sites)?;
                 if !buffered {
-                    sqlstmts::exec(env, sql, binds, fn_sites)?;
+                    env.last_write_rows = sqlstmts::exec(env, sql, binds, fn_sites)?;
                 }
                 *pc += 1;
             }

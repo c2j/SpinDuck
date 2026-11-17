@@ -8,5 +8,6 @@ pub use cursor::{CursorAttrKind, CursorState};
 pub use eval::{eval, eval_cond, EvalEnv};
 pub use frame::Frame;
 pub use interp::{
-    run, run_with_catalog, run_with_trace, RunLimits, RunOutcome, DEFAULT_STEP_BUDGET,
+    run, run_spanned, run_with_catalog, run_with_trace, RunControl, RunLimits, RunOutcome, RunSpan,
+    DEFAULT_STEP_BUDGET,
 };

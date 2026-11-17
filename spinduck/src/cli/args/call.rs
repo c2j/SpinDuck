@@ -30,6 +30,7 @@ pub(super) fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
 
     let mut db: Option<PathBuf> = None;
     let mut batch_commit = false;
+    let mut set_oriented = None;
     let mut step_budget: Option<u64> = None;
     let mut rules = None;
     let mut trace = None;
@@ -64,6 +65,16 @@ pub(super) fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
             }
             "--batch-commit" => {
                 batch_commit = true;
+            }
+            flag if flag == "--set-oriented" || flag.starts_with("--set-oriented=") => {
+                if set_oriented.is_some() {
+                    return Err(dup_flag_err("--set-oriented"));
+                }
+                let name = flag.strip_prefix("--set-oriented=").unwrap_or("strict");
+                set_oriented = Some(
+                    crate::ir::set_oriented::SetOrientedMode::from_name(name)
+                        .ok_or_else(|| usage_err("--set-oriented[=off|strict|batch-atomic]"))?,
+                );
             }
             "--step-budget" => {
                 if step_budget.is_some() {
@@ -158,6 +169,7 @@ pub(super) fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
         target,
         args,
         batch_commit,
+        set_oriented,
         step_budget,
         trace,
         trace_format: trace_format.unwrap_or_default(),
@@ -177,6 +189,66 @@ fn plan_target_if_readable(p: &std::path::Path) -> Option<String> {
 mod tests {
     use super::*;
     use crate::cli::args::{parse, v};
+
+    #[test]
+    fn should_parse_explicit_set_oriented_contract_without_consuming_arguments() {
+        use crate::ir::set_oriented::SetOrientedMode;
+        for (flag, mode) in [
+            ("--set-oriented", SetOrientedMode::Strict),
+            ("--set-oriented=off", SetOrientedMode::Off),
+            ("--set-oriented=strict", SetOrientedMode::Strict),
+            ("--set-oriented=batch-atomic", SetOrientedMode::BatchAtomic),
+        ] {
+            let command = parse(&v(&["call", flag, "p", "'batch-atomic'"])).unwrap();
+            assert_eq!(
+                command,
+                Command::Call {
+                    db: None,
+                    rules: None,
+                    files: vec![],
+                    target: CallTarget::Routine("p".into()),
+                    args: v(&["'batch-atomic'"]),
+                    batch_commit: false,
+                    set_oriented: Some(mode),
+                    step_budget: None,
+                    trace: None,
+                    trace_format: TraceFormat::Text,
+                    trace_level: TraceLevel::Bind,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn should_reject_unknown_or_repeated_set_oriented_modes() {
+        for flags in [
+            vec!["--set-oriented="],
+            vec!["--set-oriented=true"],
+            vec!["--set-oriented=unsafe"],
+            vec!["--set-oriented", "--set-oriented=off"],
+        ] {
+            let mut args = vec!["call"];
+            args.extend(flags);
+            args.push("p");
+            let error = parse(&v(&args)).unwrap_err();
+            assert_eq!(error.code.0, "ENG-0010");
+            assert!(error.message.contains("--set-oriented"), "{error}");
+        }
+    }
+
+    #[test]
+    fn should_disclose_batch_atomic_snapshot_and_durability_contract_in_help() {
+        let help = crate::cli::args::usage();
+        for text in [
+            "--set-oriented",
+            "batch-atomic",
+            "部分持久化",
+            "入口单快照",
+            "step_budget",
+        ] {
+            assert!(help.contains(text), "missing {text}: {help}");
+        }
+    }
 
     #[test]
     fn should_accept_repeated_file_flag_for_call() {
@@ -243,6 +315,7 @@ mod tests {
                 target: CallTarget::Routine("prc_x".to_string()),
                 args: v(&["1", "2"]),
                 batch_commit: false,
+                set_oriented: None,
                 step_budget: None,
                 trace: None,
                 trace_format: TraceFormat::Text,
@@ -274,6 +347,7 @@ mod tests {
                 target: CallTarget::Plan(PathBuf::from("p.toml")),
                 args: v(&["'20250715'", "'0130000001'"]),
                 batch_commit: false,
+                set_oriented: None,
                 step_budget: None,
                 trace: None,
                 trace_format: TraceFormat::Text,
@@ -295,6 +369,7 @@ mod tests {
                 target: CallTarget::Routine("prc_x".to_string()),
                 args: vec![],
                 batch_commit: false,
+                set_oriented: None,
                 step_budget: Some(20_000_000),
                 trace: None,
                 trace_format: TraceFormat::Text,
