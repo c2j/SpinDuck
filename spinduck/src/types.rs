@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 /// 引擎内部类型（与 DuckDB LogicalType 一一映射，映射值来自规则数据）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SpinType {
     Decimal { precision: u8, scale: u8 },
     Int,
@@ -75,6 +75,50 @@ impl SpinType {
             SpinType::Blob => "BLOB",
         }
     }
+}
+
+/// `DataType`（DDL 列定义 AST）→ DuckDB 类型名；`Custom` 经 `[types]`
+/// 规则解析，解析不出回退 `VARCHAR`（stub/局部 DDL 只要求 binder 可绑定，
+/// 不要求精确）。Gate 2B stub DDL 与例程体内 `CREATE TABLE` 共用此映射。
+pub(crate) fn duckdb_type_name(
+    dt: &ogsql_parser::ast::DataType,
+    rules: &crate::rules::RuleRegistry,
+) -> String {
+    use ogsql_parser::ast::DataType;
+    let std = match dt {
+        DataType::Boolean => Some("BOOLEAN"),
+        DataType::TinyInt(_) | DataType::SmallInt(_) | DataType::Integer(_) => Some("INTEGER"),
+        DataType::BigInt(_) | DataType::BigSerial => Some("BIGINT"),
+        DataType::Real | DataType::Float(_) | DataType::Double => Some("DOUBLE"),
+        DataType::BinaryFloat | DataType::BinaryDouble => Some("DOUBLE"),
+        DataType::Numeric(_, _) => Some("DECIMAL"),
+        DataType::Char(_) | DataType::Varchar(_) | DataType::Text => Some("VARCHAR"),
+        DataType::Bytea => Some("BLOB"),
+        DataType::Timestamp(_, _) | DataType::Timestamptz(_) => Some("TIMESTAMP"),
+        DataType::Date => Some("DATE"),
+        DataType::Time(_, _) => Some("TIME"),
+        DataType::Interval(_) => Some("INTERVAL"),
+        DataType::Json | DataType::Jsonb => Some("JSON"),
+        DataType::Uuid => Some("UUID"),
+        DataType::Bit(_) | DataType::Varbit(_) => Some("BIT"),
+        DataType::Serial | DataType::SmallSerial => Some("INTEGER"),
+        DataType::Array(_) => Some("VARCHAR[]"),
+        _ => None,
+    };
+    if let Some(t) = std {
+        return t.to_string();
+    }
+    if let DataType::Custom(name, _) = dt {
+        let raw = name
+            .iter()
+            .map(|i| i.value.clone())
+            .collect::<Vec<_>>()
+            .join(".");
+        if let Some(st) = rules.spin_type(&raw) {
+            return st.duckdb_name().to_string();
+        }
+    }
+    "VARCHAR".to_string()
 }
 
 /// 默认类型映射（与 config/rewrite-rules.toml `[types]` 同源；

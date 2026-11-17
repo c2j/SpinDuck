@@ -19,6 +19,8 @@ pub(crate) struct Compiler {
     /// 已注册例程名（SQL 上下文调用下沉判定；空集 = 不下沉）
     pub(crate) routine_names: BTreeSet<String>,
     pub(crate) code: Vec<IrStmt>,
+    /// 例程体内局部 DDL 标记（`code` 下标 → CTAS 与否），移交 IrProg
+    pub(crate) local_ddl: Vec<LocalDdlStmt>,
     pub(crate) labels: std::collections::HashMap<String, usize>,
     pub(crate) fixups: Vec<(usize, String)>,
     pub(crate) loop_stack: Vec<(String, String)>, // (start_label, end_label)

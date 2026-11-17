@@ -14,8 +14,11 @@ pub use chain::{chain_object_refs, routine_refs, ObjectKind, ObjectRef};
 pub(crate) use chain::{expr_func_names, is_object_name, normalize, tokens, Tok};
 pub use deploy::{
     clamp_sequence_bounds, deploy_project, deploy_routines, deploy_schema, deploy_seeds,
-    drop_cache_option, sql_units, strip_defaults, verify_project, ENGINE_PROVIDED_TABLES,
+    drop_cache_option, sql_units, strip_defaults, ENGINE_PROVIDED_TABLES,
 };
+// `verify_project` 依赖 native 内核（`DuckExecutor`），非 native 构建不导出。
+#[cfg(feature = "native")]
+pub use deploy::verify_project;
 // 计划面 `deploy`（`src/plan/deploy.rs`）复用的逐文件下发实现：口径只有一条，
 // 允许 crate 内消费，不对外扩接缝。
 pub(crate) use deploy::{

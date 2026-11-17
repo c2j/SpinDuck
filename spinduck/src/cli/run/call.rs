@@ -81,16 +81,29 @@ pub(super) fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, Eng
     };
     // 内核此刻的对象目录要在开库后、把执行器交给引擎之前取：缺件门的参照面就是它。
     let objects = crate::verify::kernel_objects(&ex)?;
+    // IR 缓存（二期）：预读全部源文本，stamp 覆盖源+规则+parser/kernel
+    // pin；能向上发现项目声明时启用，键再叠加注册上下文指纹。
+    let mut texts: Vec<(String, String)> = Vec::with_capacity(sources.len());
+    for f in &sources {
+        let text = crate::cli::read_source_strict(f)?;
+        texts.push((f.to_string_lossy().into_owned(), text));
+    }
+    let ir_cache = sources.first().and_then(|first| {
+        let project = crate::project::ProjectConfig::discover_strict(first).ok()??;
+        let stamp = crate::ir_cache::CompileGateStamp::compute(&texts, &rules);
+        let dir = project.root.join(&project.home_dir).join("ir-cache");
+        Some(crate::ir_cache::IrCache::open(&dir, &stamp))
+    });
     let mut eng = Engine::new(Box::new(ex), rules);
+    eng.ir_cache = ir_cache;
     eng.batch_commit = parts.batch_commit;
     eng.set_oriented = t.set_oriented;
     // 复核应修 C：大业务（100k 级游标循环）默认预算不够，CLI 放大入口
     if let Some(b) = parts.step_budget {
         eng.step_budget = b;
     }
-    for f in &sources {
-        let text = crate::cli::read_source_strict(f)?;
-        eng.register(&text)?;
+    for (_, text) in &texts {
+        eng.register(text)?;
     }
     if refuse_on_kernel_gaps(&eng, &target, &objects, t.codeweb_refs.as_deref(), out)? {
         return Ok(EXIT_FAIL);

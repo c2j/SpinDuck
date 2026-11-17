@@ -21,6 +21,16 @@ fn kernel_err(e: impl std::fmt::Display) -> EngineError {
     EngineError::kernel(10, format!("{e}"))
 }
 
+/// Gate 2B 编译期 prepare 校验（设计 V4 §4.4）：在给定连接上 `prepare`
+/// 只走 DuckDB Parser→Transformer→Binder，**不执行**；Binder/Parser 拒绝
+/// （缺表、未知函数、签名不匹配）统一映射 `KERNEL-0011`。调用方负责先在
+/// 连接上建好 0 行 Stub Schema。
+pub fn prepare_check(conn: &Connection, sql: &str) -> Result<(), EngineError> {
+    conn.prepare(sql)
+        .map(|_| ())
+        .map_err(|e| EngineError::kernel(11, format!("duckdb prepare: {e}")))
+}
+
 impl DuckExecutor {
     /// 内存库（开发/测试默认）。
     pub fn open_in_memory() -> Result<Self, EngineError> {
@@ -538,6 +548,22 @@ mod tests {
     use super::*;
     use crate::exec::BindMap;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn should_prepare_check_against_stub_schema() {
+        // Gate 2B 接缝（设计 V4 §4.4）：prepare 只过 Parser→Binder，不执行；
+        // 缺表/未知函数的 Binder 拒绝统一映射 KERNEL-0011。
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        ex.execute("CREATE TABLE t(a INT)", &BindMap::new())
+            .unwrap();
+        prepare_check(ex.connection(), "SELECT a FROM t").unwrap();
+
+        let err = prepare_check(ex.connection(), "SELECT * FROM missing_t").unwrap_err();
+        assert_eq!(err.code.to_string(), "KERNEL-0011", "{err:?}");
+
+        let err = prepare_check(ex.connection(), "SELECT definitely_no_such_fn(1)").unwrap_err();
+        assert_eq!(err.code.to_string(), "KERNEL-0011", "{err:?}");
+    }
 
     #[test]
     fn should_roundtrip_select_with_named_binds() {

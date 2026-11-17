@@ -5,7 +5,7 @@ use crate::exec::{Row, RowStream};
 use crate::value::SpinValue;
 
 /// 游标属性（AST CursorAttributeKind 对应）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CursorAttrKind {
     NotFound,
     Found,

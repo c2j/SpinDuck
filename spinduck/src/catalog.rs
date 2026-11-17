@@ -10,7 +10,7 @@ use ogsql_parser::ast::Statement;
 use std::collections::BTreeMap;
 
 /// 参数模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ParamMode {
     In,
     Out,
@@ -18,7 +18,7 @@ pub enum ParamMode {
 }
 
 /// 例程参数。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RoutineParam {
     pub name: String,
     pub mode: ParamMode,
@@ -106,7 +106,7 @@ fn arity_err(name: &str, len: usize, got: usize) -> EngineError {
 }
 
 /// 已编译例程。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompiledRoutine {
     pub name: String,
     pub kind: RoutineKind,
@@ -114,7 +114,7 @@ pub struct CompiledRoutine {
     pub prog: IrProg,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RoutineKind {
     Procedure,
     Function,

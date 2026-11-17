@@ -34,6 +34,10 @@ pub struct Engine {
     memo: std::rc::Rc<crate::exec::MemoCache>,
     /// 参数表点查缓存。与 memo 一样在顶层调用入口清空。
     lookup: std::rc::Rc<crate::lookup_cache::LookupState>,
+    /// IR 编译缓存（设计 V4 §5.4 二期）：`None` = 不缓存（默认）。
+    /// 命中跳过 tokenize/parse/编译全链路；键含注册上下文指纹，
+    /// 保证例程互调下沉与宏消歧不串条目。
+    pub ir_cache: Option<crate::ir_cache::IrCache>,
 }
 
 pub struct CallResultExt {
@@ -59,6 +63,7 @@ impl Engine {
             set_oriented_reports: Vec::new(),
             memo,
             lookup,
+            ir_cache: None,
         }
     }
 
@@ -69,14 +74,48 @@ impl Engine {
 
     /// 注册并返回**本次定义/替换**的例程名（目录持久化按名单写行，
     /// 不得遍历全目录——回归守护见 should_persist_each_routine_with_its_own_source）。
+    /// 注册上下文指纹：例程名 + 宏名集合（排序拼接）。fn_sites 下沉
+    /// 与宏消歧依赖目录内容，必须进缓存键。
+    fn cache_context(&self) -> String {
+        let mut parts: Vec<String> = self.catalog.routine_names().into_iter().collect();
+        parts.extend(self.macro_names.iter().cloned());
+        parts.sort();
+        parts.join("\u{1}")
+    }
+
     fn register_named(&mut self, sql_text: &str) -> Result<Vec<String>, EngineError> {
+        // IR 缓存命中：跳过解析/编译，按登记语义回放（宏安装 + 目录注册）
+        let cache_key = self
+            .ir_cache
+            .as_ref()
+            .map(|_| crate::ir_cache::IrCache::key_for(&self.cache_context(), sql_text));
+        let hit = cache_key
+            .as_ref()
+            .and_then(|k| self.ir_cache.as_ref().and_then(|c| c.get(k)));
+        if let Some(routines) = hit {
+            let mut names = Vec::with_capacity(routines.len());
+            for r in routines {
+                if self.install_sql_macro(&r)? {
+                    self.macro_names.insert(r.name.to_ascii_lowercase());
+                }
+                names.push(r.name.clone());
+                self.catalog.register(r);
+            }
+            return Ok(names);
+        }
         let tokens = Tokenizer::new(sql_text)
             .tokenize()
             .map_err(|e| EngineError::invariant(63, format!("tokenizer: {e}")))?;
         let stmts = ogsql_parser::parser::Parser::new(tokens).parse();
-        let mut names = Vec::new();
+        // Gate 2A 顶层 DDL 拦截（设计 V4 §4.4）：方言/内核不支持的 DDL 在
+        // 例程登记前显式拒绝，避免随非例程语句被静默放过。
         for st in &stmts {
-            names.extend(self.register_statement_named(st)?);
+            crate::gate::reject_unsupported_ddl(st)?;
+        }
+        let mut names = Vec::new();
+        let mut routines_sink: Vec<crate::catalog::CompiledRoutine> = Vec::new();
+        for st in &stmts {
+            names.extend(self.register_statement_named(st, &mut routines_sink)?);
         }
         // 静默丢弃护栏：文本声明了例程，解析后一条都没登记（ogsql 对个别 PL
         // 构造把整条 CREATE 降级为 Empty/其它形态）。归域 ENGINE：输入被解析器
@@ -89,6 +128,9 @@ impl Engine {
                     "声明了例程却未登记任何例程（解析器降级/静默丢弃，常见原因：体内构造不支持）：{head}"
                 ),
             ));
+        }
+        if let (Some(cache), Some(key)) = (self.ir_cache.as_mut(), cache_key) {
+            cache.put(key, routines_sink);
         }
         Ok(names)
     }
@@ -141,11 +183,17 @@ impl Engine {
     }
 
     /// 单条 AST 语句的注册（含 PACKAGE BODY 展开）。
+    /// `sink` 收集本语句产出的例程（IR 缓存写穿用；登记语义不变）。
     pub fn register_statement(&mut self, st: &Statement) -> Result<usize, EngineError> {
-        Ok(self.register_statement_named(st)?.len())
+        let mut sink = Vec::new();
+        Ok(self.register_statement_named(st, &mut sink)?.len())
     }
 
-    fn register_statement_named(&mut self, st: &Statement) -> Result<Vec<String>, EngineError> {
+    fn register_statement_named(
+        &mut self,
+        st: &Statement,
+        sink: &mut Vec<crate::catalog::CompiledRoutine>,
+    ) -> Result<Vec<String>, EngineError> {
         match st {
             Statement::CreateProcedure(_) | Statement::CreateFunction(_) => {
                 let routines =
@@ -156,6 +204,7 @@ impl Engine {
                         self.macro_names.insert(r.name.to_ascii_lowercase());
                     }
                     names.push(r.name.clone());
+                    sink.push(r.clone());
                     self.catalog.register(r);
                 }
                 Ok(names)
@@ -200,12 +249,14 @@ impl Engine {
                             .collect::<Result<Vec<_>, EngineError>>()?;
                         crate::catalog::remember_param_types(&mut prog, &params);
                         names.push(full.clone());
-                        self.catalog.register(crate::catalog::CompiledRoutine {
+                        let cr = crate::catalog::CompiledRoutine {
                             name: full,
                             kind: crate::catalog::RoutineKind::Procedure,
                             params,
                             prog,
-                        });
+                        };
+                        sink.push(cr.clone());
+                        self.catalog.register(cr);
                     }
                     if let ogsql_parser::ast::PackageItem::Function(f) = item {
                         let full = format!(
@@ -236,12 +287,14 @@ impl Engine {
                             .collect::<Result<Vec<_>, EngineError>>()?;
                         crate::catalog::remember_param_types(&mut prog, &params);
                         names.push(full.clone());
-                        self.catalog.register(crate::catalog::CompiledRoutine {
+                        let cr = crate::catalog::CompiledRoutine {
                             name: full,
                             kind: crate::catalog::RoutineKind::Function,
                             params,
                             prog,
-                        });
+                        };
+                        sink.push(cr.clone());
+                        self.catalog.register(cr);
                     }
                 }
                 Ok(names)

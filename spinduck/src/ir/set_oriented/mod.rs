@@ -77,6 +77,7 @@ pub(crate) fn optimize(
                     fn_sites: Vec::new(),
                 }],
                 var_types: routine.prog.var_types.clone(),
+                local_ddl: Vec::new(),
             },
             Status::Converted { sql },
         ),
