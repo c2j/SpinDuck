@@ -64,21 +64,26 @@ fn str_rows(vals: &[&str]) -> Vec<Vec<SpinValue>> {
         .collect()
 }
 
+/// 原生 SQL `0/0` 写进 VARCHAR 的内核拼法在平台间不一致（macOS "nan"，
+/// Linux "-nan"）；其余三行（inf / 2.0 / NULL）逐字锁定。
+fn assert_native_divergence_rows(got: &[Vec<SpinValue>]) {
+    assert_eq!(got.len(), 4, "{got:?}");
+    assert_eq!(got[0], vec![SpinValue::Str("inf".into())]);
+    assert!(
+        matches!(&got[1][0], SpinValue::Str(v) if v == "nan" || v == "-nan"),
+        "0/0 row must be nan or -nan: {got:?}"
+    );
+    assert_eq!(got[2], vec![SpinValue::Str("2.0".into())]);
+    assert_eq!(got[3], vec![SpinValue::Null]);
+}
+
 #[test]
 fn should_store_native_sql_division_inf_nan_in_varchar_target() {
     let mut eng = engine("CREATE TABLE target_rows(val VARCHAR)");
     seed(&eng, "(1, 0), (0, 0), (6, 3), (NULL, 0)");
     eng.register(NATIVE_DIV).unwrap();
     eng.call("copy_div", &[]).unwrap();
-    assert_eq!(
-        rows(&eng),
-        vec![
-            vec![SpinValue::Str("inf".into())],
-            vec![SpinValue::Str("nan".into())],
-            vec![SpinValue::Str("2.0".into())],
-            vec![SpinValue::Null],
-        ]
-    );
+    assert_native_divergence_rows(&rows(&eng));
 }
 
 #[test]
@@ -153,15 +158,7 @@ fn should_distinguish_pl_division_from_native_sql_division_by_zero() {
     off_native.register(NATIVE_DIV).unwrap();
     off_native.call("copy_div", &[]).unwrap();
     let native_rows = rows(&off_native);
-    assert_eq!(
-        native_rows,
-        vec![
-            vec![SpinValue::Str("inf".into())],
-            vec![SpinValue::Str("nan".into())],
-            vec![SpinValue::Str("2.0".into())],
-            vec![SpinValue::Null],
-        ]
-    );
+    assert_native_divergence_rows(&native_rows);
 
     let mut off_pl = engine("CREATE TABLE target_rows(val VARCHAR)");
     seed(&off_pl, SEED);
