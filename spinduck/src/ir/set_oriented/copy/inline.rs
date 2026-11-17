@@ -358,6 +358,15 @@ fn is_date_fn(name: &str) -> bool {
         .any(|n| bare.eq_ignore_ascii_case(n))
 }
 
+fn num_leaf(e: &crate::ir::IrExpr) -> bool {
+    matches!(
+        e,
+        crate::ir::IrExpr::Const(crate::value::SpinValue::Int(_))
+            | crate::ir::IrExpr::Var(_)
+            | crate::ir::IrExpr::Field { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -375,13 +384,4 @@ mod tests {
         assert_eq!(once, expected);
         assert_eq!(super::total_sql(&once).unwrap(), expected);
     }
-}
-
-fn num_leaf(e: &crate::ir::IrExpr) -> bool {
-    matches!(
-        e,
-        crate::ir::IrExpr::Const(crate::value::SpinValue::Int(_))
-            | crate::ir::IrExpr::Var(_)
-            | crate::ir::IrExpr::Field { .. }
-    )
 }

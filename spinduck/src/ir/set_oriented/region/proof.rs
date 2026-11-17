@@ -12,11 +12,11 @@ pub(crate) fn prefix_is_clean(prog: &IrProg, open_pc: usize) -> Result<(), SkipR
     let handlers = exit_only_handlers(prog, open_pc)?;
     let in_handler = |pc: usize| handlers.iter().any(|(s, e)| pc >= *s && pc < *e);
     let mut dirty = false;
-    for pc in 0..open_pc {
+    for (pc, stmt) in prog.code[..open_pc].iter().enumerate() {
         if in_handler(pc) {
             continue;
         }
-        match &prog.code[pc] {
+        match stmt {
             IrStmt::TxCommit | IrStmt::TxRollback => dirty = false,
             IrStmt::SqlExec { .. } | IrStmt::SqlExecDynamic { .. } | IrStmt::CallRoutine { .. } => {
                 dirty = true;
@@ -25,13 +25,14 @@ pub(crate) fn prefix_is_clean(prog: &IrProg, open_pc: usize) -> Result<(), SkipR
                 if *to <= pc || *to > open_pc {
                     return Err(SkipReason::UnsupportedControlFlow);
                 }
-                for p in pc + 1..*to {
+                for (i, stmt) in prog.code[pc + 1..*to].iter().enumerate() {
+                    let p = pc + 1 + i;
                     if in_handler(p) {
                         continue;
                     }
                     // 退出型处理器后的收尾跳转是不可达死代码：仅放行
                     // 与本跳转同目标的前向 Jump（无效果、同汇合点）。
-                    if matches!(&prog.code[p], IrStmt::Jump(t) if t == to) {
+                    if matches!(stmt, IrStmt::Jump(t) if t == to) {
                         continue;
                     }
                     return Err(SkipReason::UnsupportedControlFlow);
