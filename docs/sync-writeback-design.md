@@ -1,7 +1,7 @@
 # sync 回写改进设计（部分回写 + 模式化 + 快路径）
 
 > 状态：**已实现（feat/sync-writeback），openGauss 5.0.0 A 模式容器 E2E 已补齐
-> （`tests/gauss_sync_e2e.rs`，实测见 validation V49 / golden/sync-perf/）**。
+> （`tests/gauss_sync_e2e.rs`，实测见 validation V50 / golden/sync-perf/）**。
 > 参照实现：fastaas `prototype-1.7/dota-scheduler/
 > dota-adapter/src/main/java/com/dota/commit`（回写框架五层拆解见 §2）。
 > 本文只承载机制设计：实证数字落地后更新 `docs/validation.md`，机制描述在实现
@@ -106,7 +106,7 @@ COPY {t} ({cols}) FROM STDIN (FORMAT csv)      ← 单事务
 - 旧逐行路径仅作为**入库前失败**的回落（快路径失败原因并入最终错误消息，
   不静默）。COPY 已提交后的失败（清理 CSV、行数核对）不回落——append 无事务，
   回落会在无唯一约束目标上静默双写；slice/upsert 经事务回滚后目标干净，
-  仍可安全回落（`FastPathFailure.loaded` 门禁，V49.2）。
+  仍可安全回落（`FastPathFailure.loaded` 门禁，V50.2）。
 
 ### 4.2 `--mode slice`：部分回写 + 幂等重跑
 
@@ -217,7 +217,7 @@ upsert `UPDATE+INSERT == staging` 交叉校验（DROP 移出计数）。
 
 登记待后续（不阻断合入）：
 
-1. ~~G1/G4 元数据 SQL 未对真实 openGauss 执行过~~ **已闭环（V49）**：A 模式
+1. ~~G1/G4 元数据 SQL 未对真实 openGauss 执行过~~ **已闭环（V50）**：A 模式
    `''`=NULL 塌缩、`unnest(conkey)` 方言非法、`conkey::text` 花括号、裸唯一
    索引漏检四处缺陷全部实测复现并修复，`gauss_sync_e2e` 全绿。
 2. 回滚失败（`let _ = self.exec("ROLLBACK")`）吞错后仍继续回落——应终止回落。
