@@ -49,7 +49,7 @@ pub fn parse_script(text: &str) -> Result<ParsedScript, EngineError> {
     let mut vars: BTreeMap<String, String> = BTreeMap::new();
     let mut lines = Vec::new();
     let mut default_db: Option<String> = None;
-    for (line_no, raw) in logical_lines(text) {
+    for (line_no, raw) in logical_lines(text)? {
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -112,37 +112,52 @@ pub fn parse_script(text: &str) -> Result<ParsedScript, EngineError> {
 }
 
 /// 物理行 → 逻辑行（行号取续行首行的物理行号）。
-/// 续行规则（设计 §2.2）：行尾在**引号外**的奇数个 `\` 把本行与下一物理行
-/// 拼接；`\\`（偶数个）是字面反斜杠不续行；引号未闭合的行不续行
-/// （交给词法层报引号错）。EOF 处残留的续行符按普通字符处理。
-fn logical_lines(text: &str) -> Vec<(usize, String)> {
+/// 续行规则（设计 §2.2/§4.1）：**换行符紧邻**的引号外奇数个 `\` 才续行——
+/// `\` 与换行之间夹空白不续行；`\\`（偶数个）是字面反斜杠；引号未闭合的行
+/// 不续行（交给词法层报引号错）；整行 `#` 注释与空行不进入续行拼接
+/// （注释词不得成为 argv），且会终结进行中的续行；EOF 处仍挂续行 →
+/// `ENG-0010`（孤立 `\` 是词法错误，不是静默丢字符）。
+fn logical_lines(text: &str) -> Result<Vec<(usize, String)>, EngineError> {
     let mut out: Vec<(usize, String)> = Vec::new();
     let mut pending: Option<(usize, String)> = None;
     for (idx, raw) in text.lines().enumerate() {
         let line_no = idx + 1;
-        let (start, mut logical) = match pending.take() {
-            // 续行拼接处补一个空格：`foo\`+`bar` 不得黏成 `foobar`
-            Some((s, acc)) => {
-                let mut l = acc;
-                l.push(' ');
-                (s, l)
+        let trimmed = raw.trim();
+        let blank_or_comment = trimmed.is_empty() || trimmed.starts_with('#');
+        if let Some((start, acc)) = pending.take() {
+            if blank_or_comment {
+                // 注释/空行不写入逻辑行；续行就此完结（\ 换行已被消耗）
+                out.push((start, acc));
+                continue;
             }
-            None => (line_no, String::new()),
-        };
+            // 拼接处补一个空格：`foo\`+`bar` 不得黏成 `foobar`
+            let mut logical = acc;
+            logical.push(' ');
+            logical.push_str(raw);
+            match continuation_cut(&logical) {
+                Some(cut) => pending = Some((start, logical[..cut].to_string())),
+                None => out.push((start, logical)),
+            }
+            continue;
+        }
+        if blank_or_comment {
+            continue;
+        }
+        let mut logical = String::new();
         logical.push_str(raw);
         match continuation_cut(&logical) {
-            Some(cut) => pending = Some((start, logical[..cut].to_string())),
-            None => out.push((start, logical)),
+            Some(cut) => pending = Some((line_no, logical[..cut].to_string())),
+            None => out.push((line_no, logical)),
         }
     }
-    if let Some((s, acc)) = pending {
-        // EOF 续行：续行符已在 cut 处摘除，残余按普通行处理
-        out.push((s, acc));
+    if pending.is_some() {
+        return Err(usage_err("行尾孤立 `\\`（续行符后没有下一行）"));
     }
-    out
+    Ok(out)
 }
 
 /// 若逻辑行以「引号外的奇数个 `\`」结尾，返回该续行反斜杠的字节下标。
+/// 只看最后一个字符：`\` 后还有空白则不是续行（交给词法层按转义处理）。
 fn continuation_cut(line: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let (mut i, mut in_s, mut in_d) = (0usize, false, false);
@@ -167,23 +182,16 @@ fn continuation_cut(line: &str) -> Option<usize> {
         }
         i += 1;
     }
-    if in_s || in_d {
-        return None;
-    }
-    let mut end = bytes.len();
-    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    if end == 0 || bytes[end - 1] != b'\\' {
+    if in_s || in_d || bytes.last() != Some(&b'\\') {
         return None;
     }
     let mut bs = 0usize;
-    let mut j = end;
+    let mut j = bytes.len();
     while j > 0 && bytes[j - 1] == b'\\' {
         bs += 1;
         j -= 1;
     }
-    (bs % 2 == 1).then_some(end - 1)
+    (bs % 2 == 1).then_some(bytes.len() - 1)
 }
 
 /// token 的词法片段：`Lit` = 引号/转义产出的最终文本（不再展开）；
@@ -414,7 +422,7 @@ fn check_shell_ops(tokens: &[String], line_no: usize) -> Result<(), EngineError>
 /// 的单引号形态 → `SpinValue::Str`，保真前导零）。
 /// 旗标值判定必须与 `parse_call` 的取值规则一致：**吃下一个 token 的旗标**
 /// 才跳过 `str:` 转换；`--batch-commit` 是无值旗标，其后的 token 仍是位置
-/// 参数（PR#51 审核：按 `--` 前缀一刀切会把 `--batch-commit str:x` 的
+/// 参数（按 `--` 前缀一刀切会把 `--batch-commit str:x` 的
 /// `str:x` 漏转换、把 `--file` 的值误转）。
 const CALL_VALUE_FLAGS: [&str; 8] = [
     "--db",
@@ -535,7 +543,7 @@ mod tests {
 
     #[test]
     fn should_apply_str_sugar_after_valueless_batch_commit_flag() {
-        // PR#51 审核：--batch-commit 不吃下一个 token，其后的 str: 仍是位置实参
+        // --batch-commit 不吃下一个 token，其后的 str: 仍是位置实参
         let got = cmds("call --file f.sql prc_id --batch-commit str:0130000001\n");
         assert_eq!(got[0][5], "'0130000001'", "{got:?}");
         // 无值旗标后紧跟吃值旗标：str: 是 --file 的值，不得转换
@@ -583,8 +591,29 @@ mod tests {
 
     #[test]
     fn should_unescape_quote_inside_double_quotes() {
-        // 设计 §2.2：双引号内 \" → "（PR#51 审核补齐）
+        // 设计 §2.2：双引号内 \" → "
         let got = cmds("call --file f prc \"a=\\\"b\\\"\"\n");
         assert_eq!(got[0][4], "a=\"b\"", "{got:?}");
+    }
+
+    #[test]
+    fn should_reject_lone_trailing_backslash_at_eof() {
+        // 孤立续行符是词法错误（ENG-0010），不得静默吞掉 \ 继续执行
+        let e = parse_script("call --file f prc str:013\\\n").unwrap_err();
+        assert_eq!(e.code.to_string(), "ENG-0010", "{e}");
+        let e2 = parse_script("call --file f prc str:013\\").unwrap_err();
+        assert_eq!(e2.code.to_string(), "ENG-0010", "{e2}");
+    }
+
+    #[test]
+    fn should_not_continue_over_comment_or_blank_lines() {
+        // 续行遇整行 # 注释/空行：注释词不得进入 argv，续行就此完结
+        let got = cmds("call --file f prc \\\n  # note\nstr:1\n");
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0], vec!["call", "--file", "f", "prc"]);
+        assert_eq!(got[1], vec!["str:1"]);
+        // \ 与换行之间夹空白不是续行：两行各自成指令
+        let got2 = cmds("call --file f prc a\\ \ncall --file f prc b\n");
+        assert_eq!(got2.len(), 2, "{got2:?}");
     }
 }

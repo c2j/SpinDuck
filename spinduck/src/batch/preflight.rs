@@ -91,7 +91,7 @@ pub fn preflight(parsed: &ParsedScript) -> Result<Vec<Step>, EngineError> {
                     ));
                 }
                 // `--trace` 冲突只对 `call` 生效（`explain --trace` 是输入不是输出）。
-                // Phase 1 同时拒绝"目标已存在"（PR#51 审核：单步契约是
+                // Phase 1 同时拒绝"目标已存在"（单步契约是
                 // TraceRun::open create_new → ENV-0016；若拖到 Phase 2 才发现，
                 // 库文件已经落下，--dry-run 也会被误放行）。
                 if let Command::Call { trace: Some(p), .. } = &cmd {
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn should_reject_existing_trace_file_in_phase1() {
-        // PR#51 审核：trace 目标已存在必须在 Phase 1 拒（ENV-0016），
+        // trace 目标已存在必须在 Phase 1 拒（ENV-0016），
         // 否则 Phase 2 先建库后 TraceRun::open 才失败，留下空 .duckdb。
         let tmp = tempfile::tempdir().unwrap();
         let log = tmp.path().join("audit.log");

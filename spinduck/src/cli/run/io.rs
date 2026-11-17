@@ -245,7 +245,7 @@ pub(super) fn sync_cmd(parts: SyncParts, out: &mut dyn Write) -> Result<i32, Eng
 
 /// `sync` 的 GaussDB 侧前置：`resolve_mode` + 连接 env/建链。
 /// 单步与 batch 共用——**必须先于任何 DuckDB open**（缺 env/坏 mode 不得
-/// 留下空库文件，PR#51 审核）。
+/// 留下空库文件）。
 #[cfg(feature = "gauss")]
 pub(crate) fn sync_prepare(
     parts: &SyncParts,

@@ -627,7 +627,7 @@ mod tests {
         assert!(out.contains("OUT p_o = 42"), "{out}");
     }
 
-    /// PR#51 审核修复守护：batch 引擎缓存复用同一 `Engine`，`call_engine` 必须把
+    /// batch 引擎缓存复用同一 `Engine`，`call_engine` 必须把
     /// `step_budget` 缺省写回 `DEFAULT_STEP_BUDGET`——否则上一调用的
     /// `--step-budget` 泄漏给下一调用（收紧→误报 ENG-0032；放大→护栏失效）。
     #[cfg(feature = "native")]

@@ -233,7 +233,7 @@ fn run_sync(
     out: &mut dyn Write,
 ) -> Result<i32, EngineError> {
     let parts = run::io::cmd_sync(step.cmd.clone());
-    // 顺序契约（PR#51 审核）：resolve_mode + GaussDB env/连接先于 clone_executor
+    // 顺序契约：resolve_mode + GaussDB env/连接先于 clone_executor
     // ——缺 env/坏 mode 时不得留下空 .duckdb（与单步 sync_cmd 同序）。
     let (mode, mut og) = run::io::sync_prepare(&parts)?;
     let dbkey = DbKey::of(&parts.db);
@@ -247,7 +247,7 @@ fn run_sync(
 mod tests {
     use super::*;
 
-    /// PR#51 审核守护：`sync` 的 GaussDB 前置（resolve_mode/env）必须先于
+    /// `sync` 的 GaussDB 前置（resolve_mode/env）必须先于
     /// 任何 DuckDB open——前置失败时库文件不得落盘（与单步 sync_cmd 同序）。
     #[test]
     fn should_not_create_db_file_when_sync_precheck_fails() {
