@@ -31,11 +31,11 @@ if [ "${SPINDUCK_GSQL_DOCKER:-}" = "1" ]; then
         printf "%s\n" "$GSQL_PW" | $BIN -2 $CONN -U "$U" -d "$D" -v ON_ERROR_STOP=1 "$@"
       else
         tmp=$(mktemp /tmp/.gsql-stdin.XXXXXX) || exit 1
-        cat > "$tmp"
+        # EXIT trap：gsql 非零/中断也删临时 SQL（文件只含 SQL，无口令）；
+        # mktemp 路径无空格，定义期展开安全
+        trap "rm -f $tmp" EXIT
+        cat > "$tmp" || exit 1
         printf "%s\n" "$GSQL_PW" | $BIN -2 $CONN -U "$U" -d "$D" -v ON_ERROR_STOP=1 -f "$tmp"
-        rc=$?
-        rm -f "$tmp"
-        exit $rc
       fi
     ' _ "$USER" "$DB" "$@"
 else
@@ -46,12 +46,11 @@ else
       -v ON_ERROR_STOP=1 "$@"
   else
     tmp=$(mktemp /tmp/.gsql-stdin.XXXXXX) || exit 1
+    # EXIT trap：set -e 下 gsql 非零也会删临时 SQL（文件只含 SQL，无口令）
+    trap 'rm -f "$tmp"' EXIT
     cat > "$tmp"
     printf '%s\n' "$SPINDUCK_OG_PASSWORD" | gsql -2 \
       -h "$SPINDUCK_OG_HOST" -p "$PORT" -U "$USER" -d "$DB" \
       -v ON_ERROR_STOP=1 -f "$tmp"
-    rc=$?
-    rm -f "$tmp"
-    exit $rc
   fi
 fi
