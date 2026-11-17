@@ -7,12 +7,14 @@
 //! 面在 `exec.rs`。本文件只留 `Command`/`CallTarget` 契约、`parse` 派发、共享旗标
 //! 工具与 usage 文案。
 
+mod batch;
 mod call;
 mod compile;
 mod exec;
 mod project;
 mod snapshot;
 
+use batch::parse_batch;
 use call::parse_call;
 use compile::parse_compile;
 use exec::{parse_explain, parse_materialize, parse_sync};
@@ -91,6 +93,14 @@ pub enum Command {
         b: PathBuf,
         key: Vec<String>,
     },
+    /// 同进程批处理脚本（`.sdsh`）：按序编排多条指令，共享库连接/引擎缓存。
+    Batch {
+        script: PathBuf,
+        /// 步失败后继续执行余下步骤，批级退出码仍为 1。
+        continue_on_error: bool,
+        /// 只做 Phase 1 预检不执行（零副作用）。
+        dry_run: bool,
+    },
     /// 调用例程（可先从 SQL 文件注册例程；可选持久化库文件）。
     Call {
         db: Option<PathBuf>,
@@ -161,6 +171,7 @@ pub fn parse(argv: &[String]) -> Result<Command, EngineError> {
         "query" => parse_query(&argv[1..]),
         "compare" => parse_compare(&argv[1..]),
         "call" => parse_call(&argv[1..]),
+        "batch" => parse_batch(&argv[1..]),
         other => Err(usage_err(format!("unknown subcommand {other}"))),
     }
 }
@@ -245,7 +256,10 @@ pub fn usage() -> &'static str {
      \x20                                  规则口径：内置种子 < 项目发现 < --rules；\n\
      \x20                                  --trace 把审计日志逐行落盘（默认 text），sidecar <日志>.sql\n\
      \x20                                  按行内 sqlid 存 SQL 全文，可 grep 反查；日志目标已存在即\n\
-     \x20                                  ENV-0016 拒绝执行、不覆盖上一轮审计，重跑请换路径）\n"
+     \x20                                  ENV-0016 拒绝执行、不覆盖上一轮审计，重跑请换路径）\n\
+     \x20 batch <script.sdsh> [--continue-on-error] [--dry-run]\n\
+     \x20                                同进程按序执行 .sdsh 脚本（use/--db/set/子命令行）；\n\
+     \x20                                共享库连接与引擎缓存，--dry-run 只预检零副作用\n"
 }
 
 #[cfg(test)]

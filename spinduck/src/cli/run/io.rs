@@ -15,14 +15,14 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
-pub(super) struct MaterializeParts {
-    db: PathBuf,
-    tables: Vec<String>,
-    where_clause: Option<String>,
-    jobs: Option<usize>,
+pub(crate) struct MaterializeParts {
+    pub(crate) db: PathBuf,
+    pub(crate) tables: Vec<String>,
+    pub(crate) where_clause: Option<String>,
+    pub(crate) jobs: Option<usize>,
 }
 
-pub(super) fn cmd_materialize(cmd: Command) -> MaterializeParts {
+pub(crate) fn cmd_materialize(cmd: Command) -> MaterializeParts {
     match cmd {
         Command::Materialize {
             db,
@@ -39,17 +39,17 @@ pub(super) fn cmd_materialize(cmd: Command) -> MaterializeParts {
     }
 }
 
-pub(super) struct SyncParts {
-    db: PathBuf,
-    table: String,
-    cols: Vec<String>,
-    where_clause: Option<String>,
-    mode: Option<String>,
-    slice: Option<String>,
-    key: Option<String>,
+pub(crate) struct SyncParts {
+    pub(crate) db: PathBuf,
+    pub(crate) table: String,
+    pub(crate) cols: Vec<String>,
+    pub(crate) where_clause: Option<String>,
+    pub(crate) mode: Option<String>,
+    pub(crate) slice: Option<String>,
+    pub(crate) key: Option<String>,
 }
 
-pub(super) fn cmd_sync(cmd: Command) -> SyncParts {
+pub(crate) fn cmd_sync(cmd: Command) -> SyncParts {
     match cmd {
         Command::Sync {
             db,
@@ -130,17 +130,28 @@ pub(super) fn materialize_cmd(
     parts: MaterializeParts,
     out: &mut dyn Write,
 ) -> Result<i32, EngineError> {
-    let workdir = materialize_workdir(&parts.db);
     let duck = crate::sql::DuckExecutor::open(&parts.db.to_string_lossy())?;
+    materialize_with_executor(&parts, &duck, out)
+}
+
+/// batch 共享连接入口：DuckDB 连接由调用方池化提供（GaussDB 连接仍逐步新建，
+/// 不池化——见 materialize-copystream-design 决策）。
+#[cfg(feature = "gauss")]
+pub(crate) fn materialize_with_executor(
+    parts: &MaterializeParts,
+    duck: &crate::sql::DuckExecutor,
+    out: &mut dyn Write,
+) -> Result<i32, EngineError> {
+    let workdir = materialize_workdir(&parts.db);
     if let [table] = parts.tables.as_slice() {
         // 单表形态：与 V26 语义逐字一致（允许 --where）
         let mut og = open_gauss()?;
-        let outcome = og.materialize(&duck, table, parts.where_clause.as_deref(), &workdir)?;
+        let outcome = og.materialize(duck, table, parts.where_clause.as_deref(), &workdir)?;
         warn_degraded(table, outcome.degraded.as_deref());
         writeln!(out, "MATERIALIZE {} rows={}", table, outcome.rows).map_err(io_err)?;
         return Ok(EXIT_OK);
     }
-    materialize_multi(&parts, &duck, &workdir, out)
+    materialize_multi(parts, duck, &workdir, out)
 }
 
 /// 多表形态（V27 §3.6）：--jobs 个工作线程，每线程独立 GaussDB 连接 + 独立
@@ -224,17 +235,55 @@ pub(super) fn materialize_cmd(
 
 #[cfg(feature = "gauss")]
 pub(super) fn sync_cmd(parts: SyncParts, out: &mut dyn Write) -> Result<i32, EngineError> {
+    // 顺序契约：GaussDB env 校验/连接先于 DuckDB open——env 缺失时不落空库文件。
+    let (mode, mut og) = sync_prepare(&parts)?;
+    // 临时 CSV 与目标库同目录（失败诊断现场自包含；成功即删，设计 §4.1）
+    let workdir = materialize_workdir(&parts.db);
+    let duck = crate::sql::DuckExecutor::open(&parts.db.to_string_lossy())?;
+    sync_write_tail(&parts, &mode, &workdir, &mut og, &duck, out)
+}
+
+/// `sync` 的 GaussDB 侧前置：`resolve_mode` + 连接 env/建链。
+/// 单步与 batch 共用——**必须先于任何 DuckDB open**（缺 env/坏 mode 不得
+/// 留下空库文件）。
+#[cfg(feature = "gauss")]
+pub(crate) fn sync_prepare(
+    parts: &SyncParts,
+) -> Result<(crate::io::sync::SyncMode, crate::io::GaussConn), EngineError> {
     let mode = crate::io::sync::resolve_mode(
         parts.mode.as_deref(),
         parts.slice.as_deref(),
         parts.key.as_deref(),
         parts.where_clause.as_deref(),
     )?;
-    // 临时 CSV 与目标库同目录（失败诊断现场自包含；成功即删，设计 §4.1）
+    let og = open_gauss()?;
+    Ok((mode, og))
+}
+
+/// batch 共享连接入口：DuckDB 连接复用池化句柄（已开库，无新增文件副作用）；
+/// GaussDB 连接由调用方经 [`sync_prepare`] 先行建好（不跨步复用）。
+#[cfg(feature = "gauss")]
+pub(crate) fn sync_with_executor(
+    parts: &SyncParts,
+    mode: &crate::io::sync::SyncMode,
+    og: &mut crate::io::GaussConn,
+    duck: &crate::sql::DuckExecutor,
+    out: &mut dyn Write,
+) -> Result<i32, EngineError> {
     let workdir = materialize_workdir(&parts.db);
-    let mut og = open_gauss()?;
-    let duck = crate::sql::DuckExecutor::open(&parts.db.to_string_lossy())?;
-    let oc = og.sync_write(&duck, &parts.table, &parts.cols, &mode, &workdir)?;
+    sync_write_tail(parts, mode, &workdir, og, duck, out)
+}
+
+#[cfg(feature = "gauss")]
+fn sync_write_tail(
+    parts: &SyncParts,
+    mode: &crate::io::sync::SyncMode,
+    workdir: &Path,
+    og: &mut crate::io::GaussConn,
+    duck: &crate::sql::DuckExecutor,
+    out: &mut dyn Write,
+) -> Result<i32, EngineError> {
+    let oc = og.sync_write(duck, &parts.table, &parts.cols, mode, workdir)?;
     // 缺省形态（无 mode/where）保持 V26 契约逐字不变
     if parts.mode.is_none() && parts.where_clause.is_none() {
         writeln!(out, "SYNC {} rows={}", parts.table, oc.rows).map_err(io_err)?;

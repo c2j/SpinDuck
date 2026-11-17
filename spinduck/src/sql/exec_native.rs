@@ -54,6 +54,14 @@ impl DuckExecutor {
         Self { conn }
     }
 
+    /// 克隆到同一 DB instance 的新连接（batch 共享池：`Engine.ex` 独占持有，
+    /// 同库绝不二次 `Connection::open`——文件锁；编目/MACRO 级共享由 DuckDB MVCC 承载）。
+    pub fn try_clone(&self) -> Result<Self, EngineError> {
+        Ok(Self::from_connection(
+            self.conn.try_clone().map_err(kernel_err)?,
+        ))
+    }
+
     /// SpinValue → duckdb Value（NULL 以 Varchar 空类型承载，绑定语义等价）。
     fn to_duck(v: &SpinValue) -> Value {
         match v {
@@ -623,5 +631,22 @@ mod tests {
             .query("SELECT COUNT(*) FROM t", &BindMap::new())
             .unwrap_or_else(|e| panic!("失败语句后同会话不可查询: {}", e.message));
         assert_eq!(s.fetch_many(1)[0][0].as_str_loose(), "2");
+    }
+
+    #[test]
+    fn should_share_database_instance_across_try_clone_connections() {
+        // batch 共享池的连接前提：try_clone 出的连接与原连接是同一 DB instance
+        // ——原连接建的表 clone 连接可见，clone 写入原连接可见（DuckDB 编目级共享）
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        let clone = ex.try_clone().expect("in-memory 库也支持连接克隆");
+        ex.execute("CREATE TABLE t(a INT)", &BindMap::new())
+            .unwrap();
+        clone
+            .execute("INSERT INTO t VALUES (7)", &BindMap::new())
+            .unwrap();
+        let mut s = clone.query("SELECT a FROM t", &BindMap::new()).unwrap();
+        assert_eq!(s.fetch_many(1)[0][0], SpinValue::Int(7));
+        let mut s2 = ex.query("SELECT COUNT(*) FROM t", &BindMap::new()).unwrap();
+        assert_eq!(s2.fetch_many(1)[0][0].as_str_loose(), "1");
     }
 }

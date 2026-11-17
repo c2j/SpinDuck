@@ -4,14 +4,24 @@
 use crate::catalog::{compile_statement_routine_with_names, CallResult, RoutineCatalog};
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
-use crate::ir::{compile_routine_with_names, AssignTarget, IrProg, VarName};
+use crate::ir::{compile_routine_with_names, IrProg, VarName};
 use crate::rules::RuleRegistry;
 use crate::runtime::{Frame, RunOutcome};
 use crate::value::SpinValue;
 use ogsql_parser::ast::Statement;
 use ogsql_parser::token::tokenizer::Tokenizer;
 
+mod batch_hooks;
 mod set_oriented;
+mod support;
+
+pub use crate::exec::TraceNoopSink;
+pub(crate) use support::{declares_routine, format_statements, has_package_spec};
+pub use support::{param_names_to_vars, var_target, EvalCtx};
+
+/// batch 编译产物缓存类型（`engine::batch_hooks` 的公开出口——batch 层
+/// 需要具名类型来装配 `Rc<RefCell<CompiledRoutineCache>>`）。
+pub use batch_hooks::CompiledRoutineCache;
 
 /// 引擎：执行器 + 规则 + 例程目录。
 pub struct Engine {
@@ -38,6 +48,9 @@ pub struct Engine {
     /// 命中跳过 tokenize/parse/编译全链路；键含注册上下文指纹，
     /// 保证例程互调下沉与宏消歧不串条目。
     pub ir_cache: Option<crate::ir_cache::IrCache>,
+    /// batch 编译产物缓存（`engine::batch_hooks`）：`None` = 逐次编译（单步 CLI 现状）。
+    /// 命中时跳过 tokenize/parse/IR 编译，直接重放 `CompiledRoutine`。
+    compiled_cache: Option<std::rc::Rc<std::cell::RefCell<batch_hooks::CompiledRoutineCache>>>,
 }
 
 pub struct CallResultExt {
@@ -64,6 +77,7 @@ impl Engine {
             memo,
             lookup,
             ir_cache: None,
+            compiled_cache: None,
         }
     }
 
@@ -84,6 +98,14 @@ impl Engine {
     }
 
     fn register_named(&mut self, sql_text: &str) -> Result<Vec<String>, EngineError> {
+        if self.compiled_cache.is_some() {
+            return self.register_cached_named(sql_text);
+        }
+        self.register_named_uncached(sql_text)
+    }
+
+    /// 无缓存的注册路径（`register_cached_named` 未命中时委托到这里）。
+    fn register_named_uncached(&mut self, sql_text: &str) -> Result<Vec<String>, EngineError> {
         // IR 缓存命中：跳过解析/编译，按登记语义回放（宏安装 + 目录注册）
         let cache_key = self
             .ir_cache
@@ -443,66 +465,6 @@ impl Engine {
         }
         Ok(result)
     }
-}
-
-/// 文本是否声明例程（`CREATE … PROCEDURE|FUNCTION|PACKAGE`）。
-/// 粗粒度文本判定：只用于"零登记"护栏，宁可多报也不放过静默丢弃。
-fn declares_routine(sql_text: &str) -> bool {
-    let up = sql_text.to_ascii_uppercase();
-    up.contains("CREATE")
-        && ["PROCEDURE", "FUNCTION", "PACKAGE"]
-            .iter()
-            .any(|k| up.contains(k))
-}
-
-/// 解析结果里是否存在包规格（spec 合法地不产出例程名，只有包体才编译例程）。
-fn has_package_spec(stmts: &[Statement]) -> bool {
-    stmts
-        .iter()
-        .any(|st| matches!(st, Statement::CreatePackage(_)))
-}
-
-/// SQL 文本 → 各语句的规范化文本（目录表重放用，依赖 ogsql formatter）。
-fn format_statements(sql_text: &str) -> Result<Vec<String>, EngineError> {
-    let tokens = Tokenizer::new(sql_text)
-        .tokenize()
-        .map_err(|e| EngineError::invariant(63, format!("tokenizer: {e}")))?;
-    let stmts = ogsql_parser::parser::Parser::new(tokens).parse();
-    Ok(stmts
-        .iter()
-        .map(|st| ogsql_parser::formatter::SqlFormatter::new().format_statement(st))
-        .collect())
-}
-
-/// TraceSink 的空实现（引擎默认；CLI/监控注入真实 sink）。
-pub struct TraceNoopSink;
-impl crate::exec::TraceSink for TraceNoopSink {
-    #[inline]
-    fn is_enabled(&self) -> bool {
-        false
-    }
-    fn on_event(&mut self, _event: crate::exec::TraceEvent) {}
-}
-
-/// 表达式求值环境（PL 上下文函数直调需要 catalog/ex）。
-pub struct EvalCtx<'a> {
-    pub frame: &'a Frame,
-    pub ex: &'a dyn SqlExecutor,
-    pub cat: &'a RoutineCatalog,
-    pub depth: usize,
-}
-
-/// AssignTarget 的便捷构造（CallRoutine OUT 写回）。
-pub fn var_target(name: &str) -> AssignTarget {
-    AssignTarget::Var(VarName(name.to_ascii_lowercase()))
-}
-
-/// 供 ir 测试与 engine 使用：SQL 文本 → 参数名 → 帧变量集（M6 扩展点落地）。
-pub fn param_names_to_vars(params: &[String]) -> Vec<VarName> {
-    params
-        .iter()
-        .map(|p| VarName(p.to_ascii_lowercase()))
-        .collect()
 }
 
 #[cfg(all(test, feature = "native"))]

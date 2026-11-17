@@ -4,6 +4,7 @@
 //! [`exec::TraceSink`] 两个接缝；DuckDB API 只允许出现在 `sql/exec.rs` 的
 //! 原生实现中。
 
+pub mod batch;
 pub mod catalog;
 pub mod cli;
 pub mod engine;

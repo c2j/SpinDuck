@@ -16,7 +16,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 /// 兼容取包（避免在 match 中重复绑定）。
-pub(super) fn cmd_call(cmd: Command) -> CallParts {
+pub(crate) fn cmd_call(cmd: Command) -> CallParts {
     match cmd {
         Command::Call {
             db,
@@ -45,7 +45,7 @@ pub(super) fn cmd_call(cmd: Command) -> CallParts {
     }
 }
 
-pub(super) struct CallParts {
+pub(crate) struct CallParts {
     db: Option<PathBuf>,
     rules: Option<PathBuf>,
     files: Vec<PathBuf>,
@@ -59,22 +59,38 @@ pub(super) struct CallParts {
 }
 
 #[cfg(feature = "native")]
+impl CallParts {
+    /// batch 分发用：`--db` 解析结果（None = 未给且未注入 → 匿名 :memory:）。
+    pub(crate) fn db_path(&self) -> Option<&std::path::Path> {
+        self.db.as_deref()
+    }
+    /// batch 分发用：位置实参原文（`str:` 已在词法期归一为 `'...'`）。
+    pub(crate) fn args(&self) -> &[String] {
+        &self.args
+    }
+    pub(crate) fn batch_commit(&self) -> bool {
+        self.batch_commit
+    }
+    pub(crate) fn step_budget(&self) -> Option<u64> {
+        self.step_budget
+    }
+    /// batch 分发用：`--trace` 参数包（`proc` 由调用方定——batch 传 `stepNN:目标`）。
+    pub(crate) fn trace_spec(&self, proc: String) -> Option<CallTraceSpec> {
+        self.trace.as_ref().map(|p| CallTraceSpec {
+            path: p.clone(),
+            format: self.trace_format,
+            level: self.trace_level,
+            proc,
+        })
+    }
+}
+
+#[cfg(feature = "native")]
 pub(super) fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, EngineError> {
-    use crate::cli::args::parse_literal;
     use crate::engine::Engine;
-    let Some(t) = call_target_and_sources(&parts, out)? else {
+    let Some(prep) = prepare_call(&parts, out)? else {
         return Ok(EXIT_FAIL);
     };
-    // 规则优先级链（F1，与 compile 同口径）：内置种子 < 项目发现 < --rules 手动覆盖。
-    // 缺件门排在开库之前不动：先取目标与源清单，再建规则表。
-    let rules_files: Vec<PathBuf> = t.rules_files.into_iter().collect();
-    let mut rules = RuleRegistry::default().with_project_rules(&rules_files)?;
-    let (target, sources) = (t.target, t.sources);
-    if let Some(p) = &parts.rules {
-        let raw = std::fs::read_to_string(p)
-            .map_err(|e| EngineError::env(12, format!("read rules: {e}")))?;
-        rules.overlay(&raw)?;
-    }
     let ex = match &parts.db {
         Some(p) => crate::sql::DuckExecutor::open(&p.to_string_lossy())?,
         None => crate::sql::DuckExecutor::open_in_memory()?,
@@ -82,52 +98,166 @@ pub(super) fn call_cmd(parts: CallParts, out: &mut dyn Write) -> Result<i32, Eng
     // 内核此刻的对象目录要在开库后、把执行器交给引擎之前取：缺件门的参照面就是它。
     let objects = crate::verify::kernel_objects(&ex)?;
     // IR 缓存（二期）：预读全部源文本，stamp 覆盖源+规则+parser/kernel
-    // pin；能向上发现项目声明时启用，键再叠加注册上下文指纹。
-    let mut texts: Vec<(String, String)> = Vec::with_capacity(sources.len());
-    for f in &sources {
+    // pin；能向上发现项目声明时启用，键再叠加注册上下文指纹。预读文本同时
+    // 交给 call_engine 注册——stamp 与注册消费同一份读取，避免中途文件变更
+    // 造成缓存键与登记内容不一致。
+    let mut texts: Vec<(String, String)> = Vec::with_capacity(prep.sources.len());
+    for f in &prep.sources {
         let text = crate::cli::read_source_strict(f)?;
         texts.push((f.to_string_lossy().into_owned(), text));
     }
-    let ir_cache = sources.first().and_then(|first| {
+    let ir_cache = prep.sources.first().and_then(|first| {
         let project = crate::project::ProjectConfig::discover_strict(first).ok()??;
-        let stamp = crate::ir_cache::CompileGateStamp::compute(&texts, &rules);
+        let stamp = crate::ir_cache::CompileGateStamp::compute(&texts, &prep.rules);
         let dir = project.root.join(&project.home_dir).join("ir-cache");
         Some(crate::ir_cache::IrCache::open(&dir, &stamp))
     });
-    let mut eng = Engine::new(Box::new(ex), rules);
+    let mut eng = Engine::new(Box::new(ex), prep.rules.clone());
     eng.ir_cache = ir_cache;
-    eng.batch_commit = parts.batch_commit;
-    eng.set_oriented = t.set_oriented;
-    // 复核应修 C：大业务（100k 级游标循环）默认预算不够，CLI 放大入口
-    if let Some(b) = parts.step_budget {
-        eng.step_budget = b;
+    let trace = parts.trace.as_ref().map(|p| CallTraceSpec {
+        path: p.clone(),
+        format: parts.trace_format,
+        level: parts.trace_level,
+        proc: prep.target.clone(),
+    });
+    call_engine(
+        &mut eng,
+        &prep,
+        &CallRun {
+            args: &parts.args,
+            batch_commit: parts.batch_commit,
+            step_budget: parts.step_budget,
+            register_sources: true,
+            source_texts: Some(&texts),
+            objects: &objects,
+            trace,
+        },
+        out,
+    )
+}
+
+/// `call` 的开库前准备产物（batch 共享：目标/源清单/生效规则一次算清，
+/// 缺件拒绝时返回 `None` 且已打印 MISS 行）。
+#[cfg(feature = "native")]
+pub(crate) struct CallPrepared {
+    pub target: String,
+    pub sources: Vec<PathBuf>,
+    pub rules: RuleRegistry,
+    pub set_oriented: bool,
+    pub codeweb_refs: Option<Vec<crate::plan::PlanRef>>,
+}
+
+#[cfg(feature = "native")]
+pub(crate) fn prepare_call(
+    parts: &CallParts,
+    out: &mut dyn Write,
+) -> Result<Option<CallPrepared>, EngineError> {
+    let Some(t) = call_target_and_sources(parts, out)? else {
+        return Ok(None);
+    };
+    // 规则优先级链（F1，与 compile 同口径）：内置种子 < 项目发现 < --rules 手动覆盖。
+    // 缺件门排在开库之前不动：先取目标与源清单，再建规则表。
+    let rules_files: Vec<PathBuf> = t.rules_files.into_iter().collect();
+    let mut rules = RuleRegistry::default().with_project_rules(&rules_files)?;
+    if let Some(p) = &parts.rules {
+        let raw = std::fs::read_to_string(p)
+            .map_err(|e| EngineError::env(12, format!("read rules: {e}")))?;
+        rules.overlay(&raw)?;
     }
-    for (_, text) in &texts {
-        eng.register(text)?;
+    Ok(Some(CallPrepared {
+        target: t.target,
+        sources: t.sources,
+        rules,
+        set_oriented: t.set_oriented,
+        codeweb_refs: t.codeweb_refs,
+    }))
+}
+
+/// 一次 `call` 的审计日志参数。`proc` 由调用方定：单步 CLI 传目标例程名，
+/// batch 传 `stepNN:<目标>`（同毫秒相邻调用的 (sid,cid) 会撞，步序号消歧）。
+#[cfg(feature = "native")]
+pub(crate) struct CallTraceSpec {
+    pub path: PathBuf,
+    pub format: crate::trace::TraceFormat,
+    pub level: crate::trace::TraceLevel,
+    pub proc: String,
+}
+
+/// `call_engine` 的运行参数包（引擎已就位：注册与否由 `register_sources` 决定，
+/// EngineCache 命中路径传 `false`——catalog 已含全部例程，跳过 register 省编译）。
+#[cfg(feature = "native")]
+pub(crate) struct CallRun<'a> {
+    pub args: &'a [String],
+    pub batch_commit: bool,
+    pub step_budget: Option<u64>,
+    pub register_sources: bool,
+    /// 预读源文本（`(路径显示名, 内容)`）：`Some` 时注册直接消费它，不再重读文件
+    /// ——单步 `call` 的 ir_cache stamp 与注册必须看到同一份字节；`None`（batch）
+    /// 退化为注册时逐文件 `read_source_strict`。
+    pub source_texts: Option<&'a [(String, String)]>,
+    pub objects: &'a std::collections::BTreeSet<crate::verify::ObjectRef>,
+    pub trace: Option<CallTraceSpec>,
+}
+
+/// 引擎就绪后的公共尾段：运行期开关 → （可选）注册源 → 缺件门 → 审计 → call → 渲染。
+/// 单步 `call` 与 batch `call` 步共用，保证门禁顺序契约只有一份。
+#[cfg(feature = "native")]
+pub(crate) fn call_engine(
+    eng: &mut crate::engine::Engine,
+    prep: &CallPrepared,
+    run: &CallRun<'_>,
+    out: &mut dyn Write,
+) -> Result<i32, EngineError> {
+    use crate::cli::args::parse_literal;
+    eng.batch_commit = run.batch_commit;
+    eng.set_oriented = prep.set_oriented;
+    // 复核应修 C：大业务（100k 级游标循环）默认预算不够，CLI 放大入口。
+    // 缺省必须写回 DEFAULT——batch 引擎缓存复用同一 Engine，不复位会把
+    // 上一步的 --step-budget 泄漏给本步（放大/收紧都偏离单步 CLI 语义）。
+    eng.step_budget = run
+        .step_budget
+        .unwrap_or(crate::runtime::interp::DEFAULT_STEP_BUDGET);
+    if run.register_sources {
+        match run.source_texts {
+            Some(texts) => {
+                for (_, text) in texts {
+                    eng.register(text)?;
+                }
+            }
+            None => {
+                for f in &prep.sources {
+                    let text = crate::cli::read_source_strict(f)?;
+                    eng.register(&text)?;
+                }
+            }
+        }
     }
-    if refuse_on_kernel_gaps(&eng, &target, &objects, t.codeweb_refs.as_deref(), out)? {
+    if refuse_on_kernel_gaps(
+        eng,
+        &prep.target,
+        run.objects,
+        prep.codeweb_refs.as_deref(),
+        out,
+    )? {
         return Ok(EXIT_FAIL);
     }
-    let args: Vec<crate::value::SpinValue> = parts.args.iter().map(|a| parse_literal(a)).collect();
+    let args: Vec<crate::value::SpinValue> = run.args.iter().map(|a| parse_literal(a)).collect();
     // 审计日志的门禁顺序：缺件已拒 = 一条都没执行，此时不得留下日志文件，否则
     // "有日志"会变成"跑过"的假象（§11.1）。stdout 契约与 --trace 无关，恒不变。
-    let mut traced = match &parts.trace {
-        Some(p) => Some(crate::cli::trace::TraceRun::open(
-            p,
-            parts.trace_format,
-            parts.trace_level,
-            &target,
+    let mut traced = match &run.trace {
+        Some(t) => Some(crate::cli::trace::TraceRun::open(
+            &t.path, t.format, t.level, &t.proc,
         )?),
         None => None,
     };
     let res = match &mut traced {
-        Some(t) => eng.call_with_sink(&target, &args, t.sink()),
-        None => eng.call(&target, &args),
+        Some(t) => eng.call_with_sink(&prep.target, &args, t.sink()),
+        None => eng.call(&prep.target, &args),
     };
-    render_set_oriented_reports(&eng, out)?;
+    render_set_oriented_reports(eng, out)?;
     let res = res?;
     if res.outs.is_empty() && res.return_value.is_none() {
-        writeln!(out, "CALL {target} OK").map_err(io_err)?;
+        writeln!(out, "CALL {target} OK", target = prep.target).map_err(io_err)?;
     } else {
         for (k, v) in &res.outs {
             writeln!(out, "OUT {} = {}", k, v.display()).map_err(io_err)?;
@@ -495,5 +625,74 @@ mod tests {
         ]);
         assert_eq!(code, EXIT_OK, "{out}");
         assert!(out.contains("OUT p_o = 42"), "{out}");
+    }
+
+    /// batch 引擎缓存复用同一 `Engine`，`call_engine` 必须把
+    /// `step_budget` 缺省写回 `DEFAULT_STEP_BUDGET`——否则上一调用的
+    /// `--step-budget` 泄漏给下一调用（收紧→误报 ENG-0032；放大→护栏失效）。
+    #[cfg(feature = "native")]
+    #[test]
+    fn should_reset_step_budget_to_default_when_reusing_engine() {
+        use super::{call_engine, CallPrepared, CallRun};
+        use crate::engine::Engine;
+        use crate::rules::RuleRegistry;
+        use crate::sql::DuckExecutor;
+        use std::collections::BTreeSet;
+
+        let ex = DuckExecutor::open_in_memory().unwrap();
+        let objects = crate::verify::kernel_objects(&ex).unwrap();
+        let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+        eng.register(
+            "CREATE OR REPLACE FUNCTION f_loop(p IN NUMBER) RETURN NUMBER IS \
+             s NUMBER := 0; \
+             BEGIN \
+               FOR i IN 1..p LOOP s := s + i; END LOOP; \
+               RETURN s; \
+             END;",
+        )
+        .unwrap();
+        let prep = CallPrepared {
+            target: "f_loop".to_string(),
+            sources: Vec::new(),
+            rules: RuleRegistry::default(),
+            set_oriented: false,
+            codeweb_refs: None,
+        };
+        let args = vec!["5".to_string()];
+        let mut out: Vec<u8> = Vec::new();
+        // 第一步：预算 1 → 循环体必超支（ENG-0032），引擎保留 budget=1
+        let e1 = call_engine(
+            &mut eng,
+            &prep,
+            &CallRun {
+                args: &args,
+                batch_commit: false,
+                step_budget: Some(1),
+                register_sources: false,
+                source_texts: None,
+                objects: &objects,
+                trace: None,
+            },
+            &mut out,
+        );
+        assert!(e1.is_err(), "预算 1 必须超支: {e1:?}");
+        // 第二步：不带 --step-budget → 必须回到默认预算并成功
+        let code = call_engine(
+            &mut eng,
+            &prep,
+            &CallRun {
+                args: &args,
+                batch_commit: false,
+                step_budget: None,
+                register_sources: false,
+                source_texts: None,
+                objects: &BTreeSet::new(),
+                trace: None,
+            },
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(code, EXIT_OK, "{}", String::from_utf8_lossy(&out));
+        assert!(eng.step_budget > 1, "预算未复位: {}", eng.step_budget);
     }
 }

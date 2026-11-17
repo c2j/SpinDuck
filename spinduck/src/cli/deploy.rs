@@ -10,10 +10,60 @@ use crate::error::EngineError;
 use crate::plan::{self, RunPlan};
 use crate::rules::RuleRegistry;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// deploy 的开库前准备产物（batch 共享连接复用同一份准备结果）。
+pub struct DeployPrep {
+    target: String,
+    deployment: plan::deploy::Deployment,
+    rules: RuleRegistry,
+    ddl_files: usize,
+    routine_files: usize,
+    db: PathBuf,
+}
+
+impl DeployPrep {
+    /// batch 引擎缓存键用：例程源文件清单（内容哈希在调用方算）。
+    pub(crate) fn routine_sources(&self) -> &[PathBuf] {
+        &self.deployment.routines
+    }
+    /// batch 引擎缓存键用：生效规则（项目 rules_files 已叠加）。
+    pub(crate) fn rules(&self) -> &RuleRegistry {
+        &self.rules
+    }
+}
 
 /// `spinduck deploy <计划文件.toml> --db <本地 DuckDB 文件>`。
 pub fn deploy_cmd(plan_path: &Path, db: &Path, out: &mut dyn Write) -> Result<i32, EngineError> {
+    let Some(prep) = deploy_prepare(plan_path, db, out)? else {
+        return Ok(EXIT_FAIL);
+    };
+    #[cfg(feature = "native")]
+    {
+        let ex = crate::sql::DuckExecutor::open(&prep.db.to_string_lossy())?;
+        let mut eng = Engine::new(Box::new(ex), prep.rules.clone());
+        deploy_apply(&prep, &mut eng, out)
+    }
+    #[cfg(not(feature = "native"))]
+    {
+        let _ = prep;
+        Err(EngineError::env(
+            12,
+            format!(
+                "deploy 到 {} 需要 feature `native`（部署要把资产装进内核）",
+                db.display()
+            ),
+        ))
+    }
+}
+
+/// 读计划 → 缺件门 → 物化清单核对 → 规则装配。全部先于开库（`open` 即建文件）。
+/// 返回 `None` = 已打印 MISS 行并判拒（调用方退出 1）。
+pub fn deploy_prepare(
+    plan_path: &Path,
+    db: &Path,
+    out: &mut dyn Write,
+) -> Result<Option<DeployPrep>, EngineError> {
     let text = crate::cli::read_source_strict(plan_path)?;
     let plan = RunPlan::from_toml_str(&text)?;
     if !plan.missing.is_empty() {
@@ -27,7 +77,7 @@ pub fn deploy_cmd(plan_path: &Path, db: &Path, out: &mut dyn Write) -> Result<i3
             plan.missing.len()
         )
         .map_err(io_err)?;
-        return Ok(EXIT_FAIL);
+        return Ok(None);
     }
 
     let project = crate::project::ProjectConfig::locate(&plan.project_root(plan_path))?;
@@ -61,40 +111,37 @@ pub fn deploy_cmd(plan_path: &Path, db: &Path, out: &mut dyn Write) -> Result<i3
             missing_materialize.len()
         )
         .map_err(io_err)?;
-        return Ok(EXIT_FAIL);
+        return Ok(None);
     }
 
     let rules = RuleRegistry::default().with_project_rules(&project.rules_files)?;
-    let mut eng = open_engine(db, rules)?;
-    plan::deploy::apply(&mut eng, &deployment)?;
+    Ok(Some(DeployPrep {
+        target: plan.target,
+        deployment,
+        rules,
+        ddl_files,
+        routine_files,
+        db: db.to_path_buf(),
+    }))
+}
 
+/// 在既有引擎上执行部署清单并渲染结果行（单步 CLI 与 batch 共用此尾段）。
+pub fn deploy_apply(
+    prep: &DeployPrep,
+    eng: &mut Engine,
+    out: &mut dyn Write,
+) -> Result<i32, EngineError> {
+    plan::deploy::apply(eng, &prep.deployment)?;
     writeln!(
         out,
         "deploy: target={} ddl_files={} routine_files={} db={}",
-        plan.target,
-        ddl_files,
-        routine_files,
-        db.display()
+        prep.target,
+        prep.ddl_files,
+        prep.routine_files,
+        prep.db.display()
     )
     .map_err(io_err)?;
     Ok(EXIT_OK)
-}
-
-#[cfg(feature = "native")]
-fn open_engine(db: &Path, rules: RuleRegistry) -> Result<Engine, EngineError> {
-    let ex = crate::sql::DuckExecutor::open(&db.to_string_lossy())?;
-    Ok(Engine::new(Box::new(ex), rules))
-}
-
-#[cfg(not(feature = "native"))]
-fn open_engine(db: &Path, _rules: RuleRegistry) -> Result<Engine, EngineError> {
-    Err(EngineError::env(
-        12,
-        format!(
-            "deploy 到 {} 需要 feature `native`（部署要把资产装进内核）",
-            db.display()
-        ),
-    ))
 }
 
 fn io_err(e: std::io::Error) -> EngineError {
