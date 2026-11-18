@@ -2,7 +2,7 @@
 
 规格：`docs/spinduck-set-oriented-v3-design.md`（`feat/set-oriented-v3`）。
 
-owner: unassigned
+owner: feat-set-oriented-v3
 
 ## 终态
 
@@ -70,7 +70,13 @@ owner: unassigned
 
 ## 边界
 
-owner 可以在 `feat/set-oriented-v3` 上按 TDD 改代码、提交、开 PR。碰到下面任何一条就停，等仓库主人决定：
+实现者是 workmux 窗口 `feat-set-oriented-v3`（Devin）。它不是 amux worker，不能自设 `AMUX_GOAL_CHECK`。owner 写明之后，`SCHED-3` 在 `done` 连续 6 小时不升或比 6 小时前少时退出 1。
+
+审阅由当前 Grok 会话做，用中文，不改产品代码。OpenCode 留作替补，不另开窗口。
+
+当前阶段只做第 2 行（M0）。M1 及以后另发 brief。
+
+实现者可以在 `feat/set-oriented-v3` 上按 TDD 改代码、提交、开 PR。碰到下面任何一条就停，等仓库主人决定：
 
 - `SqlExecutor` 或 `TraceSink` 的签名
 - 新依赖、新 feature、新 bin
@@ -84,8 +90,8 @@ owner 可以在 `feat/set-oriented-v3` 上按 TDD 改代码、提交、开 PR。
 
 快速 checker 退出码：0 六行都满足，1 有真实缺口，2 有一行无法判定。标准输出一行 JSON：`{"done":N,"total":6,"summary":"..."}`。
 
-`scripts/goals/set-oriented-v3-measure.sh` 每小时跑一次 checker，把一行 JSON 追加到 `~/.amux/logs/spinduck-set-oriented-v3-goal.log`。owner 仍是 `unassigned` 时，度量脚本退出 0，只记日志。owner 写成具体名字之后：checker 无法判定则退出 2；`done` 连续 6 小时没有上升，或比 6 小时前少，则退出 1。
+`scripts/goals/set-oriented-v3-measure.sh` 由 amux `SCHED-3` 每小时跑一次，把一行 JSON 追加到 `~/.amux/logs/spinduck-set-oriented-v3-goal.log`。checker 无法判定时度量脚本退出 2；`done` 连续 6 小时没有上升，或比 6 小时前少，则退出 1。
 
 M3（标量求值与 Appender）等第 2 行的 release 数字出来再开，不在这 6 行里。
 
-协调者的 tmux 日程和 owner 的 `/goal` 还没设。等 owner 指定后再设。Board 保持关闭。
+不给实现者另设 amux `/goal`。不设会唤醒模型的协调日程。Board 保持关闭。
