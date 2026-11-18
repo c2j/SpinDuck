@@ -198,6 +198,20 @@ pub fn map_mode_pub(mode: &Option<String>) -> Result<ParamMode, EngineError> {
     map_mode(mode)
 }
 
+/// 形参声明中 OUT/INOUT 的名字集（小写）：写缓冲策略据此判定处理器内
+/// 赋值是否逃逸到调用方（设计 §3.6 红线 2「写 `p_o_succeed`」）。
+fn out_param_names(
+    params: &[ogsql_parser::ast::RoutineParam],
+) -> Result<std::collections::BTreeSet<String>, EngineError> {
+    let mut set = std::collections::BTreeSet::new();
+    for p in params {
+        if matches!(map_mode(&p.mode)?, ParamMode::Out | ParamMode::InOut) {
+            set.insert(p.name.to_ascii_lowercase());
+        }
+    }
+    Ok(set)
+}
+
 /// 参数模式解析：`IN OUT`/`INOUT` 必须归 [`ParamMode::InOut`]（回归守护：
 /// `contains("OUT")` 曾使 IN OUT 被归类为 OUT，丢入参值）；未知模式显式拒绝。
 fn map_mode(mode: &Option<String>) -> Result<ParamMode, EngineError> {
@@ -237,8 +251,11 @@ pub fn compile_statement_routine_with_names(
                 .iter()
                 .map(|p| p.name.to_ascii_lowercase())
                 .collect();
+            let out_params = out_param_names(&cs.parameters)?;
             let mut prog = match &cs.block {
-                Some(b) => compile_routine_with_names(b, &extra, rules, routine_names)?,
+                Some(b) => {
+                    compile_routine_with_names(b, &extra, rules, routine_names, &out_params)?
+                }
                 None => IrProg::default(),
             };
             let params = cs
@@ -265,8 +282,11 @@ pub fn compile_statement_routine_with_names(
                 .iter()
                 .map(|p| p.name.to_ascii_lowercase())
                 .collect();
+            let out_params = out_param_names(&cf.parameters)?;
             let mut prog = match &cf.block {
-                Some(b) => compile_routine_with_names(b, &extra, rules, routine_names)?,
+                Some(b) => {
+                    compile_routine_with_names(b, &extra, rules, routine_names, &out_params)?
+                }
                 None => IrProg::default(),
             };
             let params = cf

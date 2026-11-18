@@ -8,25 +8,102 @@
 //!    `TxRollback`；同表屏障：触及同表的 `SqlQuery` / `FoldedQuery` / 非
 //!    `VALUES` `SqlExec`——`OpenCursor`/`Fetch`/`CloseCursor`/`TxCommit`/
 //!    `Jump*` 不是屏障，扫描必须穿过）；
-//! 2. 包裹该 INSERT 的任意活跃 `PushTrap` 处理器体不是「空跳过」（含副作用
-//!    或控制流跳转）。
+//! 2. 包裹该 INSERT 的任意活跃 `PushTrap` 处理器体不是「空跳过」——即含
+//!    副作用或控制流跳转（`CLOSE`、`GOTO`、写 OUT/INOUT 形参如
+//!    `p_o_succeed`、写日志/调例程、SQL 读写、可能抛错的表达式等）。
+//!    纯帧内观察赋值（`v_caught := 'yes'`）不算副作用，处理器仍视为空跳过。
+//!
+//! `out_params` 为例程 OUT/INOUT 形参名集（小写）；无例程形参上下文的
+//! 编译路径（`compile_stmts`/`compile_block`）传空集。
 
-use super::types::{BufferPolicy, IrProg, IrStmt};
-use std::collections::{HashSet, VecDeque};
+use super::types::{AssignTarget, BufferPolicy, IrExpr, IrProg, IrStmt};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 
 /// 编译入口统一调用：就地写回每条 `SqlExec` 的 `buffer_policy`。
-pub(crate) fn apply(prog: &mut IrProg) {
+/// `out_params` 为例程 OUT/INOUT 形参名集（小写）；非例程路径传空集。
+pub(crate) fn apply(prog: &mut IrProg, out_params: &BTreeSet<String>) {
     let succ = successors(&prog.code);
-    for pc in 0..prog.code.len() {
-        let Some(table) = insert_target(&prog.code[pc]) else {
-            continue;
-        };
-        if scan_clean(&prog.code, &succ, pc, &table) {
-            if let IrStmt::SqlExec { buffer_policy, .. } = &mut prog.code[pc] {
+    let candidates: Vec<(usize, String)> = prog
+        .code
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, s)| insert_target(s).map(|t| (pc, t)))
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    // 例程内全部 `INSERT ... VALUES` 目标表：非 VALUES 写打到这些表上时
+    // 运行期 `flush_if_touches` 会先刷该表缓冲组、保住组内序，不算跨表耦合；
+    // 打到集合外的表才是红线 1 的「跨表写耦合」。
+    let insert_tables: HashSet<String> = candidates.iter().map(|(_, t)| t.clone()).collect();
+    let clean = classify(&prog.code, &succ, &candidates, out_params, &insert_tables);
+    for ((pc, _), ok) in candidates.iter().zip(clean) {
+        if ok {
+            if let IrStmt::SqlExec { buffer_policy, .. } = &mut prog.code[*pc] {
                 *buffer_policy = BufferPolicy::Buffered;
             }
         }
     }
+}
+
+/// 两阶段判定：先乐观扫描（其他表 `INSERT ... VALUES` 一律视为同伴候选、
+/// 穿透），再单调淘汰——路径上穿过「最终保持 Immediate 的其他表 INSERT」
+/// 的候选降级，至不动点。
+fn classify(
+    code: &[IrStmt],
+    succ: &[Vec<usize>],
+    candidates: &[(usize, String)],
+    out_params: &BTreeSet<String>,
+    insert_tables: &HashSet<String>,
+) -> Vec<bool> {
+    let mut clean = candidates
+        .iter()
+        .map(|(pc, table)| {
+            Scan {
+                code,
+                succ,
+                out_params,
+                insert_tables,
+                immediate: &HashSet::new(),
+            }
+            .clean(*pc, table)
+        })
+        .collect::<Vec<_>>();
+    loop {
+        let immediate: HashSet<usize> = candidates
+            .iter()
+            .zip(&clean)
+            .filter(|(_, ok)| !**ok)
+            .map(|((pc, _), _)| *pc)
+            .collect();
+        let scan = Scan {
+            code,
+            succ,
+            out_params,
+            insert_tables,
+            immediate: &immediate,
+        };
+        let mut changed = false;
+        for (i, (pc, table)) in candidates.iter().enumerate() {
+            if clean[i] && !scan.clean(*pc, table) {
+                clean[i] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            return clean;
+        }
+    }
+}
+
+/// 单候选的 CFG 扫描上下文；`immediate` 为已判 Immediate 的其他表
+/// `INSERT ... VALUES` 的 pc 集（淘汰轮使用，乐观轮为空集）。
+struct Scan<'a> {
+    code: &'a [IrStmt],
+    succ: &'a [Vec<usize>],
+    out_params: &'a BTreeSet<String>,
+    insert_tables: &'a HashSet<String>,
+    immediate: &'a HashSet<usize>,
 }
 
 /// 候选指令：`SqlExec` 且为严格「INSERT INTO 表 [(列)] VALUES ...」形态，
@@ -161,54 +238,77 @@ fn successors(code: &[IrStmt]) -> Vec<Vec<usize>> {
         .collect()
 }
 
-/// 红线 1 + 全局/同表屏障：BFS 全部可达路径，遇屏障即该路径终止；
-/// 任一可达「修改其他表的 DML」→ false（保持 Immediate）。
-fn scan_clean(code: &[IrStmt], succ: &[Vec<usize>], start: usize, table: &str) -> bool {
-    if trap_handler_effects(code, start) {
-        return false;
-    }
-    let mut seen = vec![false; code.len()];
-    let mut queue: VecDeque<usize> = succ[start].iter().copied().collect();
-    while let Some(pc) = queue.pop_front() {
-        if pc >= code.len() || seen[pc] {
-            continue;
+impl Scan<'_> {
+    /// 红线 1 + 全局/同表屏障：BFS 全部可达路径，遇屏障即该路径终止；
+    /// 任一可达「跨表写耦合」→ false（保持 Immediate）。
+    fn clean(&self, start: usize, table: &str) -> bool {
+        if trap_handler_effects(self.code, start, self.out_params) {
+            return false;
         }
-        seen[pc] = true;
-        match &code[pc] {
-            // 确定全局刷盘屏障：路径终止，不展开
-            IrStmt::CallRoutine { .. }
-            | IrStmt::SqlExecDynamic { .. }
-            | IrStmt::Return { .. }
-            | IrStmt::TxRollback => {}
-            IrStmt::SqlQuery { sql, .. } | IrStmt::FoldedQuery { sql, .. } => {
-                if !touches_table(sql, table) {
-                    queue.extend(succ[pc].iter().copied());
-                }
+        let mut seen = vec![false; self.code.len()];
+        let mut queue: VecDeque<usize> = self.succ[start].iter().copied().collect();
+        while let Some(pc) = queue.pop_front() {
+            if pc >= self.code.len() || seen[pc] {
+                continue;
             }
-            IrStmt::SqlExec { sql, .. } => {
-                if let Some(t) = plain_insert_values(sql) {
-                    if t != table {
-                        return false; // 改其他表的 INSERT ... VALUES
+            seen[pc] = true;
+            match &self.code[pc] {
+                // 确定全局刷盘屏障：路径终止，不展开
+                IrStmt::CallRoutine { .. }
+                | IrStmt::SqlExecDynamic { .. }
+                | IrStmt::Return { .. }
+                | IrStmt::TxRollback => {}
+                IrStmt::SqlQuery { sql, .. } | IrStmt::FoldedQuery { sql, .. } => {
+                    if !touches_table(sql, table) {
+                        queue.extend(self.succ[pc].iter().copied());
                     }
-                    queue.extend(succ[pc].iter().copied());
-                } else if touches_table(sql, table) {
-                    // 同表非 VALUES 语句：确定刷盘点，路径终止
-                } else if modifies_table(sql) {
-                    return false; // 跨表 DML
-                } else {
-                    queue.extend(succ[pc].iter().copied());
                 }
+                IrStmt::SqlExec { sql, .. } => {
+                    if let Some(t) = plain_insert_values(sql) {
+                        if t == table {
+                            // 同表 VALUES：同伴攒批（即便它最终 Immediate，
+                            // take_insert 也会先按表刷盘再即时执行）→ 穿透
+                            queue.extend(self.succ[pc].iter().copied());
+                        } else if self.immediate.contains(&pc) {
+                            // 其他表 VALUES 且已判 Immediate：即时跨表写 → 违规
+                            return false;
+                        } else {
+                            // Buffered 候选：不即时落盘 → 穿透（淘汰轮复核）
+                            queue.extend(self.succ[pc].iter().copied());
+                        }
+                    } else if touches_table(sql, table) {
+                        // 同表非 VALUES 语句：确定刷盘点，路径终止
+                    } else if touches_insert_table(sql, table, self.insert_tables) {
+                        // 其他「有 INSERT ... VALUES 候选」的表：flush_if_touches
+                        // 先刷该表组、保组内序，属可接受的跨表穿插 → 穿透
+                        queue.extend(self.succ[pc].iter().copied());
+                    } else if modifies_table(sql) {
+                        return false; // 无缓冲候选的跨表 DML（如 QFII 的 UPDATE）
+                    } else {
+                        queue.extend(self.succ[pc].iter().copied());
+                    }
+                }
+                // OpenCursor/Fetch/CloseCursor/TxCommit/Jump*/Assign/Nop/PushTrap/
+                // PopTrap 等一律不是屏障，继续扫描
+                _ => queue.extend(self.succ[pc].iter().copied()),
             }
-            // OpenCursor/Fetch/CloseCursor/TxCommit/Jump*/Assign/Nop/PushTrap/
-            // PopTrap 等一律不是屏障，继续扫描
-            _ => queue.extend(succ[pc].iter().copied()),
         }
+        true
     }
-    true
 }
 
-/// 红线 2：覆盖 `pc` 的任意 `PushTrap` 处理器体含非 `Nop` 指令 → true。
-fn trap_handler_effects(code: &[IrStmt], pc: usize) -> bool {
+/// `sql` 是否触及 `insert_tables` 中除 `table` 外的表（该表上有
+/// `INSERT ... VALUES` 候选，非 VALUES 写会先按表刷盘）。
+fn touches_insert_table(sql: &str, table: &str, insert_tables: &HashSet<String>) -> bool {
+    insert_tables
+        .iter()
+        .any(|t| t != table && touches_table(sql, t))
+}
+
+/// 红线 2：覆盖 `pc` 的任意 `PushTrap` 处理器体含非「空跳过」指令 → true。
+/// 「空跳过」= 全部语句为 `Nop` 或纯帧内观察赋值（局部变量/记录字段，
+/// 目标非 OUT/INOUT 形参，表达式无 `FuncCall`/`SqlFn`/`Lookup`）。
+fn trap_handler_effects(code: &[IrStmt], pc: usize, out_params: &BTreeSet<String>) -> bool {
     for (i, stmt) in code.iter().enumerate() {
         let IrStmt::PushTrap { entries } = stmt else {
             continue;
@@ -225,13 +325,60 @@ fn trap_handler_effects(code: &[IrStmt], pc: usize) -> bool {
         for e in entries {
             if code[e.body_start..e.body_end]
                 .iter()
-                .any(|s| !matches!(s, IrStmt::Nop))
+                .any(|s| !handler_stmt_skip_equivalent(s, out_params))
             {
                 return true;
             }
         }
     }
     false
+}
+
+/// 处理器体单句是否「空跳过」等价：`Nop`，或写帧内槽位的纯赋值。
+fn handler_stmt_skip_equivalent(stmt: &IrStmt, out_params: &BTreeSet<String>) -> bool {
+    match stmt {
+        IrStmt::Nop => true,
+        IrStmt::Assign { target, expr } => {
+            !assigns_out_param(target, out_params) && expr_is_frame_pure(expr)
+        }
+        _ => false,
+    }
+}
+
+/// 赋值目标根变量是否 OUT/INOUT 形参（写形参会逃逸到调用方，非空跳过）。
+fn assigns_out_param(target: &AssignTarget, out_params: &BTreeSet<String>) -> bool {
+    if out_params.is_empty() {
+        return false;
+    }
+    let name = match target {
+        AssignTarget::Var(v) => &v.0,
+        AssignTarget::Field { rec, .. } => &rec.0,
+    };
+    out_params.contains(name)
+}
+
+/// 表达式是否纯帧内可求值：`FuncCall`/`SqlFn`/`Lookup` 可能调例程、下发
+/// SQL 或抛错，一律视为非纯；其余变体递归要求子表达式同样纯。
+fn expr_is_frame_pure(expr: &IrExpr) -> bool {
+    match expr {
+        IrExpr::Const(_) | IrExpr::Var(_) | IrExpr::Field { .. } | IrExpr::CursorAttr { .. } => {
+            true
+        }
+        IrExpr::Bin { l, r, .. } => expr_is_frame_pure(l) && expr_is_frame_pure(r),
+        IrExpr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            operand.as_deref().is_none_or(expr_is_frame_pure)
+                && whens
+                    .iter()
+                    .all(|(w, e)| expr_is_frame_pure(w) && expr_is_frame_pure(e))
+                && else_expr.as_deref().is_none_or(expr_is_frame_pure)
+        }
+        IrExpr::Not(e) | IrExpr::IsNull(e) => expr_is_frame_pure(e),
+        IrExpr::FuncCall { .. } | IrExpr::SqlFn { .. } | IrExpr::Lookup { .. } => false,
+    }
 }
 
 /// `PushTrap` 在 `trap_pc` 的匹配 `PopTrap` 下标（按嵌套深度配对）。

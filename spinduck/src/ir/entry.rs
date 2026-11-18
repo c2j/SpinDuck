@@ -31,7 +31,7 @@ pub fn compile_stmts_with(
         local_ddl: c.local_ddl,
         ..IrProg::default()
     };
-    super::writebuf_policy::apply(&mut prog);
+    super::writebuf_policy::apply(&mut prog, &BTreeSet::new());
     Ok(prog)
 }
 
@@ -51,15 +51,17 @@ pub fn compile_routine_with(
     extra_vars: &[String],
     rules: &RuleRegistry,
 ) -> Result<IrProg, EngineError> {
-    compile_routine_with_names(block, extra_vars, rules, &BTreeSet::new())
+    compile_routine_with_names(block, extra_vars, rules, &BTreeSet::new(), &BTreeSet::new())
 }
 
-/// 例程块编译（带已注册例程名集）：SQL 上下文例程调用下沉判定依赖它。
+/// 例程块编译（带已注册例程名集与 OUT/INOUT 形参名集）：
+/// SQL 上下文例程调用下沉判定与写缓冲策略的形参逃逸检查依赖它们。
 pub fn compile_routine_with_names(
     block: &PlBlock,
     extra_vars: &[String],
     rules: &RuleRegistry,
     routine_names: &BTreeSet<String>,
+    out_params: &BTreeSet<String>,
 ) -> Result<IrProg, EngineError> {
     let mut vars = collect_var_names(&block.body);
     for v in extra_vars {
@@ -149,7 +151,7 @@ pub fn compile_routine_with_names(
         var_types,
         local_ddl: c.local_ddl,
     };
-    super::writebuf_policy::apply(&mut prog);
+    super::writebuf_policy::apply(&mut prog, out_params);
     Ok(prog)
 }
 /// 预扫描：赋值目标 + PL 表达式中的 PlVariable 引用（不进入 SQL 语句内部）。
