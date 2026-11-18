@@ -26,11 +26,13 @@ pub fn compile_stmts_with(
     };
     c.stmts(stmts)?;
     c.resolve_fixups()?;
-    Ok(IrProg {
+    let mut prog = IrProg {
         code: c.code,
         local_ddl: c.local_ddl,
         ..IrProg::default()
-    })
+    };
+    super::writebuf_policy::apply(&mut prog);
+    Ok(prog)
 }
 
 /// 从完整 PL 块编译：声明段静态游标在此编译（§7.2）。
@@ -142,11 +144,13 @@ pub fn compile_routine_with_names(
         None => c.stmts(&block.body)?,
     }
     c.resolve_fixups()?;
-    Ok(IrProg {
+    let mut prog = IrProg {
         code: c.code,
         var_types,
         local_ddl: c.local_ddl,
-    })
+    };
+    super::writebuf_policy::apply(&mut prog);
+    Ok(prog)
 }
 /// 预扫描：赋值目标 + PL 表达式中的 PlVariable 引用（不进入 SQL 语句内部）。
 /// 扩展点（M6）：例程参数与 DECLARE 声明同样入集（GaussDB 语义：声明即变量）。

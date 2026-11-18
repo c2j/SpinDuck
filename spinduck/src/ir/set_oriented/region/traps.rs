@@ -270,7 +270,7 @@ fn fallback_resets(
 mod tests {
     use super::super::loop_prog;
     use super::*;
-    use crate::ir::CursorSource;
+    use crate::ir::{BufferPolicy, CursorSource};
     use crate::runtime::cursor::CursorAttrKind;
 
     #[test]
@@ -400,6 +400,7 @@ mod tests {
                 sql: "INSERT INTO dst VALUES ($v_rec__a)".into(),
                 binds: Vec::new(),
                 fn_sites: Vec::new(),
+                buffer_policy: BufferPolicy::Immediate,
             },
             IrStmt::PopTrap,
             IrStmt::Jump(9),
@@ -458,6 +459,7 @@ mod tests {
                 sql: "INSERT INTO dst VALUES ($v_rec__a)".into(),
                 binds: Vec::new(),
                 fn_sites: Vec::new(),
+                buffer_policy: BufferPolicy::Immediate,
             },
             IrStmt::PopTrap,
             IrStmt::Assign {

@@ -354,6 +354,7 @@ fn collect_expr_reads(expr: &IrExpr, out: &mut BTreeSet<VarName>) {
 mod tests {
     use super::super::loop_prog;
     use super::*;
+    use crate::ir::BufferPolicy;
 
     #[test]
     fn should_accept_clean_prefix_ending_with_commit() {
@@ -362,6 +363,7 @@ mod tests {
             sql: "DELETE FROM t".into(),
             binds: Vec::new(),
             fn_sites: Vec::new(),
+            buffer_policy: BufferPolicy::Immediate,
         };
         prog.code[1] = IrStmt::TxCommit;
         assert_eq!(prefix_is_clean(&prog, 2), Ok(()));
@@ -374,6 +376,7 @@ mod tests {
             sql: "INSERT INTO t VALUES (1)".into(),
             binds: Vec::new(),
             fn_sites: Vec::new(),
+            buffer_policy: BufferPolicy::Immediate,
         };
         assert_eq!(
             prefix_is_clean(&prog, 1),
@@ -416,6 +419,7 @@ mod tests {
             sql: "INSERT INTO t VALUES (1)".into(),
             binds: Vec::new(),
             fn_sites: Vec::new(),
+            buffer_policy: BufferPolicy::Immediate,
         };
         prog.code[1] = IrStmt::TxRollback;
         assert_eq!(prefix_is_clean(&prog, 2), Ok(()));

@@ -348,8 +348,9 @@ fn run_inner_spanned(
                 sql,
                 binds,
                 fn_sites,
+                buffer_policy,
             } => {
-                let buffered = writebuf::take_insert(env, sql, binds, fn_sites)?;
+                let buffered = writebuf::take_insert(env, sql, binds, fn_sites, *buffer_policy)?;
                 if !buffered {
                     env.last_write_rows = sqlstmts::exec(env, sql, binds, fn_sites)?;
                 }

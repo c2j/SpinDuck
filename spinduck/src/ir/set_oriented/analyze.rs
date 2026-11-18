@@ -30,6 +30,7 @@ pub(super) fn analyze_region<'a>(
         sql: insert,
         binds,
         fn_sites,
+        ..
     }) = body.insert_stmt
     else {
         return Err(SkipReason::UnsupportedWrite);

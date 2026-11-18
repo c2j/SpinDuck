@@ -1,6 +1,7 @@
 //! writebuf / batch_commit 行为测试（§3 规模拆分：自 tests.rs 拆出，
 //! 共享 helper 经 `use super::*` 取自 mod.rs，行为断言不变）。
 use super::*;
+use crate::ir::BufferPolicy;
 
 #[test]
 fn should_coalesce_inserts_and_commits_when_batch_commit_on() {
@@ -270,6 +271,7 @@ fn should_batch_insert_with_fn_sites_by_inlining_routine_value_when_batch_commit
             .into(),
         binds: vec![],
         fn_sites: vec![site],
+        buffer_policy: BufferPolicy::Buffered,
     };
     // fn_sites INSERT 在前、普通 INSERT 在后：同前缀续攒合并为一条多值语句
     // （若普通行在前，fn_sites 的读自己写刷盘会先把普通行刷出——见 writebuf 语义②）。
@@ -280,6 +282,7 @@ fn should_batch_insert_with_fn_sites_by_inlining_routine_value_when_batch_commit
                 sql: "INSERT INTO t (a) VALUES ('x')".into(),
                 binds: vec![],
                 fn_sites: vec![],
+                buffer_policy: BufferPolicy::Buffered,
             },
         ],
         ..IrProg::default()

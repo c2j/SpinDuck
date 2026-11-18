@@ -185,6 +185,7 @@ pub(crate) fn loop_prog(prefix: usize, suffix: usize) -> IrProg {
             },
         )],
         fn_sites: Vec::new(),
+        buffer_policy: crate::ir::BufferPolicy::Immediate,
     });
     code.push(IrStmt::Jump(fetch));
     code.push(IrStmt::CloseCursor {
@@ -270,6 +271,7 @@ mod tests {
                 sql: "INSERT INTO dst VALUES ($v_rec__a)".into(),
                 binds: Vec::new(),
                 fn_sites: Vec::new(),
+                buffer_policy: crate::ir::BufferPolicy::Immediate,
             },
             IrStmt::Jump(1),
             IrStmt::CloseCursor {
@@ -322,6 +324,7 @@ mod tests {
                 sql: "INSERT INTO dst VALUES ($v_rec__a)".into(),
                 binds: Vec::new(),
                 fn_sites: Vec::new(),
+                buffer_policy: crate::ir::BufferPolicy::Immediate,
             },
             IrStmt::PopTrap,
             IrStmt::Jump(9),

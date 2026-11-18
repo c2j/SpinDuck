@@ -2,7 +2,7 @@
 
 use super::schema::{self, Table};
 use super::shape::Name;
-use super::{BindSrc, IrProg, IrStmt, OptimizeCtx, SkipReason};
+use super::{BindSrc, BufferPolicy, IrProg, IrStmt, OptimizeCtx, SkipReason};
 use crate::catalog::CompiledRoutine;
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
@@ -150,6 +150,7 @@ pub(crate) fn suffix_prog(routine: &CompiledRoutine, plan: &ConversionPlan) -> I
         sql: plan.sql.clone(),
         binds: plan.binds.clone(),
         fn_sites: Vec::new(),
+        buffer_policy: BufferPolicy::Immediate,
     }];
     if plan.tail_commit {
         code.push(IrStmt::TxCommitIfWritten);

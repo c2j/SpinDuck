@@ -22,7 +22,9 @@ mod shape;
 
 pub(crate) use entry::{entry_ok, suffix_prog, ConversionPlan};
 
-use super::{AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, VarName};
+use super::{
+    AssignTarget, BinOp, BindSrc, BufferPolicy, CursorSource, IrExpr, IrProg, IrStmt, VarName,
+};
 use crate::catalog::CompiledRoutine;
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;

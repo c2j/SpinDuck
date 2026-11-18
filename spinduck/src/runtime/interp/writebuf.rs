@@ -297,10 +297,17 @@ pub(in crate::runtime) fn take_insert(
     sql: &str,
     binds_src: &[(String, crate::ir::BindSrc)],
     fn_sites: &[crate::sql::FnSite],
+    buffer_policy: crate::ir::BufferPolicy,
 ) -> Result<bool, EngineError> {
     let Some(rc) = env.wbuf.clone() else {
         return Ok(false);
     };
+    // V3-6：编译期标注 Immediate 的语句绝不进缓冲——先按表刷盘保序，
+    // 再走即时 `sqlstmts::exec`（PL 异常处理器在原指令点生效）。
+    if buffer_policy == crate::ir::BufferPolicy::Immediate {
+        flush_if_touches(env, sql)?;
+        return Ok(false);
+    }
     if !is_insert(sql) {
         flush_if_touches(env, sql)?;
         return Ok(false);

@@ -134,7 +134,7 @@ fn should_skip_subqueries_table_functions_and_normalize_schema_prefix() {
     );
 }
 
-use crate::ir::{AssignTarget, CursorSource, IrExpr, IrProg, IrStmt, VarName};
+use crate::ir::{AssignTarget, BufferPolicy, CursorSource, IrExpr, IrProg, IrStmt, VarName};
 use crate::sql::FnSite;
 use crate::value::SpinValue;
 
@@ -255,6 +255,7 @@ fn should_collect_sql_texts_from_statements_cursors_and_fn_sites() {
                 sql: "DELETE FROM T_A".into(),
                 binds: vec![],
                 fn_sites: vec![],
+                buffer_policy: BufferPolicy::Immediate,
             },
             IrStmt::OpenCursor {
                 cursor: VarName("c".into()),
@@ -315,6 +316,7 @@ fn should_walk_exception_handler_bodies() {
                 sql: "DELETE FROM T_HANDLER".into(),
                 binds: vec![],
                 fn_sites: vec![],
+                buffer_policy: BufferPolicy::Immediate,
             },
         ],
         ..IrProg::default()
@@ -350,6 +352,7 @@ fn should_exclude_lowering_plan_tables_from_object_refs() {
                     distinct_sql: "SELECT DISTINCT k FROM T_B".into(),
                     binds: vec![],
                 }],
+                buffer_policy: BufferPolicy::Immediate,
             }],
         ..IrProg::default()};
     let got: Vec<String> = chain_object_refs(&prog)

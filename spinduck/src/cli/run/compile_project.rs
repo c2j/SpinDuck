@@ -379,6 +379,7 @@ fn collect_prog_sqls(
                 sql,
                 binds,
                 fn_sites,
+                ..
             } => push(sqls, sql, binds, fn_sites, ddl),
             IrStmt::SqlQuery {
                 sql,

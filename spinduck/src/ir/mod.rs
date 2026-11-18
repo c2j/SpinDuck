@@ -16,6 +16,7 @@ pub mod set_oriented;
 mod sql;
 mod stmt;
 mod types;
+mod writebuf_policy;
 
 pub(crate) use control::Compiler;
 pub use entry::{
@@ -25,6 +26,6 @@ pub use entry::{
 pub(crate) use expr::{ident0, ident1, ident_path, parse_decimal_literal};
 pub(crate) use types::CompiledCursorSql;
 pub use types::{
-    AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, Label, LocalDdlStmt,
-    ScalarSql, TrapEntry, VarName,
+    AssignTarget, BinOp, BindSrc, BufferPolicy, CursorSource, IrExpr, IrProg, IrStmt, Label,
+    LocalDdlStmt, ScalarSql, TrapEntry, VarName,
 };

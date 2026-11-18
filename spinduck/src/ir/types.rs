@@ -135,6 +135,18 @@ pub enum BinOp {
     Or,
 }
 
+/// 写缓冲策略（V3-6，设计 §3.6）：编译期静态 pass 为每条 `SqlExec` 标注。
+/// 默认 `Immediate`（安全失败兜底）——只有纯 `INSERT ... VALUES` 且通过
+/// CFG 安全扫描的指令才升级 `Buffered` 进入 `WriteBuffer`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum BufferPolicy {
+    /// 即时执行：`take_insert` 先按表 `flush_if_touches` 再返回 false。
+    #[default]
+    Immediate,
+    /// 允许攒批：仅编译期扫描确认安全的纯 `INSERT ... VALUES`。
+    Buffered,
+}
+
 /// 指令（PC 为编译后索引；标签在代码生成期解析）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum IrStmt {
@@ -185,6 +197,9 @@ pub enum IrStmt {
         binds: Vec<(String, BindSrc)>,
         /// SQL 上下文例程调用下沉计划（§8.3；空 = 无）
         fn_sites: Vec<crate::sql::FnSite>,
+        /// 写缓冲策略（V3-6）：编译期 pass 统一标注，旧缓存缺省 Immediate。
+        #[serde(default)]
+        buffer_policy: BufferPolicy,
     },
     /// EXECUTE IMMEDIATE（动态文本）：运行期求值文本后与动态游标走**同一条**
     /// 解析管线（ogsql 解析 → 规则改名 → 方言变换 → 函数下沉）——统一收口
