@@ -256,6 +256,20 @@ fn should_skip_rowtype_anchor_on_a_local_cursor() {
               r c%ROWTYPE; \
               BEGIN NULL; END;";
     assert!(missing(ok, &snap).is_empty(), "{:?}", missing(ok, &snap));
+    // 反例：局部锚跳过不得外溢——真缺的表锚（ghost）仍要报
+    let bad = "CREATE PROCEDURE p IS \
+               CURSOR c IS SELECT a FROM t1; \
+               r c%ROWTYPE; \
+               v_g ghost%ROWTYPE; \
+               BEGIN NULL; END;";
+    assert_eq!(
+        missing(bad, &snap),
+        [(
+            Some("ghost".to_string()),
+            "%rowtype".to_string(),
+            "missing_table"
+        )]
+    );
 }
 
 #[test]
@@ -265,6 +279,11 @@ fn should_skip_rownum_pseudo_column() {
     // rownum 形态由 Gate 2B prepare 兜底（KERNEL-0011）。
     let snap = snap_of("CREATE TABLE t1(a INT)");
     assert!(missing("SELECT a FROM t1 WHERE rownum = 1", &snap).is_empty());
+    // 反例：rownum 跳过不得吞掉同语句真缺的列
+    assert_eq!(
+        missing("SELECT bogus FROM t1 WHERE rownum = 1", &snap),
+        [(None, "bogus".to_string(), "missing")]
+    );
 }
 
 #[test]
@@ -282,6 +301,27 @@ fn should_treat_unaliased_derived_table_columns_as_unknown() {
                (SELECT commision_type, commision_fee_type FROM par_fund_seat_para \
                 WHERE fund_code = 'F') WHERE rownum = 1";
     assert!(missing(sql, &snap).is_empty(), "{:?}", missing(sql, &snap));
+}
+
+#[test]
+fn should_report_missing_column_in_mixed_known_and_unknown_scopes() {
+    // 混排口径（评审 2026-11-19）：Known 作用域（t1 有静态列集）里不存在
+    // 的裸列必须上报——不能因为旁边有无别名派生表（投影含 *，归 Unknown）
+    // 就把整条语句的裸列吞掉。纯 Unknown 作用域（没有任何 Known 项）维持
+    // V1 不判（列可能来自该表，见上一条测试）；Known 与 Unknown 混排时
+    // Known 列集外的裸列是"已知不在任何已知的表里"，照报。
+    let snap = snap_of("CREATE TABLE t1(a INT)");
+    let bad = "SELECT bogus FROM t1, (SELECT * FROM t1) WHERE rownum = 1";
+    assert_eq!(
+        missing(bad, &snap),
+        [(None, "bogus".to_string(), "missing")]
+    );
+    let good = "SELECT a FROM t1, (SELECT * FROM t1)";
+    assert!(
+        missing(good, &snap).is_empty(),
+        "{:?}",
+        missing(good, &snap)
+    );
 }
 
 #[test]

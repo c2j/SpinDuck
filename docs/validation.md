@@ -5230,8 +5230,13 @@ allowed warnings）全部通过；`cargo test --features gauss`（A 模式容器
 - 不声称 `prc_trd_deal_purchase` 本体被集合化改写：`TransactionBoundaryInsideLoop`
   （循环内 COMMIT）按契约跳过，回落解释路径；集合化转换的覆盖面由
   `tests/guard/guard_set_oriented_corpus.rs` 与 `cases_native` 断言层承担。
-- 不声称 `v_par_bond`（hz_byfund 依赖的债券视图）已补入语料：仓库无其逐字 DDL，
-  且在入口链口径下不参与体检；将来把入口切到 hz_byfund 时须先从基线 `3_视图` 取
-  原文补 `sql/ddl/views/`。
+- 不声称 `v_par_bond`（hz_byfund 依赖的债券视图）已补入语料：视图逐字原文**在库**——
+  `4327506^:golden/case_corpus_hz_byfund/sql/ddl/views/1_V_PAR_BOND.sql`（38 列，另含
+  `1_V_PAR_BOND_SECTION.sql`）；未补入的真实原因是 purchase 语料缺它依赖的 7 张基表
+  （`par_sys_entrust`、`par_sys_financial_product`、`par_sys_assurance`、`par_sys_debt_loan`、
+  `par_sys_bond_right`、`par_sys_annuity_fund`、`par_sys_asset_security`——语料只有
+  `par_sys_bond`），原文建不出来；且在入口链口径下不参与体检。补入前提是先补齐这
+  7 张基表的逐字 DDL。#56 的 `golden/v2_set_oriented_verify-complex/sql/v_par_bond.sql`
+  是 4 列最小投影，与这份 38 列视图不是同一份定义，不能互替。
 - 不声称服务器语料与仓库一致：真机 `routines=6 missing=0` 的状态是服务器侧本地补件
   产生的；本轮把等价补件正式入库后，两侧应重新对齐（服务器重跑 compile 以仓库为准）。

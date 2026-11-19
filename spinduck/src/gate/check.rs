@@ -252,8 +252,9 @@ impl RefChecker<'_> {
 
     /// 包项逐例程遍历：procedure/function 的块走独立 local 作用域；
     /// Type 项走 `walk_pl_type_decl`（与 walk_statement 同口径）。
-    /// 体检范围激活时，范围外成员与包级裸项（Variable/Type/Cursor——
-    /// 其消费者在例程体内）一并跳过。
+    /// 体检范围激活时，范围外成员跳过；包级裸项里只有 `Type` 原本会被
+    /// 本切片遍历（`walk_pl_type_decl`），范围激活后失去覆盖——
+    /// Variable/Cursor/Raw 本切片从不遍历，行为不变。
     fn package_items(&mut self, items: &[PackageItem]) -> VisitorResult {
         for item in items {
             if let Some(scope) = self.scope {
