@@ -6,9 +6,9 @@
 //! 1. 从该 INSERT 出发、到达确定刷盘屏障之前的全部可达路径上，存在跨表
 //!    写耦合：非 `VALUES` 的修改性 `SqlExec` 触及其他表，且从**例程入口**
 //!    到该写存在一条路径，其间没有任何「最终 `Buffered`、目标表被该写触及」
-//!    的 `INSERT ... VALUES` 保持有效（该 INSERT 之后、该写之前没有同表
-//!    非 `VALUES` 写 / `CallRoutine` / `SqlExecDynamic` 把该表刷掉）——
-//!    运行期 `flush_if_touches` 只在被写表已有缓冲行时才先刷盘保序；
+//!    的 `INSERT ... VALUES` 保持有效——`flush_if_touches` 命中任一缓冲
+//!    表即刷**整个**缓冲，故 `SqlQuery`/`FoldedQuery`/非 `VALUES` 修改写
+//!    触及任一守卫表、`CallRoutine`/`SqlExecDynamic` 都会使守卫失效；
 //!    全局屏障：`CallRoutine` / `SqlExecDynamic` / `Return` / `TxRollback`；
 //!    同表屏障：触及同表的 `SqlQuery` / `FoldedQuery` / 非 `VALUES`
 //!    `SqlExec`——`OpenCursor`/`Fetch`/`CloseCursor`/`TxCommit`/`Jump*`
@@ -22,7 +22,7 @@
 //! 编译路径（`compile_stmts`/`compile_block`）传空集。
 
 use super::types::{AssignTarget, BufferPolicy, IrExpr, IrProg, IrStmt};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 
 /// 编译入口统一调用：就地写回每条 `SqlExec` 的 `buffer_policy`。
 /// `out_params` 为例程 OUT/INOUT 形参名集（小写）；非例程路径传空集。
@@ -59,7 +59,7 @@ fn classify(
     let mut clean = vec![true; candidates.len()];
     let mut immediate = HashSet::new();
     loop {
-        let unguarded = unguarded_writes(code, succ, candidates, &immediate);
+        let unguarded = super::writebuf_guard::unguarded_writes(code, succ, candidates, &immediate);
         let scan = Scan {
             code,
             succ,
@@ -114,7 +114,7 @@ fn insert_target(stmt: &IrStmt) -> Option<String> {
 
 /// 严格解析 `insert into <表> [(列清单)] values ...`；非纯 VALUES 形态返回
 /// `None`（`INSERT ... SELECT`、`INSERT` 无 `VALUES` 等一律不算）。
-fn plain_insert_values(sql: &str) -> Option<String> {
+pub(super) fn plain_insert_values(sql: &str) -> Option<String> {
     let lower = sql.trim_start().to_ascii_lowercase();
     let rest = lower.strip_prefix("insert into")?;
     let rest = rest.trim_start();
@@ -193,7 +193,7 @@ fn ident_tokens(sql: &str) -> HashSet<String> {
         .collect()
 }
 
-fn touches_table(sql: &str, table: &str) -> bool {
+pub(super) fn touches_table(sql: &str, table: &str) -> bool {
     ident_tokens(sql).contains(table)
 }
 
@@ -207,7 +207,7 @@ fn first_keyword(sql: &str) -> String {
 }
 
 /// 是否「修改表」的 DML/DDL 首关键字。
-fn modifies_table(sql: &str) -> bool {
+pub(super) fn modifies_table(sql: &str) -> bool {
     matches!(
         first_keyword(sql).as_str(),
         "insert" | "update" | "delete" | "merge" | "truncate" | "create" | "drop" | "alter"
@@ -283,129 +283,6 @@ impl Scan<'_> {
             }
         }
         true
-    }
-}
-
-/// 计算「无守卫」的跨表修改写 pc 集：存在一条从例程入口（pc 0）到该写的
-/// 路径，其间没有任何「最终 `Buffered`、目标表被该写触及」的 `INSERT ...
-/// VALUES` 保持有效（该 INSERT 之后、该写之前没有把该表刷掉的点：
-/// 同表非 `VALUES` 写 / `CallRoutine` / `SqlExecDynamic`）。
-///
-/// must-数据流：`input[n]` = 所有入口→n 路径上都仍处于守卫状态的表集
-/// （到达 n 之前）。多表守卫取保守口径——到达写时守卫交集为空即视为
-/// 存在无守卫路径。
-fn unguarded_writes(
-    code: &[IrStmt],
-    succ: &[Vec<usize>],
-    candidates: &[(usize, String)],
-    immediate: &HashSet<usize>,
-) -> HashSet<usize> {
-    // 最终 Buffered 的候选：pc → 目标表
-    let buffered: HashMap<usize, &str> = candidates
-        .iter()
-        .filter(|(pc, _)| !immediate.contains(pc))
-        .map(|(pc, t)| (*pc, t.as_str()))
-        .collect();
-    let targets: HashSet<&str> = buffered.values().copied().collect();
-
-    // 入口可达集
-    let mut reachable = vec![false; code.len()];
-    if code.is_empty() {
-        return HashSet::new();
-    }
-    reachable[0] = true;
-    let mut queue = VecDeque::from([0usize]);
-    while let Some(pc) = queue.pop_front() {
-        for &s in &succ[pc] {
-            if s < code.len() && !reachable[s] {
-                reachable[s] = true;
-                queue.push_back(s);
-            }
-        }
-    }
-
-    // 可达节点的前驱表
-    let mut preds = vec![Vec::new(); code.len()];
-    for (pc, ss) in succ.iter().enumerate() {
-        if !reachable[pc] {
-            continue;
-        }
-        for &s in ss {
-            if s < code.len() && reachable[s] {
-                preds[s].push(pc);
-            }
-        }
-    }
-
-    // must 不动点：input[n] = ∩ out(p)（p 为 n 的可达前驱）；input[0] = ∅
-    let mut input: Vec<HashSet<&str>> = vec![targets.clone(); code.len()];
-    input[0] = HashSet::new();
-    loop {
-        let mut changed = false;
-        for n in 1..code.len() {
-            if !reachable[n] || preds[n].is_empty() {
-                continue;
-            }
-            let mut acc: Option<HashSet<&str>> = None;
-            for &p in &preds[n] {
-                let out = guarded_transfer(code, p, &input[p], &buffered);
-                acc = Some(match acc {
-                    None => out,
-                    Some(a) => a.intersection(&out).copied().collect(),
-                });
-            }
-            let new_in = acc.unwrap_or_else(|| targets.clone());
-            if new_in != input[n] {
-                input[n] = new_in;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    code.iter()
-        .enumerate()
-        .filter_map(|(pc, st)| match st {
-            IrStmt::SqlExec { sql, .. }
-                if reachable[pc] && plain_insert_values(sql).is_none() && modifies_table(sql) =>
-            {
-                // 到达该写时，所有入口路径共有的守卫表中没有被本写触及的
-                // → 存在无守卫路径 → 跨表写耦合
-                let guarded = input[pc].iter().any(|t| touches_table(sql, t));
-                (!guarded).then_some(pc)
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-/// 节点 `pc` 的守卫转移：最终 `Buffered` 的候选 INSERT 把其目标表加入
-/// 守卫集；`CallRoutine`/`SqlExecDynamic` 清空全部守卫；触及守卫表的非
-/// `VALUES` 修改写清除对应表守卫；其余节点透传。
-fn guarded_transfer<'a>(
-    code: &'a [IrStmt],
-    pc: usize,
-    inn: &HashSet<&'a str>,
-    buffered: &HashMap<usize, &'a str>,
-) -> HashSet<&'a str> {
-    if let Some(t) = buffered.get(&pc) {
-        let mut s = inn.clone();
-        s.insert(*t);
-        return s;
-    }
-    match &code[pc] {
-        IrStmt::CallRoutine { .. } | IrStmt::SqlExecDynamic { .. } => HashSet::new(),
-        IrStmt::SqlExec { sql, .. }
-            if plain_insert_values(sql).is_none() && modifies_table(sql) =>
-        {
-            inn.iter()
-                .filter(|t| !touches_table(sql, t))
-                .copied()
-                .collect()
-        }
-        _ => inn.clone(),
     }
 }
 

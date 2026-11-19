@@ -16,6 +16,7 @@ pub mod set_oriented;
 mod sql;
 mod stmt;
 mod types;
+mod writebuf_guard;
 mod writebuf_policy;
 
 pub(crate) use control::Compiler;

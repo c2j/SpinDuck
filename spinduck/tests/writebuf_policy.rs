@@ -107,6 +107,32 @@ const DML_ORDER_PROC: &str = "CREATE OR REPLACE PROCEDURE prc_m1_dml_order IS \
     INSERT INTO proc_log (code, msg) VALUES ('k', 'v'); \
     RETURN; END;";
 
+/// 红线 1 守卫的整缓冲刷盘语义：`flush_if_touches` 命中任一缓冲表即刷
+/// **整个**缓冲（`SqlQuery`/`FoldedQuery` 同样触发）。
+/// 1) `INSERT proc_log; SELECT ... FROM proc_log; INSERT audit_t;
+///    DELETE proc_log`——SELECT 命中缓冲中的 proc_log 整刷，DELETE proc_log
+///    到达时 proc_log 已不在缓冲 → audit_t 的 INSERT 必须 `Immediate`。
+/// 2) `INSERT audit_t; INSERT proc_log; DELETE proc_log; INSERT fxj_audit;
+///    DELETE audit_t`——DELETE proc_log 整刷后 audit_t 不在缓冲，
+///    DELETE audit_t 无守卫 → fxj_audit 的 INSERT 必须 `Immediate`。
+const FLUSH_SELECT_PROC: &str = "CREATE OR REPLACE PROCEDURE prc_m1_flush_sel IS \
+    v_code VARCHAR2; \
+    BEGIN \
+    INSERT INTO proc_log (code, msg) VALUES ('k', 'v'); \
+    SELECT code INTO v_code FROM proc_log; \
+    INSERT INTO audit_t (note) VALUES ('a1'); \
+    DELETE FROM proc_log WHERE code = 'x'; \
+    RETURN; END;";
+
+const FLUSH_DML_PROC: &str = "CREATE OR REPLACE PROCEDURE prc_m1_flush_dml IS \
+    BEGIN \
+    INSERT INTO audit_t (note) VALUES ('a1'); \
+    INSERT INTO proc_log (code, msg) VALUES ('k', 'v'); \
+    DELETE FROM proc_log WHERE code = 'x'; \
+    INSERT INTO fxj_audit (id, note) VALUES (2, 'f1'); \
+    DELETE FROM audit_t; \
+    RETURN; END;";
+
 fn setup_engine() -> Engine {
     let mut eng = Engine::new(
         Box::new(DuckExecutor::open_in_memory().unwrap()),
@@ -312,5 +338,48 @@ fn should_keep_insert_immediate_when_other_table_dml_precedes_that_tables_insert
         policy_of("insert into proc_log"),
         Some(BufferPolicy::Buffered),
         "proc_log 的 INSERT 向前扫描无耦合，应 Buffered"
+    );
+}
+
+/// 整缓冲刷盘守护：`SqlQuery` 命中缓冲表、`DELETE` 命中缓冲表都会把
+/// **整个**缓冲刷掉——其后的跨表写失去守卫，依赖候选必须 `Immediate`。
+#[test]
+fn should_keep_insert_immediate_when_an_earlier_flush_clears_the_whole_buffer() {
+    let mut eng = setup_engine();
+    eng.register(FLUSH_SELECT_PROC).unwrap();
+    eng.register(FLUSH_DML_PROC).unwrap();
+    let policy_of = |proc: &str, prefix: &str| {
+        let prog = &eng.catalog.lookup(proc).unwrap().prog;
+        prog.code.iter().find_map(|st| match st {
+            IrStmt::SqlExec {
+                sql, buffer_policy, ..
+            } if sql.to_ascii_lowercase().starts_with(prefix) => Some(*buffer_policy),
+            _ => None,
+        })
+    };
+    assert_eq!(
+        policy_of("prc_m1_flush_sel", "insert into proc_log"),
+        Some(BufferPolicy::Buffered),
+        "proc_log 的 INSERT 无耦合，应 Buffered"
+    );
+    assert_eq!(
+        policy_of("prc_m1_flush_sel", "insert into audit_t"),
+        Some(BufferPolicy::Immediate),
+        "SELECT FROM proc_log 已整刷缓冲，DELETE proc_log 无守卫"
+    );
+    assert_eq!(
+        policy_of("prc_m1_flush_dml", "insert into audit_t"),
+        Some(BufferPolicy::Immediate),
+        "fxj_audit 判 Immediate 后其 INSERT 是 audit_t 路径上的即时跨表写，级联降级"
+    );
+    assert_eq!(
+        policy_of("prc_m1_flush_dml", "insert into proc_log"),
+        Some(BufferPolicy::Buffered),
+        "proc_log 的 INSERT 无耦合，应 Buffered"
+    );
+    assert_eq!(
+        policy_of("prc_m1_flush_dml", "insert into fxj_audit"),
+        Some(BufferPolicy::Immediate),
+        "DELETE proc_log 已整刷缓冲，DELETE audit_t 无守卫"
     );
 }
