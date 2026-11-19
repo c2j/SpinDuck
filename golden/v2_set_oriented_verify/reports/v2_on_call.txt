@@ -1,0 +1,2 @@
+SET_ORIENTED pkg_split_trade_step3_sh.prc_trd_deal_purchase converted
+OUT p_o_succeed = 0

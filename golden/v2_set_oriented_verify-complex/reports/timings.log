@@ -1,0 +1,4 @@
+SpinDuck Off    100k: 691985.0 ms（单轮，解释器逐行；90k+ c_get_data 分组 + ~20k venture 分组）
+SpinDuck On     100k: 710948.0 ms（batch-atomic，skipped UnsupportedControlFlow → 回退）
+SpinDuck Strict 100k: 768234.1 ms（strict，skipped UnsupportedControlFlow → 回退；单轮噪声偏大）
+SP openGauss 7.0.0-RC3 CALL: 336946 ms（gsql 客户端墙钟，含连接开销）
