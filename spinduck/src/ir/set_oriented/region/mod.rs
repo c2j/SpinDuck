@@ -22,7 +22,9 @@ pub(crate) struct CursorRegion {
     pub record: VarName,
 }
 
-/// 从整段 IR 中抽取唯一静态游标循环区域；前缀/后缀允许存在但不在本步证明。
+/// 抽取首个静态游标循环区域为集合化候选（PC 均为原始 `IrProg.code` 下标）。
+/// V3A 只转换首个区域：其后静态游标、动态游标与例程调用均属后缀，
+/// 由 `RunSpan` 按原 PC 解释执行，不作集合化候选（设计 §4）。
 pub(crate) fn extract(prog: &IrProg) -> Result<CursorRegion, SkipReason> {
     let mut found: Option<CursorRegion> = None;
     for (open_pc, stmt) in prog.code.iter().enumerate() {
@@ -34,11 +36,27 @@ pub(crate) fn extract(prog: &IrProg) -> Result<CursorRegion, SkipReason> {
             continue;
         };
         if found.is_some() {
-            return Err(SkipReason::UnsupportedControlFlow);
+            continue;
         }
         let region = recognize(prog, open_pc, cursor)?;
         reject_external_entry_edges(prog, &region)?;
         reject_internal_exit_edges(prog, &region)?;
+        // 区域内部再遇静态游标 = 嵌套循环，整体拒绝；区域之后的静态游标
+        // 属后缀，由 RunSpan 按原 PC 解释，不作集合化候选。
+        if prog.code[region.open_pc + 1..region.close_pc]
+            .iter()
+            .any(|st| {
+                matches!(
+                    st,
+                    IrStmt::OpenCursor {
+                        source: CursorSource::Static { .. },
+                        ..
+                    }
+                )
+            })
+        {
+            return Err(SkipReason::UnsupportedControlFlow);
+        }
         found = Some(region);
     }
     found.ok_or(SkipReason::UnsupportedControlFlow)

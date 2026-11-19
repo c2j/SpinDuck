@@ -275,7 +275,9 @@ fn v2_admit(
     // 深度必须为 0，否则边界两侧的异常处理语义无法跨段保持。
     region::reject_trap_boundaries(prog, &region)?;
     region::reject_prefix_effects(prog, region.open_pc)?;
-    reject_outer_effects(&prog.code[region.close_pc + 1..])?;
+    // 后缀不再做效果准入：RunSpan 在原 IrProg 上按原 PC 解释执行，
+    // 例程调用、动态游标与 EXECUTE IMMEDIATE 均为解释器原生能力；
+    // 变量依赖由 live_out_check 兜底（设计 §2.1/§4 V3A）。
     if mode == SetOrientedMode::BatchAtomic {
         region::prefix_is_clean(prog, region.open_pc)?;
     }
@@ -358,22 +360,4 @@ fn substitute_binds(text: &str, repls: &[(String, String)]) -> String {
         }
     }
     out
-}
-
-/// 前缀/后缀效果扫描：允许事务边界与异常处理骨架（V3 RunSpan 后缀按
-/// 原 PC 解释，`PushTrap`/`PopTrap`/`Raise`/绝对 `GOTO` 天然有效），
-/// 拒绝例程调用与动态 SQL。
-fn reject_outer_effects(code: &[IrStmt]) -> Result<(), SkipReason> {
-    for stmt in code {
-        match stmt {
-            IrStmt::CallRoutine { .. } => return Err(SkipReason::UnsupportedCall),
-            IrStmt::SqlExecDynamic { .. }
-            | IrStmt::OpenCursor {
-                source: CursorSource::Dynamic { .. },
-                ..
-            } => return Err(SkipReason::DynamicSql),
-            _ => {}
-        }
-    }
-    Ok(())
 }
