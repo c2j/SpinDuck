@@ -4,6 +4,7 @@ use super::*;
 
 mod agg_walk;
 mod arith_walk;
+mod insert_log;
 use agg_walk::agg_candidates;
 
 /// IF 门种类：§3.4 聚合字段覆写 / §3.3 条件算术覆写（THEN 恰一条赋值，
@@ -164,18 +165,8 @@ impl<'a> Body<'a> {
             self.has_trap = true;
             return Ok(resume);
         }
-        // §3.5-4 INSERT 跳起型处理器：坏行数由入口守卫裁决，
-        // 存在坏行则整段退回，不得改写成行过滤。
-        if ctx.mode == SetOrientedMode::BatchAtomic {
-            if let Some(shape) = region::insert_log_handler(ctx.prog, pc) {
-                if self.insert_stmt.is_some() {
-                    return Err(SkipReason::UnsupportedWrite);
-                }
-                self.insert_stmt = Some(&ctx.prog.code[pc + 1]);
-                self.insert_log = true;
-                self.has_trap = true;
-                return Ok(shape.resume);
-            }
+        if let Some(resume) = self.insert_log_trap(ctx, pc)? {
+            return Ok(resume);
         }
         self.has_trap = true;
         Ok(pc + 1)

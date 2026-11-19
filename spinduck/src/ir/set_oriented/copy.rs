@@ -10,7 +10,7 @@ mod inputs;
 use super::schema::{Column, Default, Table};
 use super::shape::{self, Name};
 use super::{agg, expr, lookup, substitute_binds, BindSrc, CopyLoop, SinkOp, SkipReason};
-use badrow::{bad_row_guard, sd_cur_cte};
+use badrow::sd_cur_cte;
 use inline::{inline_projection, ProjEnv};
 
 pub(super) struct CopySql {
@@ -52,18 +52,13 @@ pub(super) fn copy_sql(
         inline::check_evaluation(region, (var, value), &mut env)?;
     }
     let (projections, write_guards) = write_projections(region, insert, target, &mut env)?;
-    // §3.5-4 非 NoOp INSERT 处理器：坏行数必须为 0 才准入集合化。
-    // 守卫只覆盖本条 INSERT 显式写入列（默认值填充列不在内），
-    // 非零 → entry_ok 退回原解释器，处理器副作用保持可观测。
-    if region.insert_log {
-        bad_row_guard(
-            &write_guards,
-            select,
-            source,
-            (&ctes, &joins),
-            &mut expr_guards,
-        );
-    }
+    badrow::push_bad_row_guard(
+        region,
+        (&write_guards, &ctes, &joins),
+        select,
+        source,
+        &mut expr_guards,
+    );
     guards.extend(write_guards);
     if select
         .sources

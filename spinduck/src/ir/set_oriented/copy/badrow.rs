@@ -1,6 +1,6 @@
 //! §3.5-4 非 NoOp INSERT 处理器的坏行入口守卫：`bad_rows == 0` 准入。
 
-use super::{shape, Table};
+use super::{shape, CopyLoop, Table};
 
 /// `sd_cur` CTE 定义（批写主查询与坏行守卫共用，保证行集口径一致）。
 pub(super) fn sd_cur_cte(select: &shape::Select, source: &Table) -> String {
@@ -45,4 +45,18 @@ pub(super) fn bad_row_guard(
     expr_guards.push(format!(
         "WITH {with} SELECT COUNT(*) FROM sd_cur{join_sql} WHERE {bad}"
     ));
+}
+
+/// §3.5-4 入口：`insert_log` 区域追加坏行守卫（parts = 写列守卫/CTE/join）。
+pub(super) fn push_bad_row_guard(
+    region: &CopyLoop<'_>,
+    parts: (&[String], &[String], &[String]),
+    select: &shape::Select,
+    source: &Table,
+    expr_guards: &mut Vec<String>,
+) {
+    if !region.insert_log {
+        return;
+    }
+    bad_row_guard(parts.0, select, source, (parts.1, parts.2), expr_guards);
 }
