@@ -182,11 +182,12 @@ fn plan_from(
     ctx: &OptimizeCtx<'_>,
 ) -> Result<Result<entry::ConversionPlan, SkipReason>, EngineError> {
     let mode = ctx.mode;
-    // §2.2-3：--batch-commit 不再构成集合化互斥——Strict/BatchAtomic 均可
-    // 走集合 SQL（不经 WriteBuffer）；TxCommit trace 照发，实际提交边界由
-    // run_selected 按 batch_commit 分流。BatchCommitEnabled 拒因保留枚举，
-    // 现无路径返回。
-    let selected = {
+    // §2.2-3：仅 BatchAtomic × --batch-commit 解除互斥——区域集合 SQL 不经
+    // WriteBuffer，TxCommit trace 照发但实际提交延迟到 call_with_sink 出口；
+    // Strict 仍拒绝（提交快照语义不允许合并）。
+    let selected = if ctx.batch_commit && mode != SetOrientedMode::BatchAtomic {
+        Err(SkipReason::BatchCommitEnabled)
+    } else {
         match v2_admit(&routine.prog, mode, ctx.catalog) {
             Err(reason) => Err(reason),
             Ok(region) => {

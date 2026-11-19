@@ -48,7 +48,8 @@ impl Engine {
         };
         let mut cursor_pc = 0usize;
         for p in &plans {
-            // 步 1：前缀按原 IR 执行至区域入口（stop_pc 处指令不执行、不计步）
+            // 步 1：前缀按原 IR 执行至区域入口（stop_pc 处指令不执行、不计步）；
+            // 非 Stopped 按 §2.1 直接返回——区域未执行，不记 Converted
             let out = self.run_prog(
                 &routine.prog,
                 frame,
@@ -60,51 +61,11 @@ impl Engine {
                 },
             )?;
             if !matches!(out, RunOutcome::Stopped) {
-                // 前缀提前终结例程（RETURN 等）：区域不可达，选择仍记 Converted
-                self.push_report(&routine.name, Status::Converted { sql: p.sql.clone() });
                 return Ok(out);
             }
-            // 步 2/3：入口不抛错守卫；外层 Err(EngineError) 经 `?` 直接上抛
-            // （call_with_sink 回滚），仅内层 Ok(Err(SkipReason)) 事务仍干净
-            // 才退回原区域 [open_pc .. close_pc + 1)，绝不重放前缀
-            match entry_ok(self.ex.as_ref(), p, &self.optimize_ctx(), frame)? {
-                Err(reason) => {
-                    self.push_report(&routine.name, Status::Skipped { reason });
-                    let out = self.run_prog(
-                        &routine.prog,
-                        frame,
-                        sink,
-                        limits,
-                        RunSpan {
-                            start_pc: p.open_pc,
-                            stop_pc: Some(p.close_pc + 1),
-                        },
-                    )?;
-                    if !matches!(out, RunOutcome::Stopped) {
-                        return Ok(out);
-                    }
-                }
-                Ok(()) => {
-                    self.push_report(&routine.name, Status::Converted { sql: p.sql.clone() });
-                    // 步 4/5：集合 SqlExec 当场直发（不经 WriteBuffer）；
-                    // 开始执行即失败直接上抛，严禁回放原循环
-                    let rows = self.exec_region_sql(p, frame, sink)?;
-                    if p.tail_commit && rows > 0 {
-                        // 仅发 IrStmt variant TxCommit trace，绝不发
-                        // TxCommitIfWritten；batch_commit=false 当场
-                        // COMMIT+BEGIN，true 时延迟到 call_with_sink 出口
-                        if sink.is_enabled() {
-                            sink.on_event(crate::exec::TraceEvent::IrStmt {
-                                variant: "TxCommit",
-                            });
-                        }
-                        if !self.batch_commit {
-                            self.ex.execute("COMMIT", &crate::exec::BindMap::new())?;
-                            self.ex
-                                .execute("BEGIN TRANSACTION", &crate::exec::BindMap::new())?;
-                        }
-                    }
-                }
+            // 步 2-5：入口守卫裁决 → 集合 SQL 直发或原区域续跑
+            if let Some(out) = self.adjudicate_region(routine, p, frame, sink, limits)? {
+                return Ok(out);
             }
             cursor_pc = p.close_pc + 1;
         }
@@ -119,6 +80,74 @@ impl Engine {
                 stop_pc: None,
             },
         )
+    }
+
+    /// 区域裁决（设计 §2.1 步 2-5）：`entry_ok` 外层 `Err(EngineError)` 经
+    /// `?` 直接上抛（交 call_with_sink 回滚），仅内层 `Ok(Err(SkipReason))`
+    /// 事务仍干净才退回原区域 `[open_pc .. close_pc + 1)`，绝不重放前缀；
+    /// 守卫通过则集合 SQL 当场直发（不经 WriteBuffer），开始执行即失败
+    /// 直接上抛严禁回放原循环。返回 `Some(out)` 表示例程已提前终结。
+    fn adjudicate_region(
+        &mut self,
+        routine: &CompiledRoutine,
+        plan: &ConversionPlan,
+        frame: &mut Frame,
+        sink: &mut dyn TraceSink,
+        limits: RunLimits,
+    ) -> Result<Option<RunOutcome>, EngineError> {
+        match entry_ok(self.ex.as_ref(), plan, &self.optimize_ctx(), frame)? {
+            Err(reason) => {
+                self.push_report(&routine.name, Status::Skipped { reason });
+                let out = self.run_prog(
+                    &routine.prog,
+                    frame,
+                    sink,
+                    limits,
+                    RunSpan {
+                        start_pc: plan.open_pc,
+                        stop_pc: Some(plan.close_pc + 1),
+                    },
+                )?;
+                Ok((!matches!(out, RunOutcome::Stopped)).then_some(out))
+            }
+            Ok(()) => {
+                self.push_report(
+                    &routine.name,
+                    Status::Converted {
+                        sql: plan.sql.clone(),
+                    },
+                );
+                let rows = self.exec_region_sql(plan, frame, sink)?;
+                self.commit_region_tail(plan, rows, sink)?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// 尾提交（设计 §2.1 契约 2）：仅 `tail_commit && rows_affected > 0` 时
+    /// 发 `IrStmt` variant `TxCommit` trace（绝不发 `TxCommitIfWritten`）；
+    /// `batch_commit=false` 当场 `COMMIT + BEGIN TRANSACTION`，`true` 时
+    /// 延迟到 `call_with_sink` 出口统一提交。0 行不发 trace、不切快照。
+    fn commit_region_tail(
+        &self,
+        plan: &ConversionPlan,
+        rows: usize,
+        sink: &mut dyn TraceSink,
+    ) -> Result<(), EngineError> {
+        if !(plan.tail_commit && rows > 0) {
+            return Ok(());
+        }
+        if sink.is_enabled() {
+            sink.on_event(crate::exec::TraceEvent::IrStmt {
+                variant: "TxCommit",
+            });
+        }
+        if !self.batch_commit {
+            self.ex.execute("COMMIT", &crate::exec::BindMap::new())?;
+            self.ex
+                .execute("BEGIN TRANSACTION", &crate::exec::BindMap::new())?;
+        }
+        Ok(())
     }
 
     /// 集合区域 SQL 的直发执行：按实际顺序发 `IrStmt` variant `SqlExec`
