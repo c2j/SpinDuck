@@ -13,6 +13,14 @@ struct Context<'a, 'c> {
     catalog: &'c crate::catalog::RoutineCatalog,
 }
 
+/// 准备阶段产物：INSERT 语句文本与游标/INSERT 绑定（均为 'a 程序期引用）。
+struct Prepared<'a> {
+    insert: &'a str,
+    binds: &'a [(String, BindSrc)],
+    query: &'a str,
+    query_binds: &'a [(String, BindSrc)],
+}
+
 pub(super) fn analyze_region<'a>(
     prog: &'a IrProg,
     region: &'a region::CursorRegion,
@@ -27,6 +35,18 @@ pub(super) fn analyze_region<'a>(
         catalog,
     };
     let body = body::Body::walk(&ctx)?;
+    let parts = prepare(&ctx, &body, in_params)?;
+    let flags = (body.tail_commit, body.has_trap);
+    let copy = assemble(&ctx, body, parts, in_params)?;
+    Ok((copy, flags.0, flags.1))
+}
+
+/// INSERT 形态、游标查询与写完备性检查；产出批写所需的 SQL 片段引用。
+fn prepare<'a>(
+    ctx: &Context<'a, '_>,
+    body: &body::Body<'a>,
+    in_params: &std::collections::BTreeSet<String>,
+) -> Result<Prepared<'a>, SkipReason> {
     let Some(IrStmt::SqlExec {
         sql: insert,
         binds,
@@ -36,44 +56,55 @@ pub(super) fn analyze_region<'a>(
     else {
         return Err(SkipReason::UnsupportedWrite);
     };
-    let (query, query_binds) = cursor_query(&ctx)?;
+    let (query, query_binds) = cursor_query(ctx)?;
     if !fn_sites.is_empty() {
         return Err(SkipReason::UnresolvedFnSite);
     }
-    if prog.var_types.contains_key(&region.record.0) {
+    if ctx.prog.var_types.contains_key(&ctx.region.record.0) {
         return Err(SkipReason::UnprovenExpression);
     }
-    body.validate(&ctx, binds)?;
-    prove_param_binds(prog, region, binds, in_params)?;
-    Ok((
-        CopyLoop {
-            query,
-            insert,
-            binds,
-            query_binds,
-            var_types: &prog.var_types,
-            record: &region.record,
-            allow_filter: mode == SetOrientedMode::BatchAtomic && body.has_trap,
-            insert_log: body.insert_log,
-            sinks: body.sinks,
-            lookups: body.lookups,
-            tuples: body.tuples,
-            aggs: body.aggs,
-            field_writes: body.field_writes,
-            route: body.route,
-            folded: body.folded,
-            inlined: body.inlined,
-            inline_checks: body.inline_checks,
-            varchar_inputs: body.varchar_inputs,
-            inline_preconditions: body.inline_preconditions,
-            dead: body.dead,
-            arith_writes: body.arith_writes,
-            writes: region::write_set(prog, region, catalog)?,
-            in_params: in_params.clone(),
-        },
-        body.tail_commit,
-        body.has_trap,
-    ))
+    body.validate(ctx, binds)?;
+    prove_param_binds(ctx.prog, ctx.region, binds, in_params)?;
+    Ok(Prepared {
+        insert,
+        binds,
+        query,
+        query_binds,
+    })
+}
+
+/// Body 分析结果装配为 CopyLoop（写集与 IN 形参名集在此定稿）。
+fn assemble<'a>(
+    ctx: &Context<'a, '_>,
+    body: body::Body<'a>,
+    parts: Prepared<'a>,
+    in_params: &std::collections::BTreeSet<String>,
+) -> Result<CopyLoop<'a>, SkipReason> {
+    Ok(CopyLoop {
+        query: parts.query,
+        insert: parts.insert,
+        binds: parts.binds,
+        query_binds: parts.query_binds,
+        var_types: &ctx.prog.var_types,
+        record: &ctx.region.record,
+        allow_filter: ctx.mode == SetOrientedMode::BatchAtomic && body.has_trap,
+        insert_log: body.insert_log,
+        sinks: body.sinks,
+        lookups: body.lookups,
+        tuples: body.tuples,
+        aggs: body.aggs,
+        field_writes: body.field_writes,
+        route: body.route,
+        folded: body.folded,
+        inlined: body.inlined,
+        inline_checks: body.inline_checks,
+        varchar_inputs: body.varchar_inputs,
+        inline_preconditions: body.inline_preconditions,
+        dead: body.dead,
+        arith_writes: body.arith_writes,
+        writes: region::write_set(ctx.prog, ctx.region, ctx.catalog)?,
+        in_params: in_params.clone(),
+    })
 }
 
 /// §4.2 IN 形参投影证明：INSERT 绑定引用 IN 形参时，该变量必须在区域体内

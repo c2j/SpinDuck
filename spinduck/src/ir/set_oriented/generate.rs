@@ -200,12 +200,7 @@ fn finish(
         &tuple_views,
         &agg_views,
     )?;
-    let mut binds = query_binds(copy, &resolved);
-    for (ph, src) in param_binds(copy, &generated) {
-        if !binds.iter().any(|(p, _)| p == &ph) {
-            binds.push((ph, src));
-        }
-    }
+    let binds = with_param_binds(copy, &generated, query_binds(copy, &resolved));
     let expr_guards = entry::bind_guards(generated.expr_guards, &binds)?;
     Ok(entry::ConversionPlan {
         sql: generated.sql,
@@ -241,6 +236,20 @@ fn route_guards(
         guards.push(route::guard(l, lit)?);
     }
     Ok(guards)
+}
+
+/// §4.2：把批写 SQL/守卫实际引用的 IN 形参占位符并入绑定集（去重）。
+fn with_param_binds(
+    copy: &CopyLoop<'_>,
+    generated: &copy::CopySql,
+    mut binds: Vec<(String, BindSrc)>,
+) -> Vec<(String, BindSrc)> {
+    for (ph, src) in param_binds(copy, generated) {
+        if !binds.iter().any(|(p, _)| p == &ph) {
+            binds.push((ph, src));
+        }
+    }
+    binds
 }
 
 /// §4.2：批写 SQL 与行级守卫中实际引用的 IN 形参占位符，运行期按名绑定；
