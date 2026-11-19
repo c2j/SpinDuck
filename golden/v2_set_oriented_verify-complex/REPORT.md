@@ -79,7 +79,7 @@ V2 的区域证明对该过程整体保守拒绝——与设计语义一致（�
 ## 7. 口径与限制
 
 1. **参照版本**：openGauss **7.0.0-RC3**（`sd-og70`，库 `hz`），非常驻门禁的 5.0.0；与 PR #48 历史数字不可直接比较。
-2. **桩依赖**：9 个外部函数为确定性桩（`sql/routines/0_STUB_*.sql`），两侧同一实现；真实现可能不同，但三方一致性结论不受影响（同一输入同一语义）。
+2. **桩依赖**：外部函数现分两类——`fnc_com_get_fund_code`/`fnc_com_get_main_xwdm`/`fnc_com_get_seat_para`/`fnc_get_fund_data_mode` 自 #57 起改用语料逐字体（`case_corpus_purchase/sql/routines/1_FNC_*.sql`）；其余 5 个（`fnc_com_get_seat_fee_type`/`fnc_get_bond_yjlx`/`fnc_get_rate_info2`/`fnc_get_split_date`/`fnc_get_stock_kind`）仍为确定性桩（`sql/routines/0_STUB_*.sql`）。两侧同一实现；真实现可能不同，但三方一致性结论不受影响（同一输入同一语义）。
 3. **单轮测时**：Off/On/Strict 各一轮，百秒级成本；Strict 768s vs Off 692s 的差为噪声量级。
 4. **debug 构建**：绝对值为开发机参考，倍数结论（On≈Off、SP≈2×Off）稳健。
 5. **复现**：`bash golden/v2_set_oriented_verify-complex/run_bench.sh`（`N=1000` 冒烟；`OG_CONTAINER=sd-og70 OG_LIBS=/opt/oglibs2` 启用 SP 参照）。
