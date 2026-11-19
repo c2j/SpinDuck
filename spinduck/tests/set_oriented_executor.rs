@@ -367,3 +367,86 @@ fn should_drive_multiple_regions_with_run_span_and_preserve_suffix_absolute_goto
         "退回路径按原循环逐行解释，结果须与 Off 基线逐行一致"
     );
 }
+
+/// M2 §2.2-2/§5.1-2：嵌套静态游标（内层 `OpenCursor` 落在外层
+/// `[open_pc .. close_pc]` 区间内、外层 `CLOSE` 之前）——外层区域不
+/// `Converted`，内层也不单独转换；`BatchAtomic` 与 `Off` 的结果行
+/// 与 `OUT` 逐值一致。
+const NESTED_CURSOR_PROC: &str =
+    "CREATE OR REPLACE PROCEDURE nested_cursors(p_mark OUT VARCHAR2) IS BEGIN \
+    FOR o IN SELECT a FROM source_rows LOOP \
+    FOR i IN SELECT b FROM inner_rows LOOP \
+    INSERT INTO target_rows(val, tag) VALUES (o.a, i.b); \
+    END LOOP; END LOOP; \
+    p_mark := 'done'; END;";
+
+fn setup_nested_cursor() -> Engine {
+    let mut eng = Engine::new(
+        Box::new(spinduck_core::DuckExecutor::open_in_memory().unwrap()),
+        RuleRegistry::default(),
+    );
+    for ddl in [
+        "CREATE TABLE source_rows(a BIGINT)",
+        "INSERT INTO source_rows VALUES (1), (2)",
+        "CREATE TABLE inner_rows(b VARCHAR)",
+        "INSERT INTO inner_rows VALUES ('x'), ('y')",
+        "CREATE TABLE target_rows(val BIGINT, tag VARCHAR)",
+    ] {
+        eng.ex.execute(ddl, &BindMap::new()).unwrap();
+    }
+    eng.register(NESTED_CURSOR_PROC).unwrap();
+    eng
+}
+
+fn nested_target_rows(eng: &Engine) -> Vec<Vec<SpinValue>> {
+    eng.ex
+        .query(
+            "SELECT val, tag FROM target_rows ORDER BY val, tag",
+            &BindMap::new(),
+        )
+        .unwrap()
+        .fetch_many(20)
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn should_reject_outer_and_inner_when_static_cursors_are_nested() {
+    use spinduck_core::ir::set_oriented::{SetOrientedMode, SkipReason, Status};
+
+    // Off 基线：两层静态游标按原解释器逐行执行（笛卡尔积 2×2=4 行）。
+    let mut baseline = setup_nested_cursor();
+    let expected_mark = baseline
+        .call("nested_cursors", &[SpinValue::Null])
+        .unwrap()
+        .outs
+        .get("p_mark")
+        .cloned();
+    let expected_rows = nested_target_rows(&baseline);
+    assert_eq!(expected_rows.len(), 4, "Off 基线应产出 4 行");
+
+    // BatchAtomic：嵌套静态游标不转换——报告中不得出现任何
+    // Converted（外层区域与落在其 PC 区间内的内层 OpenCursor 均不
+    // 单独转换），且结果与 Off 逐值一致。
+    let mut eng = setup_nested_cursor();
+    eng.set_oriented = SetOrientedMode::BatchAtomic;
+    let result = eng.call("nested_cursors", &[SpinValue::Null]).unwrap();
+    assert_eq!(
+        eng.set_oriented_reports().len(),
+        1,
+        "嵌套静态游标应整体拒绝: {:?}",
+        eng.set_oriented_reports()
+    );
+    assert_eq!(
+        eng.set_oriented_reports()[0].status,
+        Status::Skipped {
+            reason: SkipReason::UnsupportedControlFlow
+        },
+        "extract 见到第二个静态 OpenCursor 即拒绝整个例程"
+    );
+    assert_eq!(result.outs.get("p_mark"), expected_mark.as_ref());
+    assert_eq!(
+        nested_target_rows(&eng),
+        expected_rows,
+        "BatchAtomic 与 Off 的结果行必须逐值一致"
+    );
+}
