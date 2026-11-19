@@ -98,6 +98,28 @@ fn recognize(prog: &IrProg, open_pc: usize, cursor: &VarName) -> Result<CursorRe
     })
 }
 
+/// 分段边界陷阱深度校验（设计 §2.1 不变量 1）：`run_spanned` 每段以空
+/// 陷阱栈起步，`open_pc` 与 `close_pc + 1` 两处的静态陷阱深度必须为 0，
+/// 否则边界会切断活跃异常处理器的作用域。
+pub(crate) fn reject_trap_boundaries(
+    prog: &IrProg,
+    region: &CursorRegion,
+) -> Result<(), SkipReason> {
+    let depth_at = |pc: usize| {
+        prog.code[..pc.min(prog.code.len())]
+            .iter()
+            .fold(0usize, |d, st| match st {
+                IrStmt::PushTrap { .. } => d + 1,
+                IrStmt::PopTrap => d.saturating_sub(1),
+                _ => d,
+            })
+    };
+    if depth_at(region.open_pc) != 0 || depth_at(region.close_pc + 1) != 0 {
+        return Err(SkipReason::ExceptionScopePresent);
+    }
+    Ok(())
+}
+
 /// 区域内（含处理器）不得存在跳出区域的跳转；仅允许回循环头与 `%NOTFOUND` 正常出口。
 fn reject_internal_exit_edges(prog: &IrProg, region: &CursorRegion) -> Result<(), SkipReason> {
     let exit_pc = region.close_pc + 1;

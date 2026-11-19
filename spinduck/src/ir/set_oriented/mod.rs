@@ -20,11 +20,9 @@ mod route;
 mod schema;
 mod shape;
 
-pub(crate) use entry::{entry_ok, suffix_prog, ConversionPlan};
+pub(crate) use entry::{entry_ok, ConversionPlan};
 
-use super::{
-    AssignTarget, BinOp, BindSrc, BufferPolicy, CursorSource, IrExpr, IrProg, IrStmt, VarName,
-};
+use super::{AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, VarName};
 use crate::catalog::CompiledRoutine;
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
@@ -184,9 +182,11 @@ fn plan_from(
     ctx: &OptimizeCtx<'_>,
 ) -> Result<Result<entry::ConversionPlan, SkipReason>, EngineError> {
     let mode = ctx.mode;
-    let selected = if ctx.batch_commit {
-        Err(SkipReason::BatchCommitEnabled)
-    } else {
+    // §2.2-3：--batch-commit 不再构成集合化互斥——Strict/BatchAtomic 均可
+    // 走集合 SQL（不经 WriteBuffer）；TxCommit trace 照发，实际提交边界由
+    // run_selected 按 batch_commit 分流。BatchCommitEnabled 拒因保留枚举，
+    // 现无路径返回。
+    let selected = {
         match v2_admit(&routine.prog, mode, ctx.catalog) {
             Err(reason) => Err(reason),
             Ok(region) => {
@@ -240,6 +240,9 @@ fn v2_admit(
     catalog: &crate::catalog::RoutineCatalog,
 ) -> Result<region::CursorRegion, SkipReason> {
     let region = region::extract(prog)?;
+    // §2.1 不变量 1：run_spanned 每段空陷阱栈起步，分段边界的静态陷阱
+    // 深度必须为 0，否则边界两侧的异常处理语义无法跨段保持。
+    region::reject_trap_boundaries(prog, &region)?;
     region::reject_prefix_effects(prog, region.open_pc)?;
     reject_outer_effects(&prog.code[region.close_pc + 1..])?;
     if mode == SetOrientedMode::BatchAtomic {
@@ -326,13 +329,12 @@ fn substitute_binds(text: &str, repls: &[(String, String)]) -> String {
     out
 }
 
-/// 前缀/后缀效果扫描：允许事务边界，拒绝异常/调用/动态 SQL。
+/// 前缀/后缀效果扫描：允许事务边界与异常处理骨架（V3 RunSpan 后缀按
+/// 原 PC 解释，`PushTrap`/`PopTrap`/`Raise`/绝对 `GOTO` 天然有效），
+/// 拒绝例程调用与动态 SQL。
 fn reject_outer_effects(code: &[IrStmt]) -> Result<(), SkipReason> {
     for stmt in code {
         match stmt {
-            IrStmt::PushTrap { .. } | IrStmt::PopTrap | IrStmt::Raise { .. } => {
-                return Err(SkipReason::ExceptionScopePresent)
-            }
             IrStmt::CallRoutine { .. } => return Err(SkipReason::UnsupportedCall),
             IrStmt::SqlExecDynamic { .. }
             | IrStmt::OpenCursor {

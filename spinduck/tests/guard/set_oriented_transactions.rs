@@ -44,10 +44,11 @@ fn should_not_commit_at_exit_when_batch_atomic_writes_zero_rows() {
 }
 
 #[test]
-fn should_skip_batch_atomic_when_batch_commit_enabled_and_avoid_empty_commit() {
+fn should_convert_batch_atomic_when_batch_commit_enabled_and_avoid_empty_commit() {
     use spinduck_core::exec::TraceEvent;
-    use spinduck_core::ir::set_oriented::{SkipReason, Status};
-    // batch_commit=true：首期保守拒绝，走原逐行路径（4 次 FETCH），数据不变。
+    use spinduck_core::ir::set_oriented::Status;
+    // batch_commit=true（§2.2-3 解除互斥）：区域走集合 SQL，Fetch 归零；
+    // 报告 Converted 且 sql 与 batch_commit=false 同一条集合写语句。
     let mut eng = engine();
     eng.register(COPY).unwrap();
     eng.set_oriented = SetOrientedMode::BatchAtomic;
@@ -55,18 +56,23 @@ fn should_skip_batch_atomic_when_batch_commit_enabled_and_avoid_empty_commit() {
     let mut trace = Trace::default();
     eng.call_with_sink("copy_rows", &[], &mut trace).unwrap();
     assert_eq!(rows(&eng), expected());
-    assert_eq!(
-        eng.set_oriented_reports()[0].status,
-        Status::Skipped {
-            reason: SkipReason::BatchCommitEnabled
-        }
-    );
+    let Status::Converted { sql } = &eng.set_oriented_reports()[0].status else {
+        panic!("expected conversion: {:?}", eng.set_oriented_reports());
+    };
+    let mut baseline = engine();
+    baseline.register(COPY).unwrap();
+    baseline.set_oriented = SetOrientedMode::BatchAtomic;
+    baseline.call("copy_rows", &[]).unwrap();
+    let Status::Converted { sql: want } = &baseline.set_oriented_reports()[0].status else {
+        panic!("expected conversion: {:?}", baseline.set_oriented_reports());
+    };
+    assert_eq!(sql, want, "batch_commit 不改变集合写语句");
     let fetches = trace
         .0
         .iter()
         .filter(|e| matches!(e, TraceEvent::Fetch { .. }))
         .count();
-    assert_eq!(fetches, 4);
+    assert_eq!(fetches, 0);
     // batch_commit=false × 空游标：折叠尾提交但写入 0 行 → 出口 0 次提交。
     let sql = COPY.replace("END LOOP", "COMMIT; END LOOP");
     let commits = |trace: &Trace| {

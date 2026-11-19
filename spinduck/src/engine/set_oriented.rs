@@ -35,51 +35,115 @@ impl Engine {
         if self.set_oriented == SetOrientedMode::Off {
             return self.run_prog(&routine.prog, frame, sink, limits, RunSpan::default());
         }
-        let p = match self.select_plan(routine)? {
+        // 设计 §2.1：原 `routine.prog` 只读不变，按已选区域列表分段
+        // `RunSpan` 驱动——前缀止于 open_pc、区域按 entry_ok 裁决走集合
+        // SQL 或原 PC 续跑、后缀从 close_pc+1 起在原程序上继续，绝对
+        // `GOTO` 与 `PushTrap` 的 body_start/body_end 全部保持原 PC。
+        let plans = match self.select_plan(routine)? {
             Err(reason) => {
                 self.push_report(&routine.name, Status::Skipped { reason });
                 return self.run_prog(&routine.prog, frame, sink, limits, RunSpan::default());
             }
-            Ok(p) => p,
+            Ok(p) => vec![p],
         };
-        // 步 1：前缀按原 IR 执行至区域入口（stop_pc 处指令不执行、不计步）
-        let out = self.run_prog(
+        let mut cursor_pc = 0usize;
+        for p in &plans {
+            // 步 1：前缀按原 IR 执行至区域入口（stop_pc 处指令不执行、不计步）
+            let out = self.run_prog(
+                &routine.prog,
+                frame,
+                sink,
+                limits,
+                RunSpan {
+                    start_pc: cursor_pc,
+                    stop_pc: Some(p.open_pc),
+                },
+            )?;
+            if !matches!(out, RunOutcome::Stopped) {
+                // 前缀提前终结例程（RETURN 等）：区域不可达，选择仍记 Converted
+                self.push_report(&routine.name, Status::Converted { sql: p.sql.clone() });
+                return Ok(out);
+            }
+            // 步 2/3：入口不抛错守卫；外层 Err(EngineError) 经 `?` 直接上抛
+            // （call_with_sink 回滚），仅内层 Ok(Err(SkipReason)) 事务仍干净
+            // 才退回原区域 [open_pc .. close_pc + 1)，绝不重放前缀
+            match entry_ok(self.ex.as_ref(), p, &self.optimize_ctx(), frame)? {
+                Err(reason) => {
+                    self.push_report(&routine.name, Status::Skipped { reason });
+                    let out = self.run_prog(
+                        &routine.prog,
+                        frame,
+                        sink,
+                        limits,
+                        RunSpan {
+                            start_pc: p.open_pc,
+                            stop_pc: Some(p.close_pc + 1),
+                        },
+                    )?;
+                    if !matches!(out, RunOutcome::Stopped) {
+                        return Ok(out);
+                    }
+                }
+                Ok(()) => {
+                    self.push_report(&routine.name, Status::Converted { sql: p.sql.clone() });
+                    // 步 4/5：集合 SqlExec 当场直发（不经 WriteBuffer）；
+                    // 开始执行即失败直接上抛，严禁回放原循环
+                    let rows = self.exec_region_sql(p, frame, sink)?;
+                    if p.tail_commit && rows > 0 {
+                        // 仅发 IrStmt variant TxCommit trace，绝不发
+                        // TxCommitIfWritten；batch_commit=false 当场
+                        // COMMIT+BEGIN，true 时延迟到 call_with_sink 出口
+                        if sink.is_enabled() {
+                            sink.on_event(crate::exec::TraceEvent::IrStmt {
+                                variant: "TxCommit",
+                            });
+                        }
+                        if !self.batch_commit {
+                            self.ex.execute("COMMIT", &crate::exec::BindMap::new())?;
+                            self.ex
+                                .execute("BEGIN TRANSACTION", &crate::exec::BindMap::new())?;
+                        }
+                    }
+                }
+            }
+            cursor_pc = p.close_pc + 1;
+        }
+        // 步 6：剩余后缀在原程序上续跑至结束
+        self.run_prog(
             &routine.prog,
             frame,
             sink,
             limits,
             RunSpan {
-                start_pc: 0,
-                stop_pc: Some(p.open_pc),
+                start_pc: cursor_pc,
+                stop_pc: None,
             },
-        )?;
-        if !matches!(out, RunOutcome::Stopped) {
-            // 前缀提前终结例程（RETURN 等）：区域不可达，选择仍记 Converted
-            self.push_report(&routine.name, Status::Converted { sql: p.sql });
-            return Ok(out);
+        )
+    }
+
+    /// 集合区域 SQL 的直发执行：按实际顺序发 `IrStmt` variant `SqlExec`
+    /// trace 与 `TraceEvent::SqlExec { sql, binds, elapsed_us: 0 }`，返回
+    /// 影响行数供 `tail_commit` 判定（设计 §2.1 契约 2）。
+    fn exec_region_sql(
+        &self,
+        plan: &ConversionPlan,
+        frame: &Frame,
+        sink: &mut dyn TraceSink,
+    ) -> Result<usize, EngineError> {
+        // 与解释路径同序：先 IrStmt variant 埋点（主循环派发前），
+        // 再解析绑定发 TraceEvent::SqlExec，最后下发执行
+        if sink.is_enabled() {
+            sink.on_event(crate::exec::TraceEvent::IrStmt { variant: "SqlExec" });
         }
-        // 步 2/3：入口不抛错守卫；失败则 pc=open_pc 原样续跑，绝不重放前缀
-        match entry_ok(self.ex.as_ref(), &p, &self.optimize_ctx(), frame)? {
-            Err(reason) => {
-                self.push_report(&routine.name, Status::Skipped { reason });
-                self.run_prog(
-                    &routine.prog,
-                    frame,
-                    sink,
-                    limits,
-                    RunSpan {
-                        start_pc: p.open_pc,
-                        stop_pc: None,
-                    },
-                )
-            }
-            Ok(()) => {
-                self.push_report(&routine.name, Status::Converted { sql: p.sql.clone() });
-                // 步 4/5：批写与后缀同事务连续执行；失败直接上抛，严禁回放原循环
-                let suffix = crate::ir::set_oriented::suffix_prog(routine, &p);
-                self.run_prog(&suffix, frame, sink, limits, RunSpan::default())
-            }
+        let bound = crate::runtime::interp::resolve_binds(&plan.binds, frame)?;
+        if sink.is_enabled() {
+            sink.on_event(crate::exec::TraceEvent::SqlExec {
+                sql: plan.sql.clone(),
+                binds: bound.clone(),
+                elapsed_us: 0,
+            });
         }
+        Ok(self.ex.execute(&plan.sql, &bound)?.rows_affected)
     }
 
     fn optimize_ctx(&self) -> OptimizeCtx<'_> {

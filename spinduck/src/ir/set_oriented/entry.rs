@@ -2,8 +2,7 @@
 
 use super::schema::{self, Table};
 use super::shape::Name;
-use super::{BindSrc, BufferPolicy, IrProg, IrStmt, OptimizeCtx, SkipReason};
-use crate::catalog::CompiledRoutine;
+use super::{BindSrc, OptimizeCtx, SkipReason};
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
 
@@ -12,7 +11,7 @@ use crate::exec::SqlExecutor;
 pub(crate) struct ConversionPlan {
     pub sql: String,
     /// 批写 SQL 的按名绑定（游标查询绑定 + INSERT 绑定合并）。
-    pub(super) binds: Vec<(String, BindSrc)>,
+    pub(crate) binds: Vec<(String, BindSrc)>,
     pub tail_commit: bool,
     pub open_pc: usize,
     pub close_pc: usize,
@@ -140,25 +139,5 @@ fn drifted(ex: &dyn SqlExecutor, name: &Name, expected: &Table) -> Result<bool, 
         Some(t) => Ok(t.columns != expected.columns
             || (t.qualified != expected.qualified && expected.qualified != name.sql())),
         None => Ok(true),
-    }
-}
-
-/// 集合化后缀程序：批量 SqlExec + 条件尾提交 + 原始后缀。
-/// `TxCommitIfWritten` 由同一运行内的 SqlExec 影响行数驱动（零行不提交）。
-pub(crate) fn suffix_prog(routine: &CompiledRoutine, plan: &ConversionPlan) -> IrProg {
-    let mut code = vec![IrStmt::SqlExec {
-        sql: plan.sql.clone(),
-        binds: plan.binds.clone(),
-        fn_sites: Vec::new(),
-        buffer_policy: BufferPolicy::Immediate,
-    }];
-    if plan.tail_commit {
-        code.push(IrStmt::TxCommitIfWritten);
-    }
-    code.extend_from_slice(&routine.prog.code[plan.close_pc + 1..]);
-    IrProg {
-        code,
-        var_types: routine.prog.var_types.clone(),
-        local_ddl: routine.prog.local_ddl.clone(),
     }
 }

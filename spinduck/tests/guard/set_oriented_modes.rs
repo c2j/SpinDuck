@@ -131,7 +131,7 @@ fn should_preserve_empty_cursor_and_isolate_cte_name_from_physical_table() {
 #[test]
 fn should_select_exactly_one_execution_path_for_each_switch_combination() {
     use spinduck_core::exec::TraceEvent;
-    use spinduck_core::ir::set_oriented::{SkipReason, Status};
+    use spinduck_core::ir::set_oriented::Status;
     for (set, batch) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut eng = engine();
         eng.register(COPY).unwrap();
@@ -147,16 +147,11 @@ fn should_select_exactly_one_execution_path_for_each_switch_combination() {
             .count();
         if !set {
             assert_eq!(eng.set_oriented_reports(), &[]);
-        } else if batch {
-            assert_eq!(
-                eng.set_oriented_reports()[0].status,
-                Status::Skipped {
-                    reason: SkipReason::BatchCommitEnabled
-                }
-            );
         } else {
+            // §2.2-3：batch_commit 不再互斥，set 为真即 Converted
+            // （Strict/BatchAtomic 同断言），Fetch 归零。
             let Status::Converted { sql } = &eng.set_oriented_reports()[0].status else {
-                panic!("expected conversion");
+                panic!("expected conversion: {:?}", eng.set_oriented_reports());
             };
             let writes: Vec<_> = trace
                 .0
@@ -168,7 +163,7 @@ fn should_select_exactly_one_execution_path_for_each_switch_combination() {
                 .collect();
             assert_eq!(writes, vec![(sql, &BindMap::new())]);
         }
-        assert_eq!(fetches, if set && !batch { 0 } else { 4 });
+        assert_eq!(fetches, if set { 0 } else { 4 });
     }
 }
 
