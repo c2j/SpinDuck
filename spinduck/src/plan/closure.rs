@@ -117,6 +117,22 @@ pub(crate) fn kernel_gaps(
     Some((name, missing.into_iter().collect()))
 }
 
+/// 入口链可达例程集（design-compile「体检范围」C）：从每个目标起走
+/// [`walk_chain`——与 `call` 缺件门同一条 BFS]，收集登记全名（小写）。
+/// 任一目标未登记返回 `None`，调用方退回文件级全检（不静默缩小红面）。
+pub(crate) fn reachable_routines(
+    eng: &Engine,
+    targets: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Option<BTreeSet<String>> {
+    let mut all = BTreeSet::new();
+    for t in targets {
+        let entry = eng.catalog.lookup(t.as_ref())?;
+        let (seen, _) = walk_chain(eng, entry, |_, _, _| true);
+        all.extend(seen);
+    }
+    Some(all)
+}
+
 /// `--plan` 且 `generator` 以 `codeweb ` 开头时的缺件门。不调用 [`walk_chain`]。
 ///
 /// 只把 `table` / `view` / `sequence` 的 `[[ref]]`（含 `role=type`）变成

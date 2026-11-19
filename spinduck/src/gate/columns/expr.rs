@@ -39,6 +39,12 @@ impl Gate<'_> {
         if self.vars.contains(col) {
             return;
         }
+        // 内核已知伪列：`rownum` 由 rownum_first_row 模式改写（规则默认
+        // 开），1B 的输入是改写前 AST，不得按缺列上报；改写覆盖不到的
+        // rownum 形态由 Gate 2B prepare 兜底。
+        if col == "rownum" {
+            return;
+        }
         let mut hits = 0usize;
         let mut unknown = false;
         for e in vis {
@@ -50,7 +56,11 @@ impl Gate<'_> {
         }
         if hits > 1 {
             self.missing(None, col.to_string(), "ambiguous");
-        } else if hits == 0 && !unknown {
+        } else if hits == 0 && (!unknown || super::has_known_scope(vis)) {
+            // 纯 Unknown 作用域（没有任何 Known 项）维持 V1 不判：列可能
+            // 来自列集合不可静态确定的表。混入 Known 作用域时不再整体
+            // 吞掉——Known 列集里没有的裸列是"已知不在任何已知的表里"，
+            // 照报（评审 2026-11-19，`SELECT bogus FROM t1, (SELECT …)`）。
             self.missing(None, col.to_string(), "missing");
         }
     }

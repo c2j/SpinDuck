@@ -191,6 +191,11 @@ impl Gate<'_> {
     fn check_pl_type(&mut self, t: &PlDataType) {
         match t {
             PlDataType::PercentType { table, column } => {
+                // 单段锚命中例程变量/游标/记录名 = PL 局部锚（`rec%TYPE`），
+                // 不是 schema 对象——按 V1 保守口径跳过（只少报不误报）。
+                if self.pl_local_anchor(table) {
+                    return;
+                }
                 let name = anchor_name(table);
                 if !self.object_known(&name) {
                     self.missing(
@@ -207,6 +212,12 @@ impl Gate<'_> {
                 }
             }
             PlDataType::PercentRowType(table) => {
+                // `cursor%ROWTYPE`/`rec%ROWTYPE`：锚是例程局部游标或记录，
+                // 不是 schema 对象（考题语料 `r_get_data c_get_data%ROWTYPE`
+                // 形态实测误报）；表锚不受影响。
+                if self.pl_local_anchor(table) {
+                    return;
+                }
                 let name = anchor_name(table);
                 if !self.object_known(&name) {
                     self.missing(Some(table.clone()), "%rowtype".to_string(), "missing_table");
@@ -217,6 +228,12 @@ impl Gate<'_> {
             | PlDataType::Cursor
             | PlDataType::RefCursor => {}
         }
+    }
+
+    /// 锚是例程局部名（单段且命中 Pass 1 收集的变量/记录/游标名并集）：
+    /// PL 声明先于 SQL 可见，同名表按 PL 遮蔽口径归局部锚。
+    fn pl_local_anchor(&self, table: &str) -> bool {
+        !table.contains('.') && self.vars.contains(&table.to_ascii_lowercase())
     }
 
     /// 锚点对象存在性：表/视图（精确键或单段后缀）+ 文件级 PL
