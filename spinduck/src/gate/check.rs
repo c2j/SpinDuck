@@ -36,7 +36,15 @@ pub struct MissingRef {
 /// `CREATE [TEMP] TABLE` 声明的会话级对象按"单语句作用域 + 声明顺序"
 /// 处理：walk 到声明语句才纳入本地集合，声明之前的引用与其他语句
 /// （含同文件另一例程）不受影响；列集合延迟到 Gate 2B。
-pub fn check_statement(st: &Statement, snap: &SchemaSnapshot) -> Vec<MissingRef> {
+///
+/// `scope` = 入口链可达例程集（`Some`）：范围外的独立例程与包成员整块
+/// 跳过（引用/列检查是"链上跑得到的 SQL"的体检，design-compile「体检
+/// 范围」）；`None` = 文件级全检（旧行为，其余消费者与测试用）。
+pub fn check_statement(
+    st: &Statement,
+    snap: &SchemaSnapshot,
+    scope: Option<&std::collections::BTreeSet<String>>,
+) -> Vec<MissingRef> {
     // Pass 1：收集整条语句的 CTE 名（供 TableRef 遮蔽判定）
     let mut ctes = CteNames(BTreeSet::new());
     walk_statement(&mut ctes, st);
@@ -44,6 +52,7 @@ pub fn check_statement(st: &Statement, snap: &SchemaSnapshot) -> Vec<MissingRef>
     let mut chk = RefChecker {
         snap,
         ctes: &ctes.0,
+        scope,
         local: BTreeSet::new(),
         out: Vec::new(),
     };
@@ -71,6 +80,8 @@ impl Visitor for CteNames {
 struct RefChecker<'a> {
     snap: &'a SchemaSnapshot,
     ctes: &'a BTreeSet<String>,
+    /// 入口链可达例程集：`Some` 时范围外例程整块跳过。
+    scope: Option<&'a BTreeSet<String>>,
     /// 本语句内已声明的局部表（归一化限定名）：walk 顺序累积，
     /// 声明之后的引用视为已知，声明之前/其他语句不受影响。
     local: BTreeSet<String>,
@@ -126,6 +137,10 @@ impl RefChecker<'_> {
 
 impl Visitor for RefChecker<'_> {
     fn visit_statement(&mut self, st: &Statement) -> VisitorResult {
+        // 体检范围：范围外的独立例程整块跳过（含包成员，见 package_items）。
+        if self.out_of_scope(st) {
+            return VisitorResult::SkipChildren;
+        }
         // 包体/包说明：逐例程作用域遍历（局部表不跨 procedure/function
         // 泄漏），自行接管 items 遍历后 SkipChildren 防止 walk 重入。
         match st {
@@ -221,10 +236,38 @@ impl RefChecker<'_> {
         r
     }
 
+    /// 体检范围：`Some` 时范围外的独立例程整块跳过。包体/包说明在
+    /// `package_items` 里按成员过滤，此处只拦独立 `CREATE PROCEDURE/
+    /// FUNCTION`。其余语句（DDL 等）恒检。
+    fn out_of_scope(&self, st: &Statement) -> bool {
+        let Some(scope) = self.scope else {
+            return false;
+        };
+        match st {
+            Statement::CreateProcedure(p) => !super::scope_hit(scope, &p.name),
+            Statement::CreateFunction(f) => !super::scope_hit(scope, &f.name),
+            _ => false,
+        }
+    }
+
     /// 包项逐例程遍历：procedure/function 的块走独立 local 作用域；
     /// Type 项走 `walk_pl_type_decl`（与 walk_statement 同口径）。
+    /// 体检范围激活时，范围外成员与包级裸项（Variable/Type/Cursor——
+    /// 其消费者在例程体内）一并跳过。
     fn package_items(&mut self, items: &[PackageItem]) -> VisitorResult {
         for item in items {
+            if let Some(scope) = self.scope {
+                let member = match item {
+                    PackageItem::Procedure(p) => Some(&p.name),
+                    PackageItem::Function(f) => Some(&f.name),
+                    _ => None,
+                };
+                match member {
+                    Some(name) if !super::scope_hit(scope, name) => continue,
+                    None => continue,
+                    Some(_) => {}
+                }
+            }
             let block = match item {
                 PackageItem::Procedure(p) => p.block.as_ref(),
                 PackageItem::Function(f) => f.block.as_ref(),
@@ -292,7 +335,7 @@ mod tests {
     }
 
     fn missing(sql: &str, snap: &SchemaSnapshot) -> Vec<String> {
-        check_statement(&stmt_of(sql), snap)
+        check_statement(&stmt_of(sql), snap, None)
             .into_iter()
             .map(|m| m.object)
             .collect()
@@ -378,10 +421,11 @@ mod tests {
                  INSERT INTO tmp_t SELECT a FROM t1; END;",
             ),
             &snap,
+            None,
         );
         assert!(got.is_empty(), "{got:?}");
         // 独立语句引用同名表 → 缺失
-        let got = check_statement(&stmt_of("SELECT * FROM tmp_t"), &snap);
+        let got = check_statement(&stmt_of("SELECT * FROM tmp_t"), &snap, None);
         assert_eq!(got.len(), 1);
         // 声明之前的引用 → 缺失
         let got = check_statement(
@@ -391,6 +435,7 @@ mod tests {
                  CREATE TEMP TABLE tmp_t AS SELECT a FROM t1; END;",
             ),
             &snap,
+            None,
         );
         assert_eq!(got.len(), 1, "{got:?}");
     }
@@ -408,6 +453,7 @@ mod tests {
                  END pkg",
             ),
             &snap,
+            None,
         );
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].object, "tmp");
@@ -425,6 +471,7 @@ mod tests {
                  BEGIN INSERT INTO tmp VALUES (1); END",
             ),
             &snap,
+            None,
         );
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].object, "tmp");

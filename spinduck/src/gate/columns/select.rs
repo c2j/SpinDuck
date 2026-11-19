@@ -159,12 +159,21 @@ impl Gate<'_> {
                 }
             }
             TableRef::Subquery { query, alias, .. } => {
+                // 无别名派生表：外层裸列按 V1 保守口径归 Unknown（模块头
+                // "无别名投影的子查询…一律不判缺失"），匿名作用域项只喂
+                // unqualified 的 unknown 面，不参与 qualified 别名匹配；
+                // 派生表内部列引用仍由子查询自身作用域检查。
                 if let Some(a) = alias {
                     out.push(ScopeEntry {
                         alias: ident_key(a),
                         cols: projection_cols(query)
                             .map(Cols::Known)
                             .unwrap_or(Cols::Unknown),
+                    });
+                } else {
+                    out.push(ScopeEntry {
+                        alias: String::new(),
+                        cols: Cols::Unknown,
                     });
                 }
             }

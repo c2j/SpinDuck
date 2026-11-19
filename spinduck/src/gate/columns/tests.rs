@@ -17,7 +17,7 @@ fn stmt_of(sql: &str) -> Statement {
 }
 
 fn missing(sql: &str, snap: &SchemaSnapshot) -> Vec<(Option<String>, String, &'static str)> {
-    check_columns(&stmt_of(sql), snap)
+    check_columns(&stmt_of(sql), snap, None)
         .into_iter()
         .map(|m| (m.qualifier, m.column, m.problem))
         .collect()
@@ -102,11 +102,12 @@ fn should_skip_columns_of_local_temp_table() {
              SELECT whatever FROM tmp_pl; END;",
         ),
         &snap,
+        None,
     );
     assert!(got.is_empty(), "{got:?}");
     // 声明之前引用 tmp_pl 的列 → 对象缺失归对象级切片，
     // 列级同样不得把 tmp_pl 当已知（Cols::Unknown 之外不误伤）
-    let got = check_columns(&stmt_of("SELECT whatever FROM tmp_pl"), &snap);
+    let got = check_columns(&stmt_of("SELECT whatever FROM tmp_pl"), &snap, None);
     // tmp_pl 不在快照 → 对象级会报 missing；列级对未知对象本就 Unknown，
     // 断言仅锁定"不产生 missing/ambiguous 列诊断"。
     assert!(
@@ -130,6 +131,7 @@ fn should_isolate_local_table_columns_between_package_routines() {
              END pkg",
         ),
         &snap,
+        None,
     );
     assert_eq!(
         got.iter()
@@ -240,5 +242,61 @@ fn should_check_percent_type_and_rowtype_anchors() {
             "%rowtype".to_string(),
             "missing_table"
         )]
+    );
+}
+
+#[test]
+fn should_skip_rowtype_anchor_on_a_local_cursor() {
+    // 游标 %ROWTYPE 锚（`r c%ROWTYPE`）：锚是例程局部游标，不是 schema
+    // 对象——不得按 missing_table 上报（考题语料 PKG_SPLIT_TRADE_STEP3_SH
+    // 的 `r_get_data c_get_data%ROWTYPE` 形态实测误报）。
+    let snap = snap_of("CREATE TABLE t1(a INT, b INT)");
+    let ok = "CREATE PROCEDURE p IS \
+              CURSOR c IS SELECT a FROM t1; \
+              r c%ROWTYPE; \
+              BEGIN NULL; END;";
+    assert!(missing(ok, &snap).is_empty(), "{:?}", missing(ok, &snap));
+}
+
+#[test]
+fn should_skip_rownum_pseudo_column() {
+    // `rownum` 伪列：`rownum = 1` 由 rownum_first_row 模式改写（LIMIT 1），
+    // 1B 面对的是改写前 AST——按内核已知伪列跳过；改写不支持的其他
+    // rownum 形态由 Gate 2B prepare 兜底（KERNEL-0011）。
+    let snap = snap_of("CREATE TABLE t1(a INT)");
+    assert!(missing("SELECT a FROM t1 WHERE rownum = 1", &snap).is_empty());
+}
+
+#[test]
+fn should_treat_unaliased_derived_table_columns_as_unknown() {
+    // 无别名派生表（考题语料 `FROM (SELECT commision_type … FROM
+    // par_fund_seat_para) WHERE rownum = 1` 形态）：外层裸列按 V1 保守
+    // 口径归 Unknown，不判缺失（模块头"无别名投影的子查询…一律不判
+    // 缺失"）；派生表内部的列引用仍由子查询自身的作用域检查。
+    let snap = snap_of(
+        "CREATE TABLE par_fund_seat_para(fund_code INT, stock_kind INT, \
+         commision_type INT, commision_fee_type INT, return_rate_flag INT, \
+         return_rate_org INT, return_rate INT)",
+    );
+    let sql = "SELECT commision_type, commision_fee_type FROM \
+               (SELECT commision_type, commision_fee_type FROM par_fund_seat_para \
+                WHERE fund_code = 'F') WHERE rownum = 1";
+    assert!(missing(sql, &snap).is_empty(), "{:?}", missing(sql, &snap));
+}
+
+#[test]
+fn should_skip_type_anchor_on_a_local_record_variable() {
+    // `rec%TYPE`（锚是局部记录变量）：同游标口径，按 PL 变量解释跳过；
+    // 未声明名（ghost）仍上报，门不得因此放水。
+    let snap = snap_of("CREATE TABLE t1(a INT, b INT)");
+    let ok = "CREATE PROCEDURE p IS \
+              r t1%ROWTYPE; \
+              v_same r%TYPE; \
+              BEGIN NULL; END;";
+    assert!(missing(ok, &snap).is_empty(), "{:?}", missing(ok, &snap));
+    let bad = "CREATE PROCEDURE p IS v_x ghost.y%TYPE; BEGIN NULL; END;";
+    assert_eq!(
+        missing(bad, &snap),
+        [(Some("ghost".to_string()), "y".to_string(), "missing_table")]
     );
 }

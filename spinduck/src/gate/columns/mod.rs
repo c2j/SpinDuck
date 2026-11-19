@@ -67,7 +67,14 @@ type CteCols = BTreeMap<String, Cols>;
 /// 的列引用；返回去重排序结果。例程体内 `CREATE [TEMP] TABLE`
 /// 声明的会话级对象按"单语句作用域 + 声明顺序"累积（walk 到声明
 /// 才可见）：对象视为已知、列集合 `Cols::Unknown` 延迟 Gate 2B。
-pub fn check_columns(st: &Statement, snap: &SchemaSnapshot) -> Vec<MissingColumn> {
+///
+/// `scope` = 入口链可达例程集（`Some`）：范围外的独立例程与包成员
+/// 整块跳过（design-compile「体检范围」）；`None` = 文件级全检。
+pub fn check_columns(
+    st: &Statement,
+    snap: &SchemaSnapshot,
+    scope: Option<&std::collections::BTreeSet<String>>,
+) -> Vec<MissingColumn> {
     // Pass 1：收集例程变量名（参数 + DECLARE 变量/记录/游标/嵌套例程
     // 参数），供标识符消歧。超集收集是安全方向（只少报不误报）。
     let mut vars = PlNames::default();
@@ -75,6 +82,7 @@ pub fn check_columns(st: &Statement, snap: &SchemaSnapshot) -> Vec<MissingColumn
     let mut gate = Gate {
         snap,
         vars: &vars.0,
+        scope,
         local: BTreeSet::new(),
         out: Vec::new(),
     };
@@ -153,6 +161,8 @@ impl Visitor for PlNames {
 struct Gate<'a> {
     snap: &'a SchemaSnapshot,
     vars: &'a BTreeSet<String>,
+    /// 入口链可达例程集：`Some` 时范围外例程整块跳过。
+    scope: Option<&'a BTreeSet<String>>,
     /// 本语句内已声明的局部表（归一化限定名）：walk 顺序累积，
     /// 声明之后的引用视为 `Cols::Unknown`（列延迟 Gate 2B）。
     local: BTreeSet<String>,
@@ -161,6 +171,10 @@ struct Gate<'a> {
 
 impl Visitor for Gate<'_> {
     fn visit_statement(&mut self, st: &Statement) -> VisitorResult {
+        // 体检范围：范围外的独立例程整块跳过（含包成员，见 package_items）。
+        if self.out_of_scope(st) {
+            return VisitorResult::SkipChildren;
+        }
         // 包体/包说明：逐例程作用域遍历（局部表不跨 procedure/function
         // 泄漏），自行接管 items 遍历后 SkipChildren 防止 walk 重入。
         match st {
@@ -237,10 +251,38 @@ impl Gate<'_> {
         r
     }
 
+    /// 体检范围：`Some` 时范围外的独立例程整块跳过。包体/包说明在
+    /// `package_items` 里按成员过滤，此处只拦独立 `CREATE PROCEDURE/
+    /// FUNCTION`。其余语句（DDL 等）恒检。
+    fn out_of_scope(&self, st: &Statement) -> bool {
+        let Some(scope) = self.scope else {
+            return false;
+        };
+        match st {
+            Statement::CreateProcedure(p) => !super::scope_hit(scope, &p.name),
+            Statement::CreateFunction(f) => !super::scope_hit(scope, &f.name),
+            _ => false,
+        }
+    }
+
     /// 包项逐例程遍历：procedure/function 的块走独立 local 作用域；
     /// Type 项走 `walk_pl_type_decl`（与 walk_statement 同口径）。
+    /// 体检范围激活时，范围外成员与包级裸项（Variable/Type/Cursor——
+    /// 其消费者在例程体内）一并跳过。
     fn package_items(&mut self, items: &[PackageItem]) -> VisitorResult {
         for item in items {
+            if let Some(scope) = self.scope {
+                let member = match item {
+                    PackageItem::Procedure(p) => Some(&p.name),
+                    PackageItem::Function(f) => Some(&f.name),
+                    _ => None,
+                };
+                match member {
+                    Some(name) if !super::scope_hit(scope, name) => continue,
+                    None => continue,
+                    Some(_) => {}
+                }
+            }
             let block = match item {
                 PackageItem::Procedure(p) => p.block.as_ref(),
                 PackageItem::Function(f) => f.block.as_ref(),

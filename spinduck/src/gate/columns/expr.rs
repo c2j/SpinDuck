@@ -39,6 +39,12 @@ impl Gate<'_> {
         if self.vars.contains(col) {
             return;
         }
+        // 内核已知伪列：`rownum` 由 rownum_first_row 模式改写（规则默认
+        // 开），1B 的输入是改写前 AST，不得按缺列上报；改写覆盖不到的
+        // rownum 形态由 Gate 2B prepare 兜底。
+        if col == "rownum" {
+            return;
+        }
         let mut hits = 0usize;
         let mut unknown = false;
         for e in vis {
