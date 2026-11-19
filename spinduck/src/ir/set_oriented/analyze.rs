@@ -52,6 +52,7 @@ pub(super) fn analyze_region<'a>(
             var_types: &prog.var_types,
             record: &region.record,
             allow_filter: mode == SetOrientedMode::BatchAtomic && body.has_trap,
+            insert_log: body.insert_log,
             sinks: body.sinks,
             lookups: body.lookups,
             tuples: body.tuples,

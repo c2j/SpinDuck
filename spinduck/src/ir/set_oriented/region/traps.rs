@@ -19,6 +19,9 @@ pub(crate) fn admit_effects(
         .find(|pc| matches!(prog.code[*pc], IrStmt::Jump(t) if t == region.fetch_pc))
         .ok_or(SkipReason::UnsupportedControlFlow)?;
     let tail_commit_pc = back_pc - 1;
+    // §3.5-4：INSERT 跳起型处理器的副作用调用在 bad_rows==0 准入下不可达，
+    // 准入义务由入口守卫承担（仅 BatchAtomic）。
+    let log_bodies = super::insert_log_bodies(prog, region);
     let mut trap_depth = 0usize;
     for pc in region.open_pc..=region.close_pc {
         match &prog.code[pc] {
@@ -39,15 +42,17 @@ pub(crate) fn admit_effects(
                 args,
                 out_targets,
             } => {
-                if !in_handler_body(prog, region, pc)
-                    || !super::super::catalog_summary::call_is_noop(
+                let noop = in_handler_body(prog, region, pc)
+                    && super::super::catalog_summary::call_is_noop(
                         catalog,
                         prog,
                         name,
                         args,
                         out_targets,
-                    )
-                {
+                    );
+                let logged = mode == SetOrientedMode::BatchAtomic
+                    && log_bodies.iter().any(|(lo, hi)| pc >= *lo && pc < *hi);
+                if !noop && !logged {
                     return Err(SkipReason::UnsupportedCall);
                 }
             }
@@ -70,6 +75,11 @@ pub(crate) fn trap_bodies_admissible(
         let IrStmt::PushTrap { entries } = &prog.code[pc] else {
             continue;
         };
+        // §3.5-4 INSERT 跳起型处理器：处理器体白名单已由结构面证明，
+        // 副作用调用的可达性由 bad_rows==0 入口守卫裁决。
+        if super::insert_log_handler(prog, pc).is_some() {
+            continue;
+        }
         for entry in entries {
             if fallback_handler(prog, pc, entry) {
                 continue;

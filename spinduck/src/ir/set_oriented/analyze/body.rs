@@ -22,6 +22,8 @@ pub(super) struct Body<'a> {
     pub insert_stmt: Option<&'a IrStmt>,
     pub tail_commit: bool,
     pub has_trap: bool,
+    /// §3.5-4 INSERT 跳起型处理器：坏行数由入口守卫裁决。
+    pub insert_log: bool,
     pub sinks: Vec<(VarName, SinkOp, String, String)>,
     pub lookups: Vec<lookup::LookupQuery>,
     pub tuples: Vec<lookup::TupleQuery>,
@@ -115,7 +117,7 @@ impl<'a> Body<'a> {
         Ok(pc + 1)
     }
 
-    fn trap(&mut self, ctx: &Context<'_, '_>, pc: usize) -> Result<usize, SkipReason> {
+    fn trap(&mut self, ctx: &Context<'a, '_>, pc: usize) -> Result<usize, SkipReason> {
         // §3.4 聚合形态是 fallback_group 的子集，必须先试聚合解析。
         if let Some((query, resume)) = agg::at(ctx.prog, pc, ctx.region, ctx.catalog)? {
             self.agg_vars.insert(query.var.clone());
@@ -161,6 +163,19 @@ impl<'a> Body<'a> {
             self.route = Some(r);
             self.has_trap = true;
             return Ok(resume);
+        }
+        // §3.5-4 INSERT 跳起型处理器：坏行数由入口守卫裁决，
+        // 存在坏行则整段退回，不得改写成行过滤。
+        if ctx.mode == SetOrientedMode::BatchAtomic {
+            if let Some(shape) = region::insert_log_handler(ctx.prog, pc) {
+                if self.insert_stmt.is_some() {
+                    return Err(SkipReason::UnsupportedWrite);
+                }
+                self.insert_stmt = Some(&ctx.prog.code[pc + 1]);
+                self.insert_log = true;
+                self.has_trap = true;
+                return Ok(shape.resume);
+            }
         }
         self.has_trap = true;
         Ok(pc + 1)

@@ -151,6 +151,9 @@ struct CopyLoop<'a> {
     pub(super) record: &'a VarName,
     /// BatchAtomic × trap：授权以列级守卫过滤坏行（跳行语义等价）。
     pub(super) allow_filter: bool,
+    /// §3.5-4 INSERT 跳起型处理器（非 NoOp inst_log）：入口守卫须证
+    /// bad_rows==0，处理器不可达时副作用不观测；非零整段退回。
+    pub(super) insert_log: bool,
     /// PL 表达式下沉：变量 → (算子, 左字段, 右字段)，仅字段/字段形态。
     pub(super) sinks: Vec<(VarName, SinkOp, String, String)>,
     /// 兜底型循环不变查找（§4.4 B1）：聚合标量子查询替代 SELECT INTO。

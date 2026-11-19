@@ -119,6 +119,9 @@ pub(crate) fn write_set(
     catalog: &crate::catalog::RoutineCatalog,
 ) -> Result<BTreeSet<String>, SkipReason> {
     let mut writes = BTreeSet::new();
+    // §3.5-4：INSERT 跳起型处理器在 bad_rows==0 准入下不可达，其 callee
+    // 写集不进入区域写集（退回路径由解释器自行维护写集）。
+    let log_bodies = super::insert_log_bodies(prog, region);
     for (offset, stmt) in prog.code[region.open_pc..=region.close_pc]
         .iter()
         .enumerate()
@@ -136,15 +139,16 @@ pub(crate) fn write_set(
                 out_targets,
             } => {
                 let pc = region.open_pc + offset;
-                if !super::traps::in_handler_body(prog, region, pc)
-                    || !super::super::catalog_summary::call_is_noop(
+                let noop = super::traps::in_handler_body(prog, region, pc)
+                    && super::super::catalog_summary::call_is_noop(
                         catalog,
                         prog,
                         name,
                         args,
                         out_targets,
-                    )
-                {
+                    );
+                let logged = log_bodies.iter().any(|(lo, hi)| pc >= *lo && pc < *hi);
+                if !noop && !logged {
                     return Err(SkipReason::UnsupportedCall);
                 }
             }
