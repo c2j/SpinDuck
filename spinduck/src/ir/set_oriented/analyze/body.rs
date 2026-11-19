@@ -194,15 +194,14 @@ impl<'a> Body<'a> {
         match expr {
             IrExpr::FuncCall { name, args, .. } => {
                 self.reject_reassignment(v)?;
-                if let Some(tq) = catalog_summary::tuple_query(
-                    ctx.catalog,
-                    name,
+                let site = catalog_summary::CallSite {
                     args,
-                    v,
-                    ctx.prog,
-                    ctx.region,
-                    &ctx.region.record,
-                )? {
+                    ret_var: v,
+                    prog: ctx.prog,
+                    region: ctx.region,
+                    record: &ctx.region.record,
+                };
+                if let Some(tq) = catalog_summary::tuple_query(ctx.catalog, name, &site)? {
                     for slot in &tq.slots {
                         self.reject_slot(&slot.var)?;
                     }

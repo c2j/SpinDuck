@@ -12,7 +12,7 @@ use body::fold_body;
 use expand::expand_calls;
 pub(super) use subst::subst_env;
 pub(super) use subst::{resolve_locals, subst_var};
-pub(super) use tuple::tuple_query;
+pub(super) use tuple::{tuple_query, CallSite};
 
 use super::{AssignTarget, BinOp, IrExpr, IrProg, IrStmt, VarName};
 use crate::catalog::{ParamMode, RoutineCatalog, RoutineKind};

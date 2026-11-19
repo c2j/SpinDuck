@@ -40,16 +40,20 @@ struct Plan {
     ret_default: SpinValue,
 }
 
+/// 调用点上下文：实参、返回值写回槽与调用方程序/区域/游标记录。
+pub(crate) struct CallSite<'a> {
+    pub args: &'a [IrExpr],
+    pub ret_var: &'a VarName,
+    pub prog: &'a IrProg,
+    pub region: &'a CursorRegion,
+    pub record: &'a VarName,
+}
+
 /// 调用点入口：返回 Some(TupleQuery) 表示可按 LookupTuple 集合化。
-/// `ret_var` 为赋值目标（返回值写回槽）；`prog`/`region` 为调用方上下文。
 pub(crate) fn tuple_query(
     catalog: &RoutineCatalog,
     name: &str,
-    args: &[IrExpr],
-    ret_var: &VarName,
-    prog: &IrProg,
-    region: &CursorRegion,
-    record: &VarName,
+    site: &CallSite<'_>,
 ) -> Result<Option<TupleQuery>, SkipReason> {
     let Some(r) = catalog.lookup(name) else {
         return Ok(None);
@@ -58,14 +62,15 @@ pub(crate) fn tuple_query(
         || r.params
             .iter()
             .any(|p| !matches!(p.mode, ParamMode::In | ParamMode::Out))
-        || args.len() != r.params.len()
-        || !args
+        || site.args.len() != r.params.len()
+        || !site
+            .args
             .iter()
             .all(|a| matches!(a, IrExpr::Const(_) | IrExpr::Var(_) | IrExpr::Field { .. }))
     {
         return Ok(None);
     }
-    for (p, a) in r.params.iter().zip(args) {
+    for (p, a) in r.params.iter().zip(site.args) {
         if matches!(p.mode, ParamMode::Out) && !matches!(a, IrExpr::Var(_)) {
             return Ok(None);
         }
@@ -75,7 +80,7 @@ pub(crate) fn tuple_query(
         Shape::Impure => return Err(SkipReason::MultiOutCallImpure),
         Shape::Plain => return Ok(None),
     };
-    build(catalog, r, &plan, args, ret_var, prog, region, record)
+    build(catalog, r, &plan, site)
 }
 
 /// 结构识别：恰一个 WHEN OTHERS PushTrap；前缀仅 Nop/常量赋值；
@@ -307,33 +312,28 @@ fn handler_defaults(
 }
 
 /// 调用方装配：形参绑定映射 + 全定义文法解析 + 槽位绑定。
-#[allow(clippy::too_many_arguments)]
 fn build(
     catalog: &RoutineCatalog,
     r: &crate::catalog::CompiledRoutine,
     plan: &Plan,
-    args: &[IrExpr],
-    ret_var: &VarName,
-    prog: &IrProg,
-    region: &CursorRegion,
-    record: &VarName,
+    site: &CallSite<'_>,
 ) -> Result<Option<TupleQuery>, SkipReason> {
-    let caller_binds = match caller_binds(r, &plan.binds, args, record) {
+    let caller_binds = match caller_binds(r, &plan.binds, site) {
         Some(b) => b,
         None => return Ok(None),
     };
-    let parts = match lookup::parse_tuple_total(&plan.sql, &caller_binds, record) {
+    let parts = match lookup::parse_tuple_total(&plan.sql, &caller_binds, site.record) {
         Ok(p) => p,
         Err(_) => return Ok(None),
     };
     if !parts.in_filters.is_empty() || !parts.in_lists.is_empty() || parts.correlations.is_empty() {
         return Ok(None);
     }
-    let writes = region::write_set(prog, region, catalog)?;
+    let writes = region::write_set(site.prog, site.region, catalog)?;
     if writes.contains(&parts.table.0) {
         return Err(SkipReason::TargetReadDependency);
     }
-    let Some(slots) = out_slots(r, plan, args, ret_var)? else {
+    let Some(slots) = out_slots(r, plan, site)? else {
         return Ok(None);
     };
     Ok(Some(TupleQuery {
@@ -351,11 +351,10 @@ fn build(
 fn out_slots(
     r: &crate::catalog::CompiledRoutine,
     plan: &Plan,
-    args: &[IrExpr],
-    ret_var: &VarName,
+    site: &CallSite<'_>,
 ) -> Result<Option<Vec<TupleSlot>>, SkipReason> {
     let mut slots = Vec::new();
-    for (p, arg) in r.params.iter().zip(args) {
+    for (p, arg) in r.params.iter().zip(site.args) {
         if !matches!(p.mode, ParamMode::Out) {
             continue;
         }
@@ -376,7 +375,7 @@ fn out_slots(
         });
     }
     slots.push(TupleSlot {
-        var: ret_var.clone(),
+        var: site.ret_var.clone(),
         source: to_source(plan.ret.clone()),
         default: plan.ret_default.clone(),
     });
@@ -387,8 +386,7 @@ fn out_slots(
 fn caller_binds(
     r: &crate::catalog::CompiledRoutine,
     binds: &[(String, BindSrc)],
-    args: &[IrExpr],
-    record: &VarName,
+    site: &CallSite<'_>,
 ) -> Option<Vec<(String, BindSrc)>> {
     let mut out = Vec::with_capacity(binds.len());
     for (ph, src) in binds {
@@ -399,9 +397,9 @@ fn caller_binds(
             .params
             .iter()
             .position(|p| p.name.eq_ignore_ascii_case(&pv.0))?;
-        let bsrc = match &args[idx] {
+        let bsrc = match &site.args[idx] {
             IrExpr::Var(v) => BindSrc::Var(v.clone()),
-            IrExpr::Field { rec, field } if rec == record => BindSrc::Field {
+            IrExpr::Field { rec, field } if rec == site.record => BindSrc::Field {
                 rec: rec.clone(),
                 field: field.clone(),
             },
