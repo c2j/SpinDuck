@@ -61,6 +61,16 @@ pub(super) fn materialize_fn_sites(
                 format!("例程 {} 的 SQL 上下文参数元组超过上界 {max}", site.name),
             ));
         }
+        // 求值先于建表：例程求值可触发异常处理器 reset_session→ROLLBACK，
+        // 事务性回退会撤销已发出的 CREATE OR REPLACE TEMP（目录 DDL 参与事务），
+        // 使后续 INSERT 绑定到回退前的旧 schema。
+        let mut items_all = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let v = crate::runtime::interp::routine::call_routine_value(env, &site.name, row)?;
+            let mut items = vec![sql_literal(&v)];
+            items.extend(row.iter().map(|c| sql_literal(c)));
+            items_all.push(items);
+        }
         let arity = site.args.len();
         // 列名用 sd_ 保留前缀（与 plan::cache_subquery 同口径，避开 PL 变量命名空间）
         let mut cols = vec!["sd_v VARCHAR".to_string()];
@@ -75,16 +85,11 @@ pub(super) fn materialize_fn_sites(
             ),
             &BindMap::new(),
         )?;
-        for chunk in rows.chunks(500) {
-            let mut tuples = Vec::with_capacity(chunk.len());
-            for row in chunk {
-                let v = crate::runtime::interp::routine::call_routine_value(env, &site.name, row)?;
-                let mut items = vec![sql_literal(&v)];
-                for cell in row {
-                    items.push(sql_literal(cell));
-                }
-                tuples.push(format!("({})", items.join(", ")));
-            }
+        for chunk in items_all.chunks(500) {
+            let tuples: Vec<String> = chunk
+                .iter()
+                .map(|items| format!("({})", items.join(", ")))
+                .collect();
             env.ex.execute(
                 &format!("INSERT INTO {} VALUES {}", site.table, tuples.join(", ")),
                 &BindMap::new(),

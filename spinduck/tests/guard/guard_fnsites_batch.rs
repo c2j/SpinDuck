@@ -228,3 +228,31 @@ fn guard_should_inline_fn_site_alongside_plain_bind_columns() {
         );
     });
 }
+
+/// 回归守护：fn_sites 物化期间例程求值触发 KERNEL 域错误时，异常处理器
+/// `reset_session` 的 ROLLBACK 会撤销事务内已发出的 `CREATE OR REPLACE
+/// TEMP TABLE`（目录 DDL 参与事务），旧 schema/旧行残留使后续 INSERT
+/// 绑定失败。求值必须先于建表下发。
+#[test]
+fn guard_should_evaluate_fn_site_rows_before_creating_cache_table() {
+    big_stack(|| {
+        let func = "CREATE OR REPLACE FUNCTION fnc_kerr(p IN NUMBER) RETURN VARCHAR2 IS \
+             v_x VARCHAR2(10); \
+           BEGIN \
+             SELECT no_such_col INTO v_x FROM t1; \
+             RETURN 'ok'; \
+           EXCEPTION WHEN OTHERS THEN \
+             RETURN 'fb'; \
+           END;";
+        let proc = "CREATE OR REPLACE PROCEDURE prc_kerr IS \
+           BEGIN \
+             UPDATE t1 SET v = fnc_kerr(1); \
+           END;";
+        let mut eng = setup("CREATE TABLE t1(v VARCHAR)", func, proc);
+        eng.ex
+            .execute("INSERT INTO t1 VALUES ('old')", &BindMap::new())
+            .unwrap();
+        eng.call("prc_kerr", &[]).unwrap();
+        assert_eq!(col_str(&eng, "SELECT v FROM t1"), vec!["fb".to_string()]);
+    });
+}
