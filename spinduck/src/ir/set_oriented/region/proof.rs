@@ -290,7 +290,7 @@ pub(crate) fn var_invariant_in_region(prog: &IrProg, region: &CursorRegion, var:
     true
 }
 
-fn collect_stmt_reads(stmt: &IrStmt, out: &mut BTreeSet<VarName>) {
+pub(crate) fn collect_stmt_reads(stmt: &IrStmt, out: &mut BTreeSet<VarName>) {
     match stmt {
         IrStmt::Assign { expr, .. } => collect_expr_reads(expr, out),
         IrStmt::SqlExec { binds, .. } | IrStmt::SqlQuery { binds, .. } => {

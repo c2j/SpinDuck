@@ -99,6 +99,9 @@ pub enum SkipReason {
     /// 异值并列（含 NULL 与值并列），首行选择存在真实歧义。
     AmbiguousTop1Tie,
     UnsupportedCall,
+    /// 多 OUT 参数被调函数的 LookupTuple 证明失败：处理器漏赋 OUT/返回值、
+    /// 处理器 Raise、或成功路径拷贝表达式可抛错（设计 §3.2）。
+    MultiOutCallImpure,
     /// 语句残留非空 fn_sites：运行期物化有副作用（distinct_sql/临时表/
     /// MAX_TUPLES），Converted 计划绝不原样穿透（设计 §4.2）。
     UnresolvedFnSite,
@@ -141,6 +144,9 @@ struct CopyLoop<'a> {
     pub(super) sinks: Vec<(VarName, SinkOp, String, String)>,
     /// 兜底型循环不变查找（§4.4 B1）：聚合标量子查询替代 SELECT INTO。
     pub(super) lookups: Vec<lookup::LookupQuery>,
+    /// 多 OUT 查找函数内联（§3.2 LookupTuple）：单条 GROUP BY 派生表 +
+    /// 每变量 `CASE WHEN sd_cnt = 1 THEN 列 ELSE 兜底` 投影。
+    pub(super) tuples: Vec<lookup::TupleQuery>,
     /// IF 路由（§4.3）：(查找变量, 常量 SQL)，入口守卫证明 THEN 不可达。
     pub(super) route: Option<(VarName, String)>,
     /// PureExpr 常量折叠（§4.3 A7）：赋值变量 → 常量；仅用于静态剪枝

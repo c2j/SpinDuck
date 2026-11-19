@@ -138,6 +138,26 @@ fn load_in_tables(
     Ok(Ok(tables))
 }
 
+/// LookupTuple 解析（§3.2）：加载涉案表 + 渲染单条 GROUP BY 派生表；
+/// `base_index` 接续查找编号避免 JOIN 别名冲突。
+pub(super) fn resolve_tuples(
+    ex: &schema::Source<'_>,
+    tuples: &[lookup::TupleQuery],
+    base_index: usize,
+) -> Result<Result<Vec<(lookup::ResolvedTuple, LookupTables)>, SkipReason>, EngineError> {
+    let mut out = Vec::new();
+    for (i, tq) in tuples.iter().enumerate() {
+        let Some(table) = ex.load(&tq.table)? else {
+            return Ok(Err(SkipReason::UnknownObjectDependency));
+        };
+        match lookup::render_tuple(tq, &table, base_index + i) {
+            Ok(rt) => out.push((rt, vec![(tq.table.clone(), table)])),
+            Err(reason) => return Ok(Err(reason)),
+        }
+    }
+    Ok(Ok(out))
+}
+
 /// 内联表达式中的函数内查找（§4.3 A7）关系化提升：把每个 `IrExpr::Lookup`
 /// 替换为合成变量 `__sd_lkN`，并以 GROUP BY 派生表 LEFT JOIN 渲染（相关
 /// 聚合标量子查询深嵌套会触发内核规划栈溢出，关系化后栈深恒定）。

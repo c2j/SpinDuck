@@ -6,11 +6,13 @@ mod expand;
 mod subst;
 #[cfg(test)]
 mod tests;
+mod tuple;
 
 use body::fold_body;
 use expand::expand_calls;
 pub(super) use subst::subst_env;
 pub(super) use subst::{resolve_locals, subst_var};
+pub(super) use tuple::tuple_query;
 
 use super::{AssignTarget, BinOp, IrExpr, IrProg, IrStmt, VarName};
 use crate::catalog::{ParamMode, RoutineCatalog, RoutineKind};

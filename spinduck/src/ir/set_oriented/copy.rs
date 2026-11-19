@@ -19,6 +19,7 @@ pub(super) fn copy_sql(
     shapes: (&shape::Select, &shape::Insert),
     tables: (&Table, &Table),
     lookups: &[lookup::ResolvedLookup],
+    tuples: &[lookup::ResolvedTuple],
 ) -> Result<CopySql, SkipReason> {
     let (select, insert) = shapes;
     let (source, target) = tables;
@@ -31,6 +32,7 @@ pub(super) fn copy_sql(
         select,
         source,
         lookups,
+        tuples,
         ctes: &mut ctes,
         joins: &mut joins,
         expr_guards: &mut expr_guards,
@@ -126,6 +128,9 @@ fn projection(
         }
         if let Some((_, ie)) = region.inlined.iter().find(|(iv, _)| iv == v) {
             return inline_projection(region, to, (v, ie), env);
+        }
+        if let Some(g) = tuple_projection(to, v, env)? {
+            return Ok(g);
         }
         return sink_projection(region, env.select, env.source, to, v);
     }
@@ -393,6 +398,48 @@ fn source_column<'a>(
         .iter()
         .find(|c| c.name == *src)
         .ok_or(SkipReason::UnknownObjectDependency)
+}
+
+/// LookupTuple 槽位投影（§3.2）：`CASE WHEN sd_cnt = 1 THEN <列> ELSE <兜底>`；
+/// 共享派生表/连接按别名去重登记，相关键类型对齐与查找同口径。
+fn tuple_projection(
+    to: &Column,
+    v: &super::VarName,
+    env: &mut ProjEnv<'_>,
+) -> Result<Option<expr::GuardedExpr>, SkipReason> {
+    let Some((t, slot)) = env
+        .tuples
+        .iter()
+        .find_map(|t| t.slots.iter().find(|s| s.var == *v).map(|s| (t, s)))
+    else {
+        return Ok(None);
+    };
+    for (key_kind, cursor_field) in &t.key_checks {
+        let from = source_column(env.select, env.source, cursor_field)?;
+        if &from.kind != key_kind {
+            return Err(SkipReason::UnprovenTargetConstraints);
+        }
+    }
+    if let Some(kind) = &slot.kind {
+        if *kind != to.kind || (slot.nullable && !to.nullable) {
+            return Err(SkipReason::UnprovenTargetConstraints);
+        }
+    } else if slot.nullable && !to.nullable {
+        return Err(SkipReason::UnprovenTargetConstraints);
+    }
+    if !env.ctes.contains(&t.cte) {
+        env.ctes.push(t.cte.clone());
+    }
+    if !env.joins.contains(&t.join) {
+        env.joins.push(t.join.clone());
+    }
+    Ok(Some(expr::GuardedExpr {
+        expr: format!(
+            "CASE WHEN {} THEN {} ELSE {} END",
+            t.hit, slot.value, slot.default_sql
+        ),
+        guard: String::new(),
+    }))
 }
 
 fn sink_projection(

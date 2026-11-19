@@ -8,6 +8,9 @@ mod aggregate;
 mod lateral;
 mod parse;
 mod top1;
+mod tuple;
+pub(crate) use parse::parse_tuple_total;
+pub(super) use tuple::render_tuple;
 
 use super::region::{self, CursorRegion};
 use super::shape::Name;
@@ -118,6 +121,63 @@ pub(super) struct LookupQuery {
     /// 静态过滤引用的过程形参绑定（如 BETWEEN 区间的 p_i_date）：须并入
     /// 批写 SQL 的 binds 在运行期解析（相关键 Field 绑定不在此列）。
     pub filter_binds: Vec<(String, BindSrc)>,
+}
+
+/// 多 OUT 查找函数（§3.2 LookupTuple）的调用方绑定：单条
+/// `SELECT 多列 INTO 局部变量` 经直线拷贝写齐全部 OUT 形参与返回值，
+/// WHEN OTHERS 处理器给每个 OUT 与返回值赋全定义常量且不 Raise。
+/// 渲染为一条 GROUP BY 派生表（COUNT(*) AS sd_cnt），每个调用方变量
+/// 投影 `CASE WHEN sd_cnt = 1 THEN <列> ELSE <兜底> END`。
+pub(super) struct TupleQuery {
+    pub table: Name,
+    /// SELECT 输出列（与 INTO 目标位置对齐）。
+    pub columns: Vec<Name>,
+    /// 渲染后的静态 WHERE（空串 = 无过滤；相关键不在其中）。
+    pub filter: String,
+    /// 相关键等值（可多键）；空 = 循环不变量（保守拒绝，不渲染）。
+    pub correlations: Vec<Correlation>,
+    /// 静态过滤引用的调用方变量绑定（帧单值，运行期解析）。
+    pub filter_binds: Vec<(String, BindSrc)>,
+    /// 调用方变量绑定（OUT 实参槽位 + 返回值赋值目标）。
+    pub slots: Vec<TupleSlot>,
+}
+
+/// 单个调用方变量的取值来源与兜底。
+pub(super) struct TupleSlot {
+    pub var: VarName,
+    pub source: TupleSource,
+    /// 处理器兜底常量（SpinValue::Str/Int/Null 可渲染）。
+    pub default: SpinValue,
+}
+
+/// 槽位取值来源：查询列（按 `columns` 下标）或全路径常量。
+pub(super) enum TupleSource {
+    Col(usize),
+    Const(SpinValue),
+}
+
+/// 渲染产物：单条派生表 + 共享命中条件；每槽位一条值表达式。
+#[derive(Clone)]
+pub(super) struct ResolvedTuple {
+    pub cte: String,
+    pub join: String,
+    /// “恰 1 行命中”布尔表达式（`sd_lkN.sd_cnt = 1`，无匹配/多匹配均 false）。
+    pub hit: String,
+    pub slots: Vec<ResolvedTupleSlot>,
+    /// 逐键 (维表键列类型, 游标字段)，与源列严格一致才放行。
+    pub key_checks: Vec<(String, Name)>,
+}
+
+/// 已解析槽位：命中值表达式 + 兜底 SQL + 来源列类型证据。
+#[derive(Clone)]
+pub(super) struct ResolvedTupleSlot {
+    pub var: VarName,
+    /// 命中时的值表达式（`sd_lkN.sd_vI` 或常量字面量）。
+    pub value: String,
+    pub default_sql: String,
+    /// 来源列类型（常量槽位为 None，不做列类型对齐）。
+    pub kind: Option<String>,
+    pub nullable: bool,
 }
 
 /// 渲染产物：命中条件 + 命中值 + 兜底常量；最终 CASE 由 copy 组装

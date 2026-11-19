@@ -32,10 +32,21 @@ pub(super) fn generate(
     if let Err(reason) = resolve::substitute_lookup_refs(&mut resolved) {
         return Ok(Err(reason));
     }
-    if !matches_snapshot(ex, ctx, &inputs, &resolved)? {
+    let resolved_tuples = match resolve::resolve_tuples(ex, &copy.tuples, resolved.len() + 1)? {
+        Ok(t) => t,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    if !matches_snapshot(ex, ctx, &inputs, &resolved, &resolved_tuples)? {
         return Ok(Err(SkipReason::UnprovenTargetConstraints));
     }
-    Ok(finish(copy, inputs, resolved, region, tail_commit))
+    Ok(finish(
+        copy,
+        inputs,
+        resolved,
+        resolved_tuples,
+        region,
+        tail_commit,
+    ))
 }
 
 fn load_inputs(
@@ -109,6 +120,7 @@ fn matches_snapshot(
     ctx: &OptimizeCtx<'_>,
     inputs: &Inputs,
     resolved: &resolve::HoistedLookups,
+    tuples: &[(lookup::ResolvedTuple, resolve::LookupTables)],
 ) -> Result<bool, EngineError> {
     if let Some(snapshot) = ctx.snapshot {
         if !ex.matches_snapshot(snapshot, &inputs.select.table, ctx.rules)?
@@ -116,7 +128,11 @@ fn matches_snapshot(
         {
             return Ok(false);
         }
-        for (_, tables) in resolved {
+        for tables in resolved
+            .iter()
+            .map(|(_, t)| t)
+            .chain(tuples.iter().map(|(_, t)| t))
+        {
             for (name, _) in tables {
                 if !ex.matches_snapshot(snapshot, name, ctx.rules)? {
                     return Ok(false);
@@ -131,6 +147,7 @@ fn finish(
     copy: &CopyLoop<'_>,
     inputs: Inputs,
     resolved: resolve::HoistedLookups,
+    resolved_tuples: Vec<(lookup::ResolvedTuple, resolve::LookupTables)>,
     region: &region::CursorRegion,
     tail_commit: bool,
 ) -> Result<entry::ConversionPlan, SkipReason> {
@@ -146,11 +163,14 @@ fn finish(
         })
         .collect();
     let route_guards = route_guards(copy, &resolved)?;
+    let tuple_views: Vec<lookup::ResolvedTuple> =
+        resolved_tuples.iter().map(|(t, _)| t.clone()).collect();
     let generated = copy::copy_sql(
         copy,
         (&inputs.select, &inputs.insert),
         (&inputs.source, &inputs.target),
         &projections,
+        &tuple_views,
     )?;
     let binds = query_binds(copy, &resolved);
     let expr_guards = entry::bind_guards(generated.expr_guards, &binds)?;
@@ -164,7 +184,11 @@ fn finish(
         target: inputs.insert.table,
         source_table: inputs.source,
         target_table: inputs.target,
-        lookup_tables: resolved.into_iter().flat_map(|(_, ts)| ts).collect(),
+        lookup_tables: resolved
+            .into_iter()
+            .flat_map(|(_, ts)| ts)
+            .chain(resolved_tuples.into_iter().flat_map(|(_, ts)| ts))
+            .collect(),
         top1_guards,
         route_guards,
         expr_guards,
@@ -187,8 +211,13 @@ fn route_guards(
 
 fn query_binds(copy: &CopyLoop<'_>, resolved: &resolve::HoistedLookups) -> Vec<(String, BindSrc)> {
     let mut binds = copy.query_binds.to_vec();
-    for lq in &copy.lookups {
-        for (ph, src) in &lq.filter_binds {
+    for binds_src in copy
+        .lookups
+        .iter()
+        .map(|l| &l.filter_binds)
+        .chain(copy.tuples.iter().map(|t| &t.filter_binds))
+    {
+        for (ph, src) in binds_src {
             // 查找结果已逐行代入投影，不能再从尚未 FETCH 的帧取值。
             if let BindSrc::Var(v) = src {
                 if resolved.iter().any(|(l, _)| l.var == *v) {

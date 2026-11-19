@@ -7,6 +7,7 @@ pub(super) struct ProjEnv<'a> {
     pub select: &'a shape::Select,
     pub source: &'a Table,
     pub lookups: &'a [lookup::ResolvedLookup],
+    pub tuples: &'a [lookup::ResolvedTuple],
     pub ctes: &'a mut Vec<String>,
     pub joins: &'a mut Vec<String>,
     pub expr_guards: &'a mut Vec<String>,

@@ -4,6 +4,9 @@
 
 mod in_pred;
 mod tokens;
+mod tuple;
+
+pub(crate) use tuple::parse_tuple_total;
 
 use super::{
     BindSrc, CaseSink, Correlation, CorrelationOp, InFilter, InList, LookupQuery, Name, SkipReason,
@@ -275,7 +278,7 @@ impl WhereClause {
     }
 }
 
-fn fallback_sql(default: &SpinValue) -> Result<String, SkipReason> {
+pub(super) fn fallback_sql(default: &SpinValue) -> Result<String, SkipReason> {
     match default {
         SpinValue::Str(s) => Ok(format!("'{}'", s.replace('\'', "''"))),
         SpinValue::Int(i) => Ok(i.to_string()),

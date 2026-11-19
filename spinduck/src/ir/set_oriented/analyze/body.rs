@@ -9,6 +9,9 @@ pub(super) struct Body<'a> {
     pub has_trap: bool,
     pub sinks: Vec<(VarName, SinkOp, String, String)>,
     pub lookups: Vec<lookup::LookupQuery>,
+    pub tuples: Vec<lookup::TupleQuery>,
+    /// LookupTuple 槽位变量：调用被集合化跳过后不得再被赋值（防陈旧绑定）。
+    tuple_vars: std::collections::BTreeSet<VarName>,
     pub route: Option<(VarName, String)>,
     pub folded: Vec<(VarName, crate::value::SpinValue)>,
     pub inlined: Vec<(VarName, IrExpr)>,
@@ -185,9 +188,29 @@ impl<'a> Body<'a> {
         v: &VarName,
         expr: &IrExpr,
     ) -> Result<(), SkipReason> {
+        if self.tuple_vars.contains(v) {
+            return Err(SkipReason::UnsupportedControlFlow);
+        }
         match expr {
             IrExpr::FuncCall { name, args, .. } => {
                 self.reject_reassignment(v)?;
+                if let Some(tq) = catalog_summary::tuple_query(
+                    ctx.catalog,
+                    name,
+                    args,
+                    v,
+                    ctx.prog,
+                    ctx.region,
+                    &ctx.region.record,
+                )? {
+                    for slot in &tq.slots {
+                        self.reject_slot(&slot.var)?;
+                    }
+                    self.tuple_vars
+                        .extend(tq.slots.iter().map(|s| s.var.clone()));
+                    self.tuples.push(tq);
+                    return Ok(());
+                }
                 let call = catalog_summary::inline_pure_call(ctx.catalog, name, args)
                     .ok_or(SkipReason::UnsupportedCall)?;
                 catalog_summary::resolve_locals(&mut self.inlined);
@@ -220,6 +243,19 @@ impl<'a> Body<'a> {
                     .map(|l| l.var.clone())
                     .collect(),
             );
+        }
+        Ok(())
+    }
+
+    /// LookupTuple 槽位变量与既有绑定/查找/写汇冲突即拒绝。
+    fn reject_slot(&self, v: &VarName) -> Result<(), SkipReason> {
+        if self.folded.iter().any(|(fv, _)| fv == v)
+            || self.inlined.iter().any(|(iv, _)| iv == v)
+            || self.sinks.iter().any(|(sv, _, _, _)| sv == v)
+            || self.lookups.iter().any(|l| l.var == *v)
+            || self.tuple_vars.contains(v)
+        {
+            return Err(SkipReason::UnsupportedControlFlow);
         }
         Ok(())
     }
@@ -283,6 +319,40 @@ impl<'a> Body<'a> {
                     }
                 }
             }
+        }
+        self.validate_tuples(ctx)?;
+        Ok(())
+    }
+
+    /// LookupTuple：静态过滤变量须循环不变；OUT/返回值槽位变量在后缀
+    /// 不得被读取（集合化跳过调用，帧槽不会被函数写回）。
+    fn validate_tuples(&self, ctx: &Context<'_, '_>) -> Result<(), SkipReason> {
+        if self.tuples.is_empty() {
+            return Ok(());
+        }
+        for tq in &self.tuples {
+            for (_, src) in &tq.filter_binds {
+                if let BindSrc::Var(v) = src {
+                    if self.lookups.iter().any(|l| l.var == *v) {
+                        continue;
+                    }
+                    if !region::var_invariant_in_region(ctx.prog, ctx.region, v) {
+                        return Err(SkipReason::UnsupportedControlFlow);
+                    }
+                }
+            }
+        }
+        let mut reads = std::collections::BTreeSet::new();
+        for stmt in &ctx.prog.code[ctx.region.close_pc + 1..] {
+            region::collect_stmt_reads(stmt, &mut reads);
+        }
+        if self
+            .tuples
+            .iter()
+            .flat_map(|t| t.slots.iter().map(|s| &s.var))
+            .any(|v| reads.contains(v))
+        {
+            return Err(SkipReason::LiveOutState);
         }
         Ok(())
     }

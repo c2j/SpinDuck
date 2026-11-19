@@ -54,6 +54,7 @@ pub(super) fn analyze_region<'a>(
             allow_filter: mode == SetOrientedMode::BatchAtomic && body.has_trap,
             sinks: body.sinks,
             lookups: body.lookups,
+            tuples: body.tuples,
             route: body.route,
             folded: body.folded,
             inlined: body.inlined,
