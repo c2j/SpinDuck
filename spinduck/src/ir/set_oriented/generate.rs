@@ -32,6 +32,15 @@ pub(super) fn generate(
     if let Err(reason) = resolve::substitute_lookup_refs(&mut resolved) {
         return Ok(Err(reason));
     }
+    // §3.5：视图底表 Reads∩Writes(Region) 必须为空（视图名本身已在
+    // carryover_group_at 复核；此处补最终底表）。
+    for (l, _) in resolved.iter() {
+        if let Some(base) = &l.guard_base {
+            if copy.writes.contains(&base.0) {
+                return Ok(Err(SkipReason::TargetReadDependency));
+            }
+        }
+    }
     let resolved_tuples = match resolve::resolve_tuples(ex, &copy.tuples, resolved.len() + 1)? {
         Ok(t) => t,
         Err(reason) => return Ok(Err(reason)),

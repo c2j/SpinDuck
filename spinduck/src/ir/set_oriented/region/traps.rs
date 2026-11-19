@@ -167,7 +167,9 @@ pub(crate) fn fallback_group(
 
 /// 兜底处理器结构面判定（trap 闭包准入用）。
 fn fallback_handler(prog: &IrProg, pc: usize, entry: &crate::ir::TrapEntry) -> bool {
-    fallback_group(prog, pc, entry).is_some() || fallback_if_group(prog, pc, entry).is_some()
+    fallback_group(prog, pc, entry).is_some()
+        || fallback_if_group(prog, pc, entry).is_some()
+        || super::super::vguard::carryover_group(prog, pc, entry).is_some()
 }
 
 /// IF 路由型常量兜底闭包（§4.3 + §4.4 B1）的结构面：PushTrap 主线首条为

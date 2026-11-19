@@ -44,6 +44,14 @@ impl Source<'_> {
         }
     }
 
+    /// 视图定义原文（§3.5 V3-5 全定义证明输入）；非视图 = None。
+    pub(super) fn view_sql(&self, name: &Name) -> Result<Option<String>, EngineError> {
+        match self {
+            Self::Runtime(ex) => view_sql(*ex, name),
+            Self::Static(_) => Ok(None),
+        }
+    }
+
     pub(super) fn sys_dummy_ok(&self) -> Result<bool, EngineError> {
         match self {
             Self::Runtime(ex) => sys_dummy_ok(*ex),
@@ -216,6 +224,24 @@ fn canonical_runtime_type(ty: &str, rules: &RuleRegistry) -> String {
             other => other.duckdb_name().to_string(),
         },
         None => format!("OPAQUE:{}", upper),
+    }
+}
+
+/// 视图定义原文（duckdb_views().sql，限当前库/模式）；非视图或不存在 = None。
+pub(super) fn view_sql(ex: &dyn SqlExecutor, name: &Name) -> Result<Option<String>, EngineError> {
+    let binds = BindMap::from([("$table".into(), SpinValue::Str(name.0.clone()))]);
+    let mut stream = ex.query(
+        "SELECT sql FROM duckdb_views() WHERE lower(view_name) = $table \
+         AND database_name = current_database() AND schema_name = current_schema()",
+        &binds,
+    )?;
+    let rows = stream.fetch_many(2);
+    let [row] = rows.as_slice() else {
+        return Ok(None);
+    };
+    match row.as_slice() {
+        [SpinValue::Str(sql)] => Ok(Some(sql.clone())),
+        _ => Ok(None),
     }
 }
 

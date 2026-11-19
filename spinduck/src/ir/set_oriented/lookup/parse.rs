@@ -20,7 +20,7 @@ use tokens::LiteralTokens;
 /// （=/<>/!=/</<=/>/>=）、列 = 游标字段绑定（可多键）或
 /// 列 IN (SELECT 列 FROM 表 [WHERE 静态谓词])。
 /// 其余形态（函数/CAST/除法）一律 UnprovenQueryTotalness。
-pub(super) fn parse_total(
+pub(crate) fn parse_total(
     sql: &str,
     var: VarName,
     default: SpinValue,
@@ -74,6 +74,7 @@ pub(super) fn parse_total(
         group: 0,
         filter_on_miss: false,
         filter_binds: predicates.binds,
+        entry_guard: false,
     })
 }
 
@@ -256,6 +257,7 @@ fn parse_derived_top1(
         group: 0,
         filter_on_miss: false,
         filter_binds: predicates.binds,
+        entry_guard: false,
     })
 }
 

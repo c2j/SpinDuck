@@ -116,6 +116,14 @@ impl<'a> Body<'a> {
             self.add_group(group)?;
             return Ok(pc + 2 * n + 4);
         }
+        // §3.5 零异常守卫查找：处理器不改 INTO 变量，命中基数由入口守卫裁决。
+        if let Some((lq, resume)) =
+            vguard::carryover_group_at(ctx.prog, pc, ctx.region, ctx.catalog)?
+        {
+            self.add_group(vec![lq])?;
+            self.has_trap = true;
+            return Ok(resume);
+        }
         // Strict 的 reset_session 回滚语义与跳行过滤不等价。
         if ctx.mode == SetOrientedMode::BatchAtomic {
             if let Some(lq) = lookup::skip_lookup_at(ctx.prog, pc, ctx.region, ctx.catalog)? {

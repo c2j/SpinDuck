@@ -9,6 +9,7 @@ mod lateral;
 mod parse;
 mod top1;
 mod tuple;
+pub(crate) use parse::parse_total;
 pub(crate) use parse::parse_tuple_total;
 pub(super) use tuple::render_tuple;
 
@@ -121,6 +122,9 @@ pub(super) struct LookupQuery {
     /// 静态过滤引用的过程形参绑定（如 BETWEEN 区间的 p_i_date）：须并入
     /// 批写 SQL 的 binds 在运行期解析（相关键 Field 绑定不在此列）。
     pub filter_binds: Vec<(String, BindSrc)>,
+    /// §3.5 零异常入口守卫（V3-5）：处理器不改写 INTO 变量（跨行残留），
+    /// 命中基数由入口守卫在运行期裁决——0/多行整段退回原解释器。
+    pub entry_guard: bool,
 }
 
 /// 多 OUT 查找函数（§3.2 LookupTuple）的调用方绑定：单条
@@ -214,6 +218,8 @@ pub(super) struct ResolvedLookup {
     /// 渲染文本引用的其他查找变量（跨查找替换记录）：批写注册其派生表/
     /// 连接须先于本查找（LATERAL 引用其别名），按依赖拓扑递归登记。
     pub deps: Vec<VarName>,
+    /// §3.5 入口守卫视图的最终底表名（写集相交复核用；普通查找为 None）。
+    pub guard_base: Option<Name>,
 }
 
 /// 识别 pc 处的兜底查找组（同一 WHEN OTHERS 内 n 条连续 SELECT INTO）：
@@ -382,6 +388,9 @@ pub(super) fn render(
     index: usize,
     cur_scan: &str,
 ) -> Result<LookupRender, SkipReason> {
+    if lq.entry_guard {
+        return super::vguard::render(lq, table, index, cur_scan);
+    }
     let filter = combined_filter(lq, inner_tables)?;
     if lq.case_sink.is_some() {
         return Ok(aggregate::case_gate(lq, table));

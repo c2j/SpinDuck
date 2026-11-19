@@ -41,6 +41,10 @@ pub(super) fn resolve_one(
     cur_scan: &str,
 ) -> Result<Result<(lookup::ResolvedLookup, LookupTables), SkipReason>, EngineError> {
     let system_case = lq.case_sink.is_some() && lq.table.0 == "sys_dummy";
+    // §3.5：入口守卫查找的表可为视图——递归全定义证明失败即
+    // UnprovenQueryTotalness（不发守卫 SQL）；证明产物给出投影列证据
+    // 与最终底表（漂移/写集复核对象）。
+    let mut proof = None;
     let table = if system_case {
         // 哑表不读任何列，入口单行守卫已涵盖全部依赖，不要求用户 DDL 声明。
         schema::Table {
@@ -49,6 +53,16 @@ pub(super) fn resolve_one(
         }
     } else if let Some(table) = ex.load(&lq.table)? {
         table
+    } else if lq.entry_guard {
+        match super::vguard::prove_view(ex, &lq.table, 0)? {
+            Ok(Some(p)) => {
+                let t = p.table.clone();
+                proof = Some(p);
+                t
+            }
+            Ok(None) => return Ok(Err(SkipReason::UnknownObjectDependency)),
+            Err(reason) => return Ok(Err(reason)),
+        }
     } else {
         return Ok(Err(SkipReason::UnknownObjectDependency));
     };
@@ -59,11 +73,16 @@ pub(super) fn resolve_one(
         return Ok(Err(SkipReason::UnknownObjectDependency));
     };
     let (kind, nullable) = (col.kind.clone(), col.nullable);
-    let tables = match load_in_tables(ex, lq, table)? {
+    // 渲染证据用视图投影形状；涉案表登记最终底表（结构漂移复核对象）。
+    let render_table = table.clone();
+    let mut tables = match load_in_tables(ex, lq, table)? {
         Ok(tables) => tables,
         Err(reason) => return Ok(Err(reason)),
     };
-    let render = match lookup::render(lq, &tables[0].1, &tables[1..], index, cur_scan) {
+    if let Some(p) = &proof {
+        tables[0] = (p.base.clone(), p.base_table.clone());
+    }
+    let render = match lookup::render(lq, &render_table, &tables[1..], index, cur_scan) {
         Ok(r) => r,
         Err(reason) => return Ok(Err(reason)),
     };
@@ -77,6 +96,7 @@ pub(super) fn resolve_one(
             filter_on_miss: lq.filter_on_miss,
             case_sink: None,
             deps: Vec::new(),
+            guard_base: proof.map(|p| p.base),
         },
         tables,
     )))
@@ -99,6 +119,7 @@ fn resolve_case(
             filter_on_miss: false,
             case_sink: lq.case_sink.clone(),
             deps: Vec::new(),
+            guard_base: None,
         },
         if lq.table.0 == "sys_dummy" {
             Vec::new()

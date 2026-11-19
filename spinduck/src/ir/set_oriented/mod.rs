@@ -20,6 +20,7 @@ mod resolve;
 mod route;
 mod schema;
 mod shape;
+mod vguard;
 
 pub(crate) use entry::{entry_ok, ConversionPlan};
 
@@ -166,6 +167,8 @@ struct CopyLoop<'a> {
     pub(super) inline_preconditions: std::collections::BTreeMap<String, Vec<VarName>>,
     /// 死存储消除（§5 清单 g）：全程序无读取变量的常量赋值，整体跳过。
     pub(super) dead: Vec<VarName>,
+    /// 区域写集（§3.5 V3-5 视图底表 Reads∩Writes 复核）。
+    pub(super) writes: std::collections::BTreeSet<String>,
 }
 
 /// 一次调用选择所需的引擎上下文（模式、开关、编译期证据）。
