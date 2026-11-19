@@ -671,3 +671,94 @@ CREATE TABLE par_drv_config (
     event_type character varying(2) NOT NULL,
     accnt_book_code character varying(30)
 );
+
+-- 逐字取自基线 1_表结构/par_oper_venture.sql（hz_byfund 兄弟过程依赖；原随退役用例 case_corpus_hz_byfund 移出，2026-11-19 补回）
+CREATE TABLE par_oper_venture (
+    stock_kind_str character varying(200),
+    venture_name character varying(50),
+    market_code character varying(3) NOT NULL,
+    operation_kind character varying(5) NOT NULL
+);
+
+-- 逐字取自基线 1_表结构/dat_fund_xw_venture.sql（hz_byfund 兄弟过程依赖；原随退役用例 case_corpus_hz_byfund 移出，2026-11-19 补回）
+CREATE TABLE dat_fund_xw_venture (
+    fund_code character varying(8) NOT NULL,
+    xwdm character varying(6) NOT NULL,
+    bcrq character varying(8) NOT NULL,
+    qsje numeric(15,3),
+    scdm character varying(3) NOT NULL,
+    operation_kind character varying(5) NOT NULL,
+    trade_type character varying(1) DEFAULT '0'::character varying NOT NULL,
+    venture_type character varying(1),
+    qsje2 numeric(15,3)
+);
+
+-- 逐字取自基线 1_表结构/jyfy_temp.sql（hz_byfund 兄弟过程依赖；原随退役用例 case_corpus_hz_byfund 移出，2026-11-19 补回）
+CREATE TABLE jyfy_temp (
+    rfstreamid character varying(5),
+    gddm character varying(20),
+    subacct character varying(3),
+    ddbh character varying(16),
+    cjbh character varying(16),
+    sqbh character varying(16),
+    jydy character varying(5),
+    zqdm character varying(8),
+    sgsl numeric(15,0),
+    cjsl numeric(15,0),
+    cjjg numeric(11,3),
+    cjje numeric(16,2),
+    bcye numeric(15,0),
+    sbsj character varying(6),
+    cjsj character varying(6),
+    cjrq character varying(8),
+    bs character varying(1),
+    cjbz character varying(3),
+    kpbz character varying(1),
+    bdbz character varying(1),
+    bz character varying(3),
+    jyfy numeric(16,2),
+    cljg character varying(2),
+    text character varying(30),
+    data_date character varying(8),
+    user_code character varying(20)
+);
+
+-- 逐字取自基线 1_表结构/dic_stock_kind_sub.sql（hz_byfund 兄弟过程依赖；原随退役用例 case_corpus_hz_byfund 移出，2026-11-19 补回）
+CREATE TABLE dic_stock_kind_sub (
+    market_code character varying(3) NOT NULL,
+    stock_kind character varying(4) NOT NULL,
+    begin_code character varying(12) NOT NULL,
+    end_code character varying(12) NOT NULL,
+    descript character varying(40),
+    trade_unit numeric(5,0) DEFAULT 1,
+    operator character varying(10),
+    check_user character varying(10),
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20),
+    settle_type character varying(2)
+);
+
+-- 逐字取自基线 1_表结构/par_sys_marketrate.sql（fnc_com_get_seat_para 依赖；原随退役用例 case_corpus_hz_byfund 移出，2026-11-19 补回）
+CREATE TABLE par_sys_marketrate (
+    market_code character varying(3) NOT NULL,
+    par_code character varying(3) NOT NULL,
+    stock_kind character varying(4) NOT NULL,
+    par_kind numeric(1,0) NOT NULL,
+    par_name character varying(50),
+    par_value numeric(19,10) DEFAULT 0 NOT NULL,
+    min_value numeric(20,4) DEFAULT 0 NOT NULL,
+    max_value numeric(20,4) DEFAULT (9999999999::bigint)::numeric NOT NULL,
+    unit character varying(1),
+    min_tax numeric(15,4) DEFAULT 0 NOT NULL,
+    operator character varying(10),
+    check_user character varying(10),
+    inure_begin_date character varying(8) NOT NULL,
+    inure_end_date character varying(8) DEFAULT '99991231'::character varying,
+    par_day numeric(8,0) DEFAULT 0 NOT NULL,
+    stock_status character varying(2) DEFAULT '99'::character varying NOT NULL,
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20),
+    fund_age character varying(2) DEFAULT '0'::character varying NOT NULL
+);

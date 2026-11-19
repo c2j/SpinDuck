@@ -5145,3 +5145,93 @@ slice 幂等、search_path 消解、DECIMAL/DATE/TIMESTAMP/'' 宽类型保真。
 - 不声称并发 slice/upsert 竞态已覆盖（无并发 e2e）；
 - 不声称 CLI `batch` 串联路径的 sync 实测（复用同一 `sync_write` 接缝，
   未单独压测）。
+
+## V51. 项目态体检范围收窄到入口链 + 语料依赖补件（2026-11-19）
+
+### V51.1 动机与口径
+
+以 `golden/case_corpus_purchase` 做集合化转换真机验证时：`call --db aaspubs.duckdb --plan`
+成功（`OUT p_o_succeed = 0`），同闭包的 `compile --analyze` 却 `failed=42` 退出 1。根因是
+两层缺件口径不一致——`call` 缺件门按**入口链**（`prc_trd_deal_purchase` 不调用同包兄弟
+`prc_trd_hz_byfund`），compile 体检 Gate 1B/2B 按**闭包文件**（包文件里两个例程全检）；
+而 hz_byfund 的依赖资产随退役用例 `case_corpus_hz_byfund`（V21，提交 `4327506`）移出语料。
+修复（design-compile「体检范围」小节 + Key Decision 16，人批准）：
+
+1. **范围收窄（C）**：Gate 1B/2B 只查入口链可达例程（`plan::closure::reachable_routines`，
+   与 `call` 缺件门同一条 `walk_chain`）；Gate 1A register 失败与 Gate 2A 拒绝保持文件级。
+   目标解析失败退回文件级全检。
+2. **三条 1B 误报修复（B）**：游标/局部记录 `%TYPE`/`%ROWTYPE` 锚按 PL 局部名跳过；
+   `rownum` 伪列按内核已知伪列跳过（改写面 `rownum_first_row` 兜底）；无别名派生表裸列
+   归 `Cols::Unknown`（落实模块头既有 V1 口径）。
+3. **语料补件（A，纵深）**：从 `4327506^` 逐字恢复 5 表（`par_oper_venture`、
+   `dat_fund_xw_venture`、`jyfy_temp`、`dic_stock_kind_sub`、`par_sys_marketrate`）与
+   4 函数（`1_FNC_COM_GET_FUND_CODE/GET_MAIN_XWDM/GET_FUND_DATA_MODE/GET_SEAT_PARA`）；
+   提交内嵌 codeweb 项目标记 `codeweb.toml`（store 仍 gitignore）。Key Decision 11
+   "四表不写进缺件期望"不变——本轮是把 `par_sys_marketrate` 声明进语料 DDL，两件事不冲突。
+
+### V51.2 夹具（新增测试，全部先红后绿）
+
+- `gate/columns/tests.rs`：`should_skip_rowtype_anchor_on_a_local_cursor`、
+  `should_skip_type_anchor_on_a_local_record_variable`、`should_skip_rownum_pseudo_column`、
+  `should_treat_unaliased_derived_table_columns_as_unknown`；
+- `gate/pipeline.rs`：`should_scope_package_findings_to_reachable_members`、
+  `should_scope_standalone_routine_findings_to_reachable_entries`；
+- `tests/cli/compile_entry.rs`：`should_skip_unreachable_sibling_routine_when_scoping_ir_
+  health_to_the_entry_chain`（同文件不可达例程坏 SQL 不判 FAIL）与反例
+  `should_fail_when_the_bad_sql_is_in_the_reached_routine`（可达必红，门不永绿）。
+
+### V51.3 语料 compile 前后对照（同一命令，工作树副本）
+
+修复前：`compile: entries=1 missing=1 failed=42 dynamic=0`，退出码 1（42 条 FAIL：
+5 缺表 + 3 缺函数的 prepare/finding、游标 `%ROWTYPE` ×4、`FOR res` 记录字段、
+`v_par_fund_check_para` 不在计划 → stub 库缺视图 ×2、`v_security_id` 裸变量等）。
+修复后：
+
+```text
+$ spinduck compile --analyze --dir <case_corpus_purchase>
+plan: target=pkg_split_trade_step3_sh.prc_trd_deal_purchase routines=6 tables=1 missing=0
+compile: entries=1 missing=0 failed=0 dynamic=0      退出码 0
+```
+
+`routines=6` 与真机服务器语料一致（服务器侧同样恢复过 seat_para 桩，其 MISS 清单
+`par_sys_marketrate <- fnc_com_get_seat_para` 与本轮复现逐字吻合）。
+
+### V51.4 全链验证（本机，参照源 = golden/gaussdb-docker A 模式容器，语料 schema+seed 灌入）
+
+```text
+$ spinduck deploy .spinduck/plan/pkg_split_trade_step3_sh.prc_trd_deal_purchase.toml --db chain.duckdb
+deploy: target=… routines=6 → ddl_files=1 routine_files=6 db=chain.duckdb      rc=0
+
+$ spinduck materialize --db chain.duckdb --table mid_yjqs_detail,par_fund_partner,par_fund_seat,par_sys_purchase,swh_all_kind --jobs 4
+[1/5] MATERIALIZE par_fund_seat rows=2        … [5/5] MATERIALIZE swh_all_kind rows=1   rc=0
+
+$ spinduck call --db chain.duckdb --plan … --set-oriented "'20250715'" null
+SET_ORIENTED pkg_split_trade_step3_sh.prc_trd_deal_purchase skipped reason=TransactionBoundaryInsideLoop
+OUT p_o_succeed = 0                            rc=0
+
+$ spinduck query --db chain.duckdb --sql-file repurchase.sql --out repurchase.json
+rows=2：[0130000001, A0001, 100, 10000.000, 2.000, 0.000, 90, 0501]
+        [0130000002, A0002, 200, 20000.000, 4.000, 0.000, 180, 0501]
+```
+
+产物逐值等于 `cases/purchase.case.toml` 的 `[[case.assert]]` 基线（3 游标行 → 2 指令行，
+异常行 A999 跳过后的量额闭合）。
+
+### V51.5 门禁
+
+`cargo fmt --all -- --check`、`cargo clippy --all-features -- -D warnings`、
+`cargo test --features cli` 全量、`cargo audit`（CI 七条 zip 豁免后通过，余 3 条配置内
+allowed warnings）全部通过；`cargo test --features gauss`（A 模式容器在位，
+`SPINDUCK_OG_*` 显式注入）全量通过——`tests/gauss_e2e` 6/6
+（注意：该 e2e 缺环境变量时按 §4.1 显式红，第一次无环境运行 6 条 panic 属预期形态）。
+
+### V51.6 不声称
+
+- 不声称 `prc_trd_deal_purchase` 本体被集合化改写：`TransactionBoundaryInsideLoop`
+  （循环内 COMMIT）按契约跳过，回落解释路径；集合化转换的覆盖面由
+  `tests/guard/guard_set_oriented_corpus.rs` 与 `cases_native` 断言层承担。
+- 不声称 `v_par_bond`（hz_byfund 依赖的债券视图）已补入语料：仓库无其逐字 DDL，
+  且在入口链口径下不参与体检；将来把入口切到 hz_byfund 时须先从基线 `3_视图` 取
+  原文补 `sql/ddl/views/`。
+- 不声称服务器语料与仓库一致：真机 `routines=6 missing=0` 的状态是服务器侧本地补件
+  产生的；本轮把等价补件正式入库后，两侧应重新对齐（服务器重跑 compile 以仓库为准）。

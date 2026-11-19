@@ -107,7 +107,8 @@ export SPINDUCK_OG_HOST=127.0.0.1 SPINDUCK_OG_PORT=5433 \
 
 在项目根（含 `spinduck.toml`）声明本项目对外可调用的存过全名，项目态 `compile`
 从这些入口（或显式 `--entry`，独立例程可用裸名）出发，经 codeweb 0.9.7 图求闭包、
-按入口落盘运行计划，并对闭包源做 IR 体检——缺件即红，不留"生成了但跑不通"的中间态：
+按入口落盘运行计划，并对入口链可达例程做 IR 体检——缺件即红，不留"生成了但跑不通"
+的中间态（同文件不可达例程不进体检，口径见 `docs/design-compile.md`「体检范围」）：
 
 ```toml
 # spinduck.toml —— 示意声明形状：[[entry]] 允许多条，全名必须是 package.procedure 形态
