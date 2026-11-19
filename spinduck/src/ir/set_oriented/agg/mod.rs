@@ -212,6 +212,39 @@ pub(super) fn gate_sql(
     }
 }
 
+/// GROUP BY 键列投影、JOIN ON 与游标字段类型校验。
+#[derive(Default)]
+struct KeyParts {
+    key_cols: Vec<String>,
+    join_ons: Vec<String>,
+    checks: Vec<(String, Name)>,
+}
+
+fn key_parts(
+    aq: &AggQuery,
+    table: &super::schema::Table,
+    alias: &str,
+) -> Result<KeyParts, SkipReason> {
+    let mut parts = KeyParts::default();
+    for (i, k) in aq.keys.iter().enumerate() {
+        let Some(key_col) = table.columns.iter().find(|c| c.name == k.dim) else {
+            return Err(SkipReason::UnknownObjectDependency);
+        };
+        if let AggCursor::Field(f) = &k.cursor {
+            parts.checks.push((key_col.kind.clone(), f.clone()));
+        }
+        parts
+            .key_cols
+            .push(format!("{}.{} AS sd_k{i}", aq.alias, k.dim.sql()));
+        let rhs = match &k.cursor {
+            AggCursor::Field(f) => format!("sd_cur.{}", f.sql()),
+            AggCursor::Case(tpl) => tpl.clone(),
+        };
+        parts.join_ons.push(format!("{alias}.sd_k{i} = {rhs}"));
+    }
+    Ok(parts)
+}
+
 /// AggQuery + 维表 schema → 渲染产物（CTE/LEFT JOIN/命中值/门谓词）。
 pub(super) fn render(
     aq: &AggQuery,
@@ -219,23 +252,7 @@ pub(super) fn render(
     index: usize,
 ) -> Result<ResolvedAgg, SkipReason> {
     let alias = format!("sd_ag{index}");
-    let mut join_ons = Vec::new();
-    let mut checks = Vec::new();
-    let mut key_cols = Vec::new();
-    for (i, k) in aq.keys.iter().enumerate() {
-        let Some(key_col) = table.columns.iter().find(|c| c.name == k.dim) else {
-            return Err(SkipReason::UnknownObjectDependency);
-        };
-        if let AggCursor::Field(f) = &k.cursor {
-            checks.push((key_col.kind.clone(), f.clone()));
-        }
-        key_cols.push(format!("{}.{} AS sd_k{i}", aq.alias, k.dim.sql()));
-        let rhs = match &k.cursor {
-            AggCursor::Field(f) => format!("sd_cur.{}", f.sql()),
-            AggCursor::Case(tpl) => tpl.clone(),
-        };
-        join_ons.push(format!("{alias}.sd_k{i} = {rhs}"));
-    }
+    let parts = key_parts(aq, table, &alias)?;
     let value_col = table
         .columns
         .iter()
@@ -257,7 +274,7 @@ pub(super) fn render(
         cte: format!(
             "{alias} AS (SELECT {}, COALESCE(SUM(COALESCE({}.{}, {})), {}) AS sd_v0 \
              FROM {}{}{} GROUP BY {})",
-            key_cols.join(", "),
+            parts.key_cols.join(", "),
             aq.alias,
             aq.value_col.sql(),
             aq.inner_default,
@@ -267,11 +284,11 @@ pub(super) fn render(
             static_where,
             group_by
         ),
-        join: format!("LEFT JOIN {alias} ON {}", join_ons.join(" AND ")),
+        join: format!("LEFT JOIN {alias} ON {}", parts.join_ons.join(" AND ")),
         value: format!("COALESCE({alias}.sd_v0, {})", aq.outer_default),
         outer_default: aq.outer_default.clone(),
         gates: aq.gate_preds.join(" AND "),
-        key_checks: checks,
+        key_checks: parts.checks,
         value_kind: Some(value_col.kind.clone()),
         value_nullable: value_col.nullable,
         cursor_fields: aq.cursor_fields.clone(),
