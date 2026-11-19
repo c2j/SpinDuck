@@ -19,11 +19,39 @@ pub(super) struct Body<'a> {
     pub varchar_inputs: Vec<IrExpr>,
     pub inline_preconditions: std::collections::BTreeMap<String, Vec<VarName>>,
     pub dead: Vec<VarName>,
+    /// 条件聚合查表（§3.4）：trap 包裹 SUM 查询。
+    pub aggs: Vec<agg::AggQuery>,
+    /// 聚合结果写回游标字段（可挂 IF 门），驱动 CASE 投影。
+    pub field_writes: Vec<agg::FieldWrite>,
+    /// 已识别聚合的 INTO 槽位变量（禁止后续赋值）。
+    agg_vars: std::collections::BTreeSet<VarName>,
+    /// 区域内 SqlQuery INTO 单变量的候选集（前置清零死存储证明用）。
+    agg_candidates: std::collections::BTreeSet<VarName>,
+    /// 当前 IF 门：(条件, 汇合点 pc)；pc 到达汇合点即失效。
+    gate: Option<(IrExpr, usize)>,
+}
+
+/// 区域内 SqlQuery INTO 单变量的候选集（前置清零死存储证明用；
+/// 真实准入仍由 trap() 的聚合识别把关）。
+fn agg_candidates(ctx: &Context<'_, '_>) -> std::collections::BTreeSet<VarName> {
+    ctx.prog.code[ctx.region.open_pc..ctx.region.close_pc]
+        .iter()
+        .filter_map(|stmt| match stmt {
+            IrStmt::SqlQuery { into, .. } => match into.as_slice() {
+                [AssignTarget::Var(v)] => Some(v.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 impl<'a> Body<'a> {
     pub(super) fn walk(ctx: &Context<'a, '_>) -> Result<Self, SkipReason> {
-        let mut body = Self::default();
+        let mut body = Self {
+            agg_candidates: agg_candidates(ctx),
+            ..Default::default()
+        };
         let mut pc = ctx.region.open_pc + 3;
         while pc < ctx.region.close_pc - 1 {
             pc = body.statement(ctx, pc)?;
@@ -32,6 +60,9 @@ impl<'a> Body<'a> {
     }
 
     fn statement(&mut self, ctx: &Context<'a, '_>, pc: usize) -> Result<usize, SkipReason> {
+        if self.gate.as_ref().is_some_and(|(_, until)| pc >= *until) {
+            self.gate = None;
+        }
         let stmt = &ctx.prog.code[pc];
         match stmt {
             IrStmt::PushTrap { .. } => return self.trap(ctx, pc),
@@ -48,6 +79,10 @@ impl<'a> Body<'a> {
                 target: AssignTarget::Var(v),
                 expr,
             } => self.assign(ctx, v, expr)?,
+            IrStmt::Assign {
+                target: AssignTarget::Field { rec, field },
+                expr,
+            } => return self.field_assign(ctx, pc, rec, field, expr),
             IrStmt::CallRoutine {
                 name,
                 args,
@@ -87,6 +122,19 @@ impl<'a> Body<'a> {
     }
 
     fn trap(&mut self, ctx: &Context<'_, '_>, pc: usize) -> Result<usize, SkipReason> {
+        // §3.4 聚合形态是 fallback_group 的子集，必须先试聚合解析。
+        if let Some((query, resume)) = agg::at(ctx.prog, pc, ctx.region, ctx.catalog)? {
+            self.agg_vars.insert(query.var.clone());
+            self.aggs.push(query);
+            self.has_trap = true;
+            return Ok(resume);
+        }
+        // IF 门内其余查找/陷阱投影均无条件化，语义漂移 → 拒绝；
+        // 但先透出解析期全定义证明失败（如 UnprovenQueryTotalness）。
+        if self.gate.is_some() {
+            lookup::fallback_group_at(ctx.prog, pc, ctx.region, ctx.catalog)?;
+            return Err(SkipReason::UnsupportedControlFlow);
+        }
         if let Some(group) = lookup::fallback_group_at(ctx.prog, pc, ctx.region, ctx.catalog)? {
             let n = group.len();
             self.add_group(group)?;
@@ -160,6 +208,17 @@ impl<'a> Body<'a> {
                 return Err(SkipReason::UnsupportedControlFlow);
             }
         }
+        // §3.4 IF 门：THEN 线性走查，字段覆写投影为外层 CASE。
+        if self.gate.is_none()
+            && ctx.mode == SetOrientedMode::BatchAtomic
+            && agg::gate_renderable(cond)
+            && to > pc + 1
+            && to < back_pc
+            && matches!(ctx.prog.code.get(to - 1), Some(IrStmt::Jump(t)) if *t == to)
+        {
+            self.gate = Some((cond.clone(), to));
+            return Ok(pc + 1);
+        }
         if self.route.is_some()
             || to <= pc + 1
             || to > back_pc
@@ -188,7 +247,12 @@ impl<'a> Body<'a> {
         v: &VarName,
         expr: &IrExpr,
     ) -> Result<(), SkipReason> {
-        if self.tuple_vars.contains(v) {
+        if self.tuple_vars.contains(v) || self.agg_vars.contains(v) {
+            return Err(SkipReason::UnsupportedControlFlow);
+        }
+        // IF 门内仅常量赋值可证（死存储/聚合前置清零）；其余表达式
+        // 的投影无条件化会语义漂移。
+        if self.gate.is_some() && !matches!(expr, IrExpr::Const(_)) {
             return Err(SkipReason::UnsupportedControlFlow);
         }
         match expr {
@@ -221,7 +285,8 @@ impl<'a> Body<'a> {
             }
             IrExpr::Bin { op, l, r } => self.sink(ctx.region, v, (*op, l, r))?,
             IrExpr::Const(c) => {
-                if !dead::eliminable(ctx.prog, v, c) {
+                // 聚合槽位的前置清零：INTO/处理器在所有路径上覆写，属死存储。
+                if !dead::eliminable(ctx.prog, v, c) && !self.agg_candidates.contains(v) {
                     return Err(SkipReason::UnsupportedControlFlow);
                 }
                 self.dead.push(v.clone());
@@ -244,6 +309,34 @@ impl<'a> Body<'a> {
             );
         }
         Ok(())
+    }
+
+    /// §3.4 字段覆写：仅 `r.<field> := <agg var>`，每字段至多一次。
+    fn field_assign(
+        &mut self,
+        ctx: &Context<'_, '_>,
+        pc: usize,
+        rec: &VarName,
+        field: &str,
+        expr: &IrExpr,
+    ) -> Result<usize, SkipReason> {
+        if rec != &ctx.region.record || ctx.mode != SetOrientedMode::BatchAtomic {
+            return Err(SkipReason::UnsupportedControlFlow);
+        }
+        let IrExpr::Var(v) = expr else {
+            return Err(SkipReason::UnsupportedControlFlow);
+        };
+        if !self.agg_vars.contains(v) || self.field_writes.iter().any(|w| w.field.0 == field) {
+            return Err(SkipReason::UnsupportedControlFlow);
+        }
+        let gate = self.gate.as_ref().map(|(c, _)| c.clone());
+        self.field_writes.push(agg::FieldWrite {
+            field: shape::Name(field.to_string()),
+            var: v.clone(),
+            gate,
+            pc,
+        });
+        Ok(pc + 1)
     }
 
     /// LookupTuple 槽位变量与既有绑定/查找/写汇冲突即拒绝。
@@ -320,6 +413,35 @@ impl<'a> Body<'a> {
             }
         }
         self.validate_tuples(ctx)?;
+        self.validate_aggs(ctx)?;
+        Ok(())
+    }
+
+    /// §3.4 聚合：槽位变量读取仅限字段覆写；覆写前不得有同字段读取
+    /// （投影 CASE 全局生效，前读会错拿覆写后值）。
+    fn validate_aggs(&self, ctx: &Context<'_, '_>) -> Result<(), SkipReason> {
+        if self.aggs.is_empty() && self.field_writes.is_empty() {
+            return Ok(());
+        }
+        if ctx.mode != SetOrientedMode::BatchAtomic {
+            return Err(SkipReason::UnsupportedControlFlow);
+        }
+        for aq in &self.aggs {
+            let allowed: Vec<usize> = self
+                .field_writes
+                .iter()
+                .filter(|w| w.var == aq.var)
+                .map(|w| w.pc)
+                .collect();
+            if allowed.is_empty() || !dead::read_only_within(ctx.prog, &aq.var, &allowed) {
+                return Err(SkipReason::UnsupportedControlFlow);
+            }
+        }
+        for w in &self.field_writes {
+            if agg::field_read_before(ctx.prog, ctx.region, &ctx.region.record, &w.field.0, w.pc) {
+                return Err(SkipReason::UnsupportedControlFlow);
+            }
+        }
         Ok(())
     }
 

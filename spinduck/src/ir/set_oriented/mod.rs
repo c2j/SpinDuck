@@ -1,5 +1,6 @@
 //! 受限静态游标集合化；保留原始 IR，离线候选在调用入口同事务复核。
 
+mod agg;
 mod analyze;
 mod candidate;
 mod defaults;
@@ -147,6 +148,10 @@ struct CopyLoop<'a> {
     /// 多 OUT 查找函数内联（§3.2 LookupTuple）：单条 GROUP BY 派生表 +
     /// 每变量 `CASE WHEN sd_cnt = 1 THEN 列 ELSE 兜底` 投影。
     pub(super) tuples: Vec<lookup::TupleQuery>,
+    /// 条件无 GROUP BY 聚合查表（§3.4）：trap 包裹 SUM + 字段覆写投影。
+    pub(super) aggs: Vec<agg::AggQuery>,
+    /// 聚合结果写回游标字段（可挂 IF 门），驱动 CASE 投影。
+    pub(super) field_writes: Vec<agg::FieldWrite>,
     /// IF 路由（§4.3）：(查找变量, 常量 SQL)，入口守卫证明 THEN 不可达。
     pub(super) route: Option<(VarName, String)>,
     /// PureExpr 常量折叠（§4.3 A7）：赋值变量 → 常量；仅用于静态剪枝
@@ -221,6 +226,7 @@ fn plan_from(
                                 || copy.folded.iter().any(|(v, _)| live_param(v))
                                 || copy.inlined.iter().any(|(v, _)| live_param(v))
                                 || copy.dead.iter().any(live_param)
+                                || copy.aggs.iter().any(|a| live_param(&a.var))
                             {
                                 Err(SkipReason::LiveOutState)
                             } else {

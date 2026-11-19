@@ -2,7 +2,7 @@
 
 mod body;
 
-use super::{catalog_summary, dead, lookup, region, route};
+use super::{agg, catalog_summary, dead, lookup, region, route, shape};
 use super::{CopyLoop, SetOrientedMode, SinkOp, SkipReason};
 use crate::ir::{AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, VarName};
 
@@ -55,6 +55,8 @@ pub(super) fn analyze_region<'a>(
             sinks: body.sinks,
             lookups: body.lookups,
             tuples: body.tuples,
+            aggs: body.aggs,
+            field_writes: body.field_writes,
             route: body.route,
             folded: body.folded,
             inlined: body.inlined,

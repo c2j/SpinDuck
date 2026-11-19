@@ -158,6 +158,26 @@ pub(super) fn resolve_tuples(
     Ok(Ok(out))
 }
 
+/// §3.4 聚合查表解析：加载维表 + 渲染 GROUP BY 派生表/LEFT JOIN；
+/// `base_index` 接续查找/元组编号避免 JOIN 别名冲突。
+pub(super) fn resolve_aggs(
+    ex: &schema::Source<'_>,
+    aggs: &[super::agg::AggQuery],
+    base_index: usize,
+) -> Result<Result<Vec<(super::agg::ResolvedAgg, LookupTables)>, SkipReason>, EngineError> {
+    let mut out = Vec::new();
+    for (i, aq) in aggs.iter().enumerate() {
+        let Some(table) = ex.load(&aq.table)? else {
+            return Ok(Err(SkipReason::UnknownObjectDependency));
+        };
+        match super::agg::render(aq, &table, base_index + i) {
+            Ok(ra) => out.push((ra, vec![(aq.table.clone(), table)])),
+            Err(reason) => return Ok(Err(reason)),
+        }
+    }
+    Ok(Ok(out))
+}
+
 /// 内联表达式中的函数内查找（§4.3 A7）关系化提升：把每个 `IrExpr::Lookup`
 /// 替换为合成变量 `__sd_lkN`，并以 GROUP BY 派生表 LEFT JOIN 渲染（相关
 /// 聚合标量子查询深嵌套会触发内核规划栈溢出，关系化后栈深恒定）。

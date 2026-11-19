@@ -1,12 +1,13 @@
 //! 已证明 CopyLoop 的批写 SQL 生成与写入边界守卫。
 
+mod agg_proj;
 mod case;
 mod inline;
 mod inputs;
 
 use super::schema::{Column, Default, Table};
 use super::shape::{self, Name};
-use super::{expr, lookup, substitute_binds, BindSrc, CopyLoop, SinkOp, SkipReason};
+use super::{agg, expr, lookup, substitute_binds, BindSrc, CopyLoop, SinkOp, SkipReason};
 use inline::{inline_projection, ProjEnv};
 
 pub(super) struct CopySql {
@@ -20,6 +21,7 @@ pub(super) fn copy_sql(
     tables: (&Table, &Table),
     lookups: &[lookup::ResolvedLookup],
     tuples: &[lookup::ResolvedTuple],
+    aggs: &[agg::ResolvedAgg],
 ) -> Result<CopySql, SkipReason> {
     let (select, insert) = shapes;
     let (source, target) = tables;
@@ -33,6 +35,7 @@ pub(super) fn copy_sql(
         source,
         lookups,
         tuples,
+        aggs,
         ctes: &mut ctes,
         joins: &mut joins,
         expr_guards: &mut expr_guards,
@@ -136,6 +139,11 @@ fn projection(
     }
     if !region.allow_filter {
         return Err(SkipReason::UnsupportedWrite);
+    }
+    if let Some(field) = single_field(region, parameter) {
+        if let Some(g) = agg_proj::agg_projection(region, to, &field, env)? {
+            return Ok(g);
+        }
     }
     expr::prove(parameter, region, (env.select, env.source), to, &mut |v| {
         expression_var(region, v, env)
@@ -382,7 +390,7 @@ fn field_projection(
     Ok(format!("sd_cur.{}", field.sql()))
 }
 
-fn source_column<'a>(
+pub(super) fn source_column<'a>(
     select: &shape::Select,
     source: &'a Table,
     field: &Name,

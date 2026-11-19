@@ -36,7 +36,19 @@ pub(super) fn generate(
         Ok(t) => t,
         Err(reason) => return Ok(Err(reason)),
     };
-    if !matches_snapshot(ex, ctx, &inputs, &resolved, &resolved_tuples)? {
+    let resolved_aggs =
+        match resolve::resolve_aggs(ex, &copy.aggs, resolved.len() + resolved_tuples.len() + 1)? {
+            Ok(a) => a,
+            Err(reason) => return Ok(Err(reason)),
+        };
+    if !matches_snapshot(
+        ex,
+        ctx,
+        &inputs,
+        &resolved,
+        &resolved_tuples,
+        &resolved_aggs,
+    )? {
         return Ok(Err(SkipReason::UnprovenTargetConstraints));
     }
     Ok(finish(
@@ -44,6 +56,7 @@ pub(super) fn generate(
         inputs,
         resolved,
         resolved_tuples,
+        resolved_aggs,
         region,
         tail_commit,
     ))
@@ -121,6 +134,7 @@ fn matches_snapshot(
     inputs: &Inputs,
     resolved: &resolve::HoistedLookups,
     tuples: &[(lookup::ResolvedTuple, resolve::LookupTables)],
+    aggs: &[(super::agg::ResolvedAgg, resolve::LookupTables)],
 ) -> Result<bool, EngineError> {
     if let Some(snapshot) = ctx.snapshot {
         if !ex.matches_snapshot(snapshot, &inputs.select.table, ctx.rules)?
@@ -132,6 +146,7 @@ fn matches_snapshot(
             .iter()
             .map(|(_, t)| t)
             .chain(tuples.iter().map(|(_, t)| t))
+            .chain(aggs.iter().map(|(_, t)| t))
         {
             for (name, _) in tables {
                 if !ex.matches_snapshot(snapshot, name, ctx.rules)? {
@@ -148,6 +163,7 @@ fn finish(
     inputs: Inputs,
     resolved: resolve::HoistedLookups,
     resolved_tuples: Vec<(lookup::ResolvedTuple, resolve::LookupTables)>,
+    resolved_aggs: Vec<(super::agg::ResolvedAgg, resolve::LookupTables)>,
     region: &region::CursorRegion,
     tail_commit: bool,
 ) -> Result<entry::ConversionPlan, SkipReason> {
@@ -165,12 +181,15 @@ fn finish(
     let route_guards = route_guards(copy, &resolved)?;
     let tuple_views: Vec<lookup::ResolvedTuple> =
         resolved_tuples.iter().map(|(t, _)| t.clone()).collect();
+    let agg_views: Vec<super::agg::ResolvedAgg> =
+        resolved_aggs.iter().map(|(a, _)| a.clone()).collect();
     let generated = copy::copy_sql(
         copy,
         (&inputs.select, &inputs.insert),
         (&inputs.source, &inputs.target),
         &projections,
         &tuple_views,
+        &agg_views,
     )?;
     let binds = query_binds(copy, &resolved);
     let expr_guards = entry::bind_guards(generated.expr_guards, &binds)?;
@@ -188,6 +207,7 @@ fn finish(
             .into_iter()
             .flat_map(|(_, ts)| ts)
             .chain(resolved_tuples.into_iter().flat_map(|(_, ts)| ts))
+            .chain(resolved_aggs.into_iter().flat_map(|(_, ts)| ts))
             .collect(),
         top1_guards,
         route_guards,
@@ -210,6 +230,19 @@ fn route_guards(
 }
 
 fn query_binds(copy: &CopyLoop<'_>, resolved: &resolve::HoistedLookups) -> Vec<(String, BindSrc)> {
+    let mut binds = query_binds_inner(copy, resolved);
+    for (ph, src) in copy.aggs.iter().flat_map(|a| &a.static_binds) {
+        if !binds.iter().any(|(p, _)| p == ph) {
+            binds.push((ph.clone(), src.clone()));
+        }
+    }
+    binds
+}
+
+fn query_binds_inner(
+    copy: &CopyLoop<'_>,
+    resolved: &resolve::HoistedLookups,
+) -> Vec<(String, BindSrc)> {
     let mut binds = copy.query_binds.to_vec();
     for binds_src in copy
         .lookups
