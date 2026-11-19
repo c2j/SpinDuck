@@ -94,3 +94,5 @@ V2 的区域证明对该过程整体保守拒绝——与设计语义一致（�
 | 一致性 | 三方 100k 行全等 | 四方四表全等 |
 
 结论：V2 的收益集中在"游标逐行搬运"型过程；对含动态 SQL/GOTO/OUT 参数函数/行级 COMMIT 的复杂过程，区域证明保守拒绝，行为退化为与 Off 完全一致的安全回退——**正确性无损，性能无增益**。复杂入口的加速需要 V2 扩展准入面（动态游标、GOTO 区域、行级事务边界的批处理证明），属后续工作。
+
+> 交叉指认（validation V51.4）：表中 `prc_trd_deal_purchase` 的 **Converted 仅在 `batch-atomic` 下**成立；未指定模式（strict）的同一次 `spinduck call --set-oriented` 是 `Skipped(TransactionBoundaryInsideLoop)`——Strict 不授权改动事务边界，两处记录按各自模式口径均成立。

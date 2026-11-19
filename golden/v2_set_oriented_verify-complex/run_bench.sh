@@ -47,12 +47,12 @@ routine_files() {
     "$R/0_SIMPLIFIED_fnc_com_getday.sql" \
     "$R/0_SIMPLIFIED_fnc_com_if_deal_date.sql" \
     "$R/2_FNC_GET_PURCHASE_JS_DAYS.sql" \
-    "$S/0_STUB_fnc_com_get_fund_code.sql" \
-    "$S/0_STUB_fnc_com_get_main_xwdm.sql" \
+    "$R/1_FNC_COM_GET_FUND_CODE.sql" \
+    "$R/1_FNC_COM_GET_MAIN_XWDM.sql" \
     "$S/0_STUB_fnc_com_get_seat_fee_type.sql" \
-    "$S/0_STUB_fnc_com_get_seat_para.sql" \
+    "$R/1_FNC_COM_GET_SEAT_PARA.sql" \
     "$S/0_STUB_fnc_get_bond_yjlx.sql" \
-    "$S/0_STUB_fnc_get_fund_data_mode.sql" \
+    "$R/1_FNC_GET_FUND_DATA_MODE.sql" \
     "$S/0_STUB_fnc_get_rate_info2.sql" \
     "$S/0_STUB_fnc_get_split_date.sql" \
     "$S/0_STUB_fnc_get_stock_kind.sql" \
@@ -90,9 +90,15 @@ echo "[v2cx] CLI: $BIN ($("$BIN" version 2>/dev/null || echo '?'))"
 [ -x "$BIN" ] || { echo "[v2cx] 找不到 CLI：$BIN" >&2; exit 1; }
 
 # ---- 1. SpinDuck 工程：逐字语料 + 补充资产 ----
+# DDL 全部来自 #57 恢复的语料（case_corpus_purchase/sql/ddl/tables.sql，
+# 含 par_oper_venture/dat_fund_xw_venture/dic_stock_kind_sub/jyfy_temp/
+# par_sys_marketrate）；不再维护 extra_tables.sql 平行建表。
+# 函数改用语料逐字体（1_FNC_COM_GET_FUND_CODE/GET_MAIN_XWDM/GET_SEAT_PARA、
+# 1_FNC_GET_FUND_DATA_MODE，随 cp -R 语料 sql/ 进入工程）；保留的 0_STUB_* 是
+# 语料没有的函数（seat_fee_type/bond_yjlx/rate_info2/split_date/stock_kind）。
 P="$WORK/project"; mkdir -p "$P"
 cp -R "$CORPUS/sql" "$P/sql"; cp -R "$CORPUS/rules" "$P/rules"
-cp "$PKG_SQL/extra_tables.sql" "$PKG_SQL/v_par_bond.sql" "$P/sql/ddl/"
+cp "$PKG_SQL/v_par_bond.sql" "$P/sql/ddl/"
 cp "$PKG_SQL/routines/"0_STUB_*.sql "$P/sql/routines/"
 cat > "$P/spinduck.toml" <<'EOF'
 [project]
@@ -127,11 +133,11 @@ python3 - "$GEN" "$P/.spinduck/plan/call_plan.toml" <<'PY'
 import re,sys
 t=open(sys.argv[1]).read()
 t=re.sub(r'\[\[missing\]\][^\[]*','',t)
-# ddl 顺序：tables → 视图 → v_par_bond → extra（ALTER 依赖 par_fund_seat_para）
+# ddl 顺序：tables → 视图 → v_par_bond（4 列最小投影，validation V51.6）
 m=re.search(r'ddl_tables = \[(.*?)\]',t)
 if m:
     files=re.findall(r'"([^"]+)"',m.group(1))
-    pri={'tables.sql':0,'view_check_para.sql':1,'v_par_bond.sql':2,'extra_tables.sql':3}
+    pri={'tables.sql':0,'view_check_para.sql':1,'v_par_bond.sql':2}
     files.sort(key=lambda f: pri.get(f.rsplit('/',1)[-1],9))
     t=t[:m.start()]+'ddl_tables = ['+', '.join('"%s"'%f for f in files)+']'+t[m.end():]
 open(sys.argv[2],'w').write(t)
@@ -216,13 +222,13 @@ SP_MS=""; REF_N=""
 if [ -n "$OG_CONTAINER" ]; then
   echo "[v2cx] SP 参照：$OG_CONTAINER 部署 + 载入 + CALL"
   docker exec "$OG_CONTAINER" mkdir -p /tmp/hz
-  # DDL（顺序敏感：tables → views → v_par_bond → extra）
+  # DDL（顺序敏感：tables → views → v_par_bond；extra_tables 已退役，复用语料 tables.sql）
   docker cp "$CORPUS/sql/ddl/tables.sql" "$OG_CONTAINER:/tmp/hz/tables.sql"
   docker cp "$CORPUS/sql/ddl/views/view_check_para.sql" "$OG_CONTAINER:/tmp/hz/view_check_para.sql"
-  docker cp "$PKG_SQL/v_par_bond.sql" "$PKG_SQL/extra_tables.sql" "$OG_CONTAINER:/tmp/hz/"
+  docker cp "$PKG_SQL/v_par_bond.sql" "$OG_CONTAINER:/tmp/hz/"
   docker cp "$CORPUS/sql/routines/PKG_SPLIT_TRADE_STEP3_SH.sql" "$OG_CONTAINER:/tmp/hz/"
   docker cp "$CORPUS/sql/stubs/STUB_pkg_split_trade_log.sql" "$OG_CONTAINER:/tmp/hz/"
-  for f in "$PKG_SQL"/routines/0_STUB_*.sql "$CORPUS"/sql/routines/0_SIMPLIFIED_*.sql "$CORPUS"/sql/routines/2_FNC_GET_PURCHASE_JS_DAYS.sql; do
+  for f in "$PKG_SQL"/routines/0_STUB_*.sql "$CORPUS"/sql/routines/0_SIMPLIFIED_*.sql "$CORPUS"/sql/routines/1_FNC_*.sql "$CORPUS"/sql/routines/2_FNC_GET_PURCHASE_JS_DAYS.sql; do
     docker cp "$f" "$OG_CONTAINER:/tmp/hz/$(basename "$f")"
   done
   cat > "$WORK/ref_run.sh" <<EOF
@@ -231,7 +237,7 @@ export LD_LIBRARY_PATH=/usr/local/opengauss/lib:$OG_LIBS
 exec /usr/local/opengauss/bin/gsql -U gaussdb -W "\$GS_PASSWORD" -d hz -p 5432 -v ON_ERROR_STOP=1 "\$@"
 EOF
   docker cp "$WORK/ref_run.sh" "$OG_CONTAINER:/tmp/hz/run.sh"
-  docker exec "$OG_CONTAINER" bash -lc 'chmod +x /tmp/hz/run.sh; for f in tables.sql view_check_para.sql v_par_bond.sql extra_tables.sql 0_SIMPLIFIED_fnc_com_getday.sql 0_SIMPLIFIED_fnc_com_if_deal_date.sql 2_FNC_GET_PURCHASE_JS_DAYS.sql 0_STUB_fnc_com_get_fund_code.sql 0_STUB_fnc_com_get_main_xwdm.sql 0_STUB_fnc_com_get_seat_fee_type.sql 0_STUB_fnc_com_get_seat_para.sql 0_STUB_fnc_get_bond_yjlx.sql 0_STUB_fnc_get_fund_data_mode.sql 0_STUB_fnc_get_rate_info2.sql 0_STUB_fnc_get_split_date.sql 0_STUB_fnc_get_stock_kind.sql STUB_pkg_split_trade_log.sql PKG_SPLIT_TRADE_STEP3_SH.sql; do /tmp/hz/run.sh -f /tmp/hz/$f >/dev/null || { echo "deploy fail $f" >&2; exit 1; }; done' \
+  docker exec "$OG_CONTAINER" bash -lc 'chmod +x /tmp/hz/run.sh; for f in tables.sql view_check_para.sql v_par_bond.sql 0_SIMPLIFIED_fnc_com_getday.sql 0_SIMPLIFIED_fnc_com_if_deal_date.sql 2_FNC_GET_PURCHASE_JS_DAYS.sql 1_FNC_COM_GET_FUND_CODE.sql 1_FNC_COM_GET_MAIN_XWDM.sql 1_FNC_COM_GET_SEAT_PARA.sql 1_FNC_GET_FUND_DATA_MODE.sql 0_STUB_fnc_com_get_seat_fee_type.sql 0_STUB_fnc_get_bond_yjlx.sql 0_STUB_fnc_get_rate_info2.sql 0_STUB_fnc_get_split_date.sql 0_STUB_fnc_get_stock_kind.sql STUB_pkg_split_trade_log.sql PKG_SPLIT_TRADE_STEP3_SH.sql; do /tmp/hz/run.sh -f /tmp/hz/$f >/dev/null || { echo "deploy fail $f" >&2; exit 1; }; done' \
     || { echo "[v2cx] 参照侧例程部署失败" >&2; exit 1; }
   # 参数种子：单语句文件逐条执行
   for f in "$WORK"/seeds_stmts/*.sql; do

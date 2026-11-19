@@ -17,19 +17,24 @@ v2_set_oriented_verify-complex/
 ├── README.md            ← 本文件
 ├── REPORT.md            ← 验证报告（判定 / 性能 / 一致性 / 口径）
 ├── run_bench.sh         ← 一键三方基准（SpinDuck Off/On/Strict + SP 参照，断言一致性）
-├── sql/                 ← 补充资产（语料 tables.sql 未含的依赖）
-│   ├── extra_tables.sql ← par_oper_venture / dat_fund_xw_venture / dic_stock_kind_sub / jyfy_temp + commision_type 列宽修正
-│   ├── v_par_bond.sql   ← v_par_bond 视图（par_sys_bond 投影）
-│   ├── routines/        ← 9 个确定性桩函数（fnc_com_get_fund_code 等，双端同源）
+├── sql/                 ← 补充资产（语料之外仅视图与桩；DDL/函数复用 #57 语料）
+│   ├── v_par_bond.sql   ← v_par_bond 视图（par_sys_bond 4 列最小投影；语料 1_V_PAR_BOND 是
+│   │                       38 列且缺 7 张基表，两份不能互替，validation V51.6）
+│   ├── routines/        ← 5 个确定性桩函数（seat_fee_type/bond_yjlx/rate_info2/split_date/stock_kind，
+│   │                       语料没有这些函数；fnc_com_get_fund_code 等已改用语料逐字体）
 │   ├── seeds_params.sql ← 参数种子（partner/seat_para/bond/oper_venture/dic/jyfy_temp）
 │   └── gen_detail.sql   ← N 行 mid_yjqs_detail 生成（互质乘子打散分组键 → ~90k 分组）
 └── reports/             ← 实测日志（timings.log / consistency.log / 各方 call 输出）
 ```
 
+> 原 `extra_tables.sql`（4 表 + commision_type 列宽 ALTER）已删除：这些表由 #57 恢复进
+> 语料 `case_corpus_purchase/sql/ddl/tables.sql`，基准改加载语料 DDL，不再维护平行建表。
+
 ## 方法论
 
 1. **同一份语料**：`golden/case_corpus_purchase/sql` 原样复制进临时工程；
-   本包 `sql/` 只补语料缺失的依赖（4 表 + 1 视图 + 9 函数桩），SpinDuck 与参照两侧执行同一文件。
+   本包 `sql/` 只补语料缺失的依赖（1 视图 + 5 函数桩——原 4 表已由 #57 恢复进语料
+   DDL、4 个与语料同名的桩已退役改用语料逐字体），SpinDuck 与参照两侧执行同一文件。
 2. **同源 100k 数据**：`gen_detail.sql` 一份文件两侧执行（SpinDuck `query --file`，
    参照 `gsql -f`），分组键经互质乘子打散使 `c_get_data` 产生 ~90k 分组，
    压测逐组循环体（费率查询/债券查询/INSERT+COMMIT）。
