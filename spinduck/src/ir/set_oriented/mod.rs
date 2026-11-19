@@ -131,6 +131,15 @@ pub(super) enum SinkOp {
     Concat,
 }
 
+/// §3.3 条件算术覆写：IF 门内 `var := <DECIMAL 乘/减表达式>`，
+/// 集合化投影为 `CASE WHEN <cond> THEN <arith> ELSE <原值> END`。
+#[derive(Clone)]
+pub(super) struct ArithWrite {
+    pub var: VarName,
+    pub cond: crate::ir::IrExpr,
+    pub expr: crate::ir::IrExpr,
+}
+
 struct CopyLoop<'a> {
     pub(super) query: &'a str,
     pub(super) insert: &'a str,
@@ -155,6 +164,8 @@ struct CopyLoop<'a> {
     pub(super) field_writes: Vec<agg::FieldWrite>,
     /// IF 路由（§4.3）：(查找变量, 常量 SQL)，入口守卫证明 THEN 不可达。
     pub(super) route: Option<(VarName, String)>,
+    /// 条件算术覆写（§3.3）：IF 门内变量重赋值，投影外层 CASE。
+    pub(super) arith_writes: Vec<ArithWrite>,
     /// PureExpr 常量折叠（§4.3 A7）：赋值变量 → 常量；仅用于静态剪枝
     /// 与出口活跃证明，不参与批写投影。
     pub(super) folded: Vec<(VarName, crate::value::SpinValue)>,
@@ -230,6 +241,7 @@ fn plan_from(
                                 || copy.inlined.iter().any(|(v, _)| live_param(v))
                                 || copy.dead.iter().any(live_param)
                                 || copy.aggs.iter().any(|a| live_param(&a.var))
+                                || copy.arith_writes.iter().any(|w| live_param(&w.var))
                             {
                                 Err(SkipReason::LiveOutState)
                             } else {

@@ -30,7 +30,7 @@ fn string_value(expr: &IrExpr, region: &CopyLoop<'_>, env: &ProjEnv<'_>) -> bool
                 .is_some_and(|lookup| {
                     let hit = match &lookup.case_sink {
                         Some(case) => {
-                            string_field(&case.else_field.0, env)
+                            matches!(&case.else_value, super::lookup::CaseElse::Field(f) if string_field(&f.0, env))
                                 && case
                                     .whens
                                     .iter()

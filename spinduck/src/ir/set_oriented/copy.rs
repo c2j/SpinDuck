@@ -1,6 +1,7 @@
 //! 已证明 CopyLoop 的批写 SQL 生成与写入边界守卫。
 
 mod agg_proj;
+mod arith;
 mod case;
 mod inline;
 mod inputs;
@@ -126,6 +127,9 @@ fn projection(
             });
         }
     } else if let Some((_, BindSrc::Var(v))) = region.binds.iter().find(|(p, _)| p == parameter) {
+        if let Some(w) = region.arith_writes.iter().find(|w| w.var == *v) {
+            return arith::projection(region, w, to, env);
+        }
         if let Some(lq) = env.lookups.iter().find(|l| &l.var == v) {
             return lookup_projection(region, lq, to, env);
         }
@@ -207,28 +211,7 @@ fn lookup_projection(
         register_lookup(member, env.lookups, env.ctes, env.joins);
     }
     if let Some(cs) = &lq.case_sink {
-        let operand = env
-            .lookups
-            .iter()
-            .find(|l| l.var == cs.operand)
-            .ok_or(SkipReason::UnprovenExpression)?;
-        let value = case::value(
-            cs,
-            &operand.render.value,
-            env.select,
-            env.source,
-            (to, region.allow_filter),
-        )?;
-        if region.allow_filter {
-            return Ok(guarded_choice(&hits, value, &lq.render.default_sql, to));
-        }
-        return Ok(expr::GuardedExpr {
-            expr: format!(
-                "CASE WHEN {hits} THEN {value} ELSE {} END",
-                lq.render.default_sql
-            ),
-            guard: String::new(),
-        });
+        return case::sink(region, lq, cs, hits, to, env);
     }
     if lq.filter_on_miss {
         if !region.allow_filter {

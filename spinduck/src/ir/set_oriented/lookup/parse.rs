@@ -2,6 +2,7 @@
 //! Top-1 / 异构 CASE 写汇的 token 流识别，产出 LookupQuery；其余形态
 //! （函数/CAST/除法/嵌套子查询）一律保守拒绝，交回解释器。
 
+mod case;
 mod in_pred;
 mod tokens;
 mod tuple;
@@ -9,8 +10,8 @@ mod tuple;
 pub(crate) use tuple::parse_tuple_total;
 
 use super::{
-    BindSrc, CaseSink, Correlation, CorrelationOp, InFilter, InList, LookupQuery, Name, SkipReason,
-    Top1, VarName,
+    BindSrc, CaseElse, CaseSink, Correlation, CorrelationOp, InFilter, InList, LookupQuery, Name,
+    SkipReason, Top1, VarName,
 };
 use crate::value::SpinValue;
 use tokens::LiteralTokens;
@@ -34,7 +35,7 @@ pub(crate) fn parse_total(
         return Err(bad);
     }
     let (column, nvl_default, case_sink) = if t.peek() == Some("case") {
-        let cs = parse_case_sink(&mut t, binds, record)?;
+        let cs = case::parse_case_sink(&mut t, binds, record)?;
         (Name(String::new()), None, Some(cs))
     } else {
         let (c, n) = parse_projection(&mut t).ok_or(bad)?;
@@ -76,74 +77,6 @@ pub(crate) fn parse_total(
         filter_binds: predicates.binds,
         entry_guard: false,
     })
-}
-
-/// 异构 CASE 投影：`CASE $v_operand WHEN lit THEN $v_rec__field ... ELSE
-/// $v_rec__field END`。操作数须为变量绑定（同组查找），分支须为游标字段绑定。
-fn parse_case_sink(
-    t: &mut LiteralTokens,
-    binds: &[(String, BindSrc)],
-    record: &VarName,
-) -> Result<CaseSink, SkipReason> {
-    let bad = SkipReason::UnprovenQueryTotalness;
-    t.take("case");
-    let operand_var = match parse_case_bind(t, binds, record)? {
-        CaseBind::Var(v) => v,
-        CaseBind::Field(_) => return Err(bad),
-    };
-    let mut whens = Vec::new();
-    while t.take("when") {
-        let key = t.literal().ok_or(bad)?;
-        if !t.take("then") {
-            return Err(bad);
-        }
-        let field = match parse_case_bind(t, binds, record)? {
-            CaseBind::Field(f) => f,
-            CaseBind::Var(_) => return Err(bad),
-        };
-        whens.push((key, field));
-    }
-    if whens.is_empty() || !t.take("else") {
-        return Err(bad);
-    }
-    let else_field = match parse_case_bind(t, binds, record)? {
-        CaseBind::Field(f) => f,
-        CaseBind::Var(_) => return Err(bad),
-    };
-    if !t.take("end") {
-        return Err(bad);
-    }
-    Ok(CaseSink {
-        operand: operand_var,
-        whens,
-        else_field,
-    })
-}
-
-enum CaseBind {
-    Var(VarName),
-    Field(Name),
-}
-
-/// CASE 内的绑定占位符：`$v_<var>`（变量）或 `$v_<rec>__<field>`（游标字段）。
-fn parse_case_bind(
-    t: &mut LiteralTokens,
-    binds: &[(String, BindSrc)],
-    record: &VarName,
-) -> Result<CaseBind, SkipReason> {
-    let bad = SkipReason::UnprovenQueryTotalness;
-    let ph = t.peek().ok_or(bad)?.to_string();
-    if !ph.starts_with("$v_") {
-        return Err(bad);
-    }
-    t.take(&ph);
-    match binds.iter().find(|(p, _)| *p == ph).map(|(_, s)| s) {
-        Some(BindSrc::Var(v)) => Ok(CaseBind::Var(v.clone())),
-        Some(BindSrc::Field { rec, field }) if rec == record => {
-            Ok(CaseBind::Field(Name(field.clone())))
-        }
-        _ => Err(bad),
-    }
 }
 
 /// 投影：裸列或 `coalesce(列, 常量)`（源 nvl 经 IR 归一为 coalesce，

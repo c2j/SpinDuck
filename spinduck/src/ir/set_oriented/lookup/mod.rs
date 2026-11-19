@@ -59,7 +59,14 @@ pub(super) struct CaseSink {
     pub operand: VarName,
     /// (WHEN 字面量 SQL, 游标字段)，按出现顺序。
     pub whens: Vec<(String, Name)>,
-    pub else_field: Name,
+    pub else_value: CaseElse,
+}
+
+/// CASE ELSE 分支：游标字段或数值字面量（`ELSE 0` 是业务分支，非异常兜底）。
+#[derive(Clone)]
+pub(super) enum CaseElse {
+    Field(Name),
+    Lit(String),
 }
 
 /// IN 子查询过滤：单表投影；读表纳入传递读写不交与入口漂移复核。

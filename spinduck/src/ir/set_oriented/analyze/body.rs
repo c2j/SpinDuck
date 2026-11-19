@@ -3,7 +3,19 @@
 use super::*;
 
 mod agg_walk;
+mod arith_walk;
 use agg_walk::agg_candidates;
+
+/// IF 门种类：§3.4 聚合字段覆写 / §3.3 条件算术覆写（THEN 恰一条赋值，
+/// 走查直接跳过该语句，投影时组装外层 CASE）。
+enum Gate {
+    Agg(IrExpr),
+    Arith {
+        cond: IrExpr,
+        var: VarName,
+        expr: IrExpr,
+    },
+}
 
 #[derive(Default)]
 pub(super) struct Body<'a> {
@@ -30,8 +42,10 @@ pub(super) struct Body<'a> {
     agg_vars: std::collections::BTreeSet<VarName>,
     /// 区域内 SqlQuery INTO 单变量的候选集（前置清零死存储证明用）。
     agg_candidates: std::collections::BTreeSet<VarName>,
-    /// 当前 IF 门：(条件, 汇合点 pc)；pc 到达汇合点即失效。
-    gate: Option<(IrExpr, usize)>,
+    /// 当前 IF 门：(种类, 汇合点 pc)；pc 到达汇合点即失效。
+    gate: Option<(Gate, usize)>,
+    /// §3.3 条件算术覆写：IF 门内 `var := <DECIMAL 乘/减>`。
+    pub arith_writes: Vec<ArithWrite>,
 }
 
 impl<'a> Body<'a> {
@@ -49,7 +63,11 @@ impl<'a> Body<'a> {
 
     fn statement(&mut self, ctx: &Context<'a, '_>, pc: usize) -> Result<usize, SkipReason> {
         if self.gate.as_ref().is_some_and(|(_, until)| pc >= *until) {
-            self.gate = None;
+            if let Some((Gate::Arith { cond, var, expr }, _)) = self.gate.take() {
+                self.arith_writes.push(ArithWrite { var, cond, expr });
+            } else {
+                self.gate = None;
+            }
         }
         let stmt = &ctx.prog.code[pc];
         match stmt {
@@ -200,8 +218,12 @@ impl<'a> Body<'a> {
             && to < back_pc
             && matches!(ctx.prog.code.get(to - 1), Some(IrStmt::Jump(t)) if *t == to)
         {
-            self.gate = Some((cond.clone(), to));
+            self.gate = Some((Gate::Agg(cond.clone()), to));
             return Ok(pc + 1);
+        }
+        // §3.3 算术覆写门：THEN 恰一条 `v := <DECIMAL 乘/减>`。
+        if let Some(next) = self.arith_gate(ctx, pc, cond, to, back_pc) {
+            return Ok(next);
         }
         if self.route.is_some()
             || to <= pc + 1
@@ -397,7 +419,7 @@ impl<'a> Body<'a> {
         }
         self.validate_tuples(ctx)?;
         self.validate_aggs(ctx)?;
-        Ok(())
+        arith_walk::validate(self, ctx.mode)
     }
 
     /// LookupTuple：静态过滤变量须循环不变；OUT/返回值槽位变量在后缀

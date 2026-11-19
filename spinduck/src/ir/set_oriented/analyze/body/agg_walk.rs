@@ -36,7 +36,13 @@ impl<'a> Body<'a> {
         if !self.agg_vars.contains(v) || self.field_writes.iter().any(|w| w.field.0 == field) {
             return Err(SkipReason::UnsupportedControlFlow);
         }
-        let gate = self.gate.as_ref().map(|(c, _)| c.clone());
+        let gate = match self.gate.as_ref() {
+            Some((Gate::Agg(c), _)) => Some(c.clone()),
+            Some((Gate::Arith { .. }, _)) => {
+                return Err(SkipReason::UnsupportedControlFlow);
+            }
+            None => None,
+        };
         self.field_writes.push(agg::FieldWrite {
             field: shape::Name(field.to_string()),
             var: v.clone(),

@@ -3,7 +3,7 @@
 mod body;
 
 use super::{agg, catalog_summary, dead, lookup, region, route, shape, vguard};
-use super::{CopyLoop, SetOrientedMode, SinkOp, SkipReason};
+use super::{ArithWrite, CopyLoop, SetOrientedMode, SinkOp, SkipReason};
 use crate::ir::{AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, VarName};
 
 struct Context<'a, 'c> {
@@ -64,6 +64,7 @@ pub(super) fn analyze_region<'a>(
             varchar_inputs: body.varchar_inputs,
             inline_preconditions: body.inline_preconditions,
             dead: body.dead,
+            arith_writes: body.arith_writes,
             writes: region::write_set(prog, region, catalog)?,
         },
         body.tail_commit,
