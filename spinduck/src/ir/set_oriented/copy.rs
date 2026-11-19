@@ -148,6 +148,10 @@ fn projection(
         if let Some(g) = tuple_projection(to, v, env)? {
             return Ok(g);
         }
+        // §4.2：循环不变 IN 形参按占位符投影，值域守卫与写汇同口径。
+        if region.in_params.contains(&v.0.to_ascii_lowercase()) {
+            return Ok(expr::at_write_sink(parameter.to_string(), to));
+        }
         return sink_projection(region, env.select, env.source, to, v);
     }
     if !region.allow_filter {

@@ -200,7 +200,12 @@ fn finish(
         &tuple_views,
         &agg_views,
     )?;
-    let binds = query_binds(copy, &resolved);
+    let mut binds = query_binds(copy, &resolved);
+    for (ph, src) in param_binds(copy, &generated) {
+        if !binds.iter().any(|(p, _)| p == &ph) {
+            binds.push((ph, src));
+        }
+    }
     let expr_guards = entry::bind_guards(generated.expr_guards, &binds)?;
     Ok(entry::ConversionPlan {
         sql: generated.sql,
@@ -236,6 +241,23 @@ fn route_guards(
         guards.push(route::guard(l, lit)?);
     }
     Ok(guards)
+}
+
+/// §4.2：批写 SQL 与行级守卫中实际引用的 IN 形参占位符，运行期按名绑定；
+/// 未被引用的形参不携带（避免对未用形参做帧解析）。
+fn param_binds(copy: &CopyLoop<'_>, generated: &copy::CopySql) -> Vec<(String, BindSrc)> {
+    copy.binds
+        .iter()
+        .filter(|(ph, src)| {
+            matches!(src, BindSrc::Var(v) if copy.in_params.contains(&v.0.to_ascii_lowercase()))
+                && (generated.sql.contains(ph.as_str())
+                    || generated
+                        .expr_guards
+                        .iter()
+                        .any(|g| g.contains(ph.as_str())))
+        })
+        .cloned()
+        .collect()
 }
 
 fn query_binds(copy: &CopyLoop<'_>, resolved: &resolve::HoistedLookups) -> Vec<(String, BindSrc)> {

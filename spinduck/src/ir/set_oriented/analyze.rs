@@ -18,6 +18,7 @@ pub(super) fn analyze_region<'a>(
     region: &'a region::CursorRegion,
     mode: SetOrientedMode,
     catalog: &crate::catalog::RoutineCatalog,
+    in_params: &std::collections::BTreeSet<String>,
 ) -> Result<(CopyLoop<'a>, bool, bool), SkipReason> {
     let ctx = Context {
         prog,
@@ -43,6 +44,7 @@ pub(super) fn analyze_region<'a>(
         return Err(SkipReason::UnprovenExpression);
     }
     body.validate(&ctx, binds)?;
+    prove_param_binds(prog, region, binds, in_params)?;
     Ok((
         CopyLoop {
             query,
@@ -67,10 +69,32 @@ pub(super) fn analyze_region<'a>(
             dead: body.dead,
             arith_writes: body.arith_writes,
             writes: region::write_set(prog, region, catalog)?,
+            in_params: in_params.clone(),
         },
         body.tail_commit,
         body.has_trap,
     ))
+}
+
+/// §4.2 IN 形参投影证明：INSERT 绑定引用 IN 形参时，该变量必须在区域体内
+/// 无任何赋值（Assign/Fetch/SqlQuery INTO），否则逐行取值与形参单值不等价。
+fn prove_param_binds(
+    prog: &IrProg,
+    region: &region::CursorRegion,
+    binds: &[(String, BindSrc)],
+    in_params: &std::collections::BTreeSet<String>,
+) -> Result<(), SkipReason> {
+    for (_, src) in binds {
+        let BindSrc::Var(v) = src else {
+            continue;
+        };
+        if in_params.contains(&v.0.to_ascii_lowercase())
+            && !region::var_invariant_in_region(prog, region, v)
+        {
+            return Err(SkipReason::UnprovenExpression);
+        }
+    }
+    Ok(())
 }
 
 type CursorQuery<'a> = (&'a str, &'a [(String, BindSrc)]);

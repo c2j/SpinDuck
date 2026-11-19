@@ -25,7 +25,7 @@ mod vguard;
 pub(crate) use entry::{entry_ok, ConversionPlan};
 
 use super::{AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, VarName};
-use crate::catalog::CompiledRoutine;
+use crate::catalog::{CompiledRoutine, ParamMode};
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
 use analyze::analyze_region;
@@ -183,6 +183,8 @@ struct CopyLoop<'a> {
     pub(super) dead: Vec<VarName>,
     /// 区域写集（§3.5 V3-5 视图底表 Reads∩Writes 复核）。
     pub(super) writes: std::collections::BTreeSet<String>,
+    /// 本过程 IN 形参名（小写）：循环不变的调用方输入，可作批写投影。
+    pub(super) in_params: std::collections::BTreeSet<String>,
 }
 
 /// 一次调用选择所需的引擎上下文（模式、开关、编译期证据）。
@@ -228,24 +230,14 @@ fn plan_from(
                 {
                     Err(SkipReason::LiveOutState)
                 } else {
-                    match analyze_region(&routine.prog, &region, mode, ctx.catalog) {
+                    // §4.2：IN 形参是调用方给定的循环不变输入，可作批写投影；
+                    // OUT/INOUT 形参有回写语义，不在此列。
+                    let in_params = in_param_names(routine);
+                    match analyze_region(&routine.prog, &region, mode, ctx.catalog, &in_params) {
                         Err(reason) => Err(reason),
                         Ok((mut copy, tail, has_trap)) => {
                             // 下沉/查找变量若是 OUT/INOUT 形参，出口写回不可消除
-                            let live_param = |v: &VarName| {
-                                routine
-                                    .params
-                                    .iter()
-                                    .any(|p| p.name.eq_ignore_ascii_case(&v.0))
-                            };
-                            if copy.sinks.iter().any(|(v, _, _, _)| live_param(v))
-                                || copy.lookups.iter().any(|l| live_param(&l.var))
-                                || copy.folded.iter().any(|(v, _)| live_param(v))
-                                || copy.inlined.iter().any(|(v, _)| live_param(v))
-                                || copy.dead.iter().any(live_param)
-                                || copy.aggs.iter().any(|a| live_param(&a.var))
-                                || copy.arith_writes.iter().any(|w| live_param(&w.var))
-                            {
+                            if live_param_hit(&copy, routine) {
                                 Err(SkipReason::LiveOutState)
                             } else {
                                 match generate(&mut copy, source, ctx, &region, tail)? {
@@ -262,6 +254,33 @@ fn plan_from(
         }
     };
     Ok(selected)
+}
+
+/// 集合化产物引用了例程形参：该变量的值须随 OUT/INOUT 回写，无法消除。
+fn live_param_hit(copy: &CopyLoop<'_>, routine: &CompiledRoutine) -> bool {
+    let live_param = |v: &VarName| {
+        routine
+            .params
+            .iter()
+            .any(|p| p.name.eq_ignore_ascii_case(&v.0))
+    };
+    copy.sinks.iter().any(|(v, _, _, _)| live_param(v))
+        || copy.lookups.iter().any(|l| live_param(&l.var))
+        || copy.folded.iter().any(|(v, _)| live_param(v))
+        || copy.inlined.iter().any(|(v, _)| live_param(v))
+        || copy.dead.iter().any(live_param)
+        || copy.aggs.iter().any(|a| live_param(&a.var))
+        || copy.arith_writes.iter().any(|w| live_param(&w.var))
+}
+
+/// 例程 IN 形参名集（小写）：批写投影仅承认这些循环不变输入。
+fn in_param_names(routine: &CompiledRoutine) -> std::collections::BTreeSet<String> {
+    routine
+        .params
+        .iter()
+        .filter(|p| p.mode == ParamMode::In)
+        .map(|p| p.name.to_ascii_lowercase())
+        .collect()
 }
 
 /// V2 准入前置：区域抽取 + 前缀干净度 + 效果准入 + Trap 体限制 + 写集 + 读写不交 + 出口活跃。

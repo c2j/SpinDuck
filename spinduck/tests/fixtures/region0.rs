@@ -63,7 +63,7 @@ const BYFUND: &str = "CREATE OR REPLACE PROCEDURE prc_trd_hz_byfund_small(\
       EXIT WHEN c_get_data%NOTFOUND; \
       BEGIN \
         INSERT INTO dat_fund_cjqs (bcrq, zqdm, gddm, xwdm, bs, amt, tag) \
-        VALUES (r_get_data.bcrq, r_get_data.zqdm, r_get_data.gddm, r_get_data.xwdm, \
+        VALUES (p_i_date, r_get_data.zqdm, r_get_data.gddm, r_get_data.xwdm, \
                 r_get_data.bs, r_get_data.amt, r_get_data.tag); \
       EXCEPTION WHEN OTHERS THEN \
         inst_log('280', r_get_data.tag); \
