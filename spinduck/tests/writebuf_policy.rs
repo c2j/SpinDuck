@@ -97,6 +97,16 @@ const SAFE_PROC: &str = "CREATE OR REPLACE PROCEDURE prc_m1_safe IS \
     INSERT INTO audit_t (note) VALUES ('a2'); \
     RETURN; END;";
 
+/// 红线 1 收窄守护：`INSERT a; DELETE FROM b; INSERT b`——DELETE 执行时
+/// b 尚无缓冲行（`flush_if_touches` 不刷 a），a 的 INSERT 是跨表写耦合
+/// 必须 `Immediate`；b 的 INSERT 向前扫描看不到后续耦合，可 `Buffered`。
+const DML_ORDER_PROC: &str = "CREATE OR REPLACE PROCEDURE prc_m1_dml_order IS \
+    BEGIN \
+    INSERT INTO audit_t (note) VALUES ('a1'); \
+    DELETE FROM proc_log WHERE code = 'x'; \
+    INSERT INTO proc_log (code, msg) VALUES ('k', 'v'); \
+    RETURN; END;";
+
 fn setup_engine() -> Engine {
     let mut eng = Engine::new(
         Box::new(DuckExecutor::open_in_memory().unwrap()),
@@ -272,4 +282,35 @@ fn should_enforce_write_buffer_immediate_policy_for_qfii_cross_table_and_fxj_clo
         run_qfii_and_assert(mode);
         run_fxj_and_assert(mode);
     }
+}
+
+/// `INSERT a; DELETE FROM b; INSERT b`：DELETE 执行时 b 不在缓冲里、
+/// `flush_if_touches` 不会刷 a——a 的 INSERT 与后续跨表写构成耦合，
+/// 必须 `Immediate`；b 的 INSERT 向前看不到该耦合，可 `Buffered`。
+#[test]
+fn should_keep_insert_immediate_when_other_table_dml_precedes_that_tables_insert() {
+    let mut eng = setup_engine();
+    eng.register(DML_ORDER_PROC).unwrap();
+    let prog = &eng.catalog.lookup("prc_m1_dml_order").unwrap().prog;
+    let policy_of = |prefix: &str| {
+        prog.code
+            .iter()
+            .filter_map(|st| match st {
+                IrStmt::SqlExec {
+                    sql, buffer_policy, ..
+                } if sql.to_ascii_lowercase().starts_with(prefix) => Some(*buffer_policy),
+                _ => None,
+            })
+            .next()
+    };
+    assert_eq!(
+        policy_of("insert into audit_t"),
+        Some(BufferPolicy::Immediate),
+        "DELETE FROM proc_log 先于 proc_log 的 INSERT，audit_t 的 INSERT 不得 Buffered"
+    );
+    assert_eq!(
+        policy_of("insert into proc_log"),
+        Some(BufferPolicy::Buffered),
+        "proc_log 的 INSERT 向前扫描无耦合，应 Buffered"
+    );
 }
