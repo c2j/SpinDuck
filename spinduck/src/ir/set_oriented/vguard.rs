@@ -47,35 +47,12 @@ pub(super) fn prove_view(
     if has_where {
         return Ok(Err(SkipReason::UnprovenQueryTotalness));
     }
-    // cols_source：外层列解析依据（底表本身或内层视图投影）；
-    // (base, base_table)：最终底表名与结构（写集相交/入口漂移复核）。
-    let (cols_source, base, base_table) = match ex.load(&base)? {
-        Some(t) => {
-            let bt = t.clone();
-            (t, base.clone(), bt)
-        }
-        None => match prove_view(ex, &base, depth + 1)? {
-            Ok(Some(p)) => (p.table, p.base, p.base_table),
-            _ => return Ok(Err(SkipReason::UnprovenQueryTotalness)),
-        },
+    let Some((cols_source, base, base_table)) = resolve_base(ex, &base, depth)? else {
+        return Ok(Err(SkipReason::UnprovenQueryTotalness));
     };
-    let mut columns = Vec::with_capacity(items.len());
-    for (qual, src, out) in items {
-        if let Some(q) = qual {
-            if q != base && alias.as_ref() != Some(&q) {
-                return Ok(Err(SkipReason::UnprovenQueryTotalness));
-            }
-        }
-        let Some(col) = cols_source.columns.iter().find(|c| c.name == src) else {
-            return Ok(Err(SkipReason::UnprovenQueryTotalness));
-        };
-        columns.push(schema::Column {
-            name: out,
-            kind: col.kind.clone(),
-            nullable: col.nullable,
-            default: None,
-        });
-    }
+    let Some(columns) = view_columns(&items, &cols_source, &base, &alias) else {
+        return Ok(Err(SkipReason::UnprovenQueryTotalness));
+    };
     Ok(Ok(Some(ViewProof {
         table: Table {
             qualified: name.sql(),
@@ -84,6 +61,49 @@ pub(super) fn prove_view(
         base,
         base_table,
     })))
+}
+
+/// 底表解析：普通表直接取结构；视图递归证明。返回 (列解析依据表,
+/// 最终底表名, 最终底表结构)；无法证明 = Ok(None)。
+fn resolve_base(
+    ex: &Source<'_>,
+    base: &Name,
+    depth: usize,
+) -> Result<Option<(Table, Name, Table)>, EngineError> {
+    if let Some(t) = ex.load(base)? {
+        let bt = t.clone();
+        return Ok(Some((t, base.clone(), bt)));
+    }
+    match prove_view(ex, base, depth + 1)? {
+        Ok(Some(p)) => Ok(Some((p.table, p.base, p.base_table))),
+        _ => Ok(None),
+    }
+}
+
+/// 投影项 → 视图列证据：限定符须为底表名或其别名，源列须存在于
+/// 列解析依据表；任一不符 = None（调用方报 UnprovenQueryTotalness）。
+fn view_columns(
+    items: &[ViewItem],
+    cols_source: &Table,
+    base: &Name,
+    alias: &Option<Name>,
+) -> Option<Vec<schema::Column>> {
+    let mut columns = Vec::with_capacity(items.len());
+    for (qual, src, out) in items {
+        if let Some(q) = qual {
+            if q != base && alias.as_ref() != Some(q) {
+                return None;
+            }
+        }
+        let col = cols_source.columns.iter().find(|c| c.name == *src)?;
+        columns.push(schema::Column {
+            name: out.clone(),
+            kind: col.kind.clone(),
+            nullable: col.nullable,
+            default: None,
+        });
+    }
+    Some(columns)
 }
 
 /// 视图投影项：(限定符, 源列, 输出名)。
@@ -172,6 +192,36 @@ pub(super) fn render(
         return Err(bad);
     }
     let alias = format!("sd_lk{index}");
+    let KeyParts {
+        dims,
+        ons,
+        key_checks,
+    } = key_parts(lq, table, &alias)?;
+    let filter = lq.filter.clone();
+    let value = match &lq.nvl_default {
+        Some(d) => format!("CASE WHEN {alias}.sd_val IS NULL THEN {d} ELSE {alias}.sd_val END"),
+        None => format!("{alias}.sd_val"),
+    };
+    Ok(LookupRender {
+        cte: None,
+        join: Some(join_sql(lq, table, &alias, &dims, &ons, &filter)),
+        hit: format!("{alias}.sd_hit = 1"),
+        value,
+        default_sql: lq.default_sql.clone(),
+        key_checks,
+        tie_guard: Some(guard_sql(lq, table, cur_scan, &dims, &filter)),
+        guard_binds: lq.filter_binds.clone(),
+    })
+}
+
+/// 关联键证据：逐键 (维表键列类型, 游标字段) + JOIN/守卫共用的维度列。
+struct KeyParts {
+    dims: Vec<String>,
+    ons: Vec<String>,
+    key_checks: Vec<(String, Name)>,
+}
+
+fn key_parts(lq: &LookupQuery, table: &Table, alias: &str) -> Result<KeyParts, SkipReason> {
     let mut dims = Vec::new();
     let mut ons = Vec::new();
     let mut key_checks = Vec::new();
@@ -187,16 +237,43 @@ pub(super) fn render(
             c.cursor_field.sql()
         ));
     }
-    let filter = lq.filter.clone();
-    let col = lq.column.sql();
-    let join = format!(
-        "LEFT JOIN (SELECT {}, {} AS sd_val, 1 AS sd_hit FROM {}{}) {alias} ON {}",
+    Ok(KeyParts {
+        dims,
+        ons,
+        key_checks,
+    })
+}
+
+/// 主查询 1:1 LEFT JOIN：已过滤日期的视图投影子查询，无 MAX/HAVING/
+/// 外层 __cnt=1 滤行。
+fn join_sql(
+    lq: &LookupQuery,
+    table: &Table,
+    alias: &str,
+    dims: &[String],
+    ons: &[String],
+    filter: &str,
+) -> String {
+    format!(
+        "LEFT JOIN (SELECT {}, {} AS sd_val, 1 AS sd_hit FROM {}{}) {} ON {}",
         dims.join(", "),
-        col,
+        lq.column.sql(),
         table.qualified,
         filter,
+        alias,
         ons.join(" AND ")
-    );
+    )
+}
+
+/// 入口守卫：子查询先做日期过滤、仅按等值关联键 GROUP BY 计数，
+/// 外层 COALESCE(_b.__cnt,0)<>1，期望 COUNT(*)=0（非零即整段退回）。
+fn guard_sql(
+    lq: &LookupQuery,
+    table: &Table,
+    cur_scan: &str,
+    dims: &[String],
+    filter: &str,
+) -> String {
     let group_by = dims.join(", ");
     let g_ons = lq
         .correlations
@@ -204,26 +281,10 @@ pub(super) fn render(
         .map(|c| format!("_b.{} = _cur.{}", c.dim_column.sql(), c.cursor_field.sql()))
         .collect::<Vec<_>>()
         .join(" AND ");
-    let tie_guard = format!(
-        "SELECT COUNT(*) FROM ({cur_scan}) _cur LEFT JOIN \
-         (SELECT {group_by}, COUNT(*) AS __cnt FROM {}{filter} GROUP BY {group_by}) _b \
-         ON {g_ons} WHERE COALESCE(_b.__cnt, 0) <> 1",
+    format!(
+        "SELECT COUNT(*) FROM ({cur_scan}) _cur LEFT JOIN          (SELECT {group_by}, COUNT(*) AS __cnt FROM {}{filter} GROUP BY {group_by}) _b          ON {g_ons} WHERE COALESCE(_b.__cnt, 0) <> 1",
         table.qualified
-    );
-    let value = match &lq.nvl_default {
-        Some(d) => format!("CASE WHEN {alias}.sd_val IS NULL THEN {d} ELSE {alias}.sd_val END"),
-        None => format!("{alias}.sd_val"),
-    };
-    Ok(LookupRender {
-        cte: None,
-        join: Some(join),
-        hit: format!("{alias}.sd_hit = 1"),
-        value,
-        default_sql: lq.default_sql.clone(),
-        key_checks,
-        tie_guard: Some(tie_guard),
-        guard_binds: lq.filter_binds.clone(),
-    })
+    )
 }
 
 /// 零异常守卫型处理器结构面（§3.5 V3-5）：同一 WHEN OTHERS 内恰 1 条
