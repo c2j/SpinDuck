@@ -117,6 +117,27 @@ fn fnc_rates() -> &'static str {
      END;"
 }
 
+/// ⑤ INSERT 参数复杂表达式（byfund 同型子集）：`+`、简单 CASE、
+/// 字符串/数值字面量、CAST…AS DECIMAL、`*`——expr::prove 语法面扩展。
+fn caller_expr() -> &'static str {
+    "CREATE OR REPLACE PROCEDURE caller_expr(p_o_succeed OUT VARCHAR2) IS
+     BEGIN
+       p_o_succeed := '0';
+       FOR r IN SELECT security_id, cjje, yj11, yj12, bs, tag FROM cur_rows LOOP
+         BEGIN
+           INSERT INTO dst_rows(security_id, yj, tag)
+             VALUES (r.security_id,
+                     r.cjje + CAST(r.bs AS DECIMAL(10,2))
+                            * CASE r.security_id
+                                WHEN 'S1' THEN r.yj11
+                                ELSE 0
+                              END,
+                     CASE r.tag WHEN 'a' THEN 'hit' ELSE r.tag END);
+         EXCEPTION WHEN OTHERS THEN NULL; END;
+       END LOOP;
+     END;"
+}
+
 fn engine_with(ddl: &[&str], oriented: SetOrientedMode) -> Engine {
     engine_with_routines(ddl, oriented, &[caller()])
 }
@@ -226,6 +247,48 @@ fn should_reject_sys_dummy_block_when_not_total_and_verify_decimal_mul_sub() {
     scenario_unproven_case_branch();
     scenario_decimal_overflow();
     scenario_inlined_out_arith();
+    scenario_expr_params();
+}
+
+/// ⑤ INSERT 参数复杂表达式：Converted 且逐行同 Off。
+/// 覆盖 `expr::prove` 语法面：`+`、`*`、简单 CASE、字符串字面量、
+/// CAST…AS DECIMAL（TRY_CAST 无抛错改写）。
+fn scenario_expr_params() {
+    let ddl: Vec<&str> = BASE_DDL
+        .iter()
+        .copied()
+        .map(|s| {
+            if s.starts_with("CREATE TABLE cur_rows") {
+                "CREATE TABLE cur_rows(security_id VARCHAR, cjje DECIMAL(15,2), \
+                   yj11 DECIMAL(15,2), yj12 DECIMAL(15,2), bs VARCHAR, tag VARCHAR)"
+            } else {
+                s
+            }
+        })
+        .chain(["INSERT INTO cur_rows VALUES \
+               ('S1',1000.00,111.11,222.22,'2','a'),\
+               ('S2',500.50,11.11,22.22,'3','b'),\
+               ('S3',77.77,7.77,8.88,'4','c'),\
+               ('S4',9.99,1.11,2.22,'5','d')"])
+        .collect();
+    let routines = [caller_expr()];
+    let mut off = engine_with_routines(&ddl, SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_expr", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 4, "Off 语义基线: {expected_rows:?}");
+
+    let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_expr", &args()).unwrap();
+    let Status::Converted { sql } = eng.set_oriented_reports()[0].status.clone() else {
+        panic!(
+            "复杂参数表达式必须 Converted: {:?}",
+            eng.set_oriented_reports()
+        );
+    };
+    assert!(sql.contains("CASE"), "{sql}");
+    assert!(sql.contains("TRY_CAST"), "CAST 必须无抛错改写: {sql}");
+    assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
 }
 
 /// ④ IF 门条件/算术变量来自内联函数 OUT 写回（Lookup 表达式）：

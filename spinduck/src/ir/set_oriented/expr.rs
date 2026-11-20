@@ -110,7 +110,9 @@ impl Domain {
         }
     }
 
-    fn difference(self, rhs: Self) -> Result<Self, SkipReason> {
+    /// `+`/`-`：DECIMAL 按最大标度、整数位+进位证明（s==t 时退化为旧
+    /// difference 规则）；非 DECIMAL 混合一律拒绝。
+    fn combine(self, rhs: Self) -> Result<Self, SkipReason> {
         match (self, rhs) {
             (
                 Self::Decimal {
@@ -121,35 +123,100 @@ impl Domain {
                     precision: q,
                     scale: t,
                 },
-            ) if s == t && p.max(q) < 38 => Ok(Self::Decimal {
-                precision: p.max(q) + 1,
-                scale: s,
-            }),
+            ) => {
+                let scale = s.max(t);
+                let int = (i64::from(p) - i64::from(s)).max(i64::from(q) - i64::from(t)) + 1;
+                let precision = int + i64::from(scale);
+                if precision > 38 {
+                    return Err(SkipReason::UnprovenWriteCompleteness);
+                }
+                Ok(Self::Decimal {
+                    precision: precision as u8,
+                    scale,
+                })
+            }
+            _ => Err(SkipReason::UnprovenWriteCompleteness),
+        }
+    }
+
+    /// `*`：DECIMAL 乘法标度相加、整数位相加，精度超 38 拒绝。
+    fn product(self, rhs: Self) -> Result<Self, SkipReason> {
+        match (self, rhs) {
+            (
+                Self::Decimal {
+                    precision: p,
+                    scale: s,
+                },
+                Self::Decimal {
+                    precision: q,
+                    scale: t,
+                },
+            ) => {
+                let scale = i64::from(s) + i64::from(t);
+                let int = (i64::from(p) - i64::from(s)) + (i64::from(q) - i64::from(t));
+                let precision = int + scale;
+                if precision > 38 || scale > 38 {
+                    return Err(SkipReason::UnprovenWriteCompleteness);
+                }
+                Ok(Self::Decimal {
+                    precision: precision as u8,
+                    scale: scale as u8,
+                })
+            }
+            _ => Err(SkipReason::UnprovenWriteCompleteness),
+        }
+    }
+
+    /// CASE/多分支结果域：同族合并（DECIMAL 按 combine，Numeric/Other 同类
+    /// 直通），跨族拒绝。
+    fn unify(self, rhs: Self) -> Result<Self, SkipReason> {
+        match (self, rhs) {
+            (a @ Self::Decimal { .. }, b @ Self::Decimal { .. }) => a.combine(b),
+            (Self::Numeric, Self::Numeric) => Ok(Self::Numeric),
+            (Self::Other, Self::Other) => Ok(Self::Other),
             _ => Err(SkipReason::UnprovenWriteCompleteness),
         }
     }
 }
 
 impl Parser<'_> {
+    /// 加法层：`+`/`-` 同级左结合，域按 DECIMAL 证明合并。
     fn expr(&mut self) -> Result<(String, Domain), SkipReason> {
-        let (mut out, mut domain) = self.quotient()?;
-        while self.t.take("-") {
-            let (rhs, rhs_domain) = self.quotient()?;
-            domain = domain.difference(rhs_domain)?;
-            out = format!("({out} - {rhs})");
+        let (mut out, mut domain) = self.product()?;
+        loop {
+            let subtract = self.t.take("-");
+            if !subtract && !self.t.take("+") {
+                break;
+            }
+            let (rhs, rhs_domain) = self.product()?;
+            domain = domain.combine(rhs_domain)?;
+            out = if subtract {
+                format!("({out} - {rhs})")
+            } else {
+                format!("({out} + {rhs})")
+            };
         }
         Ok((out, domain))
     }
 
-    fn quotient(&mut self) -> Result<(String, Domain), SkipReason> {
+    /// 乘法层：`*`（DECIMAL 域证明）与 `/`（数值域）同级左结合。
+    fn product(&mut self) -> Result<(String, Domain), SkipReason> {
         let (mut out, mut domain) = self.term()?;
-        while self.t.take("/") {
-            let (rhs, rhs_domain) = self.term()?;
-            if !domain.is_numeric() || !rhs_domain.is_numeric() {
-                return Err(SkipReason::UnprovenWriteCompleteness);
+        loop {
+            if self.t.take("*") {
+                let (rhs, rhs_domain) = self.term()?;
+                domain = domain.product(rhs_domain)?;
+                out = format!("({out} * {rhs})");
+            } else if self.t.take("/") {
+                let (rhs, rhs_domain) = self.term()?;
+                if !domain.is_numeric() || !rhs_domain.is_numeric() {
+                    return Err(SkipReason::UnprovenWriteCompleteness);
+                }
+                out = format!("{out} / {rhs}");
+                domain = Domain::Numeric;
+            } else {
+                break;
             }
-            out = format!("{out} / {rhs}");
-            domain = Domain::Numeric;
         }
         Ok((out, domain))
     }
@@ -174,14 +241,100 @@ impl Parser<'_> {
         if self.t.take("concat") {
             return self.concat_call();
         }
+        if self.t.take("case") {
+            return self.case_call();
+        }
+        if self.t.take("cast") {
+            return self.cast_call();
+        }
         if word.starts_with("$v_") {
             return self.binding(&word);
         }
+        if word.starts_with('\'') {
+            self.t.take(&word);
+            return Ok((word, Domain::Other));
+        }
         if numeric_literal(&word) {
             self.t.take(&word);
-            return Ok((word, Domain::Numeric));
+            return Ok((word.clone(), literal_domain(&word)));
         }
         Err(bad)
+    }
+
+    /// 简单式 CASE：`CASE <operand> WHEN <字面量> THEN <expr>… ELSE <expr> END`。
+    /// operand/WHEN 只作比较不产出结果域；THEN/ELSE 域按 unify 合并。
+    /// 搜索式 CASE（无 operand）不支持，保守拒绝。
+    fn case_call(&mut self) -> Result<(String, Domain), SkipReason> {
+        let bad = SkipReason::UnprovenWriteCompleteness;
+        let (operand, _) = self.expr()?;
+        let mut whens = Vec::new();
+        let mut domain: Option<Domain> = None;
+        while self.t.take("when") {
+            let w = self.when_literal()?;
+            if !self.t.take("then") {
+                return Err(bad);
+            }
+            let (then_sql, then_domain) = self.expr()?;
+            domain = Some(match domain {
+                None => then_domain,
+                Some(d) => d.unify(then_domain)?,
+            });
+            whens.push(format!("WHEN {w} THEN {then_sql}"));
+        }
+        if whens.is_empty() || !self.t.take("else") {
+            return Err(bad);
+        }
+        let (else_sql, else_domain) = self.expr()?;
+        if !self.t.take("end") {
+            return Err(bad);
+        }
+        let domain = domain.ok_or(bad)?.unify(else_domain)?;
+        Ok((
+            format!("CASE {operand} {} ELSE {else_sql} END", whens.join(" ")),
+            domain,
+        ))
+    }
+
+    /// WHEN 值仅允许字符串/数值字面量（比较操作数不作表达式展开）。
+    fn when_literal(&mut self) -> Result<String, SkipReason> {
+        let bad = SkipReason::UnprovenWriteCompleteness;
+        let w = self.t.peek().ok_or(bad)?.to_string();
+        if !w.starts_with('\'') && !numeric_literal(&w) {
+            return Err(bad);
+        }
+        self.t.take(&w);
+        Ok(w)
+    }
+
+    /// `CAST(<expr> AS DECIMAL(p,s))`：改写 TRY_CAST + 行级守卫复现
+    /// 解释器"转换失败→语句错误→trap 跳过"语义；仅支持 DECIMAL 目标。
+    fn cast_call(&mut self) -> Result<(String, Domain), SkipReason> {
+        let bad = SkipReason::UnprovenWriteCompleteness;
+        if !self.t.take("(") {
+            return Err(bad);
+        }
+        let (inner, _) = self.expr()?;
+        if !self.t.take("as") || !self.t.take("decimal") || !self.t.take("(") {
+            return Err(bad);
+        }
+        let p = self.t.number().ok_or(bad)?;
+        if !self.t.take(",") {
+            return Err(bad);
+        }
+        let s = self.t.number().ok_or(bad)?;
+        if !self.t.take(")") || !self.t.take(")") {
+            return Err(bad);
+        }
+        let (Ok(precision), Ok(scale)) = (p.parse::<u8>(), s.parse::<u8>()) else {
+            return Err(bad);
+        };
+        if precision > 38 || scale > precision {
+            return Err(bad);
+        }
+        let rendered = format!("TRY_CAST(({inner}) AS DECIMAL({p}, {s}))");
+        self.guards
+            .push(format!("({inner}) IS NULL OR ({rendered}) IS NOT NULL"));
+        Ok((rendered, Domain::Decimal { precision, scale }))
     }
 
     fn abs_call(&mut self) -> Result<(String, Domain), SkipReason> {
@@ -304,4 +457,19 @@ fn numeric_literal(word: &str) -> bool {
         && word.chars().all(|c| c.is_ascii_digit() || c == '.')
         && word.chars().filter(|c| *c == '.').count() <= 1
         && word.chars().any(|c| c.is_ascii_digit())
+}
+
+/// 数值字面量的 DECIMAL 域：整数位/小数位按词法计数（值域上界证明，
+/// 非常量折叠）；位数超 38 归 Other（下游合并自然拒绝）。
+fn literal_domain(word: &str) -> Domain {
+    let (int_part, frac_part) = word.split_once('.').unwrap_or((word, ""));
+    let int_digits = int_part.trim_start_matches('0').len();
+    let precision = (int_digits + frac_part.len()).max(1);
+    if precision > 38 {
+        return Domain::Other;
+    }
+    Domain::Decimal {
+        precision: precision as u8,
+        scale: frac_part.len() as u8,
+    }
 }
