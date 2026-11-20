@@ -250,6 +250,7 @@ fn should_reject_sys_dummy_block_when_not_total_and_verify_decimal_mul_sub() {
     scenario_expr_params();
     scenario_cursor_fnsite();
     scenario_insert_fnsite();
+    scenario_agg_fnsite();
 }
 
 /// fnc_grp_mode：SQL 上下文下沉例程（游标 WHERE 内 fn_site 同型）。
@@ -311,6 +312,62 @@ fn scenario_cursor_fnsite() {
             "游标 fn_site 必须 Converted: {:?}",
             eng.set_oriented_reports()
         );
+    };
+    assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
+}
+
+/// 聚合游标 + WHERE fn_site（byfund c_get_data 同型）：SUM/COALESCE/
+/// GROUP BY 使 shape::select 不可解析，须走 verbatim sd_cur + 计划期
+/// DESCRIBE 探测输出列 schema；WHERE fn_site 仍由 FnPrelude 物化。
+fn caller_agg_fnsite() -> &'static str {
+    "CREATE OR REPLACE PROCEDURE caller_agg_fnsite(p_o_succeed OUT VARCHAR2) IS
+     BEGIN
+       p_o_succeed := '0';
+       FOR r IN SELECT a.grp, coalesce(SUM(a.val), 0) AS total
+               FROM cur_rows a
+               WHERE a.tag = 'keep' AND fnc_grp_mode(a.grp) = '1'
+               GROUP BY a.grp LOOP
+         BEGIN
+           INSERT INTO dst_rows(security_id, yj, tag)
+             VALUES (r.grp, r.total, 'agg');
+         EXCEPTION WHEN OTHERS THEN NULL; END;
+       END LOOP;
+     END;"
+}
+
+/// ⑧ 聚合游标 verbatim：Converted 且逐行同 Off（GROUP BY 行集由内核
+/// 保证，输出列类型经 DESCRIBE 探测进入投影证明）。
+fn scenario_agg_fnsite() {
+    let ddl: Vec<&str> = BASE_DDL
+        .iter()
+        .copied()
+        .map(|s| {
+            if s.starts_with("CREATE TABLE cur_rows") {
+                "CREATE TABLE cur_rows(grp VARCHAR, val DECIMAL(15,2), \
+                   tag VARCHAR)"
+            } else {
+                s
+            }
+        })
+        .chain([
+            "CREATE TABLE mode_map(grp VARCHAR, mode VARCHAR)",
+            "INSERT INTO mode_map VALUES ('G1','1'),('G2','0')",
+            "INSERT INTO cur_rows VALUES \
+               ('G1',10.50,'keep'),('G1',30.75,'keep'),('G2',20.25,'keep'),\
+               ('G1',99.00,'drop')",
+        ])
+        .collect();
+    let routines = [fnc_grp_mode(), caller_agg_fnsite()];
+    let mut off = engine_with_routines(&ddl, SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_agg_fnsite", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 1, "Off 语义基线: {expected_rows:?}");
+
+    let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_agg_fnsite", &args()).unwrap();
+    let Status::Converted { .. } = eng.set_oriented_reports()[0].status.clone() else {
+        panic!("聚合游标必须 Converted: {:?}", eng.set_oriented_reports());
     };
     assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
     assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");

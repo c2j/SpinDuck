@@ -35,6 +35,10 @@ pub(crate) struct ConversionPlan {
     pub(crate) binds: Vec<(String, BindSrc)>,
     /// 批写前须物化的例程缓存表（游标 WHERE fn_site，按声明序执行）。
     pub(crate) fn_preludes: Vec<FnPrelude>,
+    /// 入口守卫 SQL 引用缓存表（verbatim cur_scan / 写守卫子查询）时为
+    /// true：物化前导先于 entry_ok 执行。回退路径下解释器会重新物化
+    /// （例程纯度已证，仅多一次去重调用——与 Off 逐行调用次数本就不同）。
+    pub(crate) preludes_first: bool,
     pub tail_commit: bool,
     pub open_pc: usize,
     pub close_pc: usize,

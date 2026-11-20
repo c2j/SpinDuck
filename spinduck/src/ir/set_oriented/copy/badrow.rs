@@ -3,7 +3,11 @@
 use super::{shape, CopyLoop, Table};
 
 /// `sd_cur` CTE 定义（批写主查询与坏行守卫共用，保证行集口径一致）。
+/// verbatim 游标原文已含 WHERE/GROUP BY，直接内嵌不再追加过滤。
 pub(super) fn sd_cur_cte(select: &shape::Select, source: &Table) -> String {
+    if let Some(v) = &select.verbatim {
+        return format!("sd_cur AS ({v})");
+    }
     let where_clause = match &select.filter {
         Some(f) => format!(" WHERE {f}"),
         None => String::new(),

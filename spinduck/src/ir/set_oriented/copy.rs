@@ -423,6 +423,15 @@ pub(super) fn sd_cur_scan(select: &shape::Select, source: &Table) -> String {
     format!("SELECT {proj} FROM {from_clause}")
 }
 
+/// 守卫内嵌的游标行集：verbatim 游标即原文（含 WHERE/GROUP BY——守卫
+/// 针对解释器实际 FETCH 的行集）；普通游标为省略 WHERE 的全源扫描。
+pub(super) fn cur_scan(select: &shape::Select, cur: &Table) -> String {
+    match &select.verbatim {
+        Some(v) => v.clone(),
+        None => sd_cur_scan(select, cur),
+    }
+}
+
 fn register_lookup(
     l: &lookup::ResolvedLookup,
     lookups: &[lookup::ResolvedLookup],

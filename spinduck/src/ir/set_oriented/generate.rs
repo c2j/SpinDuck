@@ -6,7 +6,11 @@ use super::{BindSrc, CopyLoop, EngineError, OptimizeCtx, SkipReason};
 struct Inputs {
     select: shape::Select,
     insert: shape::Insert,
+    /// 基表结构证据：WHERE 全定义证明、入口漂移复核对象。
     source: schema::Table,
+    /// 投影证据表：普通游标 = 基表；verbatim 游标 = DESCRIBE 探测的
+    /// sd_cur 输出 schema（输出名即列名，kind 为内核实测类型）。
+    cur: schema::Table,
     target: schema::Table,
 }
 
@@ -21,7 +25,7 @@ pub(super) fn generate(
         Ok(inputs) => inputs,
         Err(reason) => return Ok(Err(reason)),
     };
-    let cur_scan = copy::sd_cur_scan(&inputs.select, &inputs.source);
+    let cur_scan = copy::cur_scan(&inputs.select, &inputs.cur);
     let mut resolved = match resolve::resolve_lookups(ex, &copy.lookups, &cur_scan)? {
         Ok(r) => r,
         Err(reason) => return Ok(Err(reason)),
@@ -75,8 +79,16 @@ fn load_inputs(
     copy: &CopyLoop<'_>,
     ex: &schema::Source<'_>,
 ) -> Result<Result<Inputs, SkipReason>, EngineError> {
-    let shape = shape::select(copy.query)
-        .and_then(|select| shape::insert(copy.insert).map(|insert| (select, insert)));
+    // 普通游标优先；SELECT 列表含表达式/聚合或 WHERE 残留尾部子句时
+    // 走 verbatim 原文内嵌（输出列 schema 另经 DESCRIBE 探测）。
+    let select = match shape::select(copy.query) {
+        Ok(s) if !s.filter.as_deref().is_some_and(shape::filter_has_tail) => s,
+        _ => match shape::select_verbatim(copy.query) {
+            Ok(s) => s,
+            Err(reason) => return Ok(Err(reason)),
+        },
+    };
+    let shape = shape::insert(copy.insert).map(|insert| (select, insert));
     let (select, insert) = match shape {
         Ok(shape) => shape,
         Err(reason) => return Ok(Err(reason)),
@@ -101,6 +113,24 @@ fn load_inputs(
             return Ok(Err(reason));
         }
     }
+    // verbatim 游标：DESCRIBE 探测输出列 schema，列名须与解析输出名
+    // 逐一对齐（顺序即 SELECT 项序）；任一不符按不可证回退。
+    let cur = match &select.verbatim {
+        Some(v) => {
+            let columns = ex.probe_columns(v)?.filter(|cols| {
+                cols.len() == select.columns.len()
+                    && cols.iter().map(|c| &c.name).eq(select.columns.iter())
+            });
+            match columns {
+                Some(columns) => schema::Table {
+                    qualified: "sd_cur".to_string(),
+                    columns,
+                },
+                None => return Ok(Err(SkipReason::UnprovenExpression)),
+            }
+        }
+        None => source.clone(),
+    };
     let Some(target) = ex.load(&insert.table)? else {
         return Ok(Err(SkipReason::UnprovenTargetConstraints));
     };
@@ -108,6 +138,7 @@ fn load_inputs(
         select,
         insert,
         source,
+        cur,
         target,
     }))
 }
@@ -185,7 +216,7 @@ fn finish(
 ) -> Result<entry::ConversionPlan, SkipReason> {
     let projections: Vec<lookup::ResolvedLookup> =
         resolved.iter().map(|(l, _)| l.clone()).collect();
-    let top1_guards = resolved
+    let top1_guards: Vec<entry::BoundGuard> = resolved
         .iter()
         .filter_map(|(l, _)| {
             l.render
@@ -202,12 +233,27 @@ fn finish(
     let generated = copy::copy_sql(
         copy,
         (&inputs.select, &inputs.insert),
-        (&inputs.source, &inputs.target),
+        (&inputs.cur, &inputs.target),
         &projections,
         &tuple_views,
         &agg_views,
     )?;
     let binds = with_param_binds(copy, &generated, query_binds(copy, &resolved));
+    // verbatim 游标的 cur_scan 原文含 $v_ 绑定：守卫 SQL 按 token 出现
+    // 情况从全量绑定集补齐（guard_binds 只覆盖查找自身过滤绑定）。
+    let top1_guards: Vec<entry::BoundGuard> = top1_guards
+        .into_iter()
+        .map(|(sql, mut gbinds)| {
+            if let Some(t) = shape::Tokens::new(&sql) {
+                for (ph, src) in &binds {
+                    if t.words().iter().any(|w| w == ph) && !gbinds.iter().any(|(p, _)| p == ph) {
+                        gbinds.push((ph.clone(), src.clone()));
+                    }
+                }
+            }
+            (sql, gbinds)
+        })
+        .collect();
     let expr_guards = entry::bind_guards(generated.expr_guards, &binds)?;
     // fn_site 物化前导：游标 WHERE site 的 distinct_sql 为编译期原文
     // （含源表与过滤），INSERT 位 site 为 copy_sql 生成的
@@ -225,10 +271,25 @@ fn finish(
         })
         .collect();
     fn_preludes.extend(generated.fn_preludes);
+    // 守卫 SQL（verbatim cur_scan / 写守卫缓存子查询）引用 sd_fn*/sd_bf*
+    // 临时表时，物化前导必须先于入口守卫执行，否则守卫查询打到不存在的表。
+    let preludes_first = {
+        let tables: Vec<&str> = fn_preludes.iter().map(|p| p.table.as_str()).collect();
+        top1_guards
+            .iter()
+            .map(|(s, _)| s.as_str())
+            .chain(route_guards.iter().map(String::as_str))
+            .chain(expr_guards.iter().map(|(s, _)| s.as_str()))
+            .any(|sql| {
+                shape::Tokens::new(sql)
+                    .is_some_and(|t| t.words().iter().any(|w| tables.contains(&w.as_str())))
+            })
+    };
     Ok(entry::ConversionPlan {
         sql: generated.sql,
         binds,
         fn_preludes,
+        preludes_first,
         tail_commit,
         open_pc: region.open_pc,
         close_pc: region.close_pc,

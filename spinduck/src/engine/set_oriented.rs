@@ -95,6 +95,21 @@ impl Engine {
         sink: &mut dyn TraceSink,
         limits: RunLimits,
     ) -> Result<Option<RunOutcome>, EngineError> {
+        // 守卫 SQL 引用缓存表的计划（verbatim cur_scan / 写守卫子查询）：
+        // 物化前导先于入口守卫，否则守卫查询打到不存在的 sd_fn*/sd_bf*。
+        // 回退时解释器会重新物化——例程纯度已证，仅多一次去重调用。
+        let mut preluded = false;
+        if plan.preludes_first && !plan.fn_preludes.is_empty() {
+            crate::runtime::interp::materialize_fn_preludes(
+                &plan.fn_preludes,
+                frame,
+                self.ex.as_ref(),
+                sink,
+                &self.catalog,
+                &routine.prog.var_types,
+            )?;
+            preluded = true;
+        }
         match entry_ok(self.ex.as_ref(), plan, &self.optimize_ctx(), frame)? {
             Err(reason) => {
                 self.push_report(&routine.name, Status::Skipped { reason });
@@ -119,7 +134,7 @@ impl Engine {
                 );
                 // fn_site 物化前导：与解释器 OpenCursor 时点同口径，
                 // 失败直接上抛（同点失败语义），绝不部分物化后续跑批写。
-                if !plan.fn_preludes.is_empty() {
+                if !preluded && !plan.fn_preludes.is_empty() {
                     crate::runtime::interp::materialize_fn_preludes(
                         &plan.fn_preludes,
                         frame,

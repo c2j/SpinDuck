@@ -143,7 +143,7 @@ impl Prover<'_> {
         let bad = SkipReason::UnprovenQueryTotalness;
         if self.t.at_subquery() {
             self.t.take("(");
-            return self.cache_subquery();
+            return self.select_query();
         }
         let word = self.t.peek().ok_or(bad)?.to_string();
         if self.t.take("substr") || self.t.take("substring") {
@@ -186,12 +186,49 @@ impl Prover<'_> {
         Ok(kind_domain(&from.kind))
     }
 
-    /// fn_site 参数缓存子查询（`(` 已消费）：
-    /// `SELECT sd_v FROM <已准入缓存表> WHERE sd_aK IS NOT DISTINCT FROM (<实参>)…)`。
-    /// 实参只允许全定义操作数（含嵌套缓存子查询）；返回 Dom::Str（sd_v 恒 VARCHAR）。
-    fn cache_subquery(&mut self) -> Result<Dom, SkipReason> {
+    /// `(` 已消费的 SELECT 子查询：`SELECT <体>)`，返回值域。
+    fn select_query(&mut self) -> Result<Dom, SkipReason> {
         let bad = SkipReason::UnprovenQueryTotalness;
-        if !self.t.take("select") || !self.t.take("sd_v") || !self.t.take("from") {
+        if !self.t.take("select") {
+            return Err(bad);
+        }
+        let d = self.select_body()?;
+        self.t.take(")").then_some(d).ok_or(bad)
+    }
+
+    /// SELECT 体：`sd_v FROM <已准入缓存表> WHERE …`（参数缓存子查询，
+    /// Dom::Str）或 `(<select-led | 操作数>)` 标量包装（域取内部）。
+    /// 源 SQL `(select fn(…))` 形态改写后即 `(SELECT (SELECT sd_v…))`。
+    fn select_body(&mut self) -> Result<Dom, SkipReason> {
+        let bad = SkipReason::UnprovenQueryTotalness;
+        if self.t.peek() == Some("(") {
+            self.t.take("(");
+            let d = if self.t.peek() == Some("select") {
+                self.t.take("select");
+                let d = self.select_body()?;
+                if !self.t.take(")") {
+                    return Err(bad);
+                }
+                d
+            } else {
+                let d = self.operand()?;
+                if !self.t.take(")") {
+                    return Err(bad);
+                }
+                d
+            };
+            return Ok(d);
+        }
+        self.cache_body()
+    }
+
+    /// fn_site 参数缓存子查询体（`sd_v` 起）：
+    /// `sd_v FROM <已准入缓存表> WHERE sd_aK IS NOT DISTINCT FROM (<实参>)…`。
+    /// 实参只允许全定义操作数（含嵌套缓存子查询）；返回 Dom::Str（sd_v 恒 VARCHAR）。
+    /// 结束于收尾 `)` 之前（由 select_query/包装层消费）。
+    fn cache_body(&mut self) -> Result<Dom, SkipReason> {
+        let bad = SkipReason::UnprovenQueryTotalness;
+        if !self.t.take("sd_v") || !self.t.take("from") {
             return Err(bad);
         }
         let table = self.t.name().ok_or(bad)?;
@@ -222,7 +259,7 @@ impl Prover<'_> {
                 break;
             }
         }
-        self.t.take(")").then_some(Dom::Str).ok_or(bad)
+        Ok(Dom::Str)
     }
 
     /// 缓存子查询实参：全定义操作数——裸操作数、括号嵌套或嵌套缓存子查询。
@@ -230,7 +267,7 @@ impl Prover<'_> {
         let bad = SkipReason::UnprovenQueryTotalness;
         if self.t.at_subquery() {
             self.t.take("(");
-            self.cache_subquery()?;
+            self.select_query()?;
             return Ok(());
         }
         if self.t.take("(") {
