@@ -1,7 +1,7 @@
 //! 集合化计划生成：结构证据、内联提升、快照复核与批写绑定。
 
 use super::{catalog_summary, copy, entry, filter, lookup, region, resolve, route, schema, shape};
-use super::{BindSrc, CopyLoop, EngineError, OptimizeCtx, SkipReason};
+use super::{BindSrc, CopyLoop, EngineError, OptimizeCtx, SkipReason, VarName};
 
 struct Inputs {
     select: shape::Select,
@@ -26,11 +26,11 @@ pub(super) fn generate(
         Err(reason) => return Ok(Err(reason)),
     };
     let cur_scan = copy::cur_scan(&inputs.select, &inputs.cur);
-    let mut resolved = match resolve::resolve_lookups(ex, &copy.lookups, &cur_scan)? {
+    let mut resolved = match resolve::resolve_lookups(ex, ctx.catalog, &copy.lookups, &cur_scan)? {
         Ok(r) => r,
         Err(reason) => return Ok(Err(reason)),
     };
-    if let Err(reason) = hoist(copy, ex, &mut resolved)? {
+    if let Err(reason) = hoist(copy, ex, ctx.catalog, region, &mut resolved)? {
         return Ok(Err(reason));
     }
     if let Err(reason) = resolve::substitute_lookup_refs(&mut resolved) {
@@ -43,6 +43,9 @@ pub(super) fn generate(
             if copy.writes.contains(&base.0) {
                 return Ok(Err(SkipReason::TargetReadDependency));
             }
+        }
+        if l.view_bases.iter().any(|b| copy.writes.contains(&b.0)) {
+            return Ok(Err(SkipReason::TargetReadDependency));
         }
     }
     let resolved_tuples = match resolve::resolve_tuples(ex, &copy.tuples, resolved.len() + 1)? {
@@ -64,7 +67,7 @@ pub(super) fn generate(
     )? {
         return Ok(Err(SkipReason::UnprovenTargetConstraints));
     }
-    Ok(finish(
+    match finish(
         copy,
         inputs,
         resolved,
@@ -72,7 +75,10 @@ pub(super) fn generate(
         resolved_aggs,
         region,
         tail_commit,
-    ))
+    ) {
+        Ok(p) => Ok(Ok(p)),
+        Err(reason) => Ok(Err(reason)),
+    }
 }
 
 fn load_inputs(
@@ -146,10 +152,27 @@ fn load_inputs(
 fn hoist(
     copy: &mut CopyLoop<'_>,
     ex: &schema::Source<'_>,
+    catalog: &crate::catalog::RoutineCatalog,
+    region: &region::CursorRegion,
     resolved: &mut resolve::HoistedLookups,
 ) -> Result<Result<(), SkipReason>, EngineError> {
     catalog_summary::resolve_locals(&mut copy.inlined);
-    let record = copy.record;
+    // Var 实参安全集：查找结果变量由 substitute_lookup_refs 逐行代入
+    // CASE；其余变量须区域内无赋值（帧单值绑定，§4.4 B1 同口径）。
+    let mut safe_vars: std::collections::BTreeSet<VarName> =
+        resolved.iter().map(|(l, _)| l.var.clone()).collect();
+    for name in copy.prog.var_types.keys() {
+        let v = VarName(name.clone());
+        if region::var_invariant_in_region(copy.prog, region, &v) {
+            safe_vars.insert(v);
+        }
+    }
+    let hctx = resolve::HoistCtx {
+        ex,
+        catalog,
+        record: copy.record,
+        safe_vars: &safe_vars,
+    };
     let mut next_index = resolved.len() + 1;
     for expr in copy
         .inlined
@@ -163,7 +186,7 @@ fn hoist(
                 .flat_map(|w| [&mut w.cond, &mut w.expr]),
         )
     {
-        match resolve::hoist_inline(ex, expr, record, next_index)? {
+        match resolve::hoist_inline(&hctx, expr, next_index)? {
             Ok((new_expr, mut acc)) => {
                 *expr = new_expr;
                 next_index += acc.len();
@@ -271,8 +294,16 @@ fn finish(
         })
         .collect();
     fn_preludes.extend(generated.fn_preludes);
+    // 视图物化前导：普通查找落在视图上时由 viewdep 产出（每查找一张
+    // sd_vwN 临时表）；先于入口守卫执行（守卫可内嵌 sd_vwN 派生表）。
+    let view_preludes: Vec<entry::ViewPrelude> = projections
+        .iter()
+        .filter_map(|l| l.view_prelude.clone())
+        .collect();
     // 守卫 SQL（verbatim cur_scan / 写守卫缓存子查询）引用 sd_fn*/sd_bf*
     // 临时表时，物化前导必须先于入口守卫执行，否则守卫查询打到不存在的表。
+    // 视图前导存在时 fn 前导同样提前：fn 例程调用可回滚会话本地建表，
+    // 必须先于视图物化完成，否则 sd_vwN 会被其回滚撤销。
     let preludes_first = {
         let tables: Vec<&str> = fn_preludes.iter().map(|p| p.table.as_str()).collect();
         top1_guards
@@ -284,11 +315,12 @@ fn finish(
                 shape::Tokens::new(sql)
                     .is_some_and(|t| t.words().iter().any(|w| tables.contains(&w.as_str())))
             })
-    };
+    } || !view_preludes.is_empty();
     Ok(entry::ConversionPlan {
         sql: generated.sql,
         binds,
         fn_preludes,
+        view_preludes,
         preludes_first,
         tail_commit,
         open_pc: region.open_pc,
@@ -374,6 +406,9 @@ fn query_binds_inner(
         .iter()
         .map(|l| &l.filter_binds)
         .chain(copy.tuples.iter().map(|t| &t.filter_binds))
+        // 内联提升查找（__sd_lkN）的静态过滤绑定同样须随批写 SQL 解析；
+        // 其占位符文本在派生表 WHERE 中，与过程级查找同口径去重。
+        .chain(resolved.iter().map(|(l, _)| &l.filter_binds))
     {
         for (ph, src) in binds_src {
             // 查找结果已逐行代入投影，不能再从尚未 FETCH 的帧取值。

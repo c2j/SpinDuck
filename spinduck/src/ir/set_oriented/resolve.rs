@@ -3,7 +3,8 @@
 use super::lookup::{self, LookupQuery};
 use super::shape;
 use super::substitute_binds;
-use super::{schema, SkipReason, VarName};
+use super::{schema, viewdep, SkipReason, VarName};
+use crate::catalog::RoutineCatalog;
 use crate::error::EngineError;
 use crate::ir::IrExpr;
 
@@ -18,12 +19,13 @@ pub(super) type HoistResult = Result<Result<(IrExpr, HoistedLookups), SkipReason
 /// IN 子查询读表一并解析，纳入漂移复核与类型对齐证据。
 pub(super) fn resolve_lookups(
     ex: &schema::Source<'_>,
+    catalog: &RoutineCatalog,
     lookups: &[LookupQuery],
     cur_scan: &str,
 ) -> Result<LookupResolution, EngineError> {
     let mut out = Vec::new();
     for (i, lq) in lookups.iter().enumerate() {
-        match resolve_one(ex, lq, i + 1, cur_scan)? {
+        match resolve_one(ex, catalog, lq, i + 1, cur_scan)? {
             Ok(item) => out.push(item),
             Err(reason) => return Ok(Err(reason)),
         }
@@ -36,6 +38,7 @@ pub(super) fn resolve_lookups(
 /// 内联提升上下文无游标形状，传空串 → LATERAL 形态保守拒绝。
 pub(super) fn resolve_one(
     ex: &schema::Source<'_>,
+    catalog: &RoutineCatalog,
     lq: &LookupQuery,
     index: usize,
     cur_scan: &str,
@@ -45,6 +48,7 @@ pub(super) fn resolve_one(
     // UnprovenQueryTotalness（不发守卫 SQL）；证明产物给出投影列证据
     // 与最终底表（漂移/写集复核对象）。
     let mut proof = None;
+    let mut view_dep = None;
     let table = if system_case {
         // 哑表不读任何列，入口单行守卫已涵盖全部依赖，不要求用户 DDL 声明。
         schema::Table {
@@ -60,22 +64,52 @@ pub(super) fn resolve_one(
                 proof = Some(p);
                 t
             }
+            // 非视图（view_sql 缺失）= 对象缺失；视图存在但全定义
+            // 证明失败 → 回退视图物化前导（确定性/依赖独立再证，
+            // vguard 渲染只依赖 qualified/columns，sd_vwN 等价）。
+            Ok(None) => return Ok(Err(SkipReason::UnknownObjectDependency)),
+            Err(_) => match viewdep::materialize(ex, catalog, &lq.table, index)? {
+                Ok(Some(dep)) => {
+                    let t = dep.table.clone();
+                    view_dep = Some(dep);
+                    t
+                }
+                Ok(None) => return Ok(Err(SkipReason::UnknownObjectDependency)),
+                Err(reason) => return Ok(Err(reason)),
+            },
+        }
+    } else {
+        // 视图物化前导：DESCRIBE 探测输出列 + 底表依赖登记，渲染改
+        // 引用 sd_vwN 临时表；非视图/不可证 = UnknownObjectDependency。
+        match viewdep::materialize(ex, catalog, &lq.table, index)? {
+            Ok(Some(dep)) => {
+                let t = dep.table.clone();
+                view_dep = Some(dep);
+                t
+            }
             Ok(None) => return Ok(Err(SkipReason::UnknownObjectDependency)),
             Err(reason) => return Ok(Err(reason)),
         }
-    } else {
-        return Ok(Err(SkipReason::UnknownObjectDependency));
     };
     if lq.case_sink.is_some() {
+        // CASE 写汇 + 视图物化暂不支持（渲染证据面不同），保守拒绝。
+        if view_dep.is_some() {
+            return Ok(Err(SkipReason::UnprovenQueryTotalness));
+        }
         return Ok(resolve_case(lq, table, index, cur_scan));
     }
     let Some(col) = table.columns.iter().find(|c| c.name == lq.column) else {
         return Ok(Err(SkipReason::UnknownObjectDependency));
     };
     let (kind, nullable) = (col.kind.clone(), col.nullable);
-    // 渲染证据用视图投影形状；涉案表登记最终底表（结构漂移复核对象）。
+    // 渲染证据用视图/探测投影形状；涉案表登记：入口守卫视图→最终底表，
+    // 物化视图→全部底表（视图名本身不可 load，登记会恒判漂移）。
     let render_table = table.clone();
-    let mut tables = match load_in_tables(ex, lq, table)? {
+    let seed = match &view_dep {
+        Some(dep) => dep.bases.clone(),
+        None => vec![(lq.table.clone(), table.clone())],
+    };
+    let mut tables = match load_in_tables(ex, lq, &render_table, seed)? {
         Ok(tables) => tables,
         Err(reason) => return Ok(Err(reason)),
     };
@@ -97,6 +131,9 @@ pub(super) fn resolve_one(
             case_sink: None,
             deps: Vec::new(),
             guard_base: proof.map(|p| p.base),
+            view_prelude: view_dep.as_ref().map(|d| d.prelude.clone()),
+            view_bases: view_dep.map(|d| d.base_names).unwrap_or_default(),
+            filter_binds: lq.filter_binds.clone(),
         },
         tables,
     )))
@@ -120,6 +157,9 @@ fn resolve_case(
             case_sink: lq.case_sink.clone(),
             deps: Vec::new(),
             guard_base: None,
+            view_prelude: None,
+            view_bases: Vec::new(),
+            filter_binds: lq.filter_binds.clone(),
         },
         if lq.table.0 == "sys_dummy" {
             Vec::new()
@@ -129,18 +169,21 @@ fn resolve_case(
     ))
 }
 
+/// `kind_src` 为 IN 两侧类型对齐的列证据源（渲染表：普通表/入口守卫
+/// 视图投影/物化视图探测列）；`seed` 为涉案表证据初值（物化视图为
+/// 全部底表，普通查找为主表本身）。
 fn load_in_tables(
     ex: &schema::Source<'_>,
     lq: &LookupQuery,
-    table: schema::Table,
+    kind_src: &schema::Table,
+    seed: Vec<(shape::Name, schema::Table)>,
 ) -> Result<Result<LookupTables, SkipReason>, EngineError> {
-    let mut tables = vec![(lq.table.clone(), table)];
+    let mut tables = seed;
     for f in &lq.in_filters {
         let Some(inner) = ex.load(&f.table)? else {
             return Ok(Err(SkipReason::UnknownObjectDependency));
         };
-        let outer_kind = tables[0]
-            .1
+        let outer_kind = kind_src
             .columns
             .iter()
             .find(|c| c.name == f.column)
@@ -199,20 +242,28 @@ pub(super) fn resolve_aggs(
     Ok(Ok(out))
 }
 
+/// 内联提升上下文：schema 源、例程目录、游标记录与 Var 实参安全集
+/// （查找结果变量 ∪ 循环不变变量；其余 Var 实参保守拒绝）。
+pub(super) struct HoistCtx<'a, 'b> {
+    pub ex: &'a schema::Source<'b>,
+    pub catalog: &'a RoutineCatalog,
+    pub record: &'a VarName,
+    pub safe_vars: &'a std::collections::BTreeSet<VarName>,
+}
+
 /// 内联表达式中的函数内查找（§4.3 A7）关系化提升：把每个 `IrExpr::Lookup`
 /// 替换为合成变量 `__sd_lkN`，并以 GROUP BY 派生表 LEFT JOIN 渲染（相关
 /// 聚合标量子查询深嵌套会触发内核规划栈溢出，关系化后栈深恒定）。
 /// 合成变量在批写投影里替换为 `CASE WHEN hit THEN value ELSE default END`。
 /// `base_index` 接续过程级查找编号，避免 JOIN 别名冲突。
 pub(super) fn hoist_inline(
-    ex: &schema::Source<'_>,
+    ctx: &HoistCtx<'_, '_>,
     expr: &IrExpr,
-    record: &VarName,
     base_index: usize,
 ) -> HoistResult {
     let mut acc = Vec::new();
     let mut next = base_index;
-    match hoist_walk(ex, expr, record, &mut next, &mut acc) {
+    match hoist_walk(ctx, expr, &mut next, &mut acc) {
         Ok(e) => Ok(Ok((e, acc))),
         Err(HoistFail::Skip(r)) => Ok(Err(r)),
         Err(HoistFail::Eng(e)) => Err(e),
@@ -239,9 +290,8 @@ impl From<EngineError> for HoistFail {
 }
 
 fn hoist_walk(
-    ex: &schema::Source<'_>,
+    ctx: &HoistCtx<'_, '_>,
     e: &IrExpr,
-    record: &VarName,
     next: &mut usize,
     acc: &mut HoistedLookups,
 ) -> Result<IrExpr, HoistFail> {
@@ -251,10 +301,11 @@ fn hoist_walk(
             args,
             default,
         } => {
-            let lq = lookup::parse_inline(query, args, default, record)?;
+            let lq = lookup::parse_inline(query, args, default, ctx.record, ctx.safe_vars)?;
             let idx = *next;
             *next += 1;
-            let (mut resolved, tables) = resolve_one(ex, &lq, idx, "")?.map_err(HoistFail::Skip)?;
+            let (mut resolved, tables) =
+                resolve_one(ctx.ex, ctx.catalog, &lq, idx, "")?.map_err(HoistFail::Skip)?;
             let var = VarName(format!("__sd_lk{idx}"));
             resolved.var = var.clone();
             resolved.group = idx;
@@ -263,16 +314,16 @@ fn hoist_walk(
         }
         IrExpr::Bin { op, l, r } => IrExpr::Bin {
             op: *op,
-            l: Box::new(hoist_walk(ex, l, record, next, acc)?),
-            r: Box::new(hoist_walk(ex, r, record, next, acc)?),
+            l: Box::new(hoist_walk(ctx, l, next, acc)?),
+            r: Box::new(hoist_walk(ctx, r, next, acc)?),
         },
         IrExpr::Case {
             operand,
             whens,
             else_expr,
-        } => hoist_case(ex, (operand, whens, else_expr), record, next, acc)?,
-        IrExpr::Not(x) => IrExpr::Not(Box::new(hoist_walk(ex, x, record, next, acc)?)),
-        IrExpr::IsNull(x) => IrExpr::IsNull(Box::new(hoist_walk(ex, x, record, next, acc)?)),
+        } => hoist_case(ctx, (operand, whens, else_expr), next, acc)?,
+        IrExpr::Not(x) => IrExpr::Not(Box::new(hoist_walk(ctx, x, next, acc)?)),
+        IrExpr::IsNull(x) => IrExpr::IsNull(Box::new(hoist_walk(ctx, x, next, acc)?)),
         IrExpr::SqlFn {
             name,
             args,
@@ -280,7 +331,7 @@ fn hoist_walk(
         } => {
             let args = args
                 .iter()
-                .map(|a| hoist_walk(ex, a, record, next, acc))
+                .map(|a| hoist_walk(ctx, a, next, acc))
                 .collect::<Result<Vec<_>, _>>()?;
             IrExpr::SqlFn {
                 name: name.clone(),
@@ -299,26 +350,25 @@ type CaseParts<'a> = (
 );
 
 fn hoist_case(
-    ex: &schema::Source<'_>,
+    ctx: &HoistCtx<'_, '_>,
     case: CaseParts<'_>,
-    record: &VarName,
     next: &mut usize,
     acc: &mut HoistedLookups,
 ) -> Result<IrExpr, HoistFail> {
     let (operand, whens, else_expr) = case;
     let operand = match operand {
-        Some(o) => Some(Box::new(hoist_walk(ex, o, record, next, acc)?)),
+        Some(o) => Some(Box::new(hoist_walk(ctx, o, next, acc)?)),
         None => None,
     };
     let mut ws = Vec::with_capacity(whens.len());
     for (c, v) in whens {
         ws.push((
-            hoist_walk(ex, c, record, next, acc)?,
-            hoist_walk(ex, v, record, next, acc)?,
+            hoist_walk(ctx, c, next, acc)?,
+            hoist_walk(ctx, v, next, acc)?,
         ));
     }
     let else_expr = match else_expr {
-        Some(o) => Some(Box::new(hoist_walk(ex, o, record, next, acc)?)),
+        Some(o) => Some(Box::new(hoist_walk(ctx, o, next, acc)?)),
         None => None,
     };
     Ok(IrExpr::Case {

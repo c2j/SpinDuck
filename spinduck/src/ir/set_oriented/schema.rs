@@ -1,6 +1,8 @@
 //! 当前事务内的表结构证据：原生标量表，解析 DEFAULT 子句为常量/非常量证据
 //! （省略列准入与漂移比对），拒绝复杂约束（PK/CHECK/COLLATE 等）。
 
+use std::collections::{HashMap, HashSet};
+
 use super::metadata::SchemaSnapshot;
 use super::shape::{Name, Tokens};
 use crate::error::EngineError;
@@ -36,6 +38,9 @@ pub(super) enum Source<'a> {
     Static(&'a SchemaSnapshot),
 }
 
+/// 对象名清单：(普通表名集合, 视图名→定义 SQL)。
+pub(super) type ObjectNames = (HashSet<String>, HashMap<String, String>);
+
 impl Source<'_> {
     pub(super) fn load(&self, name: &Name) -> Result<Option<Table>, EngineError> {
         match self {
@@ -57,6 +62,16 @@ impl Source<'_> {
             Self::Runtime(ex) => sys_dummy_ok(*ex),
             // 数据基数不是静态事实，必须延迟到区域入口检查。
             Self::Static(_) => Ok(true),
+        }
+    }
+
+    /// 当前库/模式对象名清单：(普通表名集合, 视图名→定义 SQL)——
+    /// 视图物化依赖提取的候选集（token 命中才逐个取证，过近似安全）。
+    /// Static 快照无执行器 → None。
+    pub(super) fn object_names(&self) -> Result<Option<ObjectNames>, EngineError> {
+        match self {
+            Self::Runtime(ex) => object_names(*ex).map(Some),
+            Self::Static(_) => Ok(None),
         }
     }
 
@@ -235,6 +250,33 @@ fn canonical_runtime_type(ty: &str, rules: &RuleRegistry) -> String {
         },
         None => format!("OPAQUE:{}", upper),
     }
+}
+
+/// duckdb_tables/duckdb_views 一次取回当前库/模式对象名（小写键）。
+fn object_names(ex: &dyn SqlExecutor) -> Result<ObjectNames, EngineError> {
+    let mut tables = HashSet::new();
+    let mut stream = ex.query(
+        "SELECT table_name FROM duckdb_tables() \
+         WHERE database_name = current_database() AND schema_name = current_schema()",
+        &BindMap::new(),
+    )?;
+    for row in stream.fetch_many(4096) {
+        if let [SpinValue::Str(name)] = row.as_slice() {
+            tables.insert(name.to_ascii_lowercase());
+        }
+    }
+    let mut views = HashMap::new();
+    let mut stream = ex.query(
+        "SELECT view_name, sql FROM duckdb_views() \
+         WHERE database_name = current_database() AND schema_name = current_schema()",
+        &BindMap::new(),
+    )?;
+    for row in stream.fetch_many(4096) {
+        if let [SpinValue::Str(name), SpinValue::Str(sql)] = row.as_slice() {
+            views.insert(name.to_ascii_lowercase(), sql.clone());
+        }
+    }
+    Ok((tables, views))
 }
 
 /// 视图定义原文（duckdb_views().sql，限当前库/模式）；非视图或不存在 = None。

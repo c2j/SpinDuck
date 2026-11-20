@@ -161,7 +161,7 @@ fn dst_rows(eng: &Engine) -> Vec<Vec<SpinValue>> {
     let mut stream = eng
         .ex
         .query(
-            "SELECT security_id, yj, tag FROM dst_rows ORDER BY tag",
+            "SELECT security_id, yj, tag FROM dst_rows ORDER BY tag, security_id",
             &BindMap::new(),
         )
         .unwrap();
@@ -251,6 +251,8 @@ fn should_reject_sys_dummy_block_when_not_total_and_verify_decimal_mul_sub() {
     scenario_cursor_fnsite();
     scenario_insert_fnsite();
     scenario_agg_fnsite();
+    scenario_view_lookup();
+    scenario_inline_lookup_args();
 }
 
 /// fnc_grp_mode：SQL 上下文下沉例程（游标 WHERE 内 fn_site 同型）。
@@ -445,6 +447,65 @@ fn scenario_insert_fnsite() {
     assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
 }
 
+/// 视图查找（byfund v_par_fund_check_para 同型）：UNION ALL 视图经
+/// 入口物化前导落临时表，相关键 GROUP BY 派生表渲染；重复键 sd_cnt=2
+/// 落兜底，与原 too_many_rows→WHEN OTHERS 语义一致。
+fn caller_view_lookup() -> &'static str {
+    "CREATE OR REPLACE PROCEDURE caller_view_lookup(p_o_succeed OUT VARCHAR2) IS
+       v_x VARCHAR2(20);
+     BEGIN
+       p_o_succeed := '0';
+       FOR r IN SELECT security_id, cjje, tag FROM cur_rows LOOP
+         BEGIN
+           SELECT v.val INTO v_x FROM v_dim v WHERE v.k = r.security_id;
+         EXCEPTION WHEN OTHERS THEN v_x := 'D'; END;
+         INSERT INTO dst_rows(security_id, yj, tag)
+           VALUES (r.security_id, r.cjje, v_x);
+       END LOOP;
+     END;"
+}
+
+/// ⑨ 视图查找：Converted 且逐行同 Off（K1 跨 UNION ALL 重复→兜底，
+/// K4 无匹配→兜底，K2/K3 命中）。
+fn scenario_view_lookup() {
+    let ddl: Vec<&str> = BASE_DDL
+        .iter()
+        .copied()
+        .map(|s| {
+            if s.starts_with("CREATE TABLE cur_rows") {
+                "CREATE TABLE cur_rows(security_id VARCHAR, cjje DECIMAL(20,6), \
+                   yj11 DECIMAL(15,2), yj12 DECIMAL(15,2), tag VARCHAR)"
+            } else {
+                s
+            }
+        })
+        .chain([
+            "CREATE TABLE dim_a(k VARCHAR, val VARCHAR)",
+            "CREATE TABLE dim_b(k VARCHAR, val VARCHAR)",
+            "CREATE VIEW v_dim AS SELECT k, val FROM dim_a \
+               UNION ALL SELECT k, val FROM dim_b",
+            "INSERT INTO dim_a VALUES ('K1','va1'),('K2','va2')",
+            "INSERT INTO dim_b VALUES ('K3','vb3'),('K1','vb1')",
+            "INSERT INTO cur_rows VALUES \
+               ('K1',1.00,0,0,'a'),('K2',2.00,0,0,'b'),\
+               ('K3',3.00,0,0,'c'),('K4',4.00,0,0,'d')",
+        ])
+        .collect();
+    let routines = [caller_view_lookup()];
+    let mut off = engine_with_routines(&ddl, SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_view_lookup", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 4, "Off 语义基线: {expected_rows:?}");
+
+    let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_view_lookup", &args()).unwrap();
+    let Status::Converted { .. } = eng.set_oriented_reports()[0].status.clone() else {
+        panic!("视图查找必须 Converted: {:?}", eng.set_oriented_reports());
+    };
+    assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
+}
+
 /// ⑤ INSERT 参数复杂表达式：Converted 且逐行同 Off。
 /// 覆盖 `expr::prove` 语法面：`+`、`*`、简单 CASE、字符串字面量、
 /// CAST…AS DECIMAL（TRY_CAST 无抛错改写）。
@@ -611,4 +672,80 @@ fn scenario_decimal_overflow() {
     );
     assert_eq!(dst_rows(&eng3), expected_rows3, "退回后结果须与 Off 一致");
     assert_eq!(actual3.outs, expected3.outs);
+}
+
+/// fnc_dim：内联例程内 SELECT INTO（byfund fnc_com_get_seat_para 同型
+/// 子集）。形参绑定调用方混合实参：记录字段 / IN 形参变量 / 字符串
+/// 字面量——parse_inline 原仅接受字段实参，须扩展 Var（循环不变或
+/// 查找结果变量）与 Const（字面量内联改写）两类实参。
+fn fnc_dim() -> &'static str {
+    "CREATE FUNCTION fnc_dim(p_k VARCHAR, p_kind VARCHAR, p_flag VARCHAR)
+     RETURN VARCHAR IS
+       v_x VARCHAR2(20);
+     BEGIN
+       BEGIN
+         SELECT val INTO v_x FROM dim_t
+           WHERE k = p_k AND kind = p_kind AND flag = p_flag;
+       EXCEPTION WHEN OTHERS THEN v_x := 'D'; END;
+       RETURN v_x;
+     END;"
+}
+
+fn caller_inline_lookup() -> &'static str {
+    "CREATE OR REPLACE PROCEDURE caller_inline_lookup(
+       p_kind VARCHAR2, p_o_succeed OUT VARCHAR2) IS
+       v_x VARCHAR2(20);
+     BEGIN
+       p_o_succeed := '0';
+       FOR r IN SELECT security_id, cjje, tag FROM cur_rows LOOP
+         v_x := fnc_dim(r.security_id, p_kind, 'K');
+         BEGIN
+           INSERT INTO dst_rows(security_id, yj, tag)
+             VALUES (r.security_id, r.cjje, v_x);
+         EXCEPTION WHEN OTHERS THEN NULL; END;
+       END LOOP;
+     END;"
+}
+
+/// ⑩ 内联 Lookup 混合实参：Var 实参（p_kind 循环不变）作静态绑定、
+/// Const 实参（'K'）字面量内联、Field 实参（r.security_id）相关键——
+/// Converted 且逐行同 Off。
+fn scenario_inline_lookup_args() {
+    let ddl: Vec<&str> = BASE_DDL
+        .iter()
+        .copied()
+        .map(|s| {
+            if s.starts_with("CREATE TABLE cur_rows") {
+                "CREATE TABLE cur_rows(security_id VARCHAR, cjje DECIMAL(20,6), \
+                   yj11 DECIMAL(15,2), yj12 DECIMAL(15,2), tag VARCHAR)"
+            } else {
+                s
+            }
+        })
+        .chain([
+            "CREATE TABLE dim_t(k VARCHAR, kind VARCHAR, flag VARCHAR, val VARCHAR)",
+            "INSERT INTO dim_t VALUES \
+               ('S1','A','K','hit1'),('S2','B','K','hit2'),('S1','A','X','no')",
+            "INSERT INTO cur_rows VALUES \
+               ('S1',1.00,0,0,'a'),('S2',2.00,0,0,'b'),\
+               ('S3',3.00,0,0,'c'),('S4',4.00,0,0,'d')",
+        ])
+        .collect();
+    let routines = [fnc_dim(), caller_inline_lookup()];
+    let call_args = [SpinValue::Str("A".into()), SpinValue::Null];
+    let mut off = engine_with_routines(&ddl, SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_inline_lookup", &call_args).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 4, "Off 语义基线: {expected_rows:?}");
+
+    let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_inline_lookup", &call_args).unwrap();
+    let Status::Converted { .. } = eng.set_oriented_reports()[0].status.clone() else {
+        panic!(
+            "内联 Lookup 混合实参必须 Converted: {:?}",
+            eng.set_oriented_reports()
+        );
+    };
+    assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
 }

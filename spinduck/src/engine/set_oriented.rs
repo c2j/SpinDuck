@@ -110,6 +110,29 @@ impl Engine {
             )?;
             preluded = true;
         }
+        // 视图物化前导：先于入口守卫（守卫可内嵌 sd_vwN 派生表），且在
+        // fn 物化之后——例程调用可回滚会话本地建表，视图表必须最后建。
+        // 物化失败回退原区域：原解释器逐行求值视图，错误由行级 trap
+        // 兜底，物化失败不构成调用失败。
+        if !plan.view_preludes.is_empty() && self.materialize_views(plan).is_err() {
+            self.push_report(
+                &routine.name,
+                Status::Skipped {
+                    reason: SkipReason::UnprovenQueryTotalness,
+                },
+            );
+            let out = self.run_prog(
+                &routine.prog,
+                frame,
+                sink,
+                limits,
+                RunSpan {
+                    start_pc: plan.open_pc,
+                    stop_pc: Some(plan.close_pc + 1),
+                },
+            )?;
+            return Ok((!matches!(out, RunOutcome::Stopped)).then_some(out));
+        }
         match entry_ok(self.ex.as_ref(), plan, &self.optimize_ctx(), frame)? {
             Err(reason) => {
                 self.push_report(&routine.name, Status::Skipped { reason });
@@ -149,6 +172,15 @@ impl Engine {
                 Ok(None)
             }
         }
+    }
+
+    /// 视图物化前导执行：`CREATE OR REPLACE TEMP TABLE sd_vwN AS
+    /// SELECT * FROM <视图>`，按声明序；任一失败上抛由调用方回退。
+    fn materialize_views(&self, plan: &ConversionPlan) -> Result<(), EngineError> {
+        for p in &plan.view_preludes {
+            self.ex.execute(&p.sql, &crate::exec::BindMap::new())?;
+        }
+        Ok(())
     }
 
     /// 尾提交（设计 §2.1 契约 2）：仅 `tail_commit && rows_affected > 0` 时

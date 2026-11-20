@@ -94,6 +94,7 @@ fn assemble<'a>(
         insert_sites: parts.insert_sites,
         var_types: &ctx.prog.var_types,
         record: &ctx.region.record,
+        prog: ctx.prog,
         allow_filter: ctx.mode == SetOrientedMode::BatchAtomic && body.has_trap,
         insert_log: body.insert_log,
         sinks: body.sinks,

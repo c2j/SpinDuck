@@ -229,6 +229,14 @@ pub(super) struct ResolvedLookup {
     pub deps: Vec<VarName>,
     /// §3.5 入口守卫视图的最终底表名（写集相交复核用；普通查找为 None）。
     pub guard_base: Option<Name>,
+    /// 视图物化前导（普通查找落在视图上）：sd_vwN 临时表契约，
+    /// 渲染已改引用临时表；区域入口先于守卫物化，失败回退原区域。
+    pub view_prelude: Option<super::entry::ViewPrelude>,
+    /// 静态过滤引用的绑定（形参/安全变量）：须并入批写 SQL binds 在
+    /// 运行期解析；查找结果变量绑定由 query_binds 跳过（已逐行代入）。
+    pub filter_binds: Vec<(String, BindSrc)>,
+    /// 视图底表名（写集相交复核用；入口守卫视图走 guard_base）。
+    pub view_bases: Vec<Name>,
 }
 
 /// 识别 pc 处的兜底查找组（同一 WHEN OTHERS 内 n 条连续 SELECT INTO）：
@@ -456,13 +464,16 @@ fn combined_filter(
 }
 
 /// 函数内联 Lookup（§4.3 A7）→ 全定义文法解析：实参须为游标记录字段
-/// （相关键），兜底须为常量；其余形态（不变量绑定/非常量兜底）保守
-/// 拒绝，交回解释器。复用 [`parse::parse_total`] 的相关文法（含多键）。
+/// （相关键）、安全变量（查找结果变量/循环不变变量，统一改写为
+/// `$v_<变量名>` 占位符）或常量（字面量内联进 SQL）；其余形态
+/// （循环可变非查找变量/非常量兜底）保守拒绝，交回解释器。
+/// 复用 [`parse::parse_total`] 的相关文法（含多键）。
 pub(super) fn parse_inline(
     sql: &str,
     args: &[(String, crate::ir::IrExpr)],
     default: &crate::ir::IrExpr,
     record: &VarName,
+    safe_vars: &std::collections::BTreeSet<VarName>,
 ) -> Result<LookupQuery, SkipReason> {
     use crate::ir::IrExpr;
     let bad = SkipReason::UnprovenQueryTotalness;
@@ -470,6 +481,7 @@ pub(super) fn parse_inline(
         return Err(bad);
     };
     let mut binds = Vec::with_capacity(args.len());
+    let mut repls: Vec<(String, String)> = Vec::new();
     for (ph, a) in args {
         match a {
             IrExpr::Field { rec, field } if rec == record => binds.push((
@@ -479,9 +491,35 @@ pub(super) fn parse_inline(
                     field: field.clone(),
                 },
             )),
+            // Var 实参占位符统一改写为 `$v_<变量名>`：循环不变变量走
+            // 帧单值绑定；查找结果变量由 substitute_lookup_refs 按
+            // 占位符名逐行代入 CASE（§4.4 B1 同口径）。
+            IrExpr::Var(v) if safe_vars.contains(v) => {
+                let new_ph = BindSrc::placeholder(&v.0, None);
+                repls.push((ph.clone(), new_ph.clone()));
+                binds.push((new_ph, BindSrc::Var(v.clone())));
+            }
+            IrExpr::Const(sv) => {
+                let lit = crate::sql::render::const_to_sql(sv).ok_or(bad)?;
+                repls.push((ph.clone(), lit));
+            }
             _ => return Err(bad),
         }
     }
+    // 同名占位符绑定冲突（改名后与既有绑定撞名且源不同）= 歧义，拒绝。
+    for (i, (p, s)) in binds.iter().enumerate() {
+        if binds[..i].iter().any(|(q, t)| q == p && t != s) {
+            return Err(bad);
+        }
+    }
+    repls.sort_by_key(|(ph, _)| std::cmp::Reverse(ph.len()));
+    let rewritten;
+    let sql = if repls.is_empty() {
+        sql
+    } else {
+        rewritten = super::substitute_binds(sql, &repls);
+        rewritten.as_str()
+    };
     parse::parse_total(
         sql,
         VarName("__sd_inline".to_string()),

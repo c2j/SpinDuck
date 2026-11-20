@@ -21,6 +21,7 @@ mod route;
 mod schema;
 mod shape;
 mod vguard;
+mod viewdep;
 
 pub(crate) use entry::{entry_ok, ConversionPlan, FnPrelude};
 
@@ -169,6 +170,8 @@ struct CopyLoop<'a> {
     /// 变量类型表：过滤式无抛错证明裁决绑定值域（Varchar↔str / 数值↔num）。
     pub(super) var_types: &'a std::collections::BTreeMap<String, crate::types::SpinType>,
     pub(super) record: &'a VarName,
+    /// 区域程序 IR：内联 Lookup Var 实参的循环不变性证明依据（§4.3 A7）。
+    pub(super) prog: &'a crate::ir::IrProg,
     /// BatchAtomic × trap：授权以列级守卫过滤坏行（跳行语义等价）。
     pub(super) allow_filter: bool,
     /// §3.5-4 INSERT 跳起型处理器（非 NoOp inst_log）：入口守卫须证

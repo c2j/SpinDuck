@@ -27,6 +27,18 @@ pub(crate) struct FnPrelude {
     pub needs_sd_cur: bool,
 }
 
+/// 视图物化前导（普通查找落在视图上）：区域入口把视图物化为
+/// `sd_vwN` 临时表，批写/守卫中的查找派生表改引用临时表。物化与
+/// 原解释器逐行求值视图等价的前提是视图 SQL 确定（无易变函数、
+/// 目录例程均 PureExpr）；物化失败由调用方回退原区域——行级 trap
+/// 兜底语义在解释路径下逐行复现，物化失败不构成调用失败。
+#[derive(Clone)]
+pub(crate) struct ViewPrelude {
+    /// 物化 SQL：`CREATE OR REPLACE TEMP TABLE sd_vwN AS SELECT * FROM <视图>`
+    /// （临时表名 sd_vwN 与批写/守卫 SQL 中的派生表引用一致）。
+    pub sql: String,
+}
+
 /// 结构准入与 SQL 生成的产物；入口守卫与后缀组装消费它。
 #[derive(Clone)]
 pub(crate) struct ConversionPlan {
@@ -35,6 +47,9 @@ pub(crate) struct ConversionPlan {
     pub(crate) binds: Vec<(String, BindSrc)>,
     /// 批写前须物化的例程缓存表（游标 WHERE fn_site，按声明序执行）。
     pub(crate) fn_preludes: Vec<FnPrelude>,
+    /// 视图物化前导（普通查找落在视图上）：先于入口守卫执行
+    /// （守卫可内嵌 sd_vwN 派生表），失败回退原区域。
+    pub(crate) view_preludes: Vec<ViewPrelude>,
     /// 入口守卫 SQL 引用缓存表（verbatim cur_scan / 写守卫子查询）时为
     /// true：物化前导先于 entry_ok 执行。回退路径下解释器会重新物化
     /// （例程纯度已证，仅多一次去重调用——与 Off 逐行调用次数本就不同）。

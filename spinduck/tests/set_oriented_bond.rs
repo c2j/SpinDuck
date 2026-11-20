@@ -237,8 +237,10 @@ fn should_fallback_when_v_par_bond_has_zero_overlapping_or_query_error() {
     assert_eq!(dst_rows(&eng3), expected_rows3);
     assert_eq!(actual3.outs, expected3.outs);
 
-    // ---- ④ 视图全定义证明失败：计划期拒绝，不发守卫 SQL ----
-    // CAST(bond_kind AS INTEGER) 在运行期对 'K1' 抛错 → 解释器走 WHEN OTHERS。
+    // ---- ④ 视图证明链推进后仍拒绝：不发守卫 SQL ----
+    // CAST(bond_kind AS INTEGER) 使 prove_view 全定义证明失败；视图
+    // 物化前导可解析该视图，证明推进至投影类型约束才拒绝
+    // （UnprovenTargetConstraints），同样不发守卫 SQL。
     let mut ddl4: Vec<&str> = BASE_DDL
         .iter()
         .copied()
@@ -260,7 +262,7 @@ fn should_fallback_when_v_par_bond_has_zero_overlapping_or_query_error() {
     assert_eq!(
         eng4.set_oriented_reports()[0].status,
         Status::Skipped {
-            reason: SkipReason::UnprovenQueryTotalness
+            reason: SkipReason::UnprovenTargetConstraints
         }
     );
     assert!(
