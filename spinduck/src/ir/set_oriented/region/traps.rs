@@ -80,6 +80,10 @@ pub(crate) fn trap_bodies_admissible(
         if super::insert_log_handler(prog, pc).is_some() {
             continue;
         }
+        // 零异常守卫查找跨全部处理器项裁决（可多 WHEN 分支）。
+        if super::super::vguard::carryover_group(prog, pc, entries).is_some() {
+            continue;
+        }
         for entry in entries {
             if fallback_handler(prog, pc, entry) {
                 continue;
@@ -179,7 +183,7 @@ pub(crate) fn fallback_group(
 fn fallback_handler(prog: &IrProg, pc: usize, entry: &crate::ir::TrapEntry) -> bool {
     fallback_group(prog, pc, entry).is_some()
         || fallback_if_group(prog, pc, entry).is_some()
-        || super::super::vguard::carryover_group(prog, pc, entry).is_some()
+        || super::mixed_fallback_group(prog, pc, entry).is_some()
 }
 
 /// IF 路由型常量兜底闭包（§4.3 + §4.4 B1）的结构面：PushTrap 主线首条为

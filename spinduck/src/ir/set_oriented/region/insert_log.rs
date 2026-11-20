@@ -28,18 +28,30 @@ pub(crate) fn insert_log_handler(prog: &IrProg, pc: usize) -> Option<InsertLogTr
     if entry.conds.len() != 1 || !entry.conds[0].eq_ignore_ascii_case("others") {
         return None;
     }
-    if !matches!(prog.code.get(pc + 1), Some(IrStmt::SqlExec { .. }))
-        || !matches!(prog.code.get(pc + 2), Some(IrStmt::PopTrap))
-    {
+    // 保护区 = 一条 SqlExec + 其后可选的 TxCommit（BEGIN 内 COMMIT 形态，
+    // admit_effects 的 guarded_tail 同口径放行）。
+    let mut q = pc + 1;
+    if !matches!(prog.code.get(q), Some(IrStmt::SqlExec { .. })) {
+        return None;
+    }
+    q += 1;
+    while matches!(prog.code.get(q), Some(IrStmt::TxCommit)) {
+        q += 1;
+    }
+    if !matches!(prog.code.get(q), Some(IrStmt::PopTrap)) {
         return None;
     }
     let join = entry.body_end + 1;
-    if !matches!(prog.code.get(pc + 3), Some(IrStmt::Jump(t)) if *t == join)
+    if !matches!(prog.code.get(q + 1), Some(IrStmt::Jump(t)) if *t == join)
         || !matches!(prog.code.get(entry.body_end), Some(IrStmt::Jump(t)) if *t == join)
     {
         return None;
     }
-    if !handler_body_ok(prog, entry.body_start, entry.body_end) {
+    if !handler_body_ok(prog, entry.body_start, entry.body_end)
+        || !prog.code[entry.body_start..entry.body_end]
+            .iter()
+            .any(|st| matches!(st, IrStmt::CallRoutine { .. }))
+    {
         return None;
     }
     Some(InsertLogTrap {
@@ -49,14 +61,16 @@ pub(crate) fn insert_log_handler(prog: &IrProg, pc: usize) -> Option<InsertLogTr
     })
 }
 
-/// 处理器体白名单：Nop / 任意 CallRoutine / `Var := Const`。
+/// 处理器体白名单：Nop / 任意 CallRoutine / `Var := Const` / `Jump`。
 /// 坏行存在时整段退回解释器逐条执行，处理器内容不参与集合化投影，
-/// 因此不要求 callee 可证 NoOp——准入义务全部由 bad_rows==0 守卫承担。
+/// 因此不要求 callee 可证 NoOp、Jump 目标不校验——准入义务全部由
+/// bad_rows==0 守卫承担（守卫通过时处理器整体不可达）。
 fn handler_body_ok(prog: &IrProg, start: usize, end: usize) -> bool {
     (start..end).all(|bpc| {
         matches!(
             prog.code.get(bpc),
             Some(IrStmt::Nop)
+                | Some(IrStmt::Jump(_))
                 | Some(IrStmt::CallRoutine { .. })
                 | Some(IrStmt::Assign {
                     target: AssignTarget::Var(_),

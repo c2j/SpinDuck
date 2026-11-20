@@ -68,7 +68,7 @@ pub(super) fn materialize_fn_sites(
         for row in &rows {
             let v = crate::runtime::interp::routine::call_routine_value(env, &site.name, row)?;
             let mut items = vec![sql_literal(&v)];
-            items.extend(row.iter().map(|c| sql_literal(c)));
+            items.extend(row.iter().map(sql_literal));
             items_all.push(items);
         }
         let arity = site.args.len();

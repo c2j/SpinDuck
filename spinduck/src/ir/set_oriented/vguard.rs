@@ -9,7 +9,7 @@ use super::schema::{self, Source, Table};
 use super::shape::{Name, Tokens};
 use super::{SkipReason, VarName};
 use crate::error::EngineError;
-use crate::ir::{AssignTarget, IrExpr, IrProg, IrStmt, TrapEntry};
+use crate::ir::{AssignTarget, IrProg, IrStmt, TrapEntry};
 use crate::value::SpinValue;
 
 /// 视图证明产物：投影列证据（视图形状）+ 底表名与底表结构
@@ -287,56 +287,63 @@ fn guard_sql(
     )
 }
 
-/// 零异常守卫型处理器结构面（§3.5 V3-5）：同一 WHEN OTHERS 内恰 1 条
-/// SELECT INTO，处理器体为常量赋值（不得触碰 INTO 变量——异常路径保留
-/// 上一行残留）+ 同目标续跑 Jump。返回 (查询变量, 续跑 pc)；形态不符 = None。
+/// 零异常守卫型处理器结构面（§3.5 V3-5）：保护区恰 1 条 SELECT INTO，
+/// 全部处理器体不得写 INTO 变量（异常路径保留跨行残留）、体内跳转仅
+/// 允许指向共同续跑点，首个处理器紧随保护区。返回 (查询变量, 续跑 pc)；
+/// 形态不符 = None。处理器内容在守卫证明恰 1 行后整体不可达，
+/// 其余语句形态由 admit_effects/write_set 兜底裁决。
 pub(super) fn carryover_group(
     prog: &IrProg,
     pc: usize,
-    entry: &TrapEntry,
+    entries: &[TrapEntry],
 ) -> Option<(VarName, usize)> {
-    if entry.conds.len() != 1 || !entry.conds[0].eq_ignore_ascii_case("others") {
-        return None;
-    }
     let IrStmt::SqlQuery { into, fn_sites, .. } = prog.code.get(pc + 1)? else {
         return None;
     };
     let [AssignTarget::Var(v)] = into.as_slice() else {
         return None;
     };
-    if !fn_sites.is_empty() {
+    if !fn_sites.is_empty() || entries.is_empty() {
         return None;
     }
-    if !matches!(prog.code.get(pc + 2), Some(IrStmt::PopTrap))
-        || !matches!(prog.code.get(pc + 3), Some(IrStmt::Jump(t)) if *t == entry.body_end + 1)
-        || !matches!(prog.code.get(entry.body_end), Some(IrStmt::Jump(t)) if *t == entry.body_end + 1)
+    if !matches!(prog.code.get(pc + 2), Some(IrStmt::PopTrap)) {
+        return None;
+    }
+    let join = entries.iter().map(|e| e.body_end).max()? + 1;
+    if entries.iter().map(|e| e.body_start).min() != Some(pc + 4)
+        || !matches!(prog.code.get(pc + 3), Some(IrStmt::Jump(t)) if *t == join)
     {
         return None;
     }
-    if entry.body_start != pc + 4 || entry.body_end <= entry.body_start {
-        return None;
-    }
-    for bpc in entry.body_start..entry.body_end {
-        let IrStmt::Assign {
-            target: AssignTarget::Var(av),
-            expr: IrExpr::Const(_),
-        } = prog.code.get(bpc)?
-        else {
-            return None;
-        };
-        if av == v {
+    for e in entries {
+        if e.body_start >= e.body_end
+            || !matches!(prog.code.get(e.body_end), Some(IrStmt::Jump(t)) if *t == join)
+        {
             return None;
         }
+        for bpc in e.body_start..e.body_end {
+            match prog.code.get(bpc)? {
+                IrStmt::Nop => {}
+                IrStmt::Assign {
+                    target: AssignTarget::Var(av),
+                    ..
+                } if av != v => {}
+                IrStmt::Jump(t)
+                | IrStmt::JumpIf { to: t, .. }
+                | IrStmt::JumpIfNot { to: t, .. }
+                    if *t == join => {}
+                _ => return None,
+            }
+        }
     }
-    Some((v.clone(), entry.body_end + 1))
+    Some((v.clone(), join))
 }
 
-/// 识别 pc 处的零异常守卫查找（§3.5 V3-5）：PushTrap(WHEN OTHERS) 内
-/// 恰 1 条 SELECT INTO，处理器只写其它变量常量、不改 INTO 变量（异常
-/// 路径保留跨行残留值），续跑落点在处理器块之后。解析复用 parse_total
-/// （兜底常量取 Null——守卫保证恰 1 行命中，ELSE 分支运行期不可达）。
-/// 形态不符 = Ok(None)；全定义证明失败 = Err(UnprovenQueryTotalness)；
-/// 视图/表与区域写集相交 = Err(TargetReadDependency)。
+/// 识别 pc 处的零异常守卫查找（§3.5 V3-5）：保护区恰 1 条 SELECT INTO，
+/// 处理器不写 INTO 变量（异常路径保留跨行残留值），续跑落点在处理器块
+/// 之后。解析复用 parse_total（兜底常量取 Null——守卫保证恰 1 行命中，
+/// 异常分支运行期不可达）。形态不符 = Ok(None)；全定义证明失败 =
+/// Err(UnprovenQueryTotalness)；视图/表与区域写集相交 = Err(TargetReadDependency)。
 pub(super) fn carryover_group_at(
     prog: &IrProg,
     pc: usize,
@@ -346,16 +353,17 @@ pub(super) fn carryover_group_at(
     let IrStmt::PushTrap { entries } = &prog.code[pc] else {
         return Ok(None);
     };
-    let [entry] = entries.as_slice() else {
-        return Ok(None);
-    };
-    let Some((var, resume)) = carryover_group(prog, pc, entry) else {
+    let Some((var, resume)) = carryover_group(prog, pc, entries) else {
         return Ok(None);
     };
     let IrStmt::SqlQuery { sql, binds, .. } = &prog.code[pc + 1] else {
         return Ok(None);
     };
-    let mut query = parse_total(sql, var, SpinValue::Null, binds, &region.record)?;
+    // 查询不可全定义解析时回落 None 交后续识别器（形状放宽后命中面变大，
+    // 解析失败不得短路分派——与识别顺序的"首个匹配生效"约定一致）。
+    let Ok(mut query) = parse_total(sql, var, SpinValue::Null, binds, &region.record) else {
+        return Ok(None);
+    };
     if query.correlations.iter().any(|c| c.op != CorrelationOp::Eq) {
         return Err(SkipReason::UnprovenQueryTotalness);
     }

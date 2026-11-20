@@ -6,13 +6,13 @@ use crate::ir::{AssignTarget, CursorSource, IrExpr, IrProg, IrStmt, VarName};
 use std::collections::BTreeSet;
 
 /// BatchAtomic 入口事务干净度（§4.5 第 1 项）：前缀至区域入口无未提交 DML。
-/// 仅沿正常路径扫描；退出型异常处理器体（必 Return/Raise 收尾）不在到达
-/// 区域的路径上，整体跳过；跳过处理器的前向跳转放行，其余分支保守拒绝。
-pub(crate) fn prefix_is_clean(prog: &IrProg, open_pc: usize) -> Result<(), SkipReason> {
-    let handlers = exit_only_handlers(prog, open_pc)?;
+/// 仅沿正常路径扫描；异常处理器体（体内跳转不落入区域内部）整体跳过；
+/// 跳过处理器的前向跳转放行，其余分支保守拒绝。
+pub(crate) fn prefix_is_clean(prog: &IrProg, region: &CursorRegion) -> Result<(), SkipReason> {
+    let handlers = prefix_handler_ranges(prog, region)?;
     let in_handler = |pc: usize| handlers.iter().any(|(s, e)| pc >= *s && pc < *e);
     let mut dirty = false;
-    for (pc, stmt) in prog.code[..open_pc].iter().enumerate() {
+    for (pc, stmt) in prog.code[..region.open_pc].iter().enumerate() {
         if in_handler(pc) {
             continue;
         }
@@ -22,7 +22,7 @@ pub(crate) fn prefix_is_clean(prog: &IrProg, open_pc: usize) -> Result<(), SkipR
                 dirty = true;
             }
             IrStmt::Jump(to) => {
-                if *to <= pc || *to > open_pc {
+                if *to <= pc || *to > region.open_pc {
                     return Err(SkipReason::UnsupportedControlFlow);
                 }
                 for (i, stmt) in prog.code[pc + 1..*to].iter().enumerate() {
@@ -51,12 +51,16 @@ pub(crate) fn prefix_is_clean(prog: &IrProg, open_pc: usize) -> Result<(), SkipR
     }
 }
 
-/// 前缀效果准入：允许退出型异常块（处理器必 Return/Raise 收尾，异常路径
-/// 不 reach 区域），其余调用/动态 SQL/正常路径 RAISE 仍拒绝。
-pub(crate) fn reject_prefix_effects(prog: &IrProg, open_pc: usize) -> Result<(), SkipReason> {
-    let handlers = exit_only_handlers(prog, open_pc)?;
+/// 前缀效果准入：允许异常块（处理器体完全位于前缀且体内跳转不落入
+/// 区域内部，见 prefix_handler_ranges），其余调用/动态 SQL/正常路径
+/// RAISE 仍拒绝。
+pub(crate) fn reject_prefix_effects(
+    prog: &IrProg,
+    region: &CursorRegion,
+) -> Result<(), SkipReason> {
+    let handlers = prefix_handler_ranges(prog, region)?;
     let in_handler = |pc: usize| handlers.iter().any(|(s, e)| pc >= *s && pc < *e);
-    for (pc, stmt) in prog.code[..open_pc].iter().enumerate() {
+    for (pc, stmt) in prog.code[..region.open_pc].iter().enumerate() {
         if in_handler(pc) {
             continue;
         }
@@ -75,35 +79,40 @@ pub(crate) fn reject_prefix_effects(prog: &IrProg, open_pc: usize) -> Result<(),
     Ok(())
 }
 
-/// 收集前缀内全部 PushTrap 的处理器体区间，并逐一证明其为"退出型"：
-/// 体完全位于前缀、内部无跳转/嵌套 trap、末指令必 Return/Raise。
-/// 任一不满足 = 异常路径可能落回区域，保守拒绝（ExceptionScopePresent）。
-fn exit_only_handlers(prog: &IrProg, open_pc: usize) -> Result<Vec<(usize, usize)>, SkipReason> {
+/// 收集前缀内全部 PushTrap 的处理器体区间。处理器体须完全位于前缀、
+/// 末指令为 Return/Raise/无条件 Jump（顺序落入区域入口的 fallthrough
+/// 形态不可证，保守拒绝），且体内跳转不得落入区域内部（open_pc <
+/// target <= close_pc）：落点为 open_pc（正常进区域）或区域外（留在
+/// 前缀/跳入后缀）均由解释器按原 PC 语义处理；落入区域内部会绕过
+/// 批写入口证明，保守拒绝（ExceptionScopePresent）。
+fn prefix_handler_ranges(
+    prog: &IrProg,
+    region: &CursorRegion,
+) -> Result<Vec<(usize, usize)>, SkipReason> {
     let mut ranges = Vec::new();
-    for stmt in &prog.code[..open_pc] {
+    for stmt in &prog.code[..region.open_pc] {
         let IrStmt::PushTrap { entries } = stmt else {
             continue;
         };
         for e in entries {
-            if e.body_start >= e.body_end || e.body_end > open_pc {
+            if e.body_start >= e.body_end || e.body_end > region.open_pc {
                 return Err(SkipReason::ExceptionScopePresent);
             }
-            let body = &prog.code[e.body_start..e.body_end];
-            for st in &body[..body.len() - 1] {
-                if matches!(
-                    st,
-                    IrStmt::Jump(_)
-                        | IrStmt::JumpIf { .. }
-                        | IrStmt::JumpIfNot { .. }
-                        | IrStmt::PushTrap { .. }
-                        | IrStmt::PopTrap
-                ) {
+            if !matches!(
+                prog.code.get(e.body_end - 1),
+                Some(IrStmt::Return { .. }) | Some(IrStmt::Raise { .. }) | Some(IrStmt::Jump(_))
+            ) {
+                return Err(SkipReason::ExceptionScopePresent);
+            }
+            for st in &prog.code[e.body_start..e.body_end] {
+                let target = match st {
+                    IrStmt::Jump(t) => Some(*t),
+                    IrStmt::JumpIf { to, .. } | IrStmt::JumpIfNot { to, .. } => Some(*to),
+                    _ => None,
+                };
+                if target.is_some_and(|t| t > region.open_pc && t <= region.close_pc) {
                     return Err(SkipReason::ExceptionScopePresent);
                 }
-            }
-            match body.last() {
-                Some(IrStmt::Return { .. }) | Some(IrStmt::Raise { .. }) => {}
-                _ => return Err(SkipReason::ExceptionScopePresent),
             }
             ranges.push((e.body_start, e.body_end));
         }
@@ -235,44 +244,6 @@ pub(crate) fn select_from_target(sql: &str) -> Option<String> {
     words.get(from_pos + 1).cloned()
 }
 
-/// 出口活跃变量检查（§4.2）：区域内赋值的变量不得在后缀中被读取。
-pub(crate) fn live_out_check(prog: &IrProg, region: &CursorRegion) -> Result<(), SkipReason> {
-    let mut assigned = BTreeSet::new();
-    for stmt in &prog.code[region.open_pc..=region.close_pc] {
-        match stmt {
-            IrStmt::Assign {
-                target: AssignTarget::Var(v),
-                ..
-            } => {
-                assigned.insert(v.clone());
-            }
-            IrStmt::Fetch { targets, .. } => {
-                for t in targets {
-                    if let AssignTarget::Var(v) = t {
-                        assigned.insert(v.clone());
-                    }
-                }
-            }
-            IrStmt::SqlQuery { into, .. } => {
-                for t in into {
-                    if let AssignTarget::Var(v) = t {
-                        assigned.insert(v.clone());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut reads = BTreeSet::new();
-    for stmt in &prog.code[region.close_pc + 1..] {
-        collect_stmt_reads(stmt, &mut reads);
-    }
-    if assigned.intersection(&reads).next().is_some() {
-        return Err(SkipReason::LiveOutState);
-    }
-    Ok(())
-}
-
 /// 循环不变变量证明（§4.4 B1）：变量在区域体（含处理器）内无任何赋值
 /// （Assign/Fetch/SqlQuery INTO）即为循环不变，可作静态过滤绑定单值携带。
 pub(crate) fn var_invariant_in_region(prog: &IrProg, region: &CursorRegion, var: &VarName) -> bool {
@@ -356,9 +327,14 @@ fn collect_expr_reads(expr: &IrExpr, out: &mut BTreeSet<VarName>) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::live_out_check;
     use super::super::loop_prog;
     use super::*;
     use crate::ir::BufferPolicy;
+
+    fn region(prog: &IrProg) -> CursorRegion {
+        super::super::extract(prog).unwrap()
+    }
 
     #[test]
     fn should_accept_clean_prefix_ending_with_commit() {
@@ -370,7 +346,7 @@ mod tests {
             buffer_policy: BufferPolicy::Immediate,
         };
         prog.code[1] = IrStmt::TxCommit;
-        assert_eq!(prefix_is_clean(&prog, 2), Ok(()));
+        assert_eq!(prefix_is_clean(&prog, &region(&prog)), Ok(()));
     }
 
     #[test]
@@ -383,7 +359,7 @@ mod tests {
             buffer_policy: BufferPolicy::Immediate,
         };
         assert_eq!(
-            prefix_is_clean(&prog, 1),
+            prefix_is_clean(&prog, &region(&prog)),
             Err(SkipReason::TransactionBoundaryInsideLoop)
         );
     }
@@ -391,7 +367,7 @@ mod tests {
     #[test]
     fn should_accept_empty_prefix() {
         let prog = loop_prog(0, 0);
-        assert_eq!(prefix_is_clean(&prog, 0), Ok(()));
+        assert_eq!(prefix_is_clean(&prog, &region(&prog)), Ok(()));
     }
 
     #[test]
@@ -399,7 +375,7 @@ mod tests {
         let mut prog = loop_prog(1, 0);
         prog.code[0] = IrStmt::Jump(0);
         assert_eq!(
-            prefix_is_clean(&prog, 1),
+            prefix_is_clean(&prog, &region(&prog)),
             Err(SkipReason::UnsupportedControlFlow)
         );
     }
@@ -413,7 +389,7 @@ mod tests {
             into: vec![AssignTarget::Var(VarName("v".into()))],
             fn_sites: Vec::new(),
         };
-        assert_eq!(prefix_is_clean(&prog, 1), Ok(()));
+        assert_eq!(prefix_is_clean(&prog, &region(&prog)), Ok(()));
     }
 
     #[test]
@@ -426,7 +402,7 @@ mod tests {
             buffer_policy: BufferPolicy::Immediate,
         };
         prog.code[1] = IrStmt::TxRollback;
-        assert_eq!(prefix_is_clean(&prog, 2), Ok(()));
+        assert_eq!(prefix_is_clean(&prog, &region(&prog)), Ok(()));
     }
 
     #[test]
@@ -438,7 +414,7 @@ mod tests {
             out_targets: Vec::new(),
         };
         assert_eq!(
-            prefix_is_clean(&prog, 1),
+            prefix_is_clean(&prog, &region(&prog)),
             Err(SkipReason::TransactionBoundaryInsideLoop)
         );
     }

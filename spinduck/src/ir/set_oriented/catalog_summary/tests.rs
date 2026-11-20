@@ -447,3 +447,107 @@ fn should_reject_single_return_self_recursion_as_impure() {
     assert!(matches!(summarize(&cat, "f_self"), Summary::Impure));
     assert!(inline_pure_call(&cat, "f_self", &[IrExpr::Const(SpinValue::Int(1))]).is_none());
 }
+
+#[test]
+fn should_inline_nested_trap_multi_into_with_out_params_as_lookup_chain() {
+    // fnc_com_get_seat_para 形态：非常量前缀赋值 + 嵌套 trap 兜底链 +
+    // 多目标 INTO（局部变量与 OUT 形参混合）+ 拼接 RETURN。
+    // 每个 INTO 目标折叠为计数门控 Lookup；OUT 形参写回表达式随调用返回。
+    let f = compile(
+        "CREATE FUNCTION f_chain(p_d VARCHAR2, p_f VARCHAR2, p_k VARCHAR2, \
+         p_o_flag OUT VARCHAR2, p_o_rate OUT NUMBER) RETURN VARCHAR2 IS \
+         v_a VARCHAR2(8); v_b VARCHAR2(8); v_k VARCHAR2(8); \
+         BEGIN \
+         v_a := ''; v_b := ''; v_k := ''; \
+         v_k := substr(p_k, 1, 2) || '00'; \
+         BEGIN \
+         SELECT t.c1, t.c2, t.c3 INTO v_a, v_b, p_o_flag \
+         FROM par_t t WHERE t.f = p_f AND t.k = v_k AND p_d BETWEEN t.d1 AND t.d2; \
+         EXCEPTION WHEN OTHERS THEN \
+         BEGIN \
+         SELECT t.c1, t.c2, t.c3 INTO v_a, v_b, p_o_flag \
+         FROM par_t t WHERE t.f = '000000' AND t.k = v_k; \
+         EXCEPTION WHEN OTHERS THEN \
+         v_a := '1'; v_b := '2'; p_o_flag := '0'; \
+         END; \
+         END; \
+         RETURN v_a || p_o_flag; END;",
+    );
+    let cat = catalog_with(&[f]);
+    assert!(
+        matches!(summarize(&cat, "f_chain"), Summary::PureExpr(_)),
+        "嵌套 trap 多 INTO + OUT 形态须折叠为 PureExpr"
+    );
+    let args = [
+        IrExpr::Field {
+            rec: VarName("r".into()),
+            field: "bcrq".into(),
+        },
+        IrExpr::Field {
+            rec: VarName("r".into()),
+            field: "fund_code".into(),
+        },
+        IrExpr::Field {
+            rec: VarName("r".into()),
+            field: "stock_kind".into(),
+        },
+        IrExpr::Var(VarName("v_flag".into())),
+        IrExpr::Var(VarName("v_rate".into())),
+    ];
+    let call = inline_pure_call(&cat, "f_chain", &args).expect("inline chain");
+    // 返回值 = v_a || p_o_flag：两侧都须是 Lookup（拼接两级兜底链）。
+    let IrExpr::Bin {
+        op: BinOp::Concat,
+        l,
+        r,
+    } = &call.expr
+    else {
+        panic!("返回值须为拼接: {:?}", call.expr);
+    };
+    assert!(matches!(l.as_ref(), IrExpr::Lookup { .. }), "左项须 Lookup");
+    assert!(matches!(r.as_ref(), IrExpr::Lookup { .. }), "右项须 Lookup");
+    // OUT 写回：p_o_flag（下标 3）表达式为 Lookup，p_o_rate（下标 4）体内未写 → 无条目。
+    assert_eq!(call.outs.len(), 1, "仅 p_o_flag 被写回: {:?}", call.outs);
+    let (idx, oexpr) = &call.outs[0];
+    assert_eq!(*idx, 3);
+    let IrExpr::Lookup { query, default, .. } = oexpr else {
+        panic!("OUT 写回须为 Lookup: {oexpr:?}");
+    };
+    // 兜底链：外层默认值本身是内层 Lookup（内层 query 含 '000000' 兜底谓词）。
+    let IrExpr::Lookup {
+        query: inner_q,
+        default: inner_d,
+        ..
+    } = default.as_ref()
+    else {
+        panic!("外层 Lookup 默认值须为内层 Lookup: {default:?}");
+    };
+    assert!(inner_q.contains("'000000'"), "内层须为兜底查询: {inner_q}");
+    assert!(
+        matches!(inner_d.as_ref(), IrExpr::Const(_)),
+        "最内兜底须常量"
+    );
+    assert!(query.contains("par_t"), "外层 query 须含维表: {query}");
+}
+
+#[test]
+fn should_reject_handler_write_to_non_into_target() {
+    // handler 段对非 INTO 目标的赋值是条件写回，env 无法表达 → 拒绝。
+    let f = compile(
+        "CREATE FUNCTION f_bad(p_x VARCHAR2) RETURN VARCHAR2 IS \
+         v_a VARCHAR2(8); v_b VARCHAR2(8); \
+         BEGIN \
+         v_a := ''; v_b := ''; \
+         BEGIN \
+         SELECT t.c1 INTO v_a FROM par_t t WHERE t.f = p_x; \
+         EXCEPTION WHEN OTHERS THEN \
+         v_a := '1'; v_b := '2'; \
+         END; \
+         RETURN v_a; END;",
+    );
+    let cat = catalog_with(&[f]);
+    assert!(
+        matches!(summarize(&cat, "f_bad"), Summary::Impure),
+        "handler 写非 INTO 目标须拒绝"
+    );
+}

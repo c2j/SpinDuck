@@ -4,7 +4,9 @@ use super::*;
 
 mod agg_walk;
 mod arith_walk;
+mod call;
 mod insert_log;
+mod mixed;
 use agg_walk::agg_candidates;
 
 /// IF 门种类：§3.4 聚合字段覆写 / §3.3 条件算术覆写（THEN 恰一条赋值，
@@ -47,6 +49,8 @@ pub(super) struct Body<'a> {
     agg_candidates: std::collections::BTreeSet<VarName>,
     /// 当前 IF 门：(种类, 汇合点 pc)；pc 到达汇合点即失效。
     gate: Option<(Gate, usize)>,
+    /// 混合兜底 trap 保护区深度 0 SELECT INTO 的待定查找（pc → 查找）。
+    pending_lookups: std::collections::BTreeMap<usize, lookup::LookupQuery>,
     /// §3.3 条件算术覆写：IF 门内 `var := <DECIMAL 乘/减>`。
     pub arith_writes: Vec<ArithWrite>,
 }
@@ -73,6 +77,9 @@ impl<'a> Body<'a> {
             }
         }
         let stmt = &ctx.prog.code[pc];
+        if self.pending_lookups.contains_key(&pc) {
+            return self.pending_lookup(pc);
+        }
         match stmt {
             IrStmt::PushTrap { .. } => return self.trap(ctx, pc),
             IrStmt::SqlExec { .. } => {
@@ -165,6 +172,9 @@ impl<'a> Body<'a> {
             self.has_trap = true;
             return Ok(resume);
         }
+        if let Some(resume) = self.mixed_trap(ctx, pc)? {
+            return Ok(resume);
+        }
         if let Some(resume) = self.insert_log_trap(ctx, pc)? {
             return Ok(resume);
         }
@@ -255,7 +265,7 @@ impl<'a> Body<'a> {
 
     fn assign(
         &mut self,
-        ctx: &Context<'_, '_>,
+        ctx: &Context<'a, '_>,
         v: &VarName,
         expr: &IrExpr,
     ) -> Result<(), SkipReason> {
@@ -293,79 +303,6 @@ impl<'a> Body<'a> {
                     .map(|l| l.var.clone())
                     .collect(),
             );
-        }
-        Ok(())
-    }
-
-    /// 函数调用赋值：LookupTuple 内联优先，纯函数符号内联兜底。
-    fn assign_call(
-        &mut self,
-        ctx: &Context<'_, '_>,
-        v: &VarName,
-        name: &str,
-        args: &[IrExpr],
-    ) -> Result<(), SkipReason> {
-        self.reject_reassignment(v)?;
-        let site = catalog_summary::CallSite {
-            args,
-            ret_var: v,
-            prog: ctx.prog,
-            region: ctx.region,
-            record: &ctx.region.record,
-        };
-        if let Some(tq) = catalog_summary::tuple_query(ctx.catalog, name, &site)? {
-            for slot in &tq.slots {
-                self.reject_slot(&slot.var)?;
-            }
-            self.tuple_vars
-                .extend(tq.slots.iter().map(|s| s.var.clone()));
-            self.tuples.push(tq);
-            return Ok(());
-        }
-        let call = catalog_summary::inline_pure_call(ctx.catalog, name, args)
-            .ok_or(SkipReason::UnsupportedCall)?;
-        catalog_summary::resolve_locals(&mut self.inlined);
-        self.record_checks(v, call.checks);
-        match call.expr {
-            IrExpr::Const(c) => self.folded.push((v.clone(), c)),
-            expr => self.inlined.push((v.clone(), expr)),
-        }
-        Ok(())
-    }
-
-    /// 处理器内 noop 调用放行，其余例程调用拒绝。
-    fn call_noop(
-        &self,
-        ctx: &Context<'_, '_>,
-        pc: usize,
-        name: &str,
-        args: &[IrExpr],
-        out_targets: &[Option<AssignTarget>],
-    ) -> Result<(), SkipReason> {
-        if !region::in_handler_body(ctx.prog, ctx.region, pc)
-            || !catalog_summary::call_is_noop(ctx.catalog, ctx.prog, name, args, out_targets)
-        {
-            return Err(SkipReason::UnsupportedCall);
-        }
-        Ok(())
-    }
-
-    /// LookupTuple 槽位变量与既有绑定/查找/写汇冲突即拒绝。
-    fn reject_slot(&self, v: &VarName) -> Result<(), SkipReason> {
-        if self.folded.iter().any(|(fv, _)| fv == v)
-            || self.inlined.iter().any(|(iv, _)| iv == v)
-            || self.sinks.iter().any(|(sv, _, _, _)| sv == v)
-            || self.lookups.iter().any(|l| l.var == *v)
-            || self.tuple_vars.contains(v)
-        {
-            return Err(SkipReason::UnsupportedControlFlow);
-        }
-        Ok(())
-    }
-
-    fn reject_reassignment(&self, v: &VarName) -> Result<(), SkipReason> {
-        if self.folded.iter().any(|(fv, _)| fv == v) || self.inlined.iter().any(|(iv, _)| iv == v) {
-            return Err(SkipReason::UnsupportedControlFlow);
         }
         Ok(())
     }

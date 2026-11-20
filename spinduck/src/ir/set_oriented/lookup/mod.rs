@@ -6,9 +6,11 @@
 
 mod aggregate;
 mod lateral;
+mod mixed;
 mod parse;
 mod top1;
 mod tuple;
+pub(super) use mixed::mixed_fallback_group_at;
 pub(crate) use parse::parse_total;
 pub(crate) use parse::parse_tuple_total;
 pub(super) use tuple::render_tuple;

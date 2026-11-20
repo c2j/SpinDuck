@@ -1,9 +1,13 @@
 //! 含 Trap 闭包的 SESE 游标区域抽取（V2 §4.2；原始 IR 只读）。
 
 mod insert_log;
+mod liveout;
+mod mixed;
 mod proof;
 mod traps;
 pub(crate) use insert_log::*;
+pub(crate) use liveout::*;
+pub(crate) use mixed::*;
 pub(crate) use proof::*;
 pub(crate) use traps::*;
 

@@ -293,12 +293,12 @@ fn v2_admit(
     // §2.1 不变量 1：run_spanned 每段空陷阱栈起步，分段边界的静态陷阱
     // 深度必须为 0，否则边界两侧的异常处理语义无法跨段保持。
     region::reject_trap_boundaries(prog, &region)?;
-    region::reject_prefix_effects(prog, region.open_pc)?;
+    region::reject_prefix_effects(prog, &region)?;
     // 后缀不再做效果准入：RunSpan 在原 IrProg 上按原 PC 解释执行，
     // 例程调用、动态游标与 EXECUTE IMMEDIATE 均为解释器原生能力；
     // 变量依赖由 live_out_check 兜底（设计 §2.1/§4 V3A）。
     if mode == SetOrientedMode::BatchAtomic {
-        region::prefix_is_clean(prog, region.open_pc)?;
+        region::prefix_is_clean(prog, &region)?;
     }
     region::admit_effects(prog, &region, mode, catalog)?;
     region::trap_bodies_admissible(prog, &region, catalog)?;
