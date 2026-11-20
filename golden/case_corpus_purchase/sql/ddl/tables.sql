@@ -671,3 +671,559 @@ CREATE TABLE par_drv_config (
     event_type character varying(2) NOT NULL,
     accnt_book_code character varying(30)
 );
+
+-- 逐字取自基线 1_表结构/par_oper_venture.sql（hz_byfund 兄弟过程依赖；原随退役用例 case_corpus_hz_byfund 移出，2026-11-19 补回）
+CREATE TABLE par_oper_venture (
+    stock_kind_str character varying(200),
+    venture_name character varying(50),
+    market_code character varying(3) NOT NULL,
+    operation_kind character varying(5) NOT NULL
+);
+
+-- 逐字取自基线 1_表结构/dat_fund_xw_venture.sql（hz_byfund 兄弟过程依赖；原随退役用例 case_corpus_hz_byfund 移出，2026-11-19 补回）
+CREATE TABLE dat_fund_xw_venture (
+    fund_code character varying(8) NOT NULL,
+    xwdm character varying(6) NOT NULL,
+    bcrq character varying(8) NOT NULL,
+    qsje numeric(15,3),
+    scdm character varying(3) NOT NULL,
+    operation_kind character varying(5) NOT NULL,
+    trade_type character varying(1) DEFAULT '0'::character varying NOT NULL,
+    venture_type character varying(1),
+    qsje2 numeric(15,3)
+);
+
+-- 逐字取自基线 1_表结构/jyfy_temp.sql（hz_byfund 兄弟过程依赖；原随退役用例 case_corpus_hz_byfund 移出，2026-11-19 补回）
+CREATE TABLE jyfy_temp (
+    rfstreamid character varying(5),
+    gddm character varying(20),
+    subacct character varying(3),
+    ddbh character varying(16),
+    cjbh character varying(16),
+    sqbh character varying(16),
+    jydy character varying(5),
+    zqdm character varying(8),
+    sgsl numeric(15,0),
+    cjsl numeric(15,0),
+    cjjg numeric(11,3),
+    cjje numeric(16,2),
+    bcye numeric(15,0),
+    sbsj character varying(6),
+    cjsj character varying(6),
+    cjrq character varying(8),
+    bs character varying(1),
+    cjbz character varying(3),
+    kpbz character varying(1),
+    bdbz character varying(1),
+    bz character varying(3),
+    jyfy numeric(16,2),
+    cljg character varying(2),
+    text character varying(30),
+    data_date character varying(8),
+    user_code character varying(20)
+);
+
+-- 逐字取自基线 1_表结构/dic_stock_kind_sub.sql（hz_byfund 兄弟过程依赖；原随退役用例 case_corpus_hz_byfund 移出，2026-11-19 补回）
+CREATE TABLE dic_stock_kind_sub (
+    market_code character varying(3) NOT NULL,
+    stock_kind character varying(4) NOT NULL,
+    begin_code character varying(12) NOT NULL,
+    end_code character varying(12) NOT NULL,
+    descript character varying(40),
+    trade_unit numeric(5,0) DEFAULT 1,
+    operator character varying(10),
+    check_user character varying(10),
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20),
+    settle_type character varying(2)
+);
+
+-- 逐字取自基线 1_表结构/par_sys_marketrate.sql（fnc_com_get_seat_para 依赖；原随退役用例 case_corpus_hz_byfund 移出，2026-11-19 补回）
+CREATE TABLE par_sys_marketrate (
+    market_code character varying(3) NOT NULL,
+    par_code character varying(3) NOT NULL,
+    stock_kind character varying(4) NOT NULL,
+    par_kind numeric(1,0) NOT NULL,
+    par_name character varying(50),
+    par_value numeric(19,10) DEFAULT 0 NOT NULL,
+    min_value numeric(20,4) DEFAULT 0 NOT NULL,
+    max_value numeric(20,4) DEFAULT (9999999999::bigint)::numeric NOT NULL,
+    unit character varying(1),
+    min_tax numeric(15,4) DEFAULT 0 NOT NULL,
+    operator character varying(10),
+    check_user character varying(10),
+    inure_begin_date character varying(8) NOT NULL,
+    inure_end_date character varying(8) DEFAULT '99991231'::character varying,
+    par_day numeric(8,0) DEFAULT 0 NOT NULL,
+    stock_status character varying(2) DEFAULT '99'::character varying NOT NULL,
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20),
+    fund_age character varying(2) DEFAULT '0'::character varying NOT NULL
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/dic_all_kind.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE dic_all_kind (
+    operation_kind character varying(40) NOT NULL,
+    kind_id character varying(30) NOT NULL,
+    kind_name character varying(200),
+    remark character varying(4000),
+    remark2 character varying(40)
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_fund_rate_info.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_fund_rate_info (
+    fund_code character varying(8) NOT NULL,
+    oper_type character varying(2) NOT NULL,
+    rate_flag character varying(1),
+    inure_begin_date character varying(8) NOT NULL,
+    inure_end_date character varying(8) DEFAULT '99991231'::character varying,
+    operator character varying(10),
+    stock_kind character varying(4) DEFAULT '0200'::character varying NOT NULL,
+    tax_rate numeric(5,4) DEFAULT 0,
+    market_code character varying(3) DEFAULT '000'::character varying NOT NULL
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_sys_annuity_fund.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_sys_annuity_fund (
+    fund_name character varying(100) NOT NULL,
+    fund_type character varying(4) NOT NULL,
+    invest_type character varying(100),
+    start_date character varying(8),
+    duixi_mode character varying(2),
+    invest_period character varying(4),
+    fund_accrual_type character varying(2) DEFAULT '1'::character varying,
+    dividend_method character varying(2),
+    settle_method character varying(2),
+    operator character varying(20),
+    check_user character varying(20),
+    check_state character varying(1),
+    check_action character varying(1),
+    check_time character varying(20),
+    security_id character varying(100) NOT NULL,
+    manager_code character varying(4),
+    custody_code character varying(4),
+    coin_code character varying(3),
+    par_value numeric(12,8),
+    decimal_digits numeric(2,0),
+    cash_date character varying(8),
+    section_sum numeric(4,0),
+    pmll numeric(18,15),
+    pre_pmll numeric(18,15),
+    pay_type character varying(1),
+    rate_attribute character varying(2),
+    manager_kind character varying(20),
+    inure_begin_date character varying(8) NOT NULL,
+    inure_end_date character varying(8) NOT NULL,
+    first_date character varying(8),
+    if_capital character varying(1) DEFAULT '0'::character varying NOT NULL,
+    rsb_code character varying(20),
+    rsb_code_bak character varying(20),
+    fund_name_bak character varying(100)
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_sys_asset_security.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_sys_asset_security (
+    security_id character varying(19) NOT NULL,
+    publish_code character varying(20),
+    publish_name character varying(60),
+    publish_credit_rate character varying(10),
+    voucher_name character varying(50),
+    voucher_credit_rate character varying(10),
+    credit_rate character varying(10),
+    bond_amount numeric(18,2),
+    is_voucher character varying(1),
+    publish_begin_date character varying(8),
+    publish_end_date character varying(8),
+    par_bvalue numeric(12,8) DEFAULT 100,
+    par_value numeric(12,8) DEFAULT 100,
+    duixi_mode character varying(2),
+    start_date character varying(8),
+    cash_date character varying(8),
+    rate_attribute character varying(2) DEFAULT 0,
+    bond_benchmark numeric(8,4) DEFAULT 0,
+    decimal_digits numeric(2,0),
+    section_sum numeric(4,0),
+    divident_section numeric(4,0),
+    pmll numeric(18,15),
+    bond_type character varying(1),
+    operator character varying(10),
+    check_user character varying(10),
+    inure_begin_date character varying(8) DEFAULT '19000101'::character varying NOT NULL,
+    inure_end_date character varying(8) DEFAULT '99991231'::character varying,
+    jdll numeric(12,8),
+    jzlv numeric(12,8),
+    pre_pmll numeric(18,15),
+    pay_type character varying(1),
+    coin_code character varying(3),
+    bond_accrual_type character varying(2) DEFAULT '1'::character varying,
+    bond_kind character varying(4) DEFAULT '0601'::character varying NOT NULL,
+    hqprice numeric(6,3) DEFAULT 0 NOT NULL,
+    pre_bond_accrual_type character varying(2) DEFAULT '1'::character varying,
+    pre_cash_date character varying(8) DEFAULT '99991231'::character varying,
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20),
+    main_market_code character varying(3),
+    main_stock_code character varying(12),
+    market_code character varying(3),
+    stock_code character varying(12),
+    stock_kind character varying(2),
+    stock_status character varying(2),
+    stock_short_name character varying(30),
+    in_type character varying(1),
+    stock_long_name character varying(100),
+    first_date character varying(8),
+    if_capital character varying(1) DEFAULT 1 NOT NULL,
+    isjrjg character varying(1),
+    hx_flag character varying(1)
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_sys_assurance.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_sys_assurance (
+    security_id character varying(19) NOT NULL,
+    security_kind character varying(4),
+    publish_code character varying(20),
+    publish_name character varying(60),
+    publish_credit_rate character varying(10),
+    bond_amount numeric(18,2),
+    par_value numeric(12,8) DEFAULT NULL::numeric,
+    duixi_mode character varying(2),
+    start_date character varying(8),
+    cash_date character varying(8),
+    rate_attribute character varying(2) DEFAULT NULL::character varying,
+    decimal_digits numeric(2,0),
+    section_sum numeric(4,0),
+    divident_section numeric(4,0),
+    pmll numeric(18,15),
+    operator character varying(10),
+    check_user character varying(10),
+    inure_begin_date character varying(8) DEFAULT '19000101'::character varying NOT NULL,
+    inure_end_date character varying(8) DEFAULT '99991231'::character varying,
+    pre_pmll numeric(18,15),
+    coin_code character varying(3),
+    bond_accrual_type character varying(2) DEFAULT NULL::character varying,
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20),
+    main_market_code character varying(3),
+    main_stock_code character varying(12),
+    market_code character varying(3),
+    stock_code character varying(12),
+    stock_kind character varying(2),
+    stock_status character varying(2),
+    stock_short_name character varying(30),
+    stock_long_name character varying(100),
+    in_type character varying(1),
+    if_capital character varying(1) DEFAULT 0,
+    inspercode character varying(8),
+    carry_method character varying(2)
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_sys_bond_right.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_sys_bond_right (
+    security_id character varying(19) NOT NULL,
+    dept_code character varying(8),
+    coin_code character varying(3) NOT NULL,
+    load_money numeric(20,8) DEFAULT 0 NOT NULL,
+    pmll numeric(18,15) DEFAULT 0 NOT NULL,
+    area_code character varying(4) NOT NULL,
+    duixi_mode character varying(2),
+    start_date character varying(8) NOT NULL,
+    cash_date character varying(8) NOT NULL,
+    decimal_digits numeric(2,0) NOT NULL,
+    section_sum numeric(4,0),
+    divident_section numeric(4,0),
+    bond_accrual_type character varying(2) DEFAULT '1'::character varying,
+    operator character varying(10) NOT NULL,
+    check_user character varying(10),
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20),
+    inure_begin_date character varying(8) NOT NULL,
+    inure_end_date character varying(8),
+    if_capital character varying(1) DEFAULT 1 NOT NULL,
+    first_date character varying(8),
+    publisher character varying(100),
+    exter_code character varying(15)
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_sys_debt_loan.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_sys_debt_loan (
+    security_id character varying(19) NOT NULL,
+    debt_loan_type character varying(20) NOT NULL,
+    coin_code character varying(3) NOT NULL,
+    interest_digit numeric(2,0) DEFAULT 8 NOT NULL,
+    debt_loan_month numeric(17,0) NOT NULL,
+    par_value numeric(17,2) NOT NULL,
+    interest_rate numeric(11,8) NOT NULL,
+    start_day character varying(8) NOT NULL,
+    end_day character varying(8) NOT NULL,
+    accrual_type character varying(2) NOT NULL,
+    settlement_frequency character varying(2) NOT NULL,
+    accrual_algorithm character varying(8) NOT NULL,
+    interest_date_first character varying(8) NOT NULL,
+    inure_begin_date character varying(8) NOT NULL,
+    inure_end_date character varying(8) DEFAULT '99991231'::character varying NOT NULL,
+    check_user character varying(10),
+    operator character varying(10),
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20),
+    debt_loan_name character varying(200)
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_sys_entrust.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_sys_entrust (
+    security_id character varying(19) NOT NULL,
+    coin_code character varying(3) NOT NULL,
+    entrust_type character varying(4) DEFAULT '0801'::character varying NOT NULL,
+    organ character varying(200),
+    entrust_time numeric(17,0) NOT NULL,
+    section_sum numeric(4,0),
+    trust_manager character varying(100),
+    account_bank character varying(100),
+    entrust_area numeric(19,10) DEFAULT 0,
+    fund_limit numeric(17,2) DEFAULT 0,
+    expect_income numeric(17,4),
+    start_day character varying(8) NOT NULL,
+    end_day character varying(8) NOT NULL,
+    rate_attribute character varying(2) NOT NULL,
+    duixi_mode character varying(2) DEFAULT '1'::character varying NOT NULL,
+    accrual_type character varying(2) DEFAULT '3'::character varying NOT NULL,
+    operator character varying(10),
+    check_user character varying(10),
+    inure_begin_date character varying(8) DEFAULT '19000101'::character varying NOT NULL,
+    inure_end_date character varying(8) DEFAULT '99991231'::character varying NOT NULL,
+    investor character varying(4),
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20),
+    invest_type numeric(1,0),
+    return_account character varying(40),
+    par_value numeric(17,2) DEFAULT 1 NOT NULL,
+    decimal_digits numeric(2,0) DEFAULT 8 NOT NULL,
+    rate numeric(14,10),
+    accrual_mode numeric(1,0) DEFAULT 1 NOT NULL,
+    base_interest_rate character varying(50),
+    base_interest_rate_name character varying(100),
+    float_frequency character varying(2),
+    float_percent numeric(9,6),
+    interest_rate_sub numeric(9,6),
+    agree_date character varying(8),
+    f_update_date_real character varying(8),
+    total_fee_rate numeric(9,6),
+    first_date character varying(8),
+    if_capital character varying(1) DEFAULT '0'::character varying NOT NULL,
+    redeemtax_flag character varying(1),
+    redeemtax_date character varying(8),
+    financ_flag character varying(1),
+    entr_class1_cbrc character varying(2),
+    entr_class2_cbrc character varying(4),
+    bottom_class1_cbrc character varying(4),
+    bottom_class2_cbrc character varying(2),
+    acc_recom_fee_rate numeric(9,6),
+    acc_recom_fee_type character varying(2),
+    is_acc_recom_fee character varying(1),
+    fh_method character varying(2)
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_sys_financial_product.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_sys_financial_product (
+    security_id character varying(19) NOT NULL,
+    financial_code character varying(8) NOT NULL,
+    financial_kind character varying(4) NOT NULL,
+    bank_code character varying(4) NOT NULL,
+    publish_amount numeric(25,8) DEFAULT 0 NOT NULL,
+    pmll numeric(18,15) DEFAULT 0 NOT NULL,
+    duixi_mode character varying(2),
+    start_date character varying(8) NOT NULL,
+    cash_date character varying(8) NOT NULL,
+    decimal_digits numeric(2,0) NOT NULL,
+    section_sum numeric(4,0),
+    divident_section numeric(4,0),
+    bond_accrual_type character varying(2) DEFAULT '1'::character varying,
+    zs_flag character varying(1) NOT NULL,
+    operator character varying(10) NOT NULL,
+    check_user character varying(10),
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20),
+    inure_begin_date character varying(8) NOT NULL,
+    inure_end_date character varying(8),
+    open_flag character varying(1),
+    fee numeric(20,8) DEFAULT 0,
+    end_date character varying(8),
+    endtime character varying(1),
+    pro_level character varying(1),
+    pur_trd_mode character varying(2),
+    pur_sur_mode character varying(2),
+    amount_sur_date character varying(8),
+    pur_delay_mode character varying(2),
+    deduct_delay_day numeric(8,0),
+    delay_sur_day numeric(8,0),
+    regit_date character varying(8),
+    get_date character varying(8),
+    re_trd_mode character varying(2),
+    re_sur_mode character varying(2),
+    re_amount_sur_date character varying(8),
+    re_delay_mode character varying(2),
+    re_delay_day numeric(8,0),
+    re_pay_date character varying(8),
+    re_pay_day numeric(8,0),
+    auto_pay_delay_day numeric(8,0),
+    distribution_type character varying(2),
+    dqqydj_date character varying(8),
+    dqdfpc character varying(10),
+    dqdf_date numeric(8,0),
+    qs_accouont character varying(19),
+    is_finacial character varying(2),
+    income_type character varying(2),
+    sale_cash_rate numeric(15,6),
+    if_capital character varying(1) DEFAULT '0'::character varying NOT NULL
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_sys_annuity_fund_sect.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_sys_annuity_fund_sect (
+    section_num numeric(4,0) NOT NULL,
+    seq_no numeric(2,0) NOT NULL,
+    start_date character varying(8),
+    end_date character varying(8),
+    act_cqdate character varying(8),
+    pmll numeric(18,15),
+    operator character varying(20),
+    check_user character varying(20),
+    check_state character varying(1),
+    check_action character varying(1),
+    check_time character varying(20),
+    security_id character varying(100) NOT NULL
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_sys_assr_section.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_sys_assr_section (
+    security_id character varying(19) NOT NULL,
+    section_num numeric(4,0) NOT NULL,
+    seq_no numeric(2,0) DEFAULT 1 NOT NULL,
+    start_date character varying(8),
+    end_date character varying(8),
+    act_cqdate character varying(8),
+    pmll numeric(18,15),
+    pre_pmll numeric(18,15),
+    operator character varying(10),
+    check_user character varying(10),
+    factor numeric(18,15) DEFAULT 1,
+    jcll numeric(18,15) DEFAULT 0,
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20)
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_sys_asst_section.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_sys_asst_section (
+    security_id character varying(19) NOT NULL,
+    section_num numeric(4,0) NOT NULL,
+    seq_no numeric(2,0) DEFAULT 1 NOT NULL,
+    start_date character varying(8),
+    end_date character varying(8),
+    act_cqdate character varying(8),
+    pmll numeric(18,15),
+    pre_pmll numeric(18,15),
+    operator character varying(10),
+    check_user character varying(10),
+    factor numeric(18,15) DEFAULT 1,
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20)
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_sys_bond_right_section.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_sys_bond_right_section (
+    security_id character varying(19) NOT NULL,
+    section_num numeric(4,0) NOT NULL,
+    seq_no numeric(2,0) NOT NULL,
+    start_date character varying(8),
+    end_date character varying(8),
+    act_cqdate character varying(8),
+    rate numeric(18,15),
+    operator character varying(10) NOT NULL,
+    check_user character varying(10),
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20)
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_sys_bond_section.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_sys_bond_section (
+    security_id character varying(19) NOT NULL,
+    section_num numeric(4,0) NOT NULL,
+    seq_no numeric(2,0) DEFAULT 1 NOT NULL,
+    start_date character varying(8),
+    end_date character varying(8),
+    act_cqdate character varying(8),
+    pmll numeric(18,15),
+    pre_pmll numeric(18,15),
+    operator character varying(10),
+    check_user character varying(10),
+    factor numeric(18,15) DEFAULT 1,
+    jcll numeric(18,15) DEFAULT 0,
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20)
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_sys_debt_loan_section.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_sys_debt_loan_section (
+    security_id character varying(19) NOT NULL,
+    section_num numeric(4,0) NOT NULL,
+    seq_no numeric(2,0) DEFAULT 1 NOT NULL,
+    start_date character varying(8),
+    end_date character varying(8),
+    act_cqdate character varying(8),
+    pmll numeric(28,15),
+    pre_pmll numeric(28,15),
+    operator character varying(10),
+    check_user character varying(10),
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20),
+    debt_loan_name character varying(200)
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_sys_entrust_section.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_sys_entrust_section (
+    security_id character varying(19) NOT NULL,
+    section_num numeric(4,0) NOT NULL,
+    seq_no numeric(2,0) DEFAULT 1 NOT NULL,
+    start_date character varying(8),
+    end_date character varying(8),
+    act_cqdate character varying(8),
+    pmll numeric(28,15),
+    pre_pmll numeric(28,15),
+    operator character varying(10),
+    check_user character varying(10),
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20)
+);
+
+-- 逐字取自退役语料 case_corpus_hz_byfund sql/ddl/tables/par_sys_financial_product_sect.sql（hz_byfund 依赖闭包补齐）
+CREATE TABLE par_sys_financial_product_sect (
+    security_id character varying(19) NOT NULL,
+    section_num numeric(4,0) NOT NULL,
+    seq_no numeric(2,0) DEFAULT 1 NOT NULL,
+    start_date character varying(8),
+    end_date character varying(8),
+    act_cqdate character varying(8),
+    pmll numeric(18,15),
+    operator character varying(10),
+    check_user character varying(10),
+    check_state character varying(1) DEFAULT '1'::character varying,
+    check_action character varying(1),
+    check_time character varying(20),
+    segment_type character varying(1) DEFAULT '1'::character varying,
+    min_money numeric(20,2),
+    max_money numeric(20,2),
+    dividend_regi_date character varying(8),
+    dividend_cash_date character varying(8)
+);
