@@ -6,12 +6,31 @@ use super::{BindSrc, OptimizeCtx, SkipReason};
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
 
+/// 批写前的例程物化前导（游标 WHERE fn_site）：与解释器 OpenCursor
+/// 时 `materialize_fn_sites` 同口径——distinct 元组查询 → 逐元组调用
+/// 例程 → 临时缓存表 `(sd_v, sd_a0…)`，批写 SQL 内相关子查询命中。
+#[derive(Clone)]
+pub(crate) struct FnPrelude {
+    /// 缓存临时表名（与批写 SQL 中 `sd_fnN` 引用一致）。
+    pub table: String,
+    /// 例程名（物化期 `call_routine_value` 解析）。
+    pub name: String,
+    /// 去重元组查询（游标 site 为编译期原文，含源表与过滤）。
+    pub distinct_sql: String,
+    /// 元组查询绑定（IN 形参等，运行期按名从帧解析）。
+    pub binds: Vec<(String, BindSrc)>,
+    /// 例程形参个数（缓存表 sd_a0..sd_a{arity-1} 列数）。
+    pub arity: usize,
+}
+
 /// 结构准入与 SQL 生成的产物；入口守卫与后缀组装消费它。
 #[derive(Clone)]
 pub(crate) struct ConversionPlan {
     pub sql: String,
     /// 批写 SQL 的按名绑定（游标查询绑定 + INSERT 绑定合并）。
     pub(crate) binds: Vec<(String, BindSrc)>,
+    /// 批写前须物化的例程缓存表（游标 WHERE fn_site，按声明序执行）。
+    pub(crate) fn_preludes: Vec<FnPrelude>,
     pub tail_commit: bool,
     pub open_pc: usize,
     pub close_pc: usize,

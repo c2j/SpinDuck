@@ -88,6 +88,7 @@ fn load_inputs(
         return Ok(Err(SkipReason::UnknownObjectDependency));
     };
     if let Some(f) = &select.filter {
+        let fn_tables: Vec<String> = copy.fn_sites.iter().map(|s| s.table.clone()).collect();
         if let Err(reason) = filter::prove(
             f,
             &source,
@@ -95,6 +96,7 @@ fn load_inputs(
             &select.alias,
             copy.query_binds,
             copy.var_types,
+            &fn_tables,
         ) {
             return Ok(Err(reason));
         }
@@ -207,9 +209,23 @@ fn finish(
     )?;
     let binds = with_param_binds(copy, &generated, query_binds(copy, &resolved));
     let expr_guards = entry::bind_guards(generated.expr_guards, &binds)?;
+    // 游标 WHERE fn_site → 物化前导：distinct_sql 为编译期原文（含源表
+    // 与过滤），与解释器 OpenCursor 时 materialize_fn_sites 同口径。
+    let fn_preludes = copy
+        .fn_sites
+        .iter()
+        .map(|s| entry::FnPrelude {
+            table: s.table.clone(),
+            name: s.name.clone(),
+            distinct_sql: s.distinct_sql.clone(),
+            binds: s.binds.clone(),
+            arity: s.args.len(),
+        })
+        .collect();
     Ok(entry::ConversionPlan {
         sql: generated.sql,
         binds,
+        fn_preludes,
         tail_commit,
         open_pc: region.open_pc,
         close_pc: region.close_pc,

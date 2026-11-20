@@ -42,6 +42,77 @@ pub(super) fn prepare_dynamic_sql(
     Ok((unit.text, sites))
 }
 
+/// 单站物化产物（阶段一）：distinct 元组查询 + 逐元组例程调用的字面量行。
+struct SiteRows {
+    table: String,
+    arity: usize,
+    items: Vec<Vec<String>>,
+}
+
+/// 阶段一：解析绑定 → distinct 元组查询 → 逐元组 `call_routine_value`，
+/// 结果只收集为字面量行（不建表）。例程求值可触发异常处理器
+/// reset_session→ROLLBACK，事务性回退会撤销已发出的 CREATE OR REPLACE
+/// TEMP（目录 DDL 参与事务），故全部站点求值完成后才统一建表（阶段二）。
+fn eval_site(
+    table: &str,
+    name: &str,
+    distinct_sql: &str,
+    binds_src: &[(String, crate::ir::BindSrc)],
+    arity: usize,
+    env: &mut Env<'_>,
+) -> Result<SiteRows, EngineError> {
+    let max = crate::sql::sqlfn::MAX_TUPLES;
+    let binds = resolve_binds(binds_src, env.frame)?;
+    let mut st = env.ex.query(distinct_sql, &binds)?;
+    let rows = st.fetch_many(max + 1);
+    if rows.len() > max {
+        return Err(EngineError::business(
+            157,
+            format!("例程 {name} 的 SQL 上下文参数元组超过上界 {max}"),
+        ));
+    }
+    let mut items_all = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let v = crate::runtime::interp::routine::call_routine_value(env, name, row)?;
+        let mut items = vec![sql_literal(&v)];
+        items.extend(row.iter().map(sql_literal));
+        items_all.push(items);
+    }
+    Ok(SiteRows {
+        table: table.to_string(),
+        arity,
+        items: items_all,
+    })
+}
+
+/// 阶段二：统一 CREATE OR REPLACE TEMP + 分块 INSERT（求值全成功后执行，
+/// 回退无可撤销对象）。列名用 sd_ 保留前缀（与 plan::cache_subquery 同口径）。
+fn write_site(site: &SiteRows, ex: &dyn crate::exec::SqlExecutor) -> Result<(), EngineError> {
+    let mut cols = vec!["sd_v VARCHAR".to_string()];
+    for j in 0..site.arity {
+        cols.push(format!("sd_a{j} VARCHAR"));
+    }
+    ex.execute(
+        &format!(
+            "CREATE OR REPLACE TEMP TABLE {} ({})",
+            site.table,
+            cols.join(", ")
+        ),
+        &BindMap::new(),
+    )?;
+    for chunk in site.items.chunks(500) {
+        let tuples: Vec<String> = chunk
+            .iter()
+            .map(|items| format!("({})", items.join(", ")))
+            .collect();
+        ex.execute(
+            &format!("INSERT INTO {} VALUES {}", site.table, tuples.join(", ")),
+            &BindMap::new(),
+        )?;
+    }
+    Ok(())
+}
+
 /// SQL 上下文例程调用下沉物化（§8.3 路径②）。
 ///
 /// 语句文本中的调用点已在编译期替换为参数缓存子查询；此处在执行前逐元组
@@ -50,51 +121,65 @@ pub(super) fn materialize_fn_sites(
     sites: &[crate::sql::FnSite],
     env: &mut Env<'_>,
 ) -> Result<(), EngineError> {
-    let max = crate::sql::sqlfn::MAX_TUPLES;
-    for site in sites {
-        let binds = resolve_binds(&site.binds, env.frame)?;
-        let mut st = env.ex.query(&site.distinct_sql, &binds)?;
-        let rows = st.fetch_many(max + 1);
-        if rows.len() > max {
-            return Err(EngineError::business(
-                157,
-                format!("例程 {} 的 SQL 上下文参数元组超过上界 {max}", site.name),
-            ));
-        }
-        // 求值先于建表：例程求值可触发异常处理器 reset_session→ROLLBACK，
-        // 事务性回退会撤销已发出的 CREATE OR REPLACE TEMP（目录 DDL 参与事务），
-        // 使后续 INSERT 绑定到回退前的旧 schema。
-        let mut items_all = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let v = crate::runtime::interp::routine::call_routine_value(env, &site.name, row)?;
-            let mut items = vec![sql_literal(&v)];
-            items.extend(row.iter().map(sql_literal));
-            items_all.push(items);
-        }
-        let arity = site.args.len();
-        // 列名用 sd_ 保留前缀（与 plan::cache_subquery 同口径，避开 PL 变量命名空间）
-        let mut cols = vec!["sd_v VARCHAR".to_string()];
-        for j in 0..arity {
-            cols.push(format!("sd_a{j} VARCHAR"));
-        }
-        env.ex.execute(
-            &format!(
-                "CREATE OR REPLACE TEMP TABLE {} ({})",
-                site.table,
-                cols.join(", ")
-            ),
-            &BindMap::new(),
-        )?;
-        for chunk in items_all.chunks(500) {
-            let tuples: Vec<String> = chunk
-                .iter()
-                .map(|items| format!("({})", items.join(", ")))
-                .collect();
-            env.ex.execute(
-                &format!("INSERT INTO {} VALUES {}", site.table, tuples.join(", ")),
-                &BindMap::new(),
-            )?;
-        }
+    let evaled = sites
+        .iter()
+        .map(|site| {
+            eval_site(
+                &site.table,
+                &site.name,
+                &site.distinct_sql,
+                &site.binds,
+                site.args.len(),
+                env,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for site in &evaled {
+        write_site(site, env.ex)?;
+    }
+    Ok(())
+}
+
+/// 集合化区域的 fn_site 物化前导（`ConversionPlan::fn_preludes`）：
+/// 与解释器 OpenCursor 时点同口径的两阶段物化——全部 distinct 查询与
+/// 例程求值先行，全部成功后才统一建缓存表；任一失败直接上抛
+/// EngineError（与解释路径同点失败，绝不部分物化后续跑批写）。
+pub(crate) fn materialize_fn_preludes(
+    preludes: &[crate::ir::set_oriented::FnPrelude],
+    frame: &mut crate::runtime::Frame,
+    ex: &dyn crate::exec::SqlExecutor,
+    sink: &mut dyn crate::exec::TraceSink,
+    cat: &crate::catalog::RoutineCatalog,
+    var_types: &std::collections::BTreeMap<String, crate::types::SpinType>,
+) -> Result<(), EngineError> {
+    let mut env = Env {
+        frame,
+        ex,
+        sink,
+        cat,
+        depth: 0,
+        budget: super::DEFAULT_STEP_BUDGET,
+        batch: false,
+        wbuf: None,
+        current_error: None,
+        last_write_rows: 0,
+        var_types,
+    };
+    let evaled = preludes
+        .iter()
+        .map(|p| {
+            eval_site(
+                &p.table,
+                &p.name,
+                &p.distinct_sql,
+                &p.binds,
+                p.arity,
+                &mut env,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for site in &evaled {
+        write_site(site, ex)?;
     }
     Ok(())
 }

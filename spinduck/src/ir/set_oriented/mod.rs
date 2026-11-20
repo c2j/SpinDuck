@@ -22,7 +22,7 @@ mod schema;
 mod shape;
 mod vguard;
 
-pub(crate) use entry::{entry_ok, ConversionPlan};
+pub(crate) use entry::{entry_ok, ConversionPlan, FnPrelude};
 
 use super::{AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, VarName};
 use crate::catalog::{CompiledRoutine, ParamMode};
@@ -146,6 +146,9 @@ struct CopyLoop<'a> {
     pub(super) binds: &'a [(String, BindSrc)],
     /// 游标查询自身的绑定（WHERE 引用形参等），须随批写 SQL 一并携带。
     pub(super) query_binds: &'a [(String, BindSrc)],
+    /// 游标 WHERE 内 SQL 上下文例程调用（已证位于顶层 WHERE 之后）：
+    /// 由 FnPrelude 在批写前按 distinct 元组物化缓存表。
+    pub(super) fn_sites: &'a [crate::sql::FnSite],
     /// 变量类型表：过滤式无抛错证明裁决绑定值域（Varchar↔str / 数值↔num）。
     pub(super) var_types: &'a std::collections::BTreeMap<String, crate::types::SpinType>,
     pub(super) record: &'a VarName,

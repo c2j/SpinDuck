@@ -23,6 +23,7 @@ mod trace;
 pub(in crate::runtime) mod writebuf;
 
 pub(crate) use binds::resolve_binds;
+pub(crate) use dynamic::materialize_fn_preludes;
 use trace::spinduck_trace_event;
 
 /// 单次运行结果。

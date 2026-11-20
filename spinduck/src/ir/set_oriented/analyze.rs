@@ -21,6 +21,7 @@ struct Prepared<'a> {
     binds: &'a [(String, BindSrc)],
     query: &'a str,
     query_binds: &'a [(String, BindSrc)],
+    fn_sites: &'a [crate::sql::FnSite],
 }
 
 pub(super) fn analyze_region<'a>(
@@ -59,7 +60,7 @@ fn prepare<'a>(
     else {
         return Err(SkipReason::UnsupportedWrite);
     };
-    let (query, query_binds) = cursor_query(ctx)?;
+    let (query, query_binds, cursor_sites) = cursor_query(ctx)?;
     if !fn_sites.is_empty() {
         return Err(SkipReason::UnresolvedFnSite);
     }
@@ -73,6 +74,7 @@ fn prepare<'a>(
         binds,
         query,
         query_binds,
+        fn_sites: cursor_sites,
     })
 }
 
@@ -88,6 +90,7 @@ fn assemble<'a>(
         insert: parts.insert,
         binds: parts.binds,
         query_binds: parts.query_binds,
+        fn_sites: parts.fn_sites,
         var_types: &ctx.prog.var_types,
         record: &ctx.region.record,
         allow_filter: ctx.mode == SetOrientedMode::BatchAtomic && body.has_trap,
@@ -131,7 +134,7 @@ fn prove_param_binds(
     Ok(())
 }
 
-type CursorQuery<'a> = (&'a str, &'a [(String, BindSrc)]);
+type CursorQuery<'a> = (&'a str, &'a [(String, BindSrc)], &'a [crate::sql::FnSite]);
 
 fn cursor_query<'a>(ctx: &Context<'a, '_>) -> Result<CursorQuery<'a>, SkipReason> {
     let IrStmt::OpenCursor {
@@ -146,10 +149,58 @@ fn cursor_query<'a>(ctx: &Context<'a, '_>) -> Result<CursorQuery<'a>, SkipReason
     else {
         return Err(SkipReason::UnsupportedControlFlow);
     };
-    if !fn_sites.is_empty() {
+    // fn_site 准入：缓存子查询必须整体位于顶层 WHERE 之后（游标过滤
+    // 形态，byfund c_get_data 同型）。SELECT 列表计算列形态超出
+    // shape::select 承载面，保守拒绝（守护测试口径不变）；distinct_sql
+    // 引用其他 sd_fn 缓存表（嵌套下沉）同样拒绝。
+    if !fn_sites.is_empty() && (!sites_in_where(sql, fn_sites) || sites_nested(fn_sites)) {
         return Err(SkipReason::UnresolvedFnSite);
     }
-    Ok((sql, binds))
+    Ok((sql, binds, fn_sites))
+}
+
+/// distinct_sql 内出现任何 `sd_fn*` 标识符即视为嵌套物化依赖，拒绝。
+fn sites_nested(sites: &[crate::sql::FnSite]) -> bool {
+    sites.iter().any(|s| {
+        super::shape::Tokens::new(&s.distinct_sql)
+            .is_some_and(|t| t.words().iter().any(|w| w.starts_with("sd_fn")))
+    })
+}
+
+/// 每个 site 缓存表名的全部出现位置都在顶层 `where` 之后，且确实被引用。
+fn sites_in_where(sql: &str, sites: &[crate::sql::FnSite]) -> bool {
+    let Some(t) = super::shape::Tokens::new(sql) else {
+        return false;
+    };
+    let words = t.words();
+    let mut depth = 0i32;
+    let mut where_pos = None;
+    for (i, w) in words.iter().enumerate() {
+        match w.as_str() {
+            "(" => depth += 1,
+            ")" => depth -= 1,
+            "where" if depth == 0 => {
+                where_pos = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(wp) = where_pos else {
+        return false;
+    };
+    sites.iter().all(|s| {
+        let mut seen = false;
+        for (i, w) in words.iter().enumerate() {
+            if w == &s.table {
+                if i <= wp {
+                    return false;
+                }
+                seen = true;
+            }
+        }
+        seen
+    })
 }
 
 fn invariant_reads_disjoint(

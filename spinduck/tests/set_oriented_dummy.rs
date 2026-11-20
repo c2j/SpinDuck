@@ -248,6 +248,71 @@ fn should_reject_sys_dummy_block_when_not_total_and_verify_decimal_mul_sub() {
     scenario_decimal_overflow();
     scenario_inlined_out_arith();
     scenario_expr_params();
+    scenario_cursor_fnsite();
+}
+
+/// fnc_grp_mode：SQL 上下文下沉例程（游标 WHERE 内 fn_site 同型）。
+fn fnc_grp_mode() -> &'static str {
+    "CREATE FUNCTION fnc_grp_mode(p_grp VARCHAR) RETURN VARCHAR IS
+       v_mode VARCHAR2(10);
+     BEGIN
+       BEGIN
+         SELECT mode INTO v_mode FROM mode_map WHERE grp = p_grp;
+       EXCEPTION WHEN OTHERS THEN v_mode := '0'; END;
+       RETURN v_mode;
+     END;"
+}
+
+/// 游标 WHERE 内例程调用（byfund c_get_data 同型）：fn_site 缓存子查询
+/// 随游标过滤进入 sd_cur，须由 FnPrelude 物化后方可批写。
+fn caller_fnsite() -> &'static str {
+    "CREATE OR REPLACE PROCEDURE caller_fnsite(p_o_succeed OUT VARCHAR2) IS
+     BEGIN
+       p_o_succeed := '0';
+       FOR r IN SELECT security_id, val, tag FROM cur_rows a
+               WHERE fnc_grp_mode(a.grp) = '1' LOOP
+         INSERT INTO dst_rows(security_id, yj, tag)
+           VALUES (r.security_id, r.val, r.tag);
+       END LOOP;
+     END;"
+}
+
+/// ⑥ 游标 WHERE fn_site：Converted 且逐行同 Off（缓存表物化前导）。
+fn scenario_cursor_fnsite() {
+    let ddl: Vec<&str> = BASE_DDL
+        .iter()
+        .copied()
+        .map(|s| {
+            if s.starts_with("CREATE TABLE cur_rows") {
+                "CREATE TABLE cur_rows(security_id VARCHAR, grp VARCHAR, \
+                   val DECIMAL(20,6), tag VARCHAR)"
+            } else {
+                s
+            }
+        })
+        .chain([
+            "CREATE TABLE mode_map(grp VARCHAR, mode VARCHAR)",
+            "INSERT INTO mode_map VALUES ('G1','1'),('G2','0')",
+            "INSERT INTO cur_rows VALUES \
+               ('S1','G1',10.50,'a'),('S2','G2',20.25,'b'),('S3','G1',30.75,'c')",
+        ])
+        .collect();
+    let routines = [fnc_grp_mode(), caller_fnsite()];
+    let mut off = engine_with_routines(&ddl, SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_fnsite", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 2, "Off 语义基线: {expected_rows:?}");
+
+    let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_fnsite", &args()).unwrap();
+    let Status::Converted { .. } = eng.set_oriented_reports()[0].status.clone() else {
+        panic!(
+            "游标 fn_site 必须 Converted: {:?}",
+            eng.set_oriented_reports()
+        );
+    };
+    assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
 }
 
 /// ⑤ INSERT 参数复杂表达式：Converted 且逐行同 Off。

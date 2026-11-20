@@ -23,6 +23,10 @@ enum Dom {
 }
 
 /// 证明过滤式在全部输入上求值不抛错；通过则原文透传至批写 SQL。
+/// `fn_tables` 为本区域已准入 fn_site 的缓存表名集——WHERE 中形如
+/// `(SELECT sd_v FROM sd_fnN WHERE sd_aK IS NOT DISTINCT FROM (<实参>)…)`
+/// 的参数缓存子查询按 Dom::Str 操作数接纳，其内部实参递归要求全定义
+/// （列/绑定/字面量/substr/嵌套缓存子查询）；表名不在集合内一律拒绝。
 pub(super) fn prove(
     filter: &str,
     source: &Table,
@@ -30,6 +34,7 @@ pub(super) fn prove(
     alias: &Option<Name>,
     binds: &[(String, BindSrc)],
     var_types: &BTreeMap<String, SpinType>,
+    fn_tables: &[String],
 ) -> Result<(), SkipReason> {
     let t = Tokens::new(filter).ok_or(SkipReason::UnprovenQueryTotalness)?;
     let mut p = Prover {
@@ -39,6 +44,7 @@ pub(super) fn prove(
         alias,
         binds,
         var_types,
+        fn_tables,
     };
     p.or_expr()?;
     if !p.t.done() {
@@ -54,6 +60,7 @@ struct Prover<'a> {
     alias: &'a Option<Name>,
     binds: &'a [(String, BindSrc)],
     var_types: &'a BTreeMap<String, SpinType>,
+    fn_tables: &'a [String],
 }
 
 impl Prover<'_> {
@@ -78,7 +85,8 @@ impl Prover<'_> {
         if self.t.take("not") {
             return self.unary();
         }
-        if self.t.take("(") {
+        // `(SELECT …)` 是操作数而非分组——交给 predicate→operand 解析。
+        if !self.t.at_subquery() && self.t.take("(") {
             self.or_expr()?;
             return self.t.take(")").then_some(()).ok_or(bad);
         }
@@ -133,6 +141,10 @@ impl Prover<'_> {
 
     fn operand(&mut self) -> Result<Dom, SkipReason> {
         let bad = SkipReason::UnprovenQueryTotalness;
+        if self.t.at_subquery() {
+            self.t.take("(");
+            return self.cache_subquery();
+        }
         let word = self.t.peek().ok_or(bad)?.to_string();
         if self.t.take("substr") || self.t.take("substring") {
             return self.substr_call();
@@ -172,6 +184,60 @@ impl Prover<'_> {
             .find(|c| c.name == col)
             .ok_or(bad)?;
         Ok(kind_domain(&from.kind))
+    }
+
+    /// fn_site 参数缓存子查询（`(` 已消费）：
+    /// `SELECT sd_v FROM <已准入缓存表> WHERE sd_aK IS NOT DISTINCT FROM (<实参>)…)`。
+    /// 实参只允许全定义操作数（含嵌套缓存子查询）；返回 Dom::Str（sd_v 恒 VARCHAR）。
+    fn cache_subquery(&mut self) -> Result<Dom, SkipReason> {
+        let bad = SkipReason::UnprovenQueryTotalness;
+        if !self.t.take("select") || !self.t.take("sd_v") || !self.t.take("from") {
+            return Err(bad);
+        }
+        let table = self.t.name().ok_or(bad)?;
+        if !self.fn_tables.iter().any(|f| f == &table.0) {
+            return Err(bad);
+        }
+        if !self.t.take("where") {
+            return Err(bad);
+        }
+        loop {
+            let col = self.t.name().ok_or(bad)?;
+            if !is_cache_arg_col(&col.0) {
+                return Err(bad);
+            }
+            if !(self.t.take("is")
+                && self.t.take("not")
+                && self.t.take("distinct")
+                && self.t.take("from")
+                && self.t.take("("))
+            {
+                return Err(bad);
+            }
+            self.arg_operand()?;
+            if !self.t.take(")") {
+                return Err(bad);
+            }
+            if !self.t.take("and") {
+                break;
+            }
+        }
+        self.t.take(")").then_some(Dom::Str).ok_or(bad)
+    }
+
+    /// 缓存子查询实参：全定义操作数——裸操作数、括号嵌套或嵌套缓存子查询。
+    fn arg_operand(&mut self) -> Result<(), SkipReason> {
+        let bad = SkipReason::UnprovenQueryTotalness;
+        if self.t.at_subquery() {
+            self.t.take("(");
+            self.cache_subquery()?;
+            return Ok(());
+        }
+        if self.t.take("(") {
+            self.arg_operand()?;
+            return self.t.take(")").then_some(()).ok_or(bad);
+        }
+        self.operand().map(|_| ())
     }
 
     /// substr/substring 定宽截断（同语义，1-indexed）：首参必须字符串域，
@@ -226,6 +292,12 @@ fn kind_domain(kind: &str) -> Dom {
     } else {
         Dom::Unknown
     }
+}
+
+/// 缓存子查询关联列名：`sd_a` + 非空数字后缀。
+fn is_cache_arg_col(word: &str) -> bool {
+    word.strip_prefix("sd_a")
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn numeric_literal(word: &str) -> bool {

@@ -117,6 +117,18 @@ impl Engine {
                         sql: plan.sql.clone(),
                     },
                 );
+                // fn_site 物化前导：与解释器 OpenCursor 时点同口径，
+                // 失败直接上抛（同点失败语义），绝不部分物化后续跑批写。
+                if !plan.fn_preludes.is_empty() {
+                    crate::runtime::interp::materialize_fn_preludes(
+                        &plan.fn_preludes,
+                        frame,
+                        self.ex.as_ref(),
+                        sink,
+                        &self.catalog,
+                        &routine.prog.var_types,
+                    )?;
+                }
                 let rows = self.exec_region_sql(plan, frame, sink)?;
                 self.commit_region_tail(plan, rows, sink)?;
                 Ok(None)

@@ -137,6 +137,12 @@ impl Tokens {
         self.words.get(self.pos).map(String::as_str)
     }
 
+    /// 当前 token 为 `(` 且紧随 `select`（标量/缓存子查询起点判定）。
+    pub(super) fn at_subquery(&self) -> bool {
+        self.words.get(self.pos).is_some_and(|w| w == "(")
+            && self.words.get(self.pos + 1).is_some_and(|w| w == "select")
+    }
+
     pub(super) fn number(&mut self) -> Option<String> {
         let word = self.words.get(self.pos)?;
         if word.is_empty() || !word.chars().all(|c| c.is_ascii_digit()) {
