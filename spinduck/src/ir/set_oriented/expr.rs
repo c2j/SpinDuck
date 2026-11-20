@@ -1,8 +1,10 @@
 //! 原生写入表达式的类型/值域证明与列级守卫：DECIMAL 减法/abs、数值除法/round、concat。
 
 use super::schema::{Column, Table};
-use super::shape::{Name, Select, Tokens};
-use super::{BindSrc, SkipReason, VarName};
+use super::shape::{is_cache_arg_col, Name, Select, Tokens};
+use super::{BindSrc, CopyLoop, InsertSite, SkipReason, VarName};
+use crate::types::SpinType;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// 渲染后的写入表达式及其行级守卫（TRY_CAST 精确转换 + 可空性）。
 pub(super) struct GuardedExpr {
@@ -19,15 +21,8 @@ pub(super) fn prove(
     resolve: &mut impl FnMut(&VarName) -> Result<BoundExpr, SkipReason>,
 ) -> Result<GuardedExpr, SkipReason> {
     let mut t = Tokens::new(parameter).ok_or(SkipReason::UnprovenWriteCompleteness)?;
-    let mut p = Parser {
-        t: &mut t,
-        binds: region.binds,
-        record: region.record,
-        select: source.0,
-        source: source.1,
-        resolve,
-        guards: Vec::new(),
-    };
+    let (select, source) = source;
+    let mut p = Parser::new(&mut t, region, select, source, resolve);
     let (expr, _) = p.expr()?;
     if !p.t.done() {
         return Err(SkipReason::UnprovenWriteCompleteness);
@@ -37,6 +32,26 @@ pub(super) fn prove(
         result.guard = format!("({}) AND ({})", p.guards.join(") AND ("), result.guard);
     }
     Ok(result)
+}
+
+/// fn_site distinct 实参渲染：与 [`prove`] 同语法面，但产出裸表达式
+/// （无写汇 TRY_CAST 守卫）——供 `SELECT DISTINCT <实参> FROM sd_cur`
+/// 前导物化查询使用。解析期登记的行级守卫非空即拒绝（实参错误语义
+/// 无法在前导查询中复现，保守退回）。
+pub(super) fn render_arg(
+    text: &str,
+    region: &CopyLoop<'_>,
+    select: &Select,
+    source: &Table,
+    resolve: &mut impl FnMut(&VarName) -> Result<BoundExpr, SkipReason>,
+) -> Result<String, SkipReason> {
+    let mut t = Tokens::new(text).ok_or(SkipReason::UnprovenWriteCompleteness)?;
+    let mut p = Parser::new(&mut t, region, select, source, resolve);
+    let (expr, _) = p.expr()?;
+    if !p.t.done() || !p.guards.is_empty() {
+        return Err(SkipReason::UnprovenWriteCompleteness);
+    }
+    Ok(expr)
 }
 
 pub(super) struct BoundExpr {
@@ -77,8 +92,34 @@ struct Parser<'a> {
     record: &'a VarName,
     select: &'a Select,
     source: &'a Table,
+    sites: &'a [InsertSite],
+    in_params: &'a BTreeSet<String>,
+    var_types: &'a BTreeMap<String, SpinType>,
     resolve: &'a mut dyn FnMut(&VarName) -> Result<BoundExpr, SkipReason>,
     guards: Vec<String>,
+}
+
+impl<'a> Parser<'a> {
+    fn new(
+        t: &'a mut Tokens,
+        region: &'a CopyLoop<'a>,
+        select: &'a Select,
+        source: &'a Table,
+        resolve: &'a mut dyn FnMut(&VarName) -> Result<BoundExpr, SkipReason>,
+    ) -> Self {
+        Self {
+            t,
+            binds: region.binds,
+            record: region.record,
+            select,
+            source,
+            sites: &region.insert_sites,
+            in_params: &region.in_params,
+            var_types: region.var_types,
+            resolve,
+            guards: Vec::new(),
+        }
+    }
 }
 
 pub(super) enum Domain {
@@ -224,6 +265,9 @@ impl Parser<'_> {
     fn term(&mut self) -> Result<(String, Domain), SkipReason> {
         let bad = SkipReason::UnprovenWriteCompleteness;
         let word = self.t.peek().ok_or(bad)?.to_string();
+        if self.t.at_subquery() {
+            return self.cache_subquery();
+        }
         if self.t.take("(") {
             let (inner, num) = self.expr()?;
             return self
@@ -386,8 +430,71 @@ impl Parser<'_> {
         Ok((format!("concat({})", args.join(", ")), Domain::Other))
     }
 
+    /// INSERT 位 fn_site 参数缓存子查询叶：`(SELECT sd_v FROM sd_fnN
+    /// WHERE sd_aK IS NOT DISTINCT FROM (<实参>)…)`——表名按已准入
+    /// InsertSite 改写 `sd_bfN`，实参递归走表达式语法（`$v_` 占位符
+    /// → sd_cur 列 / 行级表达式 / IN 形参占位符）。结果域 VARCHAR。
+    fn cache_subquery(&mut self) -> Result<(String, Domain), SkipReason> {
+        let bad = SkipReason::UnprovenWriteCompleteness;
+        if !(self.t.take("(")
+            && self.t.take("select")
+            && self.t.take("sd_v")
+            && self.t.take("from"))
+        {
+            return Err(bad);
+        }
+        let table = self.t.name().ok_or(bad)?;
+        let Some(site) = self.sites.iter().find(|s| s.orig_table == table.0) else {
+            return Err(bad);
+        };
+        if !self.t.take("where") {
+            return Err(bad);
+        }
+        let mut conds = Vec::new();
+        loop {
+            let col = self.t.name().ok_or(bad)?;
+            if !is_cache_arg_col(&col.0) {
+                return Err(bad);
+            }
+            if !(self.t.take("is")
+                && self.t.take("not")
+                && self.t.take("distinct")
+                && self.t.take("from")
+                && self.t.take("("))
+            {
+                return Err(bad);
+            }
+            let (arg, _) = self.expr()?;
+            if !self.t.take(")") {
+                return Err(bad);
+            }
+            conds.push(format!("{} IS NOT DISTINCT FROM ({arg})", col.sql()));
+            if !self.t.take("and") {
+                break;
+            }
+        }
+        self.t
+            .take(")")
+            .then(|| {
+                (
+                    format!(
+                        "(SELECT sd_v FROM {} WHERE {})",
+                        site.table,
+                        conds.join(" AND ")
+                    ),
+                    Domain::Other,
+                )
+            })
+            .ok_or(bad)
+    }
+
     fn binding(&mut self, word: &str) -> Result<(String, Domain), SkipReason> {
         if let Some((_, BindSrc::Var(var))) = self.binds.iter().find(|(p, _)| p == word) {
+            // 循环不变 IN 形参：占位符原样保留，运行期随 plan.binds 解析。
+            if self.in_params.contains(&var.0.to_ascii_lowercase()) {
+                self.t.take(word);
+                return Ok((word.to_string(), type_domain(self.var_types, var)));
+            }
             let bound = (self.resolve)(var)?;
             self.t.take(word);
             if !bound.value.guard.is_empty() {
@@ -421,6 +528,15 @@ impl Parser<'_> {
             return Err(bad);
         }
         Ok((field.0, Domain::of(&from.kind)))
+    }
+}
+
+/// IN 形参绑定的值域：Varchar→Other（字符串域），数值族→Numeric
+/// （DECIMAL 精度不可静态裁决，混合运算自然退回）。
+fn type_domain(var_types: &BTreeMap<String, SpinType>, var: &VarName) -> Domain {
+    match var_types.get(&var.0) {
+        Some(SpinType::Varchar) => Domain::Other,
+        _ => Domain::Numeric,
     }
 }
 

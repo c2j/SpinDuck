@@ -140,6 +140,20 @@ pub(super) struct ArithWrite {
     pub expr: crate::ir::IrExpr,
 }
 
+/// INSERT 位 fn_site（缓存表改名 `sd_bfN`）：`distinct_sql` 为无 FROM
+/// 实参数列表，批写时在投影环境下改写为 `SELECT DISTINCT <实参>
+/// FROM sd_cur <joins>` 前导物化；`orig_table` 为编译产物中的 `sd_fnN`，
+/// 缓存子查询实参渲染时据此换名。
+#[derive(Clone)]
+pub(super) struct InsertSite {
+    pub orig_table: String,
+    pub table: String,
+    pub name: String,
+    pub distinct_sql: String,
+    pub binds: Vec<(String, BindSrc)>,
+    pub arity: usize,
+}
+
 struct CopyLoop<'a> {
     pub(super) query: &'a str,
     pub(super) insert: &'a str,
@@ -149,6 +163,9 @@ struct CopyLoop<'a> {
     /// 游标 WHERE 内 SQL 上下文例程调用（已证位于顶层 WHERE 之后）：
     /// 由 FnPrelude 在批写前按 distinct 元组物化缓存表。
     pub(super) fn_sites: &'a [crate::sql::FnSite],
+    /// INSERT 参数内 SQL 上下文例程调用（PureExpr + 无 FROM 实参列表）：
+    /// distinct-over-sd_cur 前导物化，缓存表名已改 `sd_bfN`。
+    pub(super) insert_sites: Vec<InsertSite>,
     /// 变量类型表：过滤式无抛错证明裁决绑定值域（Varchar↔str / 数值↔num）。
     pub(super) var_types: &'a std::collections::BTreeMap<String, crate::types::SpinType>,
     pub(super) record: &'a VarName,

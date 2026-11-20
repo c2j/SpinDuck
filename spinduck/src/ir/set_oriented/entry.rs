@@ -21,6 +21,10 @@ pub(crate) struct FnPrelude {
     pub binds: Vec<(String, BindSrc)>,
     /// 例程形参个数（缓存表 sd_a0..sd_a{arity-1} 列数）。
     pub arity: usize,
+    /// INSERT 位前导：distinct 查询内嵌 `sd_cur`（依赖游标 site 缓存表
+    /// 先行物化），其例程求值的会话回滚可能撤销已建游标表——物化器对
+    /// 本类前导在依赖方求值后重写基础表。
+    pub needs_sd_cur: bool,
 }
 
 /// 结构准入与 SQL 生成的产物；入口守卫与后缀组装消费它。

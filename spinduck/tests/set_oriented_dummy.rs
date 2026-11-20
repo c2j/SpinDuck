@@ -249,6 +249,7 @@ fn should_reject_sys_dummy_block_when_not_total_and_verify_decimal_mul_sub() {
     scenario_inlined_out_arith();
     scenario_expr_params();
     scenario_cursor_fnsite();
+    scenario_insert_fnsite();
 }
 
 /// fnc_grp_mode：SQL 上下文下沉例程（游标 WHERE 内 fn_site 同型）。
@@ -308,6 +309,78 @@ fn scenario_cursor_fnsite() {
     let Status::Converted { .. } = eng.set_oriented_reports()[0].status.clone() else {
         panic!(
             "游标 fn_site 必须 Converted: {:?}",
+            eng.set_oriented_reports()
+        );
+    };
+    assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
+}
+
+/// fnc_mode2：SQL 上下文下沉例程（INSERT 位 fn_site 同型，byfund
+/// fnc_get_rate_info2 子集）。trap+SELECT INTO+RETURN 形态可摘要 PureExpr。
+fn fnc_mode2() -> &'static str {
+    "CREATE FUNCTION fnc_mode2(p_code VARCHAR, p_kind VARCHAR) RETURN VARCHAR IS
+       v_mode VARCHAR2(10);
+     BEGIN
+       BEGIN
+         SELECT mode INTO v_mode FROM mode_map2
+           WHERE code = p_code AND kind = p_kind;
+       EXCEPTION WHEN OTHERS THEN v_mode := '0'; END;
+       RETURN v_mode;
+     END;"
+}
+
+/// INSERT 参数内例程调用：`CASE fnc_mode2(r.security_id,'K') …` 编译为
+/// 参数缓存子查询 + fn_site；批写须 distinct-over-sd_cur 物化前导。
+fn caller_insert_fnsite() -> &'static str {
+    "CREATE OR REPLACE PROCEDURE caller_insert_fnsite(p_o_succeed OUT VARCHAR2) IS
+     BEGIN
+       p_o_succeed := '0';
+       FOR r IN SELECT security_id, val, tag FROM cur_rows LOOP
+         BEGIN
+           INSERT INTO dst_rows(security_id, yj, tag)
+             VALUES (r.security_id,
+                     CASE fnc_mode2(r.security_id, 'K')
+                       WHEN '1' THEN r.val ELSE 0 END,
+                     r.tag);
+         EXCEPTION WHEN OTHERS THEN NULL; END;
+       END LOOP;
+     END;"
+}
+
+/// ⑦ INSERT 位 fn_site：Converted 且逐行同 Off（distinct-over-sd_cur
+/// 物化前导 + 缓存子查询实参渲染）。
+fn scenario_insert_fnsite() {
+    let ddl: Vec<&str> = BASE_DDL
+        .iter()
+        .copied()
+        .map(|s| {
+            if s.starts_with("CREATE TABLE cur_rows") {
+                "CREATE TABLE cur_rows(security_id VARCHAR, val DECIMAL(15,2), \
+                   tag VARCHAR)"
+            } else {
+                s
+            }
+        })
+        .chain([
+            "CREATE TABLE mode_map2(code VARCHAR, kind VARCHAR, mode VARCHAR)",
+            "INSERT INTO mode_map2 VALUES \
+               ('S1','K','1'),('S2','K','0'),('S3','K','1')",
+            "INSERT INTO cur_rows VALUES \
+               ('S1',10.50,'a'),('S2',20.25,'b'),('S3',30.75,'c'),('S4',40.00,'d')",
+        ])
+        .collect();
+    let routines = [fnc_mode2(), caller_insert_fnsite()];
+    let mut off = engine_with_routines(&ddl, SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_insert_fnsite", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 4, "Off 语义基线: {expected_rows:?}");
+
+    let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_insert_fnsite", &args()).unwrap();
+    let Status::Converted { .. } = eng.set_oriented_reports()[0].status.clone() else {
+        panic!(
+            "INSERT fn_site 必须 Converted: {:?}",
             eng.set_oriented_reports()
         );
     };

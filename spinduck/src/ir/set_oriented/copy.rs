@@ -9,13 +9,15 @@ mod inputs;
 
 use super::schema::{Column, Default, Table};
 use super::shape::{self, Name};
-use super::{agg, expr, lookup, substitute_binds, BindSrc, CopyLoop, SinkOp, SkipReason};
+use super::{agg, entry, expr, lookup, substitute_binds, BindSrc, CopyLoop, SinkOp, SkipReason};
 use badrow::sd_cur_cte;
 use inline::{inline_projection, ProjEnv};
 
 pub(super) struct CopySql {
     pub sql: String,
     pub expr_guards: Vec<String>,
+    /// INSERT 位 fn_site 的 distinct-over-sd_cur 前导查询（needs_sd_cur）。
+    pub fn_preludes: Vec<entry::FnPrelude>,
 }
 
 pub(super) fn copy_sql(
@@ -52,6 +54,7 @@ pub(super) fn copy_sql(
         inline::check_evaluation(region, (var, value), &mut env)?;
     }
     let (projections, write_guards) = write_projections(region, insert, target, &mut env)?;
+    let fn_preludes = fn_distincts(region, select, source, &mut env)?;
     badrow::push_bad_row_guard(
         region,
         (&write_guards, &ctes, &joins),
@@ -74,7 +77,114 @@ pub(super) fn copy_sql(
         projections,
         (guards, ctes, joins),
     );
-    Ok(CopySql { sql, expr_guards })
+    Ok(CopySql {
+        sql,
+        expr_guards,
+        fn_preludes,
+    })
+}
+
+/// INSERT 位 fn_site 的 distinct-over-sd_cur 前导查询：实参按投影
+/// 环境渲染（`$v_` → sd_cur 列 / 行级表达式 / IN 形参占位符），CTE/join
+/// 与主批写同口径；渲染后仍残留的 `$v_` 占位符按 site.binds 回填，
+/// 运行期由物化前导从帧解析。
+fn fn_distincts(
+    region: &CopyLoop<'_>,
+    select: &shape::Select,
+    source: &Table,
+    env: &mut ProjEnv<'_>,
+) -> Result<Vec<entry::FnPrelude>, SkipReason> {
+    region
+        .insert_sites
+        .iter()
+        .map(|site| {
+            let args = distinct_args(&site.distinct_sql)?;
+            if args.len() != site.arity {
+                return Err(SkipReason::UnresolvedFnSite);
+            }
+            let mut rendered = Vec::with_capacity(args.len());
+            for arg in &args {
+                rendered.push(expr::render_arg(
+                    arg,
+                    region,
+                    env.select,
+                    env.source,
+                    &mut |v| expression_var(region, v, env),
+                )?);
+            }
+            let with = std::iter::once(sd_cur_cte(select, source))
+                .chain(env.ctes.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let join_sql = if env.joins.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", env.joins.join(" "))
+            };
+            let sql = format!(
+                "WITH {with} SELECT DISTINCT {} FROM sd_cur{join_sql}",
+                rendered.join(", ")
+            );
+            let tokens = shape::Tokens::new(&sql).ok_or(SkipReason::UnprovenWriteCompleteness)?;
+            let words = tokens.words();
+            let binds = site
+                .binds
+                .iter()
+                .filter(|(ph, _)| words.iter().any(|w| w == ph))
+                .cloned()
+                .collect();
+            Ok(entry::FnPrelude {
+                table: site.table.clone(),
+                name: site.name.clone(),
+                distinct_sql: sql,
+                binds,
+                arity: site.arity,
+                needs_sd_cur: true,
+            })
+        })
+        .collect()
+}
+
+/// distinct_sql 的 SELECT 列表项：`select [distinct] item (, item)*`，
+/// 顶层逗号切分，词法 token 以空格重组（analyze 已证无 FROM 子句）。
+fn distinct_args(sql: &str) -> Result<Vec<String>, SkipReason> {
+    let bad = SkipReason::UnresolvedFnSite;
+    let t = shape::Tokens::new(sql).ok_or(bad)?;
+    let w = t.words();
+    if w.first().map(String::as_str) != Some("select") {
+        return Err(bad);
+    }
+    let mut i = 1;
+    if w.get(i).is_some_and(|x| x == "distinct") {
+        i += 1;
+    }
+    let mut items = Vec::new();
+    let mut cur: Vec<&str> = Vec::new();
+    let mut depth = 0i32;
+    for word in &w[i..] {
+        match word.as_str() {
+            "(" => {
+                depth += 1;
+                cur.push(word);
+            }
+            ")" => {
+                depth -= 1;
+                cur.push(word);
+            }
+            "," if depth == 0 => {
+                items.push(cur.join(" "));
+                cur = Vec::new();
+            }
+            _ => cur.push(word),
+        }
+    }
+    if !cur.is_empty() {
+        items.push(cur.join(" "));
+    }
+    if items.is_empty() {
+        return Err(bad);
+    }
+    Ok(items)
 }
 
 fn write_projections(

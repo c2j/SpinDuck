@@ -189,6 +189,12 @@ impl Tokens {
     }
 }
 
+/// 缓存子查询关联列名：`sd_a` + 非空数字后缀。
+pub(super) fn is_cache_arg_col(word: &str) -> bool {
+    word.strip_prefix("sd_a")
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+}
+
 pub(super) fn select(sql: &str) -> Result<Select, SkipReason> {
     let parse = || {
         let mut t = Tokens::new(sql)?;

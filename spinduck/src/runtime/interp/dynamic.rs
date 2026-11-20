@@ -144,6 +144,12 @@ pub(super) fn materialize_fn_sites(
 /// 与解释器 OpenCursor 时点同口径的两阶段物化——全部 distinct 查询与
 /// 例程求值先行，全部成功后才统一建缓存表；任一失败直接上抛
 /// EngineError（与解释路径同点失败，绝不部分物化后续跑批写）。
+///
+/// `needs_sd_cur` 前导（INSERT 位）的 distinct 查询内嵌 `sd_cur`，其
+/// WHERE 中的游标缓存子查询依赖基础前导（游标 site）的表已存在——
+/// 分两相位：先求值+建基础表，再求值依赖方，随后**重写**基础表
+/// （依赖方例程求值触发的会话回滚可能撤销未提交的基础缓存表），
+/// 最后建依赖方缓存表。重写不重复例程调用（字面量行已在内存）。
 pub(crate) fn materialize_fn_preludes(
     preludes: &[crate::ir::set_oriented::FnPrelude],
     frame: &mut crate::runtime::Frame,
@@ -165,20 +171,28 @@ pub(crate) fn materialize_fn_preludes(
         last_write_rows: 0,
         var_types,
     };
-    let evaled = preludes
+    let eval = |p: &crate::ir::set_oriented::FnPrelude,
+                env: &mut Env<'_>|
+     -> Result<SiteRows, EngineError> {
+        eval_site(&p.table, &p.name, &p.distinct_sql, &p.binds, p.arity, env)
+    };
+    let (base, dep): (Vec<_>, Vec<_>) = preludes.iter().partition(|p| !p.needs_sd_cur);
+    let base_rows = base
         .iter()
-        .map(|p| {
-            eval_site(
-                &p.table,
-                &p.name,
-                &p.distinct_sql,
-                &p.binds,
-                p.arity,
-                &mut env,
-            )
-        })
+        .map(|p| eval(p, &mut env))
         .collect::<Result<Vec<_>, _>>()?;
-    for site in &evaled {
+    for site in &base_rows {
+        write_site(site, ex)?;
+    }
+    let dep_rows = dep
+        .iter()
+        .map(|p| eval(p, &mut env))
+        .collect::<Result<Vec<_>, _>>()?;
+    // 依赖方例程求值的 reset_session→ROLLBACK 可能撤销基础缓存表，重写恢复。
+    for site in &base_rows {
+        write_site(site, ex)?;
+    }
+    for site in &dep_rows {
         write_site(site, ex)?;
     }
     Ok(())

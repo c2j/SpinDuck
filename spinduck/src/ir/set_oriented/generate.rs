@@ -209,9 +209,10 @@ fn finish(
     )?;
     let binds = with_param_binds(copy, &generated, query_binds(copy, &resolved));
     let expr_guards = entry::bind_guards(generated.expr_guards, &binds)?;
-    // 游标 WHERE fn_site → 物化前导：distinct_sql 为编译期原文（含源表
-    // 与过滤），与解释器 OpenCursor 时 materialize_fn_sites 同口径。
-    let fn_preludes = copy
+    // fn_site 物化前导：游标 WHERE site 的 distinct_sql 为编译期原文
+    // （含源表与过滤），INSERT 位 site 为 copy_sql 生成的
+    // distinct-over-sd_cur 查询（needs_sd_cur，依赖游标表先行物化）。
+    let mut fn_preludes: Vec<entry::FnPrelude> = copy
         .fn_sites
         .iter()
         .map(|s| entry::FnPrelude {
@@ -220,8 +221,10 @@ fn finish(
             distinct_sql: s.distinct_sql.clone(),
             binds: s.binds.clone(),
             arity: s.args.len(),
+            needs_sd_cur: false,
         })
         .collect();
+    fn_preludes.extend(generated.fn_preludes);
     Ok(entry::ConversionPlan {
         sql: generated.sql,
         binds,

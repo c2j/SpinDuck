@@ -10,7 +10,7 @@
 //! 比较/IN/BETWEEN 两侧值域必须一致且可证（str↔varchar、num↔数值族）。
 
 use super::schema::Table;
-use super::shape::{Name, Tokens};
+use super::shape::{is_cache_arg_col, Name, Tokens};
 use super::{BindSrc, SkipReason};
 use crate::types::SpinType;
 use std::collections::BTreeMap;
@@ -292,12 +292,6 @@ fn kind_domain(kind: &str) -> Dom {
     } else {
         Dom::Unknown
     }
-}
-
-/// 缓存子查询关联列名：`sd_a` + 非空数字后缀。
-fn is_cache_arg_col(word: &str) -> bool {
-    word.strip_prefix("sd_a")
-        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn numeric_literal(word: &str) -> bool {

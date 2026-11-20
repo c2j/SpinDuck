@@ -22,6 +22,7 @@ struct Prepared<'a> {
     query: &'a str,
     query_binds: &'a [(String, BindSrc)],
     fn_sites: &'a [crate::sql::FnSite],
+    insert_sites: Vec<super::InsertSite>,
 }
 
 pub(super) fn analyze_region<'a>(
@@ -61,9 +62,7 @@ fn prepare<'a>(
         return Err(SkipReason::UnsupportedWrite);
     };
     let (query, query_binds, cursor_sites) = cursor_query(ctx)?;
-    if !fn_sites.is_empty() {
-        return Err(SkipReason::UnresolvedFnSite);
-    }
+    let insert_sites = admit_insert_sites(ctx, fn_sites)?;
     if ctx.prog.var_types.contains_key(&ctx.region.record.0) {
         return Err(SkipReason::UnprovenExpression);
     }
@@ -75,6 +74,7 @@ fn prepare<'a>(
         query,
         query_binds,
         fn_sites: cursor_sites,
+        insert_sites,
     })
 }
 
@@ -91,6 +91,7 @@ fn assemble<'a>(
         binds: parts.binds,
         query_binds: parts.query_binds,
         fn_sites: parts.fn_sites,
+        insert_sites: parts.insert_sites,
         var_types: &ctx.prog.var_types,
         record: &ctx.region.record,
         allow_filter: ctx.mode == SetOrientedMode::BatchAtomic && body.has_trap,
@@ -157,6 +158,71 @@ fn cursor_query<'a>(ctx: &Context<'a, '_>) -> Result<CursorQuery<'a>, SkipReason
         return Err(SkipReason::UnresolvedFnSite);
     }
     Ok((sql, binds, fn_sites))
+}
+
+/// INSERT 位 fn_site 准入：例程须 PureExpr（确定性无副作用——批写按
+/// DISTINCT 元组去重调用，与解释器逐行调用结果一致）；distinct_sql 须为
+/// 无 FROM 实参数列表（批写改写为 distinct-over-sd_cur）；无嵌套 sd_fn
+/// 依赖。缓存表名改 `sd_bfN`，避免与游标 site 的 `sd_fnN` 冲突。
+fn admit_insert_sites(
+    ctx: &Context<'_, '_>,
+    sites: &[crate::sql::FnSite],
+) -> Result<Vec<super::InsertSite>, SkipReason> {
+    if sites_nested(sites) {
+        return Err(SkipReason::UnresolvedFnSite);
+    }
+    sites
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let pure = matches!(
+                catalog_summary::summarize(ctx.catalog, &s.name),
+                catalog_summary::Summary::PureExpr(_)
+            );
+            if !pure || !select_list_only(&s.distinct_sql) {
+                return Err(SkipReason::UnresolvedFnSite);
+            }
+            Ok(super::InsertSite {
+                orig_table: s.table.clone(),
+                table: format!("sd_bf{i}"),
+                name: s.name.clone(),
+                distinct_sql: s.distinct_sql.clone(),
+                binds: s.binds.clone(),
+                arity: s.args.len(),
+            })
+        })
+        .collect()
+}
+
+/// distinct_sql 仅 SELECT 列表（可选 DISTINCT 关键字）：无 FROM/WHERE/
+/// GROUP/ORDER/LIMIT/JOIN/集合操作等子句（深度 0 判定）。
+fn select_list_only(sql: &str) -> bool {
+    let Some(t) = super::shape::Tokens::new(sql) else {
+        return false;
+    };
+    let w = t.words();
+    if w.first().map(String::as_str) != Some("select") {
+        return false;
+    }
+    let mut i = 1;
+    if w.get(i).is_some_and(|x| x == "distinct") {
+        i += 1;
+    }
+    let mut depth = 0i32;
+    for word in &w[i..] {
+        match word.as_str() {
+            "(" => depth += 1,
+            ")" => depth -= 1,
+            "from" | "where" | "group" | "order" | "limit" | "join" | "inner" | "left"
+            | "right" | "full" | "cross" | "union" | "intersect" | "except" | "having" | "into"
+                if depth == 0 =>
+            {
+                return false
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// distinct_sql 内出现任何 `sd_fn*` 标识符即视为嵌套物化依赖，拒绝。
