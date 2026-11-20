@@ -56,7 +56,72 @@ fn caller() -> &'static str {
      END;"
 }
 
+/// ④ §3.3 算术覆写门扩展：IF 条件/算术中的变量来自内联函数 OUT 写回
+/// （逐目标 Lookup 表达式），按行代入后仍投影为 CASE WHEN … END。
+fn caller_fn() -> &'static str {
+    "CREATE OR REPLACE PROCEDURE caller_dummy_fn(p_o_succeed OUT VARCHAR2) IS
+       v_commision_type VARCHAR2(4);
+       v_ret VARCHAR2(10);
+       v_return_rate_flag VARCHAR2(4);
+       v_return_rate_org NUMBER;
+       v_return_rate NUMBER;
+       v_yj NUMBER;
+     BEGIN
+       p_o_succeed := '0';
+       FOR r IN SELECT security_id, cjje, yj11, yj12, tag FROM cur_rows LOOP
+         BEGIN
+           SELECT commision_type INTO v_commision_type
+             FROM seat_para WHERE security_id = r.security_id;
+         EXCEPTION WHEN OTHERS THEN v_commision_type := '00'; END;
+         v_ret := fnc_rates(r.security_id, v_return_rate_flag,
+                            v_return_rate_org, v_return_rate);
+         BEGIN
+           SELECT CASE v_commision_type
+                    WHEN '11' THEN r.yj11
+                    WHEN '12' THEN r.yj12
+                    ELSE 0
+                  END
+             INTO v_yj
+             FROM sys_dummy;
+         EXCEPTION WHEN OTHERS THEN v_yj := 0; END;
+         IF v_return_rate_flag = '1' THEN
+           v_yj := r.cjje * v_return_rate_org - r.cjje * v_return_rate;
+         END IF;
+         INSERT INTO dst_rows(security_id, yj, tag)
+           VALUES (r.security_id, v_yj, r.tag);
+       END LOOP;
+     END;"
+}
+
+/// 三个 OUT 各自由独立 trap 包裹的单列查找 + 常量兜底写回（seat_para 同型
+/// 子集）：OUT 表达式折叠为逐目标 Lookup，供 IF 门内联代入。
+fn fnc_rates() -> &'static str {
+    "CREATE OR REPLACE FUNCTION fnc_rates(
+       p_sid VARCHAR2,
+       p_o_flag OUT VARCHAR2, p_o_org OUT NUMBER, p_o_rate OUT NUMBER
+     ) RETURN VARCHAR2 IS
+     BEGIN
+       BEGIN
+         SELECT return_rate_flag INTO p_o_flag
+           FROM seat_para WHERE security_id = p_sid;
+       EXCEPTION WHEN OTHERS THEN p_o_flag := '0'; END;
+       BEGIN
+         SELECT return_rate_org INTO p_o_org
+           FROM seat_para WHERE security_id = p_sid;
+       EXCEPTION WHEN OTHERS THEN p_o_org := 0; END;
+       BEGIN
+         SELECT return_rate INTO p_o_rate
+           FROM seat_para WHERE security_id = p_sid;
+       EXCEPTION WHEN OTHERS THEN p_o_rate := 0; END;
+       RETURN p_sid;
+     END;"
+}
+
 fn engine_with(ddl: &[&str], oriented: SetOrientedMode) -> Engine {
+    engine_with_routines(ddl, oriented, &[caller()])
+}
+
+fn engine_with_routines(ddl: &[&str], oriented: SetOrientedMode, routines: &[&str]) -> Engine {
     let mut eng = Engine::new(
         Box::new(DuckExecutor::open_in_memory().unwrap()),
         RuleRegistry::default(),
@@ -64,7 +129,9 @@ fn engine_with(ddl: &[&str], oriented: SetOrientedMode) -> Engine {
     for sql in ddl {
         eng.ex.execute(sql, &BindMap::new()).unwrap();
     }
-    eng.register(caller()).unwrap();
+    for sql in routines {
+        eng.register(sql).unwrap();
+    }
     eng.set_oriented = oriented;
     eng
 }
@@ -158,6 +225,30 @@ fn should_reject_sys_dummy_block_when_not_total_and_verify_decimal_mul_sub() {
     scenario_positive();
     scenario_unproven_case_branch();
     scenario_decimal_overflow();
+    scenario_inlined_out_arith();
+}
+
+/// ④ IF 门条件/算术变量来自内联函数 OUT 写回（Lookup 表达式）：
+/// 代入后投影仍为 CASE WHEN … END，Converted 且逐行同 Off。
+fn scenario_inlined_out_arith() {
+    let ddl = ddl1();
+    let routines = [fnc_rates(), caller_fn()];
+    let mut off = engine_with_routines(&ddl, SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_dummy_fn", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 4);
+
+    let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_dummy_fn", &args()).unwrap();
+    let Status::Converted { sql } = eng.set_oriented_reports()[0].status.clone() else {
+        panic!(
+            "内联 OUT 变量的 IF 算术门必须 Converted: {:?}",
+            eng.set_oriented_reports()
+        );
+    };
+    assert!(sql.contains("CASE"), "{sql}");
+    assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
 }
 
 /// ① 正例：CASE 全分支可证 + 乘减宽度 ≤38 → Converted，逐行同 Off。

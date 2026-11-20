@@ -2,10 +2,11 @@
 
 use super::*;
 
-/// §3.3 IF 门条件形态：Field/Var/Const 叶子与 And/Or/比较/Not。
+/// §3.3 IF 门条件形态：Field/Var/Const/Lookup 叶子与 And/Or/比较/Not。
+/// Lookup 叶子为内联函数 OUT 写回代入后的计数门控查找（§4.3 A7）。
 pub(super) fn cond_shape(cond: &IrExpr) -> bool {
     match cond {
-        IrExpr::Const(_) | IrExpr::Field { .. } | IrExpr::Var(_) => true,
+        IrExpr::Const(_) | IrExpr::Field { .. } | IrExpr::Var(_) | IrExpr::Lookup { .. } => true,
         IrExpr::Not(e) => cond_shape(e),
         IrExpr::Bin { op, l, r } => {
             matches!(
@@ -34,7 +35,7 @@ fn expr_shape(expr: &IrExpr, record: &VarName) -> bool {
             r,
         } => expr_shape(l, record) && expr_shape(r, record),
         IrExpr::Field { rec, .. } => rec == record,
-        IrExpr::Var(_) => true,
+        IrExpr::Var(_) | IrExpr::Lookup { .. } => true,
         IrExpr::Const(c) => matches!(
             c,
             crate::value::SpinValue::Int(_) | crate::value::SpinValue::Decimal(..)
@@ -57,23 +58,124 @@ fn vars_of(expr: &IrExpr, out: &mut Vec<VarName>) {
 }
 
 /// 条件与赋值表达式的变量叶子须全部是已识别查找变量（逐行代入）。
+/// Lookup 子树内部的变量不在此列——由 `lookup_binds_invariant` 单独证明。
 fn vars_bound(expr: &IrExpr, lookups: &[lookup::LookupQuery]) -> bool {
     let mut vars = Vec::new();
     vars_of(expr, &mut vars);
     vars.iter().all(|v| lookups.iter().any(|l| &l.var == v))
 }
 
-/// IF 门整体判定：条件形态 + 变量绑定 + 门体恰一条乘/减赋值。
+/// 内联变量逐行代入：`self.inlined` 经 `resolve_locals` 已封闭（表达式内
+/// 不再引用其他内联变量），单次顺序替换即得不动点。
+fn subst_inlined(expr: &IrExpr, inlined: &[(VarName, IrExpr)]) -> IrExpr {
+    let mut cur = expr.clone();
+    for (v, ie) in inlined {
+        cur = catalog_summary::subst_var(cur, &v.0, ie);
+    }
+    cur
+}
+
+/// 收集表达式中所有 Lookup 子树（args + default，含嵌套 Lookup）内部的
+/// Var 叶子；Lookup 之外的变量由 `vars_bound` 按查找变量口径另行证明。
+fn lookup_inner_vars(expr: &IrExpr, out: &mut Vec<VarName>) {
+    match expr {
+        IrExpr::Lookup { args, default, .. } => {
+            for (_, a) in args {
+                all_vars(a, out);
+            }
+            all_vars(default, out);
+        }
+        IrExpr::Bin { l, r, .. } => {
+            lookup_inner_vars(l, out);
+            lookup_inner_vars(r, out);
+        }
+        IrExpr::Not(e) | IrExpr::IsNull(e) => lookup_inner_vars(e, out),
+        IrExpr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            if let Some(o) = operand {
+                lookup_inner_vars(o, out);
+            }
+            for (c, v) in whens {
+                lookup_inner_vars(c, out);
+                lookup_inner_vars(v, out);
+            }
+            if let Some(e) = else_expr {
+                lookup_inner_vars(e, out);
+            }
+        }
+        IrExpr::FuncCall { args, .. } | IrExpr::SqlFn { args, .. } => {
+            for a in args {
+                lookup_inner_vars(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 表达式内全部 Var 叶子（含 Lookup 内部）。
+fn all_vars(expr: &IrExpr, out: &mut Vec<VarName>) {
+    match expr {
+        IrExpr::Var(v) => out.push(v.clone()),
+        IrExpr::Lookup { args, default, .. } => {
+            for (_, a) in args {
+                all_vars(a, out);
+            }
+            all_vars(default, out);
+        }
+        IrExpr::Bin { l, r, .. } => {
+            all_vars(l, out);
+            all_vars(r, out);
+        }
+        IrExpr::Not(e) | IrExpr::IsNull(e) => all_vars(e, out),
+        IrExpr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            if let Some(o) = operand {
+                all_vars(o, out);
+            }
+            for (c, v) in whens {
+                all_vars(c, out);
+                all_vars(v, out);
+            }
+            if let Some(e) = else_expr {
+                all_vars(e, out);
+            }
+        }
+        IrExpr::FuncCall { args, .. } | IrExpr::SqlFn { args, .. } => {
+            for a in args {
+                all_vars(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Lookup 内部的 Var 绑定渲染为静态实参，必须是循环不变的 IN 形参
+/// （如 p_i_date）；区域查找变量等逐行变量不可证 → 拒绝。
+fn lookup_binds_invariant(expr: &IrExpr, in_params: &std::collections::BTreeSet<String>) -> bool {
+    let mut vars = Vec::new();
+    lookup_inner_vars(expr, &mut vars);
+    vars.iter()
+        .all(|v| in_params.contains(&v.0.to_ascii_lowercase()))
+}
+
+/// IF 门整体判定：内联变量代入 + 条件形态 + 变量绑定 + 门体恰一条乘/减赋值。
+#[allow(clippy::too_many_arguments)]
 pub(super) fn gate(
     prog: &IrProg,
     pc: usize,
     cond: &IrExpr,
     lookups: &[lookup::LookupQuery],
     record: &VarName,
-) -> Option<(VarName, IrExpr)> {
-    if !cond_shape(cond) || !vars_bound(cond, lookups) {
-        return None;
-    }
+    inlined: &[(VarName, IrExpr)],
+    in_params: &std::collections::BTreeSet<String>,
+) -> Option<(VarName, IrExpr, IrExpr)> {
+    let cond = subst_inlined(cond, inlined);
     let IrStmt::Assign {
         target: AssignTarget::Var(v),
         expr,
@@ -81,10 +183,17 @@ pub(super) fn gate(
     else {
         return None;
     };
-    if !expr_shape(expr, record) || !vars_bound(expr, lookups) {
+    let expr = subst_inlined(expr, inlined);
+    if !cond_shape(&cond)
+        || !vars_bound(&cond, lookups)
+        || !lookup_binds_invariant(&cond, in_params)
+        || !expr_shape(&expr, record)
+        || !vars_bound(&expr, lookups)
+        || !lookup_binds_invariant(&expr, in_params)
+    {
         return None;
     }
-    Some((v.clone(), expr.clone()))
+    Some((v.clone(), cond, expr))
 }
 
 impl<'a> Body<'a> {
@@ -104,15 +213,16 @@ impl<'a> Body<'a> {
         {
             return None;
         }
-        let (var, expr) = gate(ctx.prog, pc, cond, &self.lookups, &ctx.region.record)?;
-        self.gate = Some((
-            Gate::Arith {
-                cond: cond.clone(),
-                var,
-                expr,
-            },
-            to,
-        ));
+        let (var, cond, expr) = gate(
+            ctx.prog,
+            pc,
+            cond,
+            &self.lookups,
+            &ctx.region.record,
+            &self.inlined,
+            &ctx.in_params,
+        )?;
+        self.gate = Some((Gate::Arith { cond, var, expr }, to));
         Some(pc + 2)
     }
 }

@@ -49,8 +49,8 @@ pub(crate) fn mixed_fallback_group(
 fn scan_queries(prog: &IrProg, pc: usize) -> Option<(Vec<(usize, VarName)>, usize)> {
     let mut queries = Vec::new();
     let mut depth = 0usize;
-    for i in pc + 1..prog.code.len() {
-        match &prog.code[i] {
+    for (i, stmt) in prog.code.iter().enumerate().skip(pc + 1) {
+        match stmt {
             IrStmt::PushTrap { .. } => depth += 1,
             IrStmt::PopTrap => {
                 if depth == 0 {

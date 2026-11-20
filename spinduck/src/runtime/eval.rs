@@ -3,10 +3,10 @@
 
 mod numeric;
 
-use crate::catalog::RoutineCatalog;
+use crate::catalog::{ParamMode, RoutineCatalog};
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
-use crate::ir::{BinOp, IrExpr};
+use crate::ir::{AssignTarget, BinOp, IrExpr};
 use crate::runtime::frame::Frame;
 use crate::runtime::RunOutcome;
 use crate::value::SpinValue;
@@ -17,7 +17,8 @@ use numeric::{arith, compare};
 /// `sink` 也在这里：表达式里直调的例程与 CALL 下去的例程共用同一条埋点链，
 /// 断在哪一环，审计日志就少哪一环（§11.1 禁止静默丢弃）。
 pub struct EvalEnv<'a> {
-    pub frame: &'a Frame,
+    /// 调用方帧可变借用：表达式位函数调用的 OUT/INOUT 形参须写回（§8 分派矩阵）。
+    pub frame: &'a mut Frame,
     pub ex: &'a dyn SqlExecutor,
     pub cat: &'a RoutineCatalog,
     pub depth: usize,
@@ -26,7 +27,6 @@ pub struct EvalEnv<'a> {
 
 /// 三值逻辑条件求值：Some(bool) 确定性；None = UNKNOWN（EXIT WHEN 按 false）。
 pub fn eval_cond(e: &IrExpr, env: &mut EvalEnv<'_>) -> Result<Option<bool>, EngineError> {
-    let _f = env.frame;
     match eval(e, env)? {
         SpinValue::Null => Ok(None),
         SpinValue::Bool(b) => Ok(Some(b)),
@@ -39,14 +39,14 @@ pub fn eval_cond(e: &IrExpr, env: &mut EvalEnv<'_>) -> Result<Option<bool>, Engi
 
 /// PL 表达式求值（NULL 传播 + 三值逻辑 AND/OR）。
 pub fn eval(e: &IrExpr, env: &mut EvalEnv<'_>) -> Result<SpinValue, EngineError> {
-    let f = env.frame;
     match e {
         IrExpr::Const(v) => Ok(v.clone()),
-        IrExpr::Var(name) => f
+        IrExpr::Var(name) => env
+            .frame
             .get(name)
             .cloned()
             .ok_or_else(|| EngineError::business(122, format!("undefined variable {}", name.0))),
-        IrExpr::Field { rec, field } => f.record_field(rec, field).cloned(),
+        IrExpr::Field { rec, field } => env.frame.record_field(rec, field).cloned(),
         IrExpr::IsNull(inner) => {
             let v = eval(inner, env)?;
             Ok(SpinValue::Bool(matches!(v, SpinValue::Null)))
@@ -69,7 +69,7 @@ pub fn eval(e: &IrExpr, env: &mut EvalEnv<'_>) -> Result<SpinValue, EngineError>
             whens,
             else_expr,
         } => eval_case(operand.as_deref(), whens, else_expr.as_deref(), env),
-        IrExpr::CursorAttr { cursor, kind } => Ok(f.cursor_attr(cursor, *kind)),
+        IrExpr::CursorAttr { cursor, kind } => Ok(env.frame.cursor_attr(cursor, *kind)),
         IrExpr::SqlFn { prepared, .. } => eval_sqlfn(prepared, env),
         IrExpr::FuncCall {
             name,
@@ -114,7 +114,7 @@ fn eval_sqlfn(
     env: &mut EvalEnv<'_>,
 ) -> Result<SpinValue, EngineError> {
     let template = prepared.as_ref().map_err(Clone::clone)?;
-    let bind_map = crate::runtime::interp::resolve_binds(&template.binds, env.frame)?;
+    let bind_map = crate::runtime::interp::resolve_binds(&template.binds, &*env.frame)?;
     let mut rows = env.ex.query(&template.sql, &bind_map)?;
     Ok(rows
         .fetch_many(1)
@@ -169,6 +169,25 @@ fn eval_funccall(
         env.depth + 1,
         crate::runtime::interp::RunLimits::default(),
     )?;
+    // OUT/INOUT 写回：与 CallRoutine 语句同口径——实参为 Var/Field 时把
+    // 被调帧终值写回调用方对应槽位；非常量表达式实参不可写回（GaussDB
+    // 报 not an lvalue，这里保守沿用既有静默语义）。
+    for (i, p) in routine.params.iter().enumerate() {
+        if p.mode == ParamMode::In {
+            continue;
+        }
+        let target = match args.get(i) {
+            Some(IrExpr::Var(v)) => AssignTarget::Var(v.clone()),
+            Some(IrExpr::Field { rec, field }) => AssignTarget::Field {
+                rec: rec.clone(),
+                field: field.clone(),
+            },
+            _ => continue,
+        };
+        if let Some(v) = callee.get(&crate::ir::VarName(p.name.to_ascii_lowercase())) {
+            env.frame.assign(&target, v.clone())?;
+        }
+    }
     match out {
         RunOutcome::Returned(Some(v)) => Ok(v),
         _ => Ok(SpinValue::Null),
@@ -276,12 +295,12 @@ mod tests {
         // 误入须报不变量错误而非静默求值（AGENTS §5 新错误码挂探针）。
         use crate::exec::{FakeExecutor, TraceNoopSink};
         use crate::runtime::frame::Frame;
-        let frame = Frame::new();
+        let mut frame = Frame::new();
         let ex = FakeExecutor::default();
         let cat = crate::catalog::RoutineCatalog::new();
         let mut sink = TraceNoopSink;
         let mut env = EvalEnv {
-            frame: &frame,
+            frame: &mut frame,
             ex: &ex,
             cat: &cat,
             depth: 0,

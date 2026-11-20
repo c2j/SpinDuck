@@ -11,6 +11,8 @@ struct Context<'a, 'c> {
     region: &'a region::CursorRegion,
     mode: SetOrientedMode,
     catalog: &'c crate::catalog::RoutineCatalog,
+    /// IN 形参名集（小写）：Lookup 内部绑定须为循环不变实参的证明依据。
+    in_params: std::collections::BTreeSet<String>,
 }
 
 /// 准备阶段产物：INSERT 语句文本与游标/INSERT 绑定（均为 'a 程序期引用）。
@@ -33,6 +35,7 @@ pub(super) fn analyze_region<'a>(
         region,
         mode,
         catalog,
+        in_params: in_params.clone(),
     };
     let body = body::Body::walk(&ctx)?;
     let parts = prepare(&ctx, &body, in_params)?;

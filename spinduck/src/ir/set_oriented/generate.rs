@@ -124,6 +124,11 @@ fn hoist(
         .chain(copy.inline_checks.iter_mut())
         .map(|(_, expr)| expr)
         .chain(copy.varchar_inputs.iter_mut())
+        .chain(
+            copy.arith_writes
+                .iter_mut()
+                .flat_map(|w| [&mut w.cond, &mut w.expr]),
+        )
     {
         match resolve::hoist_inline(ex, expr, record, next_index)? {
             Ok((new_expr, mut acc)) => {
