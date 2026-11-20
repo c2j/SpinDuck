@@ -150,11 +150,23 @@ fn parse_derived_top1(
     if !t.take("(") || !t.take("select") {
         return Err(bad);
     }
-    let inner_col = t.column().ok_or(bad)?;
-    let inner_alias = projection_alias(t, &inner_col)?;
-    if &inner_alias != outer_col {
-        return Err(bad);
+    // 内层投影为裸列清单；外层投影名须命中其中一项的输出名
+    // （别名优先，否则列名），命中项源列作为查找列——多列 SELECT INTO
+    // 只取 Top-1 首行的目标列，其余投影列不参与值提取。
+    let mut inner_col = None;
+    loop {
+        let col = t.column().ok_or(bad)?;
+        if projection_alias(t, &col)? == *outer_col {
+            if inner_col.is_some() {
+                return Err(bad);
+            }
+            inner_col = Some(col);
+        }
+        if !t.take(",") {
+            break;
+        }
     }
+    let inner_col = inner_col.ok_or(bad)?;
     if !t.take("from") {
         return Err(bad);
     }
@@ -276,6 +288,8 @@ fn parse_where(
             && t.words.get(t.pos + 1).is_some_and(|w| w == "between")
         {
             parse_between(t, binds, record, &mut result)?;
+        } else if t.peek() == Some("(") {
+            parse_or_group(t, binds, &mut result)?;
         } else {
             parse_column_predicate(t, binds, record, &mut result)?;
         }
@@ -324,6 +338,55 @@ fn parse_between(
             }
         }
     }
+    Ok(())
+}
+
+/// 等值 OR 组：`(列 = 操作数 OR 列 = 操作数 ...)`——同列多操作数，
+/// 操作数限字面量或 Var 绑定占位符（Field 相关键不支持析取，拒绝）。
+/// 整体作为单个 AND 项输出（自带括号）；逐析取 `=` 对 NULL 的排除
+/// 语义与 AND 连接的谓词串一致。
+fn parse_or_group(
+    t: &mut LiteralTokens,
+    binds: &[(String, BindSrc)],
+    result: &mut WhereClause,
+) -> Result<(), SkipReason> {
+    let bad = SkipReason::UnprovenQueryTotalness;
+    if !t.take("(") {
+        return Err(bad);
+    }
+    let mut col: Option<Name> = None;
+    let mut disjuncts = Vec::new();
+    loop {
+        let c = t.column().ok_or(bad)?;
+        match &col {
+            None => col = Some(c.clone()),
+            Some(k) if *k == c => {}
+            Some(_) => return Err(bad),
+        }
+        if !t.take("=") {
+            return Err(bad);
+        }
+        let operand = if t.peek().is_some_and(|w| w.starts_with("$v_")) {
+            let w = t.peek().ok_or(bad)?.to_string();
+            let found = binds.iter().find(|(p, _)| **p == w);
+            let Some((_, BindSrc::Var(v))) = found else {
+                return Err(bad);
+            };
+            t.take(&w);
+            result.binds.push((w.clone(), BindSrc::Var(v.clone())));
+            w
+        } else {
+            t.literal().ok_or(bad)?
+        };
+        disjuncts.push(format!("{} = {}", c.sql(), operand));
+        if !t.take("or") {
+            break;
+        }
+    }
+    if !t.take(")") {
+        return Err(bad);
+    }
+    result.parts.push(format!("({})", disjuncts.join(" OR ")));
     Ok(())
 }
 

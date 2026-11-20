@@ -253,6 +253,7 @@ fn should_reject_sys_dummy_block_when_not_total_and_verify_decimal_mul_sub() {
     scenario_agg_fnsite();
     scenario_view_lookup();
     scenario_inline_lookup_args();
+    scenario_inline_derived_or();
 }
 
 /// fnc_grp_mode：SQL 上下文下沉例程（游标 WHERE 内 fn_site 同型）。
@@ -743,6 +744,86 @@ fn scenario_inline_lookup_args() {
     let Status::Converted { .. } = eng.set_oriented_reports()[0].status.clone() else {
         panic!(
             "内联 Lookup 混合实参必须 Converted: {:?}",
+            eng.set_oriented_reports()
+        );
+    };
+    assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
+}
+
+/// fnc_dtop：派生表 Top-1 内联查找（byfund fnc_com_get_seat_para 同型
+/// 子集）——内层多列投影 + WHERE 等值 OR 组 + ORDER BY/LIMIT 1。
+fn fnc_dtop() -> &'static str {
+    "CREATE FUNCTION fnc_dtop(p_k VARCHAR, p_kind VARCHAR, p_flag VARCHAR)
+     RETURN VARCHAR IS
+       v_x VARCHAR2(20);
+     BEGIN
+       BEGIN
+         SELECT val INTO v_x FROM (
+           SELECT val, val2, flag2 FROM dim_t2
+           WHERE k = p_k
+             AND (kind = p_kind OR kind = 'Z' OR kind = p_flag)
+           ORDER BY flag2 DESC
+         ) LIMIT 1;
+       EXCEPTION WHEN OTHERS THEN v_x := 'D'; END;
+       RETURN v_x;
+     END;"
+}
+
+fn caller_inline_derived() -> &'static str {
+    "CREATE OR REPLACE PROCEDURE caller_inline_derived(
+       p_kind VARCHAR2, p_o_succeed OUT VARCHAR2) IS
+       v_x VARCHAR2(20);
+     BEGIN
+       p_o_succeed := '0';
+       FOR r IN SELECT security_id, cjje, tag FROM cur_rows LOOP
+         v_x := fnc_dtop(r.security_id, p_kind, 'K');
+         BEGIN
+           INSERT INTO dst_rows(security_id, yj, tag)
+             VALUES (r.security_id, r.cjje, v_x);
+         EXCEPTION WHEN OTHERS THEN NULL; END;
+       END LOOP;
+     END;"
+}
+
+/// ⑪ 派生 Top-1 多列内层 + OR 等值组：p_kind='A' 时 S1 命中
+/// flag2 最大的 'Z' 行（vz1）、S2 命中 va2、S3/S4 落兜底 'D'。
+fn scenario_inline_derived_or() {
+    let ddl: Vec<&str> = BASE_DDL
+        .iter()
+        .copied()
+        .map(|s| {
+            if s.starts_with("CREATE TABLE cur_rows") {
+                "CREATE TABLE cur_rows(security_id VARCHAR, cjje DECIMAL(20,6), \
+                   yj11 DECIMAL(15,2), yj12 DECIMAL(15,2), tag VARCHAR)"
+            } else {
+                s
+            }
+        })
+        .chain([
+            "CREATE TABLE dim_t2(k VARCHAR, kind VARCHAR, val VARCHAR, \
+               val2 VARCHAR, flag2 INTEGER)",
+            "INSERT INTO dim_t2 VALUES \
+               ('S1','A','va1','x1',2),('S1','B','vb1','x2',5),\
+               ('S1','Z','vz1','x3',9),('S2','A','va2','y1',1),\
+               ('S3','Q','vq3','z1',7)",
+            "INSERT INTO cur_rows VALUES \
+               ('S1',1.00,0,0,'a'),('S2',2.00,0,0,'b'),\
+               ('S3',3.00,0,0,'c'),('S4',4.00,0,0,'d')",
+        ])
+        .collect();
+    let routines = [fnc_dtop(), caller_inline_derived()];
+    let call_args = [SpinValue::Str("A".into()), SpinValue::Null];
+    let mut off = engine_with_routines(&ddl, SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_inline_derived", &call_args).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 4, "Off 语义基线: {expected_rows:?}");
+
+    let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_inline_derived", &call_args).unwrap();
+    let Status::Converted { .. } = eng.set_oriented_reports()[0].status.clone() else {
+        panic!(
+            "派生 Top-1 + OR 组必须 Converted: {:?}",
             eng.set_oriented_reports()
         );
     };
