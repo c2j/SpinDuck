@@ -1,0 +1,8 @@
+{
+  "git_head": "c9d6c78414ccd66b54c79b14aa48b4be442dfe67",
+  "input_rows": 100000,
+  "p_o_succeed": 0,
+  "off_matches_gauss": true,
+  "batch_atomic_matches_gauss": true,
+  "method": "prc_trd_hz_byfund 100k 三方对账：openGauss 7.0.0-RC3 CALL vs SpinDuck Off vs BatchAtomic；四表全列排序逐行全等；run_golden.sh 复现"
+}

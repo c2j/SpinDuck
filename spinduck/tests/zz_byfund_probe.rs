@@ -1,9 +1,10 @@
 #![cfg(feature = "native")]
 use spinduck_core::exec::{ExecOutcome, RowStream, SqlExecutor};
-use spinduck_core::ir::set_oriented::SetOrientedMode;
+use spinduck_core::ir::set_oriented::{SetOrientedMode, Status};
 use spinduck_core::project::ProjectConfig;
 use spinduck_core::verify::deploy_project;
 use spinduck_core::{BindMap, DuckExecutor, Engine, EngineError, RuleRegistry, SpinValue};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 struct DE(DuckExecutor);
@@ -16,8 +17,12 @@ impl SqlExecutor for DE {
     }
 }
 
-#[test]
-fn probe() {
+fn args() -> [SpinValue; 2] {
+    [SpinValue::Str("20250715".into()), SpinValue::Null]
+}
+
+/// purchase 语料 + byfund 种子部署；返回已配置集合化模式的引擎。
+fn deploy_seeded(mode: SetOrientedMode) -> Engine {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -45,67 +50,69 @@ fn probe() {
             eprintln!("SEED_SKIP {} -> {}", &stmt[..stmt.len().min(60)], e.message);
         }
     }
-    // dump IR: 找含 v_return_rate_flag 的条件跳转及邻近语句
-    for name in eng.catalog.names() {
-        if name.contains("hz_byfund") {
-            let r = eng.catalog.lookup(&name).unwrap();
-            for (i, st) in r.prog.code.iter().enumerate() {
-                let d = format!("{:?}", st);
-                if d.contains("v_return_rate_flag") || d.contains("v_return_rate_org") {
-                    for j in i.saturating_sub(3)..=(i + 4).min(r.prog.code.len() - 1) {
-                        eprintln!("IR{} {:?}", j, r.prog.code[j]);
-                    }
-                    eprintln!("---");
-                }
-                if let spinduck_core::ir::IrStmt::OpenCursor {
-                    source:
-                        spinduck_core::ir::CursorSource::Static {
-                            sql,
-                            binds,
-                            fn_sites,
-                        },
-                    ..
-                } = st
-                {
-                    if !fn_sites.is_empty() {
-                        eprintln!("CURSOR_SQL {}", sql);
-                        eprintln!("CURSOR_BINDS {:?}", binds);
-                        for s in fn_sites {
-                            eprintln!(
-                                "CSITE table={} name={} args={:?}\n  distinct={}\n  binds={:?}",
-                                s.table, s.name, s.args, s.distinct_sql, s.binds
-                            );
-                        }
-                    }
-                }
-                if let spinduck_core::ir::IrStmt::SqlExec {
-                    sql,
-                    binds,
-                    fn_sites,
-                    ..
-                } = st
-                {
-                    if !fn_sites.is_empty() {
-                        eprintln!("FNSITE_SQL {}", sql);
-                        eprintln!("FNSITE_BINDS {:?}", binds);
-                        for s in fn_sites {
-                            eprintln!(
-                                "SITE table={} name={} args={:?}\n  distinct={}\n  binds={:?}",
-                                s.table, s.name, s.args, s.distinct_sql, s.binds
-                            );
-                        }
-                    }
-                }
-            }
+    eng.set_oriented = mode;
+    eng
+}
+
+/// 全部用户表（排除 sd_* 物化临时表）行集快照：行内容排序后逐表全等，
+/// 不依赖列序/ORDER BY 语义。
+fn snapshot(eng: &Engine) -> BTreeMap<String, Vec<String>> {
+    let names = eng
+        .ex
+        .query(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = 'main' ORDER BY 1",
+            &BindMap::new(),
+        )
+        .unwrap()
+        .fetch_many(10_000);
+    let mut out = BTreeMap::new();
+    for row in names {
+        let SpinValue::Str(name) = &row[0] else {
+            continue;
+        };
+        if name.starts_with("sd_") {
+            continue;
         }
+        let mut rows: Vec<String> = eng
+            .ex
+            .query(&format!("SELECT * FROM \"{name}\""), &BindMap::new())
+            .unwrap()
+            .fetch_many(2_000_000)
+            .iter()
+            .map(|r| format!("{r:?}"))
+            .collect();
+        rows.sort();
+        out.insert(name.clone(), rows);
     }
-    eng.set_oriented = SetOrientedMode::BatchAtomic;
-    let args = [SpinValue::Str("20250715".into()), SpinValue::Null];
-    match eng.call("pkg_split_trade_step3_sh.prc_trd_hz_byfund", &args) {
-        Ok(o) => eprintln!("CALL_OK outs={:?} ret={:?}", o.outs, o.return_value),
-        Err(e) => eprintln!("CALL_ERR {}", e.message),
-    }
-    for r in eng.set_oriented_reports() {
-        eprintln!("REPORT {:?}", r.status);
-    }
+    out
+}
+
+/// 真实 purchase 语料端到端：byfund 区域 0（c_get_data）必须
+/// BatchAtomic Converted，且 OUT 形参 + 全部用户表行集与 Off 逐行全等。
+#[test]
+fn probe() {
+    let mut off = deploy_seeded(SetOrientedMode::Off);
+    let expected = off
+        .call("pkg_split_trade_step3_sh.prc_trd_hz_byfund", &args())
+        .unwrap();
+    let expected_state = snapshot(&off);
+
+    let mut eng = deploy_seeded(SetOrientedMode::BatchAtomic);
+    let actual = eng
+        .call("pkg_split_trade_step3_sh.prc_trd_hz_byfund", &args())
+        .unwrap();
+
+    let reports = eng.set_oriented_reports();
+    assert_eq!(reports.len(), 1, "仅区域 0 应产生报告: {reports:?}");
+    assert!(
+        matches!(reports[0].status, Status::Converted { .. }),
+        "区域 0 必须 Converted: {reports:?}"
+    );
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
+    assert_eq!(
+        snapshot(&eng),
+        expected_state,
+        "全部用户表须与 Off 逐行全等"
+    );
 }

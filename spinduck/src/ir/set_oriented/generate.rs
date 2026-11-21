@@ -73,6 +73,33 @@ pub(super) fn generate(
     )? {
         return Ok(Err(SkipReason::UnprovenTargetConstraints));
     }
+    // 视图物化探测前移到前缀执行之前（物化失败会中止事务）：要求
+    // 前缀与 fn 前导例程的写集同全部视图底表不相交、且无动态 SQL/
+    // DDL 等不可枚举副作用——否则探测时点与物化时点数据可能不一致，
+    // 前移探测结论失效。fn 前导例程名 = 游标 fn_sites + INSERT 位
+    // insert_sites（finish 内 fn_preludes 的同一来源）。
+    if resolved.iter().any(|(l, _)| l.view_prelude.is_some()) {
+        let (mut writes, mut opaque) =
+            region::prefix_write_set(copy.prog, region.open_pc, ctx.catalog);
+        for name in copy
+            .fn_sites
+            .iter()
+            .map(|s| s.name.as_str())
+            .chain(copy.insert_sites.iter().map(|s| s.name.as_str()))
+        {
+            let (w, o) = region::routine_write_set(ctx.catalog, name);
+            writes.extend(w);
+            opaque |= o;
+        }
+        let hits_base = resolved.iter().any(|(l, _)| {
+            l.view_bases
+                .iter()
+                .any(|b| writes.contains(&b.0.to_ascii_lowercase()))
+        });
+        if opaque || hits_base {
+            return Ok(Err(SkipReason::TargetReadDependency));
+        }
+    }
     match finish(
         copy,
         inputs,

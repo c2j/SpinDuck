@@ -229,6 +229,52 @@ fn guard_should_inline_fn_site_alongside_plain_bind_columns() {
     });
 }
 
+/// 嵌套下沉 + 不可内联例程（含 LOOP，非 PureExpr 内核宏）：外层站点
+/// distinct_sql 内嵌内层缓存表 `sd_fn1`，物化必须按拓扑序先建内层表——
+/// 两阶段「全求值后全建表」会让外层 distinct 打到不存在的表（PR#59 评审）。
+#[test]
+fn guard_should_materialize_nested_fn_sites_in_dependency_order() {
+    big_stack(|| {
+        let func = "CREATE OR REPLACE FUNCTION fnc_loop(p IN NUMBER) RETURN NUMBER IS \
+             v NUMBER := p; \
+             i NUMBER := 0; \
+           BEGIN \
+             LOOP \
+               i := i + 1; \
+               v := v + i; \
+               EXIT WHEN i >= 3; \
+             END LOOP; \
+             RETURN v; \
+           END;";
+        let proc = "CREATE OR REPLACE PROCEDURE prc_nested IS \
+           BEGIN \
+             INSERT INTO t(id, val) SELECT id, fnc_loop(fnc_loop(id)) FROM src; \
+           END;";
+        let mut eng = Engine::new(
+            Box::new(DuckExecutor::open_in_memory().unwrap()),
+            RuleRegistry::default(),
+        );
+        eng.ex
+            .execute("CREATE TABLE src(id INT)", &BindMap::new())
+            .unwrap();
+        eng.ex
+            .execute("CREATE TABLE t(id INT, val INT)", &BindMap::new())
+            .unwrap();
+        eng.ex
+            .execute("INSERT INTO src VALUES (1), (2)", &BindMap::new())
+            .unwrap();
+        eng.register(func).unwrap();
+        eng.register(proc).unwrap();
+        eng.call("prc_nested", &[]).unwrap();
+        // fnc_loop(x) = x + 6；fnc_loop(fnc_loop(1)) = 13，fnc_loop(fnc_loop(2)) = 14
+        let expect = vec!["1:13".to_string(), "2:14".to_string()];
+        assert_eq!(
+            col_str(&eng, "SELECT id || ':' || val FROM t ORDER BY id"),
+            expect
+        );
+    });
+}
+
 /// 回归守护：fn_sites 物化期间例程求值触发 KERNEL 域错误时，异常处理器
 /// `reset_session` 的 ROLLBACK 会撤销事务内已发出的 `CREATE OR REPLACE
 /// TEMP TABLE`（目录 DDL 参与事务），旧 schema/旧行残留使后续 INSERT

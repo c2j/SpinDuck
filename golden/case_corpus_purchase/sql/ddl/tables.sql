@@ -1227,3 +1227,11 @@ CREATE TABLE par_sys_financial_product_sect (
     dividend_regi_date character varying(8),
     dividend_cash_date character varying(8)
 );
+
+-- 逐字取自基线 1_表结构/par_sys_stock.sql（fnc_get_stock_kind 的 %TYPE 引用所需；原随退役用例 case_corpus_hz_byfund 移出）
+CREATE TABLE par_sys_stock (
+    security_id character varying(19) NOT NULL,
+    stock_kind character varying(4),
+    inure_begin_date character varying(8) NOT NULL,
+    inure_end_date character varying(8)
+);

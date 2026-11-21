@@ -109,14 +109,16 @@ pub(super) fn resolve_one(
         Some(dep) => dep.bases.clone(),
         None => vec![(lq.table.clone(), table.clone())],
     };
-    let mut tables = match load_in_tables(ex, lq, &render_table, seed)? {
-        Ok(tables) => tables,
+    // 涉案表（漂移/写集复核）与 IN 子查询表（渲染 inner_tables）分列：
+    // 物化视图的 seed 可为零底表（常量视图），`tables[1..]` 式切片会越界。
+    let (mut tables, in_tables) = match load_in_tables(ex, lq, &render_table, seed)? {
+        Ok(pair) => pair,
         Err(reason) => return Ok(Err(reason)),
     };
     if let Some(p) = &proof {
         tables[0] = (p.base.clone(), p.base_table.clone());
     }
-    let render = match lookup::render(lq, &render_table, &tables[1..], index, cur_scan) {
+    let render = match lookup::render(lq, &render_table, &in_tables, index, cur_scan) {
         Ok(r) => r,
         Err(reason) => return Ok(Err(reason)),
     };
@@ -174,13 +176,16 @@ fn resolve_case(
 /// `kind_src` 为 IN 两侧类型对齐的列证据源（渲染表：普通表/入口守卫
 /// 视图投影/物化视图探测列）；`seed` 为涉案表证据初值（物化视图为
 /// 全部底表，普通查找为主表本身）。
+/// 返回 `(涉案表全集, IN 子查询表)`：前者供入口漂移复核与写集相交，
+/// 后者仅作 `lookup::render` 的 inner_tables 证据源。
 fn load_in_tables(
     ex: &schema::Source<'_>,
     lq: &LookupQuery,
     kind_src: &schema::Table,
     seed: Vec<(shape::Name, schema::Table)>,
-) -> Result<Result<LookupTables, SkipReason>, EngineError> {
+) -> Result<Result<(LookupTables, LookupTables), SkipReason>, EngineError> {
     let mut tables = seed;
+    let mut in_tables = Vec::new();
     for f in &lq.in_filters {
         let Some(inner) = ex.load(&f.table)? else {
             return Ok(Err(SkipReason::UnknownObjectDependency));
@@ -199,9 +204,10 @@ fn load_in_tables(
             (Some(a), Some(b)) if a == b => {}
             _ => return Ok(Err(SkipReason::UnprovenQueryTotalness)),
         }
-        tables.push((f.table.clone(), inner));
+        tables.push((f.table.clone(), inner.clone()));
+        in_tables.push((f.table.clone(), inner));
     }
-    Ok(Ok(tables))
+    Ok(Ok((tables, in_tables)))
 }
 
 /// LookupTuple 解析（§3.2）：加载涉案表 + 渲染单条 GROUP BY 派生表；

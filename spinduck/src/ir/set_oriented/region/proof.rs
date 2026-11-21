@@ -329,6 +329,201 @@ fn collect_expr_reads(expr: &IrExpr, out: &mut BTreeSet<VarName>) {
     }
 }
 
+/// 前缀写集枚举：区域入口之前全部语句（含嵌入 fn_site 与例程调用
+/// 递归展开）的 DML 目标表（小写归一）+ 不可枚举副作用标记。
+/// 视图物化探测前移到前缀执行之前（engine/set_oriented.rs），要求
+/// 该集合与全部视图底表不相交且无 opaque——否则探测时点与物化
+/// 时点数据可能不一致，探测结论失效。
+pub(crate) fn prefix_write_set(
+    prog: &IrProg,
+    open_pc: usize,
+    catalog: &crate::catalog::RoutineCatalog,
+) -> (BTreeSet<String>, bool) {
+    let mut out = WriteScan::default();
+    scan_stmt_writes(&prog.code[..open_pc], catalog, &mut Vec::new(), &mut out);
+    (out.writes, out.opaque)
+}
+
+/// 例程写集：fn_site 物化前导调用的例程按同口径枚举（整个 prog
+/// 扫描，保守超集——调用可达任意写点均计入）。
+pub(crate) fn routine_write_set(
+    catalog: &crate::catalog::RoutineCatalog,
+    name: &str,
+) -> (BTreeSet<String>, bool) {
+    let mut out = WriteScan::default();
+    scan_routine_writes(catalog, name, &mut Vec::new(), &mut out);
+    (out.writes, out.opaque)
+}
+
+#[derive(Default)]
+struct WriteScan {
+    writes: BTreeSet<String>,
+    /// 动态 SQL / DDL / 非常规语句 / 未解析或递归例程调用——写集
+    /// 无法静态枚举，调用方须按保守口径拒绝依赖数据不变的证明。
+    opaque: bool,
+}
+
+fn scan_stmt_writes(
+    stmts: &[IrStmt],
+    catalog: &crate::catalog::RoutineCatalog,
+    visiting: &mut Vec<String>,
+    out: &mut WriteScan,
+) {
+    for stmt in stmts {
+        match stmt {
+            IrStmt::SqlExec { sql, fn_sites, .. } => {
+                match classify_exec(sql) {
+                    ExecClass::Write(t) => {
+                        // 限定名同时登记末段：视图底表以未限定名登记，
+                        // `s.t` 与 `t` 须命中同一相交判定。
+                        if let Some(seg) = t.rsplit('.').next() {
+                            if seg != t {
+                                out.writes.insert(seg.to_string());
+                            }
+                        }
+                        out.writes.insert(t);
+                    }
+                    ExecClass::Read => {}
+                    ExecClass::Opaque => out.opaque = true,
+                }
+                scan_sites(fn_sites, catalog, visiting, out);
+            }
+            IrStmt::SqlQuery { fn_sites, .. } => {
+                scan_sites(fn_sites, catalog, visiting, out);
+            }
+            IrStmt::OpenCursor {
+                source: CursorSource::Static { fn_sites, .. },
+                ..
+            } => {
+                scan_sites(fn_sites, catalog, visiting, out);
+            }
+            IrStmt::OpenCursor {
+                source: CursorSource::Dynamic { .. },
+                ..
+            } => out.opaque = true,
+            IrStmt::SqlExecDynamic { .. } => out.opaque = true,
+            IrStmt::CallRoutine { name, .. } => {
+                scan_routine_writes(catalog, name, visiting, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scan_sites(
+    sites: &[crate::sql::FnSite],
+    catalog: &crate::catalog::RoutineCatalog,
+    visiting: &mut Vec<String>,
+    out: &mut WriteScan,
+) {
+    for s in sites {
+        scan_routine_writes(catalog, &s.name, visiting, out);
+    }
+}
+
+fn scan_routine_writes(
+    catalog: &crate::catalog::RoutineCatalog,
+    name: &str,
+    visiting: &mut Vec<String>,
+    out: &mut WriteScan,
+) {
+    let key = name.to_ascii_lowercase();
+    if visiting.contains(&key) {
+        out.opaque = true;
+        return;
+    }
+    let Some(routine) = catalog.lookup(name) else {
+        out.opaque = true;
+        return;
+    };
+    visiting.push(key);
+    scan_stmt_writes(&routine.prog.code, catalog, visiting, out);
+    visiting.pop();
+}
+
+/// SqlExec 首词分类：DML 目标表 / 只读 / 不可静态判定（DDL、SET、
+/// WITH..DML 等一律 Opaque——宁可多拒不可漏写）。
+enum ExecClass {
+    Write(String),
+    Read,
+    Opaque,
+}
+
+fn classify_exec(sql: &str) -> ExecClass {
+    use ogsql_parser::token::tokenizer::Tokenizer;
+    let Ok(tokens) = Tokenizer::new(sql).tokenize() else {
+        return ExecClass::Opaque;
+    };
+    // 全 token 文本（小写）：ident = 首字符为字母（关键字同为 ident，
+    // 由结构校验排除）；括号/点/运算符保留以判定相邻关系。
+    let toks: Vec<String> = tokens
+        .iter()
+        .filter_map(|t| sql.get(t.span.start..t.span.end))
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    let is_ident = |i: usize| {
+        toks.get(i)
+            .is_some_and(|t| t.chars().next().is_some_and(|c| c.is_ascii_alphabetic()))
+    };
+    // 限定名抽取：ident 起，按 "." ident 续接（"s.t" 单 token 形态天然覆盖）。
+    // 返回 (全名, 下一 token 下标)；起点非 ident → None。
+    let qualified = |mut i: usize| -> Option<(String, usize)> {
+        if !is_ident(i) {
+            return None;
+        }
+        let mut name = toks[i].clone();
+        i += 1;
+        while toks.get(i).is_some_and(|t| t == ".") && is_ident(i + 1) {
+            name.push('.');
+            name.push_str(&toks[i + 1]);
+            i += 2;
+        }
+        Some((name, i))
+    };
+    let keyword = |i: usize, kw: &str| toks.get(i).is_some_and(|t| t == kw);
+    match toks.first().map(String::as_str) {
+        Some("insert") | Some("merge") => {
+            // INSERT [ALL] INTO / MERGE INTO：ALL 多表插入保守拒绝。
+            if !keyword(1, "into") {
+                return ExecClass::Opaque;
+            }
+            qualified(2)
+                .map(|(t, _)| ExecClass::Write(t))
+                .unwrap_or(ExecClass::Opaque)
+        }
+        Some("update") => {
+            // UPDATE <表> SET：目标后必须紧跟 SET——`UPDATE (子查询)`、
+            // `UPDATE ONLY t` 等非常规形态一律 Opaque。
+            match qualified(1) {
+                Some((t, i)) if keyword(i, "set") => ExecClass::Write(t),
+                _ => ExecClass::Opaque,
+            }
+        }
+        Some("delete") => {
+            // DELETE FROM <表> [WHERE|USING]：目标后仅允许子句关键字或语句尾。
+            if !keyword(1, "from") {
+                return ExecClass::Opaque;
+            }
+            match qualified(2) {
+                Some((t, i)) if i >= toks.len() || keyword(i, "where") || keyword(i, "using") => {
+                    ExecClass::Write(t)
+                }
+                _ => ExecClass::Opaque,
+            }
+        }
+        Some("select") => {
+            // SELECT ... INTO <表> 也是写；其余只读。
+            if toks.iter().any(|t| t == "into") {
+                ExecClass::Opaque
+            } else {
+                ExecClass::Read
+            }
+        }
+        Some("values") | Some("table") => ExecClass::Read,
+        _ => ExecClass::Opaque,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::live_out_check;
@@ -536,5 +731,65 @@ mod tests {
         };
         let region = super::super::extract(&prog).unwrap();
         assert_eq!(live_out_check(&prog, &region), Ok(()));
+    }
+
+    #[test]
+    fn should_classify_simple_dml_targets() {
+        assert!(matches!(
+            classify_exec("insert into t values (1)"),
+            ExecClass::Write(ref t) if t == "t"
+        ));
+        assert!(matches!(
+            classify_exec("update t set a = 1"),
+            ExecClass::Write(ref t) if t == "t"
+        ));
+        assert!(matches!(
+            classify_exec("delete from t where a = 1"),
+            ExecClass::Write(ref t) if t == "t"
+        ));
+        assert!(matches!(
+            classify_exec("merge into s.t using u on (1=1) when matched then update set a=1"),
+            ExecClass::Write(ref t) if t == "s.t"
+        ));
+        assert!(matches!(classify_exec("select * from t"), ExecClass::Read));
+        assert!(matches!(classify_exec("values (1)"), ExecClass::Read));
+    }
+
+    #[test]
+    fn should_classify_qualified_target_with_last_segment() {
+        let prog = {
+            let mut p = loop_prog(1, 0);
+            p.code[0] = IrStmt::SqlExec {
+                sql: "insert into sch.t values (1)".into(),
+                binds: Vec::new(),
+                fn_sites: Vec::new(),
+                buffer_policy: BufferPolicy::Immediate,
+            };
+            p
+        };
+        let (writes, opaque) = prefix_write_set(&prog, 1, &Default::default());
+        assert!(!opaque);
+        assert!(writes.contains("sch.t"));
+        assert!(writes.contains("t"));
+    }
+
+    #[test]
+    fn should_reject_unusual_dml_shapes_as_opaque() {
+        // UPDATE (子查询) / UPDATE ONLY / DELETE ONLY / SELECT INTO /
+        // WITH..DML / INSERT ALL：目标不可静态枚举 → opaque。
+        for sql in [
+            "update (select a from t) x set a = 1",
+            "update only t set a = 1",
+            "delete from only t where a = 1",
+            "select a into t from s",
+            "with x as (select 1) insert into t select * from x",
+            "insert all into t values (1) into u values (2)",
+            "delete t from t join u on (1=1)",
+        ] {
+            assert!(
+                matches!(classify_exec(sql), ExecClass::Opaque),
+                "{sql} 应判 Opaque"
+            );
+        }
     }
 }

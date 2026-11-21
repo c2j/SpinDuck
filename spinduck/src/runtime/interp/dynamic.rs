@@ -116,40 +116,44 @@ fn write_site(site: &SiteRows, ex: &dyn crate::exec::SqlExecutor) -> Result<(), 
 /// SQL 上下文例程调用下沉物化（§8.3 路径②）。
 ///
 /// 语句文本中的调用点已在编译期替换为参数缓存子查询；此处在执行前逐元组
-/// 调用例程、填充缓存表（拓扑序保证依赖表先建）。
+/// 调用例程、填充缓存表。`sites` 已按拓扑序排列（依赖方在被依赖方之后），
+/// 外层站点的 distinct 查询可内嵌内层缓存表——必须逐站点
+/// 「求值 → 建表 → 重写全部已建表」交错执行：求值依赖方前其前驱表已存在，
+/// 例程求值触发的 reset_session→ROLLBACK 又可能撤销已建表，重写恢复。
 pub(super) fn materialize_fn_sites(
     sites: &[crate::sql::FnSite],
     env: &mut Env<'_>,
 ) -> Result<(), EngineError> {
-    let evaled = sites
-        .iter()
-        .map(|site| {
-            eval_site(
-                &site.table,
-                &site.name,
-                &site.distinct_sql,
-                &site.binds,
-                site.args.len(),
-                env,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    for site in &evaled {
-        write_site(site, env.ex)?;
+    let mut written: Vec<SiteRows> = Vec::with_capacity(sites.len());
+    for site in sites {
+        let rows = eval_site(
+            &site.table,
+            &site.name,
+            &site.distinct_sql,
+            &site.binds,
+            site.args.len(),
+            env,
+        )?;
+        write_site(&rows, env.ex)?;
+        for prev in &written {
+            write_site(prev, env.ex)?;
+        }
+        written.push(rows);
     }
     Ok(())
 }
 
 /// 集合化区域的 fn_site 物化前导（`ConversionPlan::fn_preludes`）：
-/// 与解释器 OpenCursor 时点同口径的两阶段物化——全部 distinct 查询与
-/// 例程求值先行，全部成功后才统一建缓存表；任一失败直接上抛
+/// 与解释器 OpenCursor 时点同口径的物化——任一失败直接上抛
 /// EngineError（与解释路径同点失败，绝不部分物化后续跑批写）。
 ///
 /// `needs_sd_cur` 前导（INSERT 位）的 distinct 查询内嵌 `sd_cur`，其
 /// WHERE 中的游标缓存子查询依赖基础前导（游标 site）的表已存在——
-/// 分两相位：先求值+建基础表，再求值依赖方，随后**重写**基础表
-/// （依赖方例程求值触发的会话回滚可能撤销未提交的基础缓存表），
-/// 最后建依赖方缓存表。重写不重复例程调用（字面量行已在内存）。
+/// 分两相位：先处理基础前导，再处理依赖方。相位内与相位间统一按
+/// 「求值 → 建表 → 重写全部已建表」交错执行：嵌套站点的依赖表先于
+/// 依赖方求值存在，例程求值的会话回滚撤销的缓存表逐站点重写恢复
+/// （重写不重复例程调用，字面量行已在内存）。任一失败直接上抛
+/// EngineError（与解释路径同点失败，绝不部分物化后续跑批写）。
 pub(crate) fn materialize_fn_preludes(
     preludes: &[crate::ir::set_oriented::FnPrelude],
     frame: &mut crate::runtime::Frame,
@@ -171,29 +175,22 @@ pub(crate) fn materialize_fn_preludes(
         last_write_rows: 0,
         var_types,
     };
-    let eval = |p: &crate::ir::set_oriented::FnPrelude,
-                env: &mut Env<'_>|
-     -> Result<SiteRows, EngineError> {
-        eval_site(&p.table, &p.name, &p.distinct_sql, &p.binds, p.arity, env)
-    };
     let (base, dep): (Vec<_>, Vec<_>) = preludes.iter().partition(|p| !p.needs_sd_cur);
-    let base_rows = base
-        .iter()
-        .map(|p| eval(p, &mut env))
-        .collect::<Result<Vec<_>, _>>()?;
-    for site in &base_rows {
-        write_site(site, ex)?;
-    }
-    let dep_rows = dep
-        .iter()
-        .map(|p| eval(p, &mut env))
-        .collect::<Result<Vec<_>, _>>()?;
-    // 依赖方例程求值的 reset_session→ROLLBACK 可能撤销基础缓存表，重写恢复。
-    for site in &base_rows {
-        write_site(site, ex)?;
-    }
-    for site in &dep_rows {
-        write_site(site, ex)?;
+    let mut written: Vec<SiteRows> = Vec::with_capacity(preludes.len());
+    for p in base.iter().chain(dep.iter()) {
+        let rows = eval_site(
+            &p.table,
+            &p.name,
+            &p.distinct_sql,
+            &p.binds,
+            p.arity,
+            &mut env,
+        )?;
+        write_site(&rows, ex)?;
+        for prev in &written {
+            write_site(prev, ex)?;
+        }
+        written.push(rows);
     }
     Ok(())
 }

@@ -20,7 +20,21 @@ impl<'a> Body<'a> {
         self.pending_lookups.extend(group.lookups);
         self.has_trap = true;
         let mut p = pc + 1;
+        // 深度 0 SELECT INTO 命中待定查找后，其 miss/dup 会让处理器跳至
+        // 续跑 pc、跳过保护区内其后全部语句（含后续待定查找——首查找落空
+        // 时次查找的 INTO 变量由处理器兜底常量写回，与批写独立求值的
+        // 命中值不等价）。故消费首个待定查找后仅允许 PopTrap/Nop 收尾，
+        // 其余语句一律保守拒绝。
+        let mut seen_lookup = false;
         while p <= group.pop_pc {
+            if self.pending_lookups.contains_key(&p) {
+                if seen_lookup {
+                    return Err(SkipReason::UnsupportedControlFlow);
+                }
+                seen_lookup = true;
+            } else if seen_lookup && !matches!(ctx.prog.code[p], IrStmt::PopTrap | IrStmt::Nop) {
+                return Err(SkipReason::UnsupportedControlFlow);
+            }
             p = self.statement(ctx, p)?;
         }
         if self

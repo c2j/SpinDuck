@@ -2,7 +2,7 @@
 #![cfg(feature = "native")]
 
 use spinduck_core::exec::SqlExecutor;
-use spinduck_core::ir::set_oriented::{SetOrientedMode, Status};
+use spinduck_core::ir::set_oriented::{SetOrientedMode, SkipReason, Status};
 use spinduck_core::value::SpinValue;
 use spinduck_core::{
     BindMap, DuckExecutor, Engine, EngineError, ExecOutcome, RowStream, RuleRegistry,
@@ -258,6 +258,9 @@ fn should_reject_sys_dummy_block_when_not_total_and_verify_decimal_mul_sub() {
     scenario_dec_wide_fallback();
     scenario_miss_emu();
     scenario_miss_fallbacks();
+    scenario_view_cast_fallback();
+    scenario_const_view();
+    scenario_mixed_trap_skip();
 }
 
 /// byfund c_get_data 同型：NO_DATA_FOUND 保护的 SELECT INTO +
@@ -410,6 +413,118 @@ fn scenario_miss_fallbacks() {
     );
     assert_eq!(dst_rows(&eng), expected_rows);
     assert_eq!(actual.outs, expected.outs, "回退后 OUT 须与 Off 一致");
+}
+
+/// 混合兜底 trap 回归（PR#59 评审）：保护区内 SELECT INTO 之后的语句
+/// 在 miss/dup 时被处理器跳过（跳至续跑 pc），批写不得无条件内联。
+/// dim 空表 → 每行 NO_DATA_FOUND → `w := identity_fn(r.id)` 不执行，
+/// w 保持循环外初值 5；错误实现会写入 r.id。
+fn caller_mixed_skip() -> &'static str {
+    "CREATE OR REPLACE PROCEDURE caller_mixed_skip(p_o_succeed OUT VARCHAR2) IS
+       w NUMBER := 5;
+       v VARCHAR2(10);
+     BEGIN
+       p_o_succeed := '0';
+       FOR r IN SELECT id, tag FROM cur_num LOOP
+         BEGIN
+           SELECT d.val INTO v FROM dim d WHERE d.id = r.id;
+           w := identity_fn(r.id);
+         EXCEPTION WHEN OTHERS THEN v := 'E'; END;
+         INSERT INTO dst_rows(security_id, yj, tag)
+           VALUES (r.tag, w, r.tag);
+       END LOOP;
+     END;"
+}
+
+fn identity_fn() -> &'static str {
+    "CREATE OR REPLACE FUNCTION identity_fn(p NUMBER) RETURN NUMBER IS
+     BEGIN RETURN p; END;"
+}
+
+/// 混合兜底 trap：查找后还有保护区语句 → 必须整体回退解释器
+/// （处理器短路语义无法逐行批量刻画），结果与 Off 逐行一致。
+fn scenario_mixed_trap_skip() {
+    let ddl: Vec<&str> = BASE_DDL
+        .iter()
+        .copied()
+        .chain([
+            "CREATE TABLE cur_num(id DECIMAL(10,0), tag VARCHAR)",
+            "CREATE TABLE dim(id DECIMAL(10,0), val VARCHAR)",
+            "INSERT INTO cur_num VALUES (1,'a'),(2,'b')",
+        ])
+        .collect();
+    let routines = [caller_mixed_skip(), identity_fn()];
+    let mut off = engine_with_routines(&ddl, SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_mixed_skip", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 2, "Off 语义基线: {expected_rows:?}");
+
+    let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_mixed_skip", &args()).unwrap();
+    assert!(
+        !matches!(
+            eng.set_oriented_reports()[0].status,
+            Status::Converted { .. }
+        ),
+        "查找后保护区语句必须回退: {:?}",
+        eng.set_oriented_reports()
+    );
+    assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
+}
+
+/// 视图物化失败不得中止事务（PR#59 评审）：视图投影 CAST 遇坏行时
+/// 全量物化失败会让 DuckDB 事务进入 aborted 态——物化探测必须前移到
+/// 前缀执行之前，失败安全回退整段解释器。Off 按行求值视图、过滤下推
+/// 只碰匹配行，坏行不触发错误，调用正常完成。
+fn caller_view_cast() -> &'static str {
+    "CREATE OR REPLACE PROCEDURE caller_view_cast(p_o_succeed OUT VARCHAR2) IS
+       v_x DECIMAL(20,6);
+     BEGIN
+       p_o_succeed := '0';
+       FOR r IN SELECT id, tag FROM cur_num LOOP
+         BEGIN
+           SELECT v.val INTO v_x FROM v_cast v WHERE v.id = r.id;
+         EXCEPTION WHEN OTHERS THEN v_x := 7; END;
+         INSERT INTO dst_rows(security_id, yj, tag)
+           VALUES (r.tag, v_x, r.tag);
+       END LOOP;
+     END;"
+}
+
+/// 视图物化探测前移：dim_raw 含坏行 id=2（CAST 失败），游标只查 id=1/3
+/// ——Off 成功且逐行结果确定；BatchAtomic 必须 Skipped 回退而非
+/// 在 aborted 事务里续跑解释器。
+fn scenario_view_cast_fallback() {
+    let ddl: Vec<&str> = BASE_DDL
+        .iter()
+        .copied()
+        .chain([
+            "CREATE TABLE cur_num(id DECIMAL(10,0), tag VARCHAR)",
+            "CREATE TABLE dim_raw(id DECIMAL(10,0), raw VARCHAR)",
+            "CREATE VIEW v_cast AS SELECT id, CAST(raw AS DECIMAL(20,6)) AS val FROM dim_raw",
+            "INSERT INTO dim_raw VALUES (1,'10'),(2,'bad')",
+            "INSERT INTO cur_num VALUES (1,'a'),(3,'c')",
+        ])
+        .collect();
+    let routines = [caller_view_cast()];
+    let mut off = engine_with_routines(&ddl, SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_view_cast", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 2, "Off 语义基线: {expected_rows:?}");
+
+    let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_view_cast", &args()).unwrap();
+    assert_eq!(
+        eng.set_oriented_reports()[0].status,
+        Status::Skipped {
+            reason: SkipReason::UnprovenQueryTotalness
+        },
+        "视图物化失败必须安全回退: {:?}",
+        eng.set_oriented_reports()
+    );
+    assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
 }
 
 /// fnc_grp_mode：SQL 上下文下沉例程（游标 WHERE 内 fn_site 同型）。
@@ -659,6 +774,46 @@ fn scenario_view_lookup() {
     let Status::Converted { .. } = eng.set_oriented_reports()[0].status.clone() else {
         panic!("视图查找必须 Converted: {:?}", eng.set_oriented_reports());
     };
+    assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
+}
+
+fn caller_const_view() -> &'static str {
+    "CREATE OR REPLACE PROCEDURE caller_const_view(p_o_succeed OUT VARCHAR2) IS
+       v_x VARCHAR2(20);
+     BEGIN
+       p_o_succeed := '0';
+       FOR r IN SELECT security_id, cjje, tag FROM cur_rows LOOP
+         BEGIN
+           SELECT v.val INTO v_x FROM v_const v WHERE v.k = r.security_id;
+         EXCEPTION WHEN OTHERS THEN v_x := 'D'; END;
+         INSERT INTO dst_rows(security_id, yj, tag)
+           VALUES (r.security_id, r.cjje, v_x);
+       END LOOP;
+     END;"
+}
+
+/// 零底表常量视图查找（PR#59 评审回归）：`SELECT 'S1', 'OK'` 无 FROM，
+/// 物化前导 bases 为空——涉案表清单与 IN 子查询表清单必须分列，
+/// 不得以 `tables[1..]` 切片取证（空表集越界 panic）。
+fn scenario_const_view() {
+    let ddl: Vec<&str> = BASE_DDL
+        .iter()
+        .copied()
+        .chain([
+            "CREATE VIEW v_const AS SELECT 'S1' AS k, 'OK' AS val",
+            "INSERT INTO cur_rows VALUES \
+               ('S1',1.00,0,0,'a'),('S2',2.00,0,0,'b')",
+        ])
+        .collect();
+    let routines = [caller_const_view()];
+    let mut off = engine_with_routines(&ddl, SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_const_view", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 2, "Off 语义基线: {expected_rows:?}");
+
+    let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_const_view", &args()).unwrap();
     assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
     assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
 }

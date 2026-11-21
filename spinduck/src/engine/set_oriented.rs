@@ -46,6 +46,33 @@ impl Engine {
             }
             Ok(p) => vec![p],
         };
+        // 视图物化探测前移：`CREATE … AS SELECT * FROM <视图>` 遇坏数据
+        // 会让 DuckDB 事务进入 aborted 态，此后任何语句（含解释器续跑）
+        // 都失败——必须在任何用户代码（前缀、fn 物化前导）执行前探测；
+        // 失败时事务内尚无副作用，ROLLBACK 重开后整段按原 IR 解释执行。
+        // 计划期已证前缀与 fn 前导写集同视图底表不相交，探测通过 ⇒
+        // 物化时点数据与探测时点一致。
+        if plans.iter().any(|p| !p.view_preludes.is_empty()) {
+            let mut failed = false;
+            for p in &plans {
+                if self.materialize_views(p).is_err() {
+                    failed = true;
+                    break;
+                }
+            }
+            if failed {
+                self.ex.execute("ROLLBACK", &crate::exec::BindMap::new())?;
+                self.ex
+                    .execute("BEGIN TRANSACTION", &crate::exec::BindMap::new())?;
+                self.push_report(
+                    &routine.name,
+                    Status::Skipped {
+                        reason: SkipReason::UnprovenQueryTotalness,
+                    },
+                );
+                return self.run_prog(&routine.prog, frame, sink, limits, RunSpan::default());
+            }
+        }
         let mut cursor_pc = 0usize;
         for p in &plans {
             // 步 1：前缀按原 IR 执行至区域入口（stop_pc 处指令不执行、不计步）；
@@ -105,9 +132,14 @@ impl Engine {
             // 可回滚会话临时表，视图在 fn 后由下方步骤再物化（幂等）。
             // 物化失败则 fn 前导不可跑（distinct 引用 sd_vwN），跳过
             // 物化——下方视图步骤同样失败，走既有回退。
+            // 前移探测已证物化必成功；此处失败属计划期证明缺陷，
+            // 直接上抛——吞错会让事务停在 aborted 态。
             let views_ready = plan.view_preludes.is_empty()
                 || !plan.fn_preludes.iter().any(|p| p.needs_sd_cur)
-                || self.materialize_views(plan).is_ok();
+                || {
+                    self.materialize_views(plan)?;
+                    true
+                };
             if views_ready {
                 crate::runtime::interp::materialize_fn_preludes(
                     &plan.fn_preludes,
@@ -122,26 +154,10 @@ impl Engine {
         }
         // 视图物化前导：先于入口守卫（守卫可内嵌 sd_vwN 派生表），且在
         // fn 物化之后——例程调用可回滚会话本地建表，视图表必须最后建。
-        // 物化失败回退原区域：原解释器逐行求值视图，错误由行级 trap
-        // 兜底，物化失败不构成调用失败。
-        if !plan.view_preludes.is_empty() && self.materialize_views(plan).is_err() {
-            self.push_report(
-                &routine.name,
-                Status::Skipped {
-                    reason: SkipReason::UnprovenQueryTotalness,
-                },
-            );
-            let out = self.run_prog(
-                &routine.prog,
-                frame,
-                sink,
-                limits,
-                RunSpan {
-                    start_pc: plan.open_pc,
-                    stop_pc: Some(plan.close_pc + 1),
-                },
-            )?;
-            return Ok((!matches!(out, RunOutcome::Stopped)).then_some(out));
+        // 前移探测 + 计划期写集不相交证明保证此处物化必成功；失败上抛
+        // （事务已中止，无法安全回退解释器）。
+        if !plan.view_preludes.is_empty() {
+            self.materialize_views(plan)?;
         }
         match entry_ok(self.ex.as_ref(), plan, &self.optimize_ctx(), frame)? {
             Err(reason) => {
@@ -197,7 +213,9 @@ impl Engine {
     }
 
     /// 视图物化前导执行：`CREATE OR REPLACE TEMP TABLE sd_vwN AS
-    /// SELECT * FROM <视图>`，按声明序；任一失败上抛由调用方回退。
+    /// SELECT * FROM <视图>`，按声明序；任一失败上抛——物化失败会
+    /// 中止事务，调用方必须已在无用户副作用的时点探测过（前移
+    /// 探测）或按计划期证明保证不会失败。
     fn materialize_views(&self, plan: &ConversionPlan) -> Result<(), EngineError> {
         for p in &plan.view_preludes {
             self.ex.execute(&p.sql, &crate::exec::BindMap::new())?;
