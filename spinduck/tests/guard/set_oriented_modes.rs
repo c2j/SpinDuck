@@ -148,6 +148,7 @@ fn should_select_exactly_one_execution_path_for_each_switch_combination() {
         if !set {
             assert_eq!(eng.set_oriented_reports(), &[]);
         } else if batch {
+            // Strict × batch_commit 仍互斥拒绝（§2.2-3 仅解除 BatchAtomic）
             assert_eq!(
                 eng.set_oriented_reports()[0].status,
                 Status::Skipped {
@@ -156,7 +157,7 @@ fn should_select_exactly_one_execution_path_for_each_switch_combination() {
             );
         } else {
             let Status::Converted { sql } = &eng.set_oriented_reports()[0].status else {
-                panic!("expected conversion");
+                panic!("expected conversion: {:?}", eng.set_oriented_reports());
             };
             let writes: Vec<_> = trace
                 .0

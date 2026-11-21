@@ -412,6 +412,7 @@ impl Compiler {
                     sql: unit.text,
                     binds: unit.binds,
                     fn_sites: Vec::new(),
+                    buffer_policy: BufferPolicy::Immediate,
                 });
             }
             PlStatement::Raise(ra) => {

@@ -2,12 +2,16 @@
 //! Top-1 / 异构 CASE 写汇的 token 流识别，产出 LookupQuery；其余形态
 //! （函数/CAST/除法/嵌套子查询）一律保守拒绝，交回解释器。
 
+mod case;
 mod in_pred;
 mod tokens;
+mod tuple;
+
+pub(crate) use tuple::parse_tuple_total;
 
 use super::{
-    BindSrc, CaseSink, Correlation, CorrelationOp, InFilter, InList, LookupQuery, Name, SkipReason,
-    Top1, VarName,
+    BindSrc, CaseElse, CaseSink, Correlation, CorrelationOp, InFilter, InList, InListItem,
+    LookupQuery, Name, SkipReason, Top1, VarName,
 };
 use crate::value::SpinValue;
 use tokens::LiteralTokens;
@@ -17,21 +21,20 @@ use tokens::LiteralTokens;
 /// （=/<>/!=/</<=/>/>=）、列 = 游标字段绑定（可多键）或
 /// 列 IN (SELECT 列 FROM 表 [WHERE 静态谓词])。
 /// 其余形态（函数/CAST/除法）一律 UnprovenQueryTotalness。
-pub(super) fn parse_total(
+pub(crate) fn parse_total(
     sql: &str,
     var: VarName,
-    default: SpinValue,
+    default_sql: String,
     binds: &[(String, BindSrc)],
     record: &VarName,
 ) -> Result<LookupQuery, SkipReason> {
-    let default_sql = fallback_sql(&default)?;
     let mut t = LiteralTokens::new(sql).ok_or(SkipReason::UnprovenQueryTotalness)?;
     let bad = SkipReason::UnprovenQueryTotalness;
     if !t.take("select") {
         return Err(bad);
     }
     let (column, nvl_default, case_sink) = if t.peek() == Some("case") {
-        let cs = parse_case_sink(&mut t, binds, record)?;
+        let cs = case::parse_case_sink(&mut t, binds, record)?;
         (Name(String::new()), None, Some(cs))
     } else {
         let (c, n) = parse_projection(&mut t).ok_or(bad)?;
@@ -63,6 +66,7 @@ pub(super) fn parse_total(
         nvl_default,
         filter: predicates.sql(),
         default_sql,
+        default_var: None,
         correlations: predicates.correlations,
         in_filters: predicates.in_filters,
         in_lists: predicates.in_lists,
@@ -71,75 +75,9 @@ pub(super) fn parse_total(
         group: 0,
         filter_on_miss: false,
         filter_binds: predicates.binds,
+        entry_guard: false,
+        miss_emu: None,
     })
-}
-
-/// 异构 CASE 投影：`CASE $v_operand WHEN lit THEN $v_rec__field ... ELSE
-/// $v_rec__field END`。操作数须为变量绑定（同组查找），分支须为游标字段绑定。
-fn parse_case_sink(
-    t: &mut LiteralTokens,
-    binds: &[(String, BindSrc)],
-    record: &VarName,
-) -> Result<CaseSink, SkipReason> {
-    let bad = SkipReason::UnprovenQueryTotalness;
-    t.take("case");
-    let operand_var = match parse_case_bind(t, binds, record)? {
-        CaseBind::Var(v) => v,
-        CaseBind::Field(_) => return Err(bad),
-    };
-    let mut whens = Vec::new();
-    while t.take("when") {
-        let key = t.literal().ok_or(bad)?;
-        if !t.take("then") {
-            return Err(bad);
-        }
-        let field = match parse_case_bind(t, binds, record)? {
-            CaseBind::Field(f) => f,
-            CaseBind::Var(_) => return Err(bad),
-        };
-        whens.push((key, field));
-    }
-    if whens.is_empty() || !t.take("else") {
-        return Err(bad);
-    }
-    let else_field = match parse_case_bind(t, binds, record)? {
-        CaseBind::Field(f) => f,
-        CaseBind::Var(_) => return Err(bad),
-    };
-    if !t.take("end") {
-        return Err(bad);
-    }
-    Ok(CaseSink {
-        operand: operand_var,
-        whens,
-        else_field,
-    })
-}
-
-enum CaseBind {
-    Var(VarName),
-    Field(Name),
-}
-
-/// CASE 内的绑定占位符：`$v_<var>`（变量）或 `$v_<rec>__<field>`（游标字段）。
-fn parse_case_bind(
-    t: &mut LiteralTokens,
-    binds: &[(String, BindSrc)],
-    record: &VarName,
-) -> Result<CaseBind, SkipReason> {
-    let bad = SkipReason::UnprovenQueryTotalness;
-    let ph = t.peek().ok_or(bad)?.to_string();
-    if !ph.starts_with("$v_") {
-        return Err(bad);
-    }
-    t.take(&ph);
-    match binds.iter().find(|(p, _)| *p == ph).map(|(_, s)| s) {
-        Some(BindSrc::Var(v)) => Ok(CaseBind::Var(v.clone())),
-        Some(BindSrc::Field { rec, field }) if rec == record => {
-            Ok(CaseBind::Field(Name(field.clone())))
-        }
-        _ => Err(bad),
-    }
 }
 
 /// 投影：裸列或 `coalesce(列, 常量)`（源 nvl 经 IR 归一为 coalesce，
@@ -213,11 +151,23 @@ fn parse_derived_top1(
     if !t.take("(") || !t.take("select") {
         return Err(bad);
     }
-    let inner_col = t.column().ok_or(bad)?;
-    let inner_alias = projection_alias(t, &inner_col)?;
-    if &inner_alias != outer_col {
-        return Err(bad);
+    // 内层投影为裸列清单；外层投影名须命中其中一项的输出名
+    // （别名优先，否则列名），命中项源列作为查找列——多列 SELECT INTO
+    // 只取 Top-1 首行的目标列，其余投影列不参与值提取。
+    let mut inner_col = None;
+    loop {
+        let col = t.column().ok_or(bad)?;
+        if projection_alias(t, &col)? == *outer_col {
+            if inner_col.is_some() {
+                return Err(bad);
+            }
+            inner_col = Some(col);
+        }
+        if !t.take(",") {
+            break;
+        }
     }
+    let inner_col = inner_col.ok_or(bad)?;
     if !t.take("from") {
         return Err(bad);
     }
@@ -245,6 +195,7 @@ fn parse_derived_top1(
         nvl_default: None,
         filter: predicates.sql(),
         default_sql: String::new(),
+        default_var: None,
         correlations: predicates.correlations,
         in_filters: predicates.in_filters,
         in_lists: predicates.in_lists,
@@ -253,6 +204,8 @@ fn parse_derived_top1(
         group: 0,
         filter_on_miss: false,
         filter_binds: predicates.binds,
+        entry_guard: false,
+        miss_emu: None,
     })
 }
 
@@ -275,7 +228,7 @@ impl WhereClause {
     }
 }
 
-fn fallback_sql(default: &SpinValue) -> Result<String, SkipReason> {
+pub(super) fn fallback_sql(default: &SpinValue) -> Result<String, SkipReason> {
     match default {
         SpinValue::Str(s) => Ok(format!("'{}'", s.replace('\'', "''"))),
         SpinValue::Int(i) => Ok(i.to_string()),
@@ -338,6 +291,8 @@ fn parse_where(
             && t.words.get(t.pos + 1).is_some_and(|w| w == "between")
         {
             parse_between(t, binds, record, &mut result)?;
+        } else if t.peek() == Some("(") {
+            parse_or_group(t, binds, record, &mut result)?;
         } else {
             parse_column_predicate(t, binds, record, &mut result)?;
         }
@@ -373,6 +328,7 @@ fn parse_between(
                 .parts
                 .push(format!("{ph} BETWEEN {} AND {}", lo.sql(), hi.sql()));
         }
+        BindSrc::Expr { .. } => return Err(bad),
         BindSrc::Field { rec, field } => {
             if rec != record {
                 return Err(bad);
@@ -385,6 +341,111 @@ fn parse_between(
                 });
             }
         }
+    }
+    Ok(())
+}
+
+/// 等值析取组：`(列 = 操作数 OR 列 = 操作数 ...)`。
+/// - 全部操作数为逐行项（游标字段绑定 / 表达式实参 / 字面量）→
+///   等价改写 `列 IN (项, ...)`（`x=a OR x=b` 与 `x IN (a,b)` 的
+///   NULL 逐析取排除语义一致），交 LATERAL 渲染；
+/// - 全部操作数为静态项（字面量 / Var 绑定占位符）→ 保持括号 OR
+///   作为单个 AND 项（自带括号）；
+/// - 混合逐行与静态、Field 相关键与异列析取一律保守拒绝。
+fn parse_or_group(
+    t: &mut LiteralTokens,
+    binds: &[(String, BindSrc)],
+    record: &VarName,
+    result: &mut WhereClause,
+) -> Result<(), SkipReason> {
+    let bad = SkipReason::UnprovenQueryTotalness;
+    if !t.take("(") {
+        return Err(bad);
+    }
+    /// 析取操作数：逐行项（IN-list）或静态项（OR parts）。
+    enum OrItem {
+        Field(Name),
+        Expr { sql: String, field: String },
+        Lit(String),
+        Static(String),
+    }
+    let mut col: Option<Name> = None;
+    let mut items = Vec::new();
+    loop {
+        let c = t.column().ok_or(bad)?;
+        match &col {
+            None => col = Some(c.clone()),
+            Some(k) if *k == c => {}
+            Some(_) => return Err(bad),
+        }
+        if !t.take("=") {
+            return Err(bad);
+        }
+        let item = if t.peek().is_some_and(|w| w.starts_with("$v_")) {
+            let w = t.peek().ok_or(bad)?.to_string();
+            t.take(&w);
+            match binds.iter().find(|(p, _)| **p == w) {
+                Some((_, BindSrc::Expr { sql, field })) => OrItem::Expr {
+                    sql: sql.clone(),
+                    field: field.clone(),
+                },
+                Some((_, BindSrc::Field { rec, field })) if rec == record => {
+                    OrItem::Field(Name(field.clone()))
+                }
+                Some((_, src @ BindSrc::Var(_))) => {
+                    result.binds.push((w.clone(), src.clone()));
+                    OrItem::Static(w)
+                }
+                _ => return Err(bad),
+            }
+        } else {
+            OrItem::Lit(t.literal().ok_or(bad)?)
+        };
+        items.push(item);
+        if !t.take("or") {
+            break;
+        }
+    }
+    if !t.take(")") {
+        return Err(bad);
+    }
+    let column = col.ok_or(bad)?;
+    let per_row = items.iter().all(|i| !matches!(i, OrItem::Static(_)));
+    let all_static = items
+        .iter()
+        .all(|i| matches!(i, OrItem::Lit(_) | OrItem::Static(_)));
+    if per_row {
+        let mut in_items = Vec::with_capacity(items.len());
+        for i in items {
+            in_items.push(match i {
+                OrItem::Field(f) => InListItem::Field(f),
+                OrItem::Expr { sql, field } => InListItem::Expr {
+                    sql,
+                    base_field: Name(field),
+                },
+                OrItem::Lit(s) => InListItem::Lit(s),
+                OrItem::Static(_) => return Err(bad),
+            });
+        }
+        result.in_lists.push(InList {
+            column,
+            items: in_items,
+        });
+    } else if all_static {
+        let disjuncts = items
+            .iter()
+            .map(|i| {
+                let operand = match i {
+                    OrItem::Lit(s) | OrItem::Static(s) => s.as_str(),
+                    _ => return None,
+                };
+                Some(format!("{} = {}", column.sql(), operand))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(bad)?;
+        result.parts.push(format!("({})", disjuncts.join(" OR ")));
+    } else {
+        return Err(bad);
     }
     Ok(())
 }

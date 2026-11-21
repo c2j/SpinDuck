@@ -1,5 +1,6 @@
 //! 受限静态游标集合化；保留原始 IR，离线候选在调用入口同事务复核。
 
+mod agg;
 mod analyze;
 mod candidate;
 mod defaults;
@@ -19,11 +20,13 @@ mod resolve;
 mod route;
 mod schema;
 mod shape;
+mod vguard;
+mod viewdep;
 
-pub(crate) use entry::{entry_ok, suffix_prog, ConversionPlan};
+pub(crate) use entry::{entry_ok, ConversionPlan, FnPrelude};
 
 use super::{AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, VarName};
-use crate::catalog::CompiledRoutine;
+use crate::catalog::{CompiledRoutine, ParamMode};
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
 use analyze::analyze_region;
@@ -99,6 +102,9 @@ pub enum SkipReason {
     /// 异值并列（含 NULL 与值并列），首行选择存在真实歧义。
     AmbiguousTop1Tie,
     UnsupportedCall,
+    /// 多 OUT 参数被调函数的 LookupTuple 证明失败：处理器漏赋 OUT/返回值、
+    /// 处理器 Raise、或成功路径拷贝表达式可抛错（设计 §3.2）。
+    MultiOutCallImpure,
     /// 语句残留非空 fn_sites：运行期物化有副作用（distinct_sql/临时表/
     /// MAX_TUPLES），Converted 计划绝不原样穿透（设计 §4.2）。
     UnresolvedFnSite,
@@ -126,23 +132,66 @@ pub(super) enum SinkOp {
     Concat,
 }
 
+/// §3.3 条件算术覆写：IF 门内 `var := <DECIMAL 乘/减表达式>`，
+/// 集合化投影为 `CASE WHEN <cond> THEN <arith> ELSE <原值> END`。
+#[derive(Clone)]
+pub(super) struct ArithWrite {
+    pub var: VarName,
+    pub cond: crate::ir::IrExpr,
+    pub expr: crate::ir::IrExpr,
+}
+
+/// INSERT 位 fn_site（缓存表改名 `sd_bfN`）：`distinct_sql` 为无 FROM
+/// 实参数列表，批写时在投影环境下改写为 `SELECT DISTINCT <实参>
+/// FROM sd_cur <joins>` 前导物化；`orig_table` 为编译产物中的 `sd_fnN`，
+/// 缓存子查询实参渲染时据此换名。
+#[derive(Clone)]
+pub(super) struct InsertSite {
+    pub orig_table: String,
+    pub table: String,
+    pub name: String,
+    pub distinct_sql: String,
+    pub binds: Vec<(String, BindSrc)>,
+    pub arity: usize,
+}
+
 struct CopyLoop<'a> {
     pub(super) query: &'a str,
     pub(super) insert: &'a str,
     pub(super) binds: &'a [(String, BindSrc)],
     /// 游标查询自身的绑定（WHERE 引用形参等），须随批写 SQL 一并携带。
     pub(super) query_binds: &'a [(String, BindSrc)],
+    /// 游标 WHERE 内 SQL 上下文例程调用（已证位于顶层 WHERE 之后）：
+    /// 由 FnPrelude 在批写前按 distinct 元组物化缓存表。
+    pub(super) fn_sites: &'a [crate::sql::FnSite],
+    /// INSERT 参数内 SQL 上下文例程调用（PureExpr + 无 FROM 实参列表）：
+    /// distinct-over-sd_cur 前导物化，缓存表名已改 `sd_bfN`。
+    pub(super) insert_sites: Vec<InsertSite>,
     /// 变量类型表：过滤式无抛错证明裁决绑定值域（Varchar↔str / 数值↔num）。
     pub(super) var_types: &'a std::collections::BTreeMap<String, crate::types::SpinType>,
     pub(super) record: &'a VarName,
+    /// 区域程序 IR：内联 Lookup Var 实参的循环不变性证明依据（§4.3 A7）。
+    pub(super) prog: &'a crate::ir::IrProg,
     /// BatchAtomic × trap：授权以列级守卫过滤坏行（跳行语义等价）。
     pub(super) allow_filter: bool,
+    /// §3.5-4 INSERT 跳起型处理器（非 NoOp inst_log）：入口守卫须证
+    /// bad_rows==0，处理器不可达时副作用不观测；非零整段退回。
+    pub(super) insert_log: bool,
     /// PL 表达式下沉：变量 → (算子, 左字段, 右字段)，仅字段/字段形态。
     pub(super) sinks: Vec<(VarName, SinkOp, String, String)>,
     /// 兜底型循环不变查找（§4.4 B1）：聚合标量子查询替代 SELECT INTO。
     pub(super) lookups: Vec<lookup::LookupQuery>,
+    /// 多 OUT 查找函数内联（§3.2 LookupTuple）：单条 GROUP BY 派生表 +
+    /// 每变量 `CASE WHEN sd_cnt = 1 THEN 列 ELSE 兜底` 投影。
+    pub(super) tuples: Vec<lookup::TupleQuery>,
+    /// 条件无 GROUP BY 聚合查表（§3.4）：trap 包裹 SUM + 字段覆写投影。
+    pub(super) aggs: Vec<agg::AggQuery>,
+    /// 聚合结果写回游标字段（可挂 IF 门），驱动 CASE 投影。
+    pub(super) field_writes: Vec<agg::FieldWrite>,
     /// IF 路由（§4.3）：(查找变量, 常量 SQL)，入口守卫证明 THEN 不可达。
     pub(super) route: Option<(VarName, String)>,
+    /// 条件算术覆写（§3.3）：IF 门内变量重赋值，投影外层 CASE。
+    pub(super) arith_writes: Vec<ArithWrite>,
     /// PureExpr 常量折叠（§4.3 A7）：赋值变量 → 常量；仅用于静态剪枝
     /// 与出口活跃证明，不参与批写投影。
     pub(super) folded: Vec<(VarName, crate::value::SpinValue)>,
@@ -155,6 +204,10 @@ struct CopyLoop<'a> {
     pub(super) inline_preconditions: std::collections::BTreeMap<String, Vec<VarName>>,
     /// 死存储消除（§5 清单 g）：全程序无读取变量的常量赋值，整体跳过。
     pub(super) dead: Vec<VarName>,
+    /// 区域写集（§3.5 V3-5 视图底表 Reads∩Writes 复核）。
+    pub(super) writes: std::collections::BTreeSet<String>,
+    /// 本过程 IN 形参名（小写）：循环不变的调用方输入，可作批写投影。
+    pub(super) in_params: std::collections::BTreeSet<String>,
 }
 
 /// 一次调用选择所需的引擎上下文（模式、开关、编译期证据）。
@@ -182,7 +235,10 @@ fn plan_from(
     ctx: &OptimizeCtx<'_>,
 ) -> Result<Result<entry::ConversionPlan, SkipReason>, EngineError> {
     let mode = ctx.mode;
-    let selected = if ctx.batch_commit {
+    // §2.2-3：仅 BatchAtomic × --batch-commit 解除互斥——区域集合 SQL 不经
+    // WriteBuffer，TxCommit trace 照发但实际提交延迟到 call_with_sink 出口；
+    // Strict 仍拒绝（提交快照语义不允许合并）。
+    let selected = if ctx.batch_commit && mode != SetOrientedMode::BatchAtomic {
         Err(SkipReason::BatchCommitEnabled)
     } else {
         match v2_admit(&routine.prog, mode, ctx.catalog) {
@@ -197,22 +253,14 @@ fn plan_from(
                 {
                     Err(SkipReason::LiveOutState)
                 } else {
-                    match analyze_region(&routine.prog, &region, mode, ctx.catalog) {
+                    // §4.2：IN 形参是调用方给定的循环不变输入，可作批写投影；
+                    // OUT/INOUT 形参有回写语义，不在此列。
+                    let in_params = in_param_names(routine);
+                    match analyze_region(&routine.prog, &region, mode, ctx.catalog, &in_params) {
                         Err(reason) => Err(reason),
                         Ok((mut copy, tail, has_trap)) => {
                             // 下沉/查找变量若是 OUT/INOUT 形参，出口写回不可消除
-                            let live_param = |v: &VarName| {
-                                routine
-                                    .params
-                                    .iter()
-                                    .any(|p| p.name.eq_ignore_ascii_case(&v.0))
-                            };
-                            if copy.sinks.iter().any(|(v, _, _, _)| live_param(v))
-                                || copy.lookups.iter().any(|l| live_param(&l.var))
-                                || copy.folded.iter().any(|(v, _)| live_param(v))
-                                || copy.inlined.iter().any(|(v, _)| live_param(v))
-                                || copy.dead.iter().any(live_param)
-                            {
+                            if live_param_hit(&copy, routine) {
                                 Err(SkipReason::LiveOutState)
                             } else {
                                 match generate(&mut copy, source, ctx, &region, tail)? {
@@ -231,6 +279,33 @@ fn plan_from(
     Ok(selected)
 }
 
+/// 集合化产物引用了例程形参：该变量的值须随 OUT/INOUT 回写，无法消除。
+fn live_param_hit(copy: &CopyLoop<'_>, routine: &CompiledRoutine) -> bool {
+    let live_param = |v: &VarName| {
+        routine
+            .params
+            .iter()
+            .any(|p| p.name.eq_ignore_ascii_case(&v.0))
+    };
+    copy.sinks.iter().any(|(v, _, _, _)| live_param(v))
+        || copy.lookups.iter().any(|l| live_param(&l.var))
+        || copy.folded.iter().any(|(v, _)| live_param(v))
+        || copy.inlined.iter().any(|(v, _)| live_param(v))
+        || copy.dead.iter().any(live_param)
+        || copy.aggs.iter().any(|a| live_param(&a.var))
+        || copy.arith_writes.iter().any(|w| live_param(&w.var))
+}
+
+/// 例程 IN 形参名集（小写）：批写投影仅承认这些循环不变输入。
+fn in_param_names(routine: &CompiledRoutine) -> std::collections::BTreeSet<String> {
+    routine
+        .params
+        .iter()
+        .filter(|p| p.mode == ParamMode::In)
+        .map(|p| p.name.to_ascii_lowercase())
+        .collect()
+}
+
 /// V2 准入前置：区域抽取 + 前缀干净度 + 效果准入 + Trap 体限制 + 写集 + 读写不交 + 出口活跃。
 fn v2_admit(
     prog: &IrProg,
@@ -238,10 +313,15 @@ fn v2_admit(
     catalog: &crate::catalog::RoutineCatalog,
 ) -> Result<region::CursorRegion, SkipReason> {
     let region = region::extract(prog)?;
-    region::reject_prefix_effects(prog, region.open_pc)?;
-    reject_outer_effects(&prog.code[region.close_pc + 1..])?;
+    // §2.1 不变量 1：run_spanned 每段空陷阱栈起步，分段边界的静态陷阱
+    // 深度必须为 0，否则边界两侧的异常处理语义无法跨段保持。
+    region::reject_trap_boundaries(prog, &region)?;
+    region::reject_prefix_effects(prog, &region)?;
+    // 后缀不再做效果准入：RunSpan 在原 IrProg 上按原 PC 解释执行，
+    // 例程调用、动态游标与 EXECUTE IMMEDIATE 均为解释器原生能力；
+    // 变量依赖由 live_out_check 兜底（设计 §2.1/§4 V3A）。
     if mode == SetOrientedMode::BatchAtomic {
-        region::prefix_is_clean(prog, region.open_pc)?;
+        region::prefix_is_clean(prog, &region)?;
     }
     region::admit_effects(prog, &region, mode, catalog)?;
     region::trap_bodies_admissible(prog, &region, catalog)?;
@@ -322,23 +402,4 @@ fn substitute_binds(text: &str, repls: &[(String, String)]) -> String {
         }
     }
     out
-}
-
-/// 前缀/后缀效果扫描：允许事务边界，拒绝异常/调用/动态 SQL。
-fn reject_outer_effects(code: &[IrStmt]) -> Result<(), SkipReason> {
-    for stmt in code {
-        match stmt {
-            IrStmt::PushTrap { .. } | IrStmt::PopTrap | IrStmt::Raise { .. } => {
-                return Err(SkipReason::ExceptionScopePresent)
-            }
-            IrStmt::CallRoutine { .. } => return Err(SkipReason::UnsupportedCall),
-            IrStmt::SqlExecDynamic { .. }
-            | IrStmt::OpenCursor {
-                source: CursorSource::Dynamic { .. },
-                ..
-            } => return Err(SkipReason::DynamicSql),
-            _ => {}
-        }
-    }
-    Ok(())
 }

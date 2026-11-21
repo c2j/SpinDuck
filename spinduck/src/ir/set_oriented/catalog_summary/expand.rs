@@ -122,7 +122,7 @@ impl Expander<'_> {
             .extend(args.iter().filter(|arg| !super::arg_total(arg)).cloned());
         let args =
             super::installed_args(self.catalog, name, &args, &mut self.checks.varchar_inputs)?;
-        let body = super::bind_body(body, &routine.params, &args, self.checks);
+        let (body, _) = super::bind_body(body, &routine.params, &args, self.checks);
         self.visiting.push(key);
         let out = self.expand(body, depth + 1);
         self.visiting.pop();

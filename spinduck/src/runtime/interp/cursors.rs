@@ -110,7 +110,7 @@ pub(super) fn close(env: &mut Env<'_>, cursor: &VarName) -> Result<(), EngineErr
 /// 表达式求值（游标动态文本用）。
 fn eval_text(env: &mut Env<'_>, expr: &IrExpr) -> Result<SpinValue, EngineError> {
     let mut env_ = EvalEnv {
-        frame: env.frame,
+        frame: &mut *env.frame,
         ex: env.ex,
         cat: env.cat,
         depth: env.depth,

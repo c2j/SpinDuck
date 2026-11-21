@@ -1,0 +1,20 @@
+{
+  "routine": "prc_trd_hz_byfund",
+  "git_head": "35456d1fb74af402449c3f4c00d0a545d781ceee",
+  "unit": "ms",
+  "method": "truncated-variant end-to-end wall clock per segment; prefix=prc_m0_prefix-prc_m0_noop, c_get_data=prc_m0_cgetdata-prc_m0_prefix, c_fxj=prc_m0_cfxj-prc_m0_cgetdata, qfii=full-prc_m0_cfxj; median of 3 rounds; seed detail=5000 qfii=5000",
+  "builds": {
+    "debug": {
+      "prefix_ms": 56.651,
+      "c_get_data_ms": 5748.797,
+      "c_fxj_ms": 46.308,
+      "qfii_ms": 122.368
+    },
+    "release": {
+      "prefix_ms": 9.245,
+      "c_get_data_ms": 716.117,
+      "c_fxj_ms": 16.581,
+      "qfii_ms": 22.091
+    }
+  }
+}

@@ -130,8 +130,17 @@ pub(crate) fn compile_package_item(
         .iter()
         .map(|p| p.name.to_ascii_lowercase())
         .collect();
+    let mut out_params = BTreeSet::new();
+    for p in parameters {
+        if matches!(
+            super::map_mode_pub(&p.mode)?,
+            super::ParamMode::Out | super::ParamMode::InOut
+        ) {
+            out_params.insert(p.name.to_ascii_lowercase());
+        }
+    }
     let mut prog = match block {
-        Some(block) => compile_routine_with_names(block, &extra, rules, names)?,
+        Some(block) => compile_routine_with_names(block, &extra, rules, names, &out_params)?,
         None => IrProg::default(),
     };
     let params = parameters

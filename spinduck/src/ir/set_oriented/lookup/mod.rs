@@ -6,14 +6,32 @@
 
 mod aggregate;
 mod lateral;
+mod mixed;
 mod parse;
 mod top1;
+mod tuple;
+pub(super) use mixed::mixed_fallback_group_at;
+pub(crate) use parse::parse_total;
+pub(crate) use parse::parse_tuple_total;
+pub(super) use tuple::render_tuple;
 
 use super::region::{self, CursorRegion};
 use super::shape::Name;
 use super::{BindSrc, SkipReason, VarName};
 use crate::ir::{AssignTarget, IrExpr, IrProg, IrStmt};
 use crate::value::SpinValue;
+
+/// `CASE WHEN hit THEN value ELSE default END` 的类型统一渲染：
+/// DuckDB 1.5.5 拒绝 INTEGER_LITERAL 与 VARCHAR 混排的 CASE（解释器
+/// SpinValue 无静态类型，命中列型与兜底字面量型可不同）——两分支
+/// TRY_CAST 到查找列声明类型，与写汇 `at_write_sink`/`guarded_choice`
+/// 同口径；兜底坏值→NULL 与写汇 TRY_CAST 的 NULL 传播一致。
+pub(super) fn typed_case(hit: &str, value: &str, default: &str, kind: &str) -> String {
+    let ty = kind.to_ascii_uppercase();
+    format!(
+        "CASE WHEN {hit} THEN TRY_CAST(({value}) AS {ty}) ELSE TRY_CAST(({default}) AS {ty}) END"
+    )
+}
 
 /// 维表列与游标字段的关联比较。
 pub(super) struct Correlation {
@@ -55,7 +73,14 @@ pub(super) struct CaseSink {
     pub operand: VarName,
     /// (WHEN 字面量 SQL, 游标字段)，按出现顺序。
     pub whens: Vec<(String, Name)>,
-    pub else_field: Name,
+    pub else_value: CaseElse,
+}
+
+/// CASE ELSE 分支：游标字段或数值字面量（`ELSE 0` 是业务分支，非异常兜底）。
+#[derive(Clone)]
+pub(super) enum CaseElse {
+    Field(Name),
+    Lit(String),
 }
 
 /// IN 子查询过滤：单表投影；读表纳入传递读写不交与入口漂移复核。
@@ -99,6 +124,10 @@ pub(super) struct LookupQuery {
     /// 渲染后的静态 WHERE 谓词（空串 = 无过滤；相关键与 IN 子查询不在其中）。
     pub filter: String,
     pub default_sql: String,
+    /// 兜底为查找结果变量时的来源变量（内联 Lookup 嵌套兜底）：
+    /// default_sql 已渲染为 `$v_<var>` 占位（substitute_lookup_refs 代入
+    /// 内层 CASE）；类型证明经此字段递归到内层查找，不解析 CASE 文本。
+    pub default_var: Option<VarName>,
     /// 相关键等值（可多键，如 sd_partner 的 partner/sub_partner/market）；
     /// 空 = 循环不变量。GROUP BY/JOIN 按全部键派生。
     pub correlations: Vec<Correlation>,
@@ -118,6 +147,103 @@ pub(super) struct LookupQuery {
     /// 静态过滤引用的过程形参绑定（如 BETWEEN 区间的 p_i_date）：须并入
     /// 批写 SQL 的 binds 在运行期解析（相关键 Field 绑定不在此列）。
     pub filter_binds: Vec<(String, BindSrc)>,
+    /// §3.5 零异常入口守卫（V3-5）：处理器不改写 INTO 变量（跨行残留），
+    /// 命中基数由入口守卫在运行期裁决——0/多行整段退回原解释器。
+    pub entry_guard: bool,
+    /// NO_DATA_FOUND miss 仿真证据（入口守卫放宽到"全命中或全 miss"）：
+    /// INTO 变量 miss 值 = 循环外 Const 初值（渲染进 default_sql）；
+    /// no_data_found 处理器标量赋值改批写后标量出口回填。命中/落空
+    /// 混合、处理器赋值逐行非均匀、目标变量被区域后续写/读时不构造。
+    pub miss_emu: Option<MissEmu>,
+}
+
+/// miss 仿真证据（见 [`LookupQuery::miss_emu`]）。
+#[derive(Clone)]
+pub(super) struct MissEmu {
+    /// INTO 变量初始化常量的 SQL 字面量（miss 时 carryover 值）。
+    pub init_sql: String,
+    /// no_data_found 处理器标量赋值（逐行结果，批写后标量出口回填）。
+    pub assigns: Vec<MissAssign>,
+    /// 查找 pc：miss_out 按程序序应用（后写覆盖先写）。
+    pub pc: usize,
+}
+
+/// 处理器单条标量赋值的批量渲染：目标变量 + 逐行 SQL + 运行期绑定。
+/// SQL 中游标记录字段已替换为 `_cur."列"`，形参等不变量保留 `$v_`
+/// 占位由 binds 运行期解析。
+#[derive(Clone)]
+pub(super) struct MissAssign {
+    pub var: VarName,
+    pub sql: String,
+    pub binds: Vec<(String, BindSrc)>,
+}
+
+/// 批写后标量出口（miss 仿真处理器赋值回填）：存在 miss 行时取回
+/// 处理器赋值结果写回帧；无 miss 行时变量保持批写前值。
+#[derive(Clone)]
+pub(super) struct MissOut {
+    /// 查找 pc：多个出口按程序序应用（后写覆盖先写）。
+    pub pc: usize,
+    pub targets: Vec<VarName>,
+    pub sql: String,
+    pub binds: Vec<(String, BindSrc)>,
+}
+
+/// 多 OUT 查找函数（§3.2 LookupTuple）的调用方绑定：单条
+/// `SELECT 多列 INTO 局部变量` 经直线拷贝写齐全部 OUT 形参与返回值，
+/// WHEN OTHERS 处理器给每个 OUT 与返回值赋全定义常量且不 Raise。
+/// 渲染为一条 GROUP BY 派生表（COUNT(*) AS sd_cnt），每个调用方变量
+/// 投影 `CASE WHEN sd_cnt = 1 THEN <列> ELSE <兜底> END`。
+pub(super) struct TupleQuery {
+    pub table: Name,
+    /// SELECT 输出列（与 INTO 目标位置对齐）。
+    pub columns: Vec<Name>,
+    /// 渲染后的静态 WHERE（空串 = 无过滤；相关键不在其中）。
+    pub filter: String,
+    /// 相关键等值（可多键）；空 = 循环不变量（保守拒绝，不渲染）。
+    pub correlations: Vec<Correlation>,
+    /// 静态过滤引用的调用方变量绑定（帧单值，运行期解析）。
+    pub filter_binds: Vec<(String, BindSrc)>,
+    /// 调用方变量绑定（OUT 实参槽位 + 返回值赋值目标）。
+    pub slots: Vec<TupleSlot>,
+}
+
+/// 单个调用方变量的取值来源与兜底。
+pub(super) struct TupleSlot {
+    pub var: VarName,
+    pub source: TupleSource,
+    /// 处理器兜底常量（SpinValue::Str/Int/Null 可渲染）。
+    pub default: SpinValue,
+}
+
+/// 槽位取值来源：查询列（按 `columns` 下标）或全路径常量。
+pub(super) enum TupleSource {
+    Col(usize),
+    Const(SpinValue),
+}
+
+/// 渲染产物：单条派生表 + 共享命中条件；每槽位一条值表达式。
+#[derive(Clone)]
+pub(super) struct ResolvedTuple {
+    pub cte: String,
+    pub join: String,
+    /// “恰 1 行命中”布尔表达式（`sd_lkN.sd_cnt = 1`，无匹配/多匹配均 false）。
+    pub hit: String,
+    pub slots: Vec<ResolvedTupleSlot>,
+    /// 逐键 (维表键列类型, 游标字段)，与源列严格一致才放行。
+    pub key_checks: Vec<(String, Name)>,
+}
+
+/// 已解析槽位：命中值表达式 + 兜底 SQL + 来源列类型证据。
+#[derive(Clone)]
+pub(super) struct ResolvedTupleSlot {
+    pub var: VarName,
+    /// 命中时的值表达式（`sd_lkN.sd_vI` 或常量字面量）。
+    pub value: String,
+    pub default_sql: String,
+    /// 来源列类型（常量槽位为 None，不做列类型对齐）。
+    pub kind: Option<String>,
+    pub nullable: bool,
 }
 
 /// 渲染产物：命中条件 + 命中值 + 兜底常量；最终 CASE 由 copy 组装
@@ -138,6 +264,11 @@ pub(super) struct LookupRender {
     /// 并列守卫须随行的形参绑定（LATERAL 静态过滤含 BETWEEN 等）；
     /// 入口守卫从运行帧解析这些绑定后求值（其余渲染器无守卫绑定）。
     pub guard_binds: Vec<(String, BindSrc)>,
+    /// miss 仿真入口守卫（期望求值 = 0）：命中/落空混合拒绝 +
+    /// 处理器赋值逐行结果非均匀拒绝。绑定与 tie_guard 同口径。
+    pub miss_guards: Vec<(String, Vec<(String, BindSrc)>)>,
+    /// 批写后标量出口（miss 仿真处理器赋值回填）。
+    pub miss_out: Option<MissOut>,
 }
 
 /// 结构解析 + 模式识别后的已解析查找（generate 期填充 schema 证据）。
@@ -154,6 +285,18 @@ pub(super) struct ResolvedLookup {
     /// 渲染文本引用的其他查找变量（跨查找替换记录）：批写注册其派生表/
     /// 连接须先于本查找（LATERAL 引用其别名），按依赖拓扑递归登记。
     pub deps: Vec<VarName>,
+    /// §3.5 入口守卫视图的最终底表名（写集相交复核用；普通查找为 None）。
+    pub guard_base: Option<Name>,
+    /// 视图物化前导（普通查找落在视图上）：sd_vwN 临时表契约，
+    /// 渲染已改引用临时表；区域入口先于守卫物化，失败回退原区域。
+    pub view_prelude: Option<super::entry::ViewPrelude>,
+    /// 静态过滤引用的绑定（形参/安全变量）：须并入批写 SQL binds 在
+    /// 运行期解析；查找结果变量绑定由 query_binds 跳过（已逐行代入）。
+    pub filter_binds: Vec<(String, BindSrc)>,
+    /// 视图底表名（写集相交复核用；入口守卫视图走 guard_base）。
+    pub view_bases: Vec<Name>,
+    /// 兜底查找变量来源（同 LookupQuery.default_var）：类型证明递归入口。
+    pub default_var: Option<VarName>,
 }
 
 /// 识别 pc 处的兜底查找组（同一 WHEN OTHERS 内 n 条连续 SELECT INTO）：
@@ -179,7 +322,13 @@ pub(super) fn fallback_group_at(
         let IrStmt::SqlQuery { sql, binds, .. } = &prog.code[pc + 1 + i] else {
             return Ok(None);
         };
-        let query = parse::parse_total(sql, var, default, binds, &region.record)?;
+        let query = parse::parse_total(
+            sql,
+            var,
+            parse::fallback_sql(&default)?,
+            binds,
+            &region.record,
+        )?;
         if writes.contains(&query.table.0)
             || query.in_filters.iter().any(|f| writes.contains(&f.table.0))
         {
@@ -224,7 +373,13 @@ pub(super) fn fallback_if_group_at(
             .find(|(rv, _)| rv == var)
             .map(|(_, d)| d.clone())
             .unwrap_or(SpinValue::Null);
-        let query = parse::parse_total(sql, var.clone(), default, binds, &region.record)?;
+        let query = parse::parse_total(
+            sql,
+            var.clone(),
+            parse::fallback_sql(&default)?,
+            binds,
+            &region.record,
+        )?;
         if writes.contains(&query.table.0)
             || query.in_filters.iter().any(|f| writes.contains(&f.table.0))
         {
@@ -300,7 +455,8 @@ pub(super) fn skip_lookup_at(
     if !fn_sites.is_empty() {
         return Ok(None);
     }
-    let mut query = parse::parse_total(sql, var.clone(), SpinValue::Null, binds, &region.record)?;
+    let mut query =
+        parse::parse_total(sql, var.clone(), "NULL".to_string(), binds, &region.record)?;
     if query.correlations.is_empty() {
         return Ok(None);
     }
@@ -322,6 +478,9 @@ pub(super) fn render(
     index: usize,
     cur_scan: &str,
 ) -> Result<LookupRender, SkipReason> {
+    if lq.entry_guard {
+        return super::vguard::render(lq, table, index, cur_scan);
+    }
     let filter = combined_filter(lq, inner_tables)?;
     if lq.case_sink.is_some() {
         return Ok(aggregate::case_gate(lq, table));
@@ -377,21 +536,36 @@ fn combined_filter(
     })
 }
 
+/// parse_inline 的判定上下文：记录变量、安全变量集与查找结果变量集
+/// （default 为查找变量时渲染 `$v_<var>` 占位，由 substitute_lookup_refs
+/// 逐行代入内层 CASE——内层恰 1 行命中才取值，否则取其自身兜底）。
+pub(super) struct InlineCtx<'a> {
+    pub record: &'a VarName,
+    pub safe_vars: &'a std::collections::BTreeSet<VarName>,
+    pub lookup_vars: &'a std::collections::BTreeSet<VarName>,
+}
+
 /// 函数内联 Lookup（§4.3 A7）→ 全定义文法解析：实参须为游标记录字段
-/// （相关键），兜底须为常量；其余形态（不变量绑定/非常量兜底）保守
-/// 拒绝，交回解释器。复用 [`parse::parse_total`] 的相关文法（含多键）。
+/// （相关键）、安全变量（查找结果变量/循环不变变量，统一改写为
+/// `$v_<变量名>` 占位符）或常量（字面量内联进 SQL）；其余形态
+/// （循环可变非查找变量/非常量兜底）保守拒绝，交回解释器。
+/// 复用 [`parse::parse_total`] 的相关文法（含多键）。
 pub(super) fn parse_inline(
     sql: &str,
     args: &[(String, crate::ir::IrExpr)],
     default: &crate::ir::IrExpr,
-    record: &VarName,
+    ctx: &InlineCtx<'_>,
 ) -> Result<LookupQuery, SkipReason> {
     use crate::ir::IrExpr;
     let bad = SkipReason::UnprovenQueryTotalness;
-    let IrExpr::Const(default_sv) = default else {
-        return Err(bad);
+    let record = ctx.record;
+    let (default_sql, default_var) = match default {
+        IrExpr::Const(sv) => (parse::fallback_sql(sv)?, None),
+        IrExpr::Var(v) if ctx.lookup_vars.contains(v) => (format!("$v_{}", v.0), Some(v.clone())),
+        _ => return Err(bad),
     };
     let mut binds = Vec::with_capacity(args.len());
+    let mut repls: Vec<(String, String)> = Vec::new();
     for (ph, a) in args {
         match a {
             IrExpr::Field { rec, field } if rec == record => binds.push((
@@ -401,14 +575,143 @@ pub(super) fn parse_inline(
                     field: field.clone(),
                 },
             )),
-            _ => return Err(bad),
+            // Var 实参占位符统一改写为 `$v_<变量名>`：循环不变变量走
+            // 帧单值绑定；查找结果变量由 substitute_lookup_refs 按
+            // 占位符名逐行代入 CASE（§4.4 B1 同口径）。
+            IrExpr::Var(v) if ctx.safe_vars.contains(v) => {
+                let new_ph = BindSrc::placeholder(&v.0, None);
+                repls.push((ph.clone(), new_ph.clone()));
+                binds.push((new_ph, BindSrc::Var(v.clone())));
+            }
+            IrExpr::Const(sv) => {
+                let lit = crate::sql::render::const_to_sql(sv).ok_or(bad)?;
+                repls.push((ph.clone(), lit));
+            }
+            // 行相关表达式实参（局部变量内联产生，如 `p_flag||'0'`、
+            // `SUBSTRING(r.f,1,2)||'00'`）：渲染为引用 sd_cur.字段的
+            // 逐行 SQL，经 BindSrc::Expr 供等值析取组转 IN-list 项；
+            // 其余形态（Var 混合/多基字段/白名单外函数）保守拒绝。
+            other => {
+                let (sql, field) = expr_arg(other, record)?;
+                binds.push((ph.clone(), BindSrc::Expr { sql, field }));
+            }
         }
     }
-    parse::parse_total(
+    // 同名占位符绑定冲突（改名后与既有绑定撞名且源不同）= 歧义，拒绝。
+    for (i, (p, s)) in binds.iter().enumerate() {
+        if binds[..i].iter().any(|(q, t)| q == p && t != s) {
+            return Err(bad);
+        }
+    }
+    repls.sort_by_key(|(ph, _)| std::cmp::Reverse(ph.len()));
+    let rewritten;
+    let sql = if repls.is_empty() {
+        sql
+    } else {
+        rewritten = super::substitute_binds(sql, &repls);
+        rewritten.as_str()
+    };
+    let mut lq = parse::parse_total(
         sql,
         VarName("__sd_inline".to_string()),
-        default_sv.clone(),
+        default_sql,
         &binds,
         record,
-    )
+    )?;
+    lq.default_var = default_var;
+    Ok(lq)
+}
+
+/// 内联表达式实参 → 逐行 SQL（引用 `sd_cur."字段"`）+ 唯一基字段名。
+/// 叶子限当前记录字段与常量；函数限字符串/数值白名单（全定义不抛错）；
+/// Var 叶子（查找结果/不变变量）混入即拒绝——IN-list 项无法携带
+/// 逐行 CASE 替换语义，保守交回解释器。
+fn expr_arg(e: &IrExpr, record: &VarName) -> Result<(String, String), SkipReason> {
+    let bad = SkipReason::UnprovenQueryTotalness;
+    if !expr_arg_safe(e, record) {
+        return Err(bad);
+    }
+    let (text, ebinds) = crate::sql::render::expr_to_scalar_sql_binds(e).ok_or(bad)?;
+    let mut field: Option<String> = None;
+    let mut repls = Vec::with_capacity(ebinds.len());
+    for (ph, src) in &ebinds {
+        let BindSrc::Field { rec, field: f } = src else {
+            return Err(bad);
+        };
+        if rec != record || field.as_ref().is_some_and(|x| x != f) {
+            return Err(bad);
+        }
+        field = Some(f.clone());
+        repls.push((ph.clone(), format!("sd_cur.{}", Name(f.clone()).sql())));
+    }
+    let Some(field) = field else {
+        return Err(bad);
+    };
+    repls.sort_by_key(|(ph, _)| std::cmp::Reverse(ph.len()));
+    let sql = super::substitute_binds(&text, &repls);
+    if sql.contains("$v_") {
+        return Err(bad);
+    }
+    Ok((sql, field))
+}
+
+/// 表达式实参白名单：Field(当前记录)/Const 叶子、全算子 Bin、
+/// prepared 可解析的白名单标量函数（substring/concat/字符串与
+/// abs/round 等全定义函数）。FuncCall 未知名一律拒绝。
+fn expr_arg_safe(e: &IrExpr, record: &VarName) -> bool {
+    use crate::ir::BinOp;
+    match e {
+        IrExpr::Const(_) => true,
+        IrExpr::Field { rec, .. } => rec == record,
+        IrExpr::Bin { op, l, r } => {
+            matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Concat
+                    | BinOp::And
+                    | BinOp::Or
+                    | BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge
+            ) && expr_arg_safe(l, record)
+                && expr_arg_safe(r, record)
+        }
+        IrExpr::FuncCall {
+            name,
+            args,
+            prepared,
+        } => {
+            prepared.is_ok()
+                && [
+                    "substring",
+                    "substr",
+                    "concat",
+                    "upper",
+                    "lower",
+                    "trim",
+                    "length",
+                    "replace",
+                    "left",
+                    "right",
+                    "lpad",
+                    "rpad",
+                    "abs",
+                    "round",
+                    "coalesce",
+                    "nullif",
+                    "greatest",
+                    "least",
+                ]
+                .iter()
+                .any(|n| name.trim_start_matches('@').eq_ignore_ascii_case(n))
+                && args.iter().all(|a| expr_arg_safe(a, record))
+        }
+        _ => false,
+    }
 }

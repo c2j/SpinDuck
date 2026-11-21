@@ -2,17 +2,68 @@
 
 use super::schema::{self, Table};
 use super::shape::Name;
-use super::{BindSrc, IrProg, IrStmt, OptimizeCtx, SkipReason};
-use crate::catalog::CompiledRoutine;
+use super::{BindSrc, OptimizeCtx, SkipReason, VarName};
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
+
+/// 批写前的例程物化前导（游标 WHERE fn_site）：与解释器 OpenCursor
+/// 时 `materialize_fn_sites` 同口径——distinct 元组查询 → 逐元组调用
+/// 例程 → 临时缓存表 `(sd_v, sd_a0…)`，批写 SQL 内相关子查询命中。
+#[derive(Clone)]
+pub(crate) struct FnPrelude {
+    /// 缓存临时表名（与批写 SQL 中 `sd_fnN` 引用一致）。
+    pub table: String,
+    /// 例程名（物化期 `call_routine_value` 解析）。
+    pub name: String,
+    /// 去重元组查询（游标 site 为编译期原文，含源表与过滤）。
+    pub distinct_sql: String,
+    /// 元组查询绑定（IN 形参等，运行期按名从帧解析）。
+    pub binds: Vec<(String, BindSrc)>,
+    /// 例程形参个数（缓存表 sd_a0..sd_a{arity-1} 列数）。
+    pub arity: usize,
+    /// INSERT 位前导：distinct 查询内嵌 `sd_cur`（依赖游标 site 缓存表
+    /// 先行物化），其例程求值的会话回滚可能撤销已建游标表——物化器对
+    /// 本类前导在依赖方求值后重写基础表。
+    pub needs_sd_cur: bool,
+}
+
+/// 视图物化前导（普通查找落在视图上）：区域入口把视图物化为
+/// `sd_vwN` 临时表，批写/守卫中的查找派生表改引用临时表。物化与
+/// 原解释器逐行求值视图等价的前提是视图 SQL 确定（无易变函数、
+/// 目录例程均 PureExpr）；物化失败由调用方回退原区域——行级 trap
+/// 兜底语义在解释路径下逐行复现，物化失败不构成调用失败。
+#[derive(Clone)]
+pub(crate) struct ViewPrelude {
+    /// 物化 SQL：`CREATE OR REPLACE TEMP TABLE sd_vwN AS SELECT * FROM <视图>`
+    /// （临时表名 sd_vwN 与批写/守卫 SQL 中的派生表引用一致）。
+    pub sql: String,
+}
+
+/// 批写后标量出口（miss 仿真处理器赋值回填）：批写成功后、后缀续跑
+/// 前执行；返回行时把各列值按 `targets` 顺序写回帧，无行保持批写前值。
+/// 多个出口按查找程序序应用（后写覆盖先写）。
+#[derive(Clone)]
+pub(crate) struct MissOut {
+    pub targets: Vec<VarName>,
+    pub sql: String,
+    pub binds: Vec<(String, BindSrc)>,
+}
 
 /// 结构准入与 SQL 生成的产物；入口守卫与后缀组装消费它。
 #[derive(Clone)]
 pub(crate) struct ConversionPlan {
     pub sql: String,
     /// 批写 SQL 的按名绑定（游标查询绑定 + INSERT 绑定合并）。
-    pub(super) binds: Vec<(String, BindSrc)>,
+    pub(crate) binds: Vec<(String, BindSrc)>,
+    /// 批写前须物化的例程缓存表（游标 WHERE fn_site，按声明序执行）。
+    pub(crate) fn_preludes: Vec<FnPrelude>,
+    /// 视图物化前导（普通查找落在视图上）：先于入口守卫执行
+    /// （守卫可内嵌 sd_vwN 派生表），失败回退原区域。
+    pub(crate) view_preludes: Vec<ViewPrelude>,
+    /// 入口守卫 SQL 引用缓存表（verbatim cur_scan / 写守卫子查询）时为
+    /// true：物化前导先于 entry_ok 执行。回退路径下解释器会重新物化
+    /// （例程纯度已证，仅多一次去重调用——与 Off 逐行调用次数本就不同）。
+    pub(crate) preludes_first: bool,
     pub tail_commit: bool,
     pub open_pc: usize,
     pub close_pc: usize,
@@ -30,6 +81,9 @@ pub(crate) struct ConversionPlan {
     /// 内联表达式入口无抛错守卫 SQL（期望 COUNT = 0，§4.5-2）：以 TRY_
     /// 全定义预筛全部源行，任一行结果为 NULL（坏输入或 NULL 输入）即退回。
     pub(super) expr_guards: Vec<BoundGuard>,
+    /// miss 仿真标量出口（NO_DATA_FOUND 处理器赋值回填）：批写成功后
+    /// 按程序序执行，返回行时写回帧变量。
+    pub(crate) miss_outs: Vec<MissOut>,
 }
 
 pub(super) type BoundGuard = (String, Vec<(String, BindSrc)>);
@@ -140,24 +194,5 @@ fn drifted(ex: &dyn SqlExecutor, name: &Name, expected: &Table) -> Result<bool, 
         Some(t) => Ok(t.columns != expected.columns
             || (t.qualified != expected.qualified && expected.qualified != name.sql())),
         None => Ok(true),
-    }
-}
-
-/// 集合化后缀程序：批量 SqlExec + 条件尾提交 + 原始后缀。
-/// `TxCommitIfWritten` 由同一运行内的 SqlExec 影响行数驱动（零行不提交）。
-pub(crate) fn suffix_prog(routine: &CompiledRoutine, plan: &ConversionPlan) -> IrProg {
-    let mut code = vec![IrStmt::SqlExec {
-        sql: plan.sql.clone(),
-        binds: plan.binds.clone(),
-        fn_sites: Vec::new(),
-    }];
-    if plan.tail_commit {
-        code.push(IrStmt::TxCommitIfWritten);
-    }
-    code.extend_from_slice(&routine.prog.code[plan.close_pc + 1..]);
-    IrProg {
-        code,
-        var_types: routine.prog.var_types.clone(),
-        local_ddl: routine.prog.local_ddl.clone(),
     }
 }

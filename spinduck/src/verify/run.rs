@@ -529,6 +529,7 @@ mod tests {
                     sql: sql.to_string(),
                     binds: vec![],
                     fn_sites: vec![],
+                    buffer_policy: crate::ir::BufferPolicy::Immediate,
                 })
                 .collect(),
             ..IrProg::default()

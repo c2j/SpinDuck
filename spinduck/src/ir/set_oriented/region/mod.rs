@@ -1,7 +1,13 @@
 //! 含 Trap 闭包的 SESE 游标区域抽取（V2 §4.2；原始 IR 只读）。
 
+mod insert_log;
+mod liveout;
+mod mixed;
 mod proof;
 mod traps;
+pub(crate) use insert_log::*;
+pub(crate) use liveout::*;
+pub(crate) use mixed::*;
 pub(crate) use proof::*;
 pub(crate) use traps::*;
 
@@ -20,7 +26,9 @@ pub(crate) struct CursorRegion {
     pub record: VarName,
 }
 
-/// 从整段 IR 中抽取唯一静态游标循环区域；前缀/后缀允许存在但不在本步证明。
+/// 抽取首个静态游标循环区域为集合化候选（PC 均为原始 `IrProg.code` 下标）。
+/// V3A 只转换首个区域：其后静态游标、动态游标与例程调用均属后缀，
+/// 由 `RunSpan` 按原 PC 解释执行，不作集合化候选（设计 §4）。
 pub(crate) fn extract(prog: &IrProg) -> Result<CursorRegion, SkipReason> {
     let mut found: Option<CursorRegion> = None;
     for (open_pc, stmt) in prog.code.iter().enumerate() {
@@ -32,11 +40,27 @@ pub(crate) fn extract(prog: &IrProg) -> Result<CursorRegion, SkipReason> {
             continue;
         };
         if found.is_some() {
-            return Err(SkipReason::UnsupportedControlFlow);
+            continue;
         }
         let region = recognize(prog, open_pc, cursor)?;
         reject_external_entry_edges(prog, &region)?;
         reject_internal_exit_edges(prog, &region)?;
+        // 区域内部再遇静态游标 = 嵌套循环，整体拒绝；区域之后的静态游标
+        // 属后缀，由 RunSpan 按原 PC 解释，不作集合化候选。
+        if prog.code[region.open_pc + 1..region.close_pc]
+            .iter()
+            .any(|st| {
+                matches!(
+                    st,
+                    IrStmt::OpenCursor {
+                        source: CursorSource::Static { .. },
+                        ..
+                    }
+                )
+            })
+        {
+            return Err(SkipReason::UnsupportedControlFlow);
+        }
         found = Some(region);
     }
     found.ok_or(SkipReason::UnsupportedControlFlow)
@@ -96,6 +120,28 @@ fn recognize(prog: &IrProg, open_pc: usize, cursor: &VarName) -> Result<CursorRe
         cursor: cursor.clone(),
         record: record.clone(),
     })
+}
+
+/// 分段边界陷阱深度校验（设计 §2.1 不变量 1）：`run_spanned` 每段以空
+/// 陷阱栈起步，`open_pc` 与 `close_pc + 1` 两处的静态陷阱深度必须为 0，
+/// 否则边界会切断活跃异常处理器的作用域。
+pub(crate) fn reject_trap_boundaries(
+    prog: &IrProg,
+    region: &CursorRegion,
+) -> Result<(), SkipReason> {
+    let depth_at = |pc: usize| {
+        prog.code[..pc.min(prog.code.len())]
+            .iter()
+            .fold(0usize, |d, st| match st {
+                IrStmt::PushTrap { .. } => d + 1,
+                IrStmt::PopTrap => d.saturating_sub(1),
+                _ => d,
+            })
+    };
+    if depth_at(region.open_pc) != 0 || depth_at(region.close_pc + 1) != 0 {
+        return Err(SkipReason::ExceptionScopePresent);
+    }
+    Ok(())
 }
 
 /// 区域内（含处理器）不得存在跳出区域的跳转；仅允许回循环头与 `%NOTFOUND` 正常出口。
@@ -185,6 +231,7 @@ pub(crate) fn loop_prog(prefix: usize, suffix: usize) -> IrProg {
             },
         )],
         fn_sites: Vec::new(),
+        buffer_policy: crate::ir::BufferPolicy::Immediate,
     });
     code.push(IrStmt::Jump(fetch));
     code.push(IrStmt::CloseCursor {
@@ -270,6 +317,7 @@ mod tests {
                 sql: "INSERT INTO dst VALUES ($v_rec__a)".into(),
                 binds: Vec::new(),
                 fn_sites: Vec::new(),
+                buffer_policy: crate::ir::BufferPolicy::Immediate,
             },
             IrStmt::Jump(1),
             IrStmt::CloseCursor {
@@ -322,6 +370,7 @@ mod tests {
                 sql: "INSERT INTO dst VALUES ($v_rec__a)".into(),
                 binds: Vec::new(),
                 fn_sites: Vec::new(),
+                buffer_policy: crate::ir::BufferPolicy::Immediate,
             },
             IrStmt::PopTrap,
             IrStmt::Jump(9),

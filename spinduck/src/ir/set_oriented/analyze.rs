@@ -2,8 +2,8 @@
 
 mod body;
 
-use super::{catalog_summary, dead, lookup, region, route};
-use super::{CopyLoop, SetOrientedMode, SinkOp, SkipReason};
+use super::{agg, catalog_summary, dead, lookup, region, route, shape, vguard};
+use super::{ArithWrite, CopyLoop, SetOrientedMode, SinkOp, SkipReason};
 use crate::ir::{AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, VarName};
 
 struct Context<'a, 'c> {
@@ -11,6 +11,18 @@ struct Context<'a, 'c> {
     region: &'a region::CursorRegion,
     mode: SetOrientedMode,
     catalog: &'c crate::catalog::RoutineCatalog,
+    /// IN 形参名集（小写）：Lookup 内部绑定须为循环不变实参的证明依据。
+    in_params: std::collections::BTreeSet<String>,
+}
+
+/// 准备阶段产物：INSERT 语句文本与游标/INSERT 绑定（均为 'a 程序期引用）。
+struct Prepared<'a> {
+    insert: &'a str,
+    binds: &'a [(String, BindSrc)],
+    query: &'a str,
+    query_binds: &'a [(String, BindSrc)],
+    fn_sites: &'a [crate::sql::FnSite],
+    insert_sites: Vec<super::InsertSite>,
 }
 
 pub(super) fn analyze_region<'a>(
@@ -18,55 +30,113 @@ pub(super) fn analyze_region<'a>(
     region: &'a region::CursorRegion,
     mode: SetOrientedMode,
     catalog: &crate::catalog::RoutineCatalog,
+    in_params: &std::collections::BTreeSet<String>,
 ) -> Result<(CopyLoop<'a>, bool, bool), SkipReason> {
     let ctx = Context {
         prog,
         region,
         mode,
         catalog,
+        in_params: in_params.clone(),
     };
     let body = body::Body::walk(&ctx)?;
+    let parts = prepare(&ctx, &body, in_params)?;
+    let flags = (body.tail_commit, body.has_trap);
+    let copy = assemble(&ctx, body, parts, in_params)?;
+    Ok((copy, flags.0, flags.1))
+}
+
+/// INSERT 形态、游标查询与写完备性检查；产出批写所需的 SQL 片段引用。
+fn prepare<'a>(
+    ctx: &Context<'a, '_>,
+    body: &body::Body<'a>,
+    in_params: &std::collections::BTreeSet<String>,
+) -> Result<Prepared<'a>, SkipReason> {
     let Some(IrStmt::SqlExec {
         sql: insert,
         binds,
         fn_sites,
+        ..
     }) = body.insert_stmt
     else {
         return Err(SkipReason::UnsupportedWrite);
     };
-    let (query, query_binds) = cursor_query(&ctx)?;
-    if !fn_sites.is_empty() {
-        return Err(SkipReason::UnresolvedFnSite);
-    }
-    if prog.var_types.contains_key(&region.record.0) {
+    let (query, query_binds, cursor_sites) = cursor_query(ctx)?;
+    let insert_sites = admit_insert_sites(ctx, fn_sites)?;
+    if ctx.prog.var_types.contains_key(&ctx.region.record.0) {
         return Err(SkipReason::UnprovenExpression);
     }
-    body.validate(&ctx, binds)?;
-    Ok((
-        CopyLoop {
-            query,
-            insert,
-            binds,
-            query_binds,
-            var_types: &prog.var_types,
-            record: &region.record,
-            allow_filter: mode == SetOrientedMode::BatchAtomic && body.has_trap,
-            sinks: body.sinks,
-            lookups: body.lookups,
-            route: body.route,
-            folded: body.folded,
-            inlined: body.inlined,
-            inline_checks: body.inline_checks,
-            varchar_inputs: body.varchar_inputs,
-            inline_preconditions: body.inline_preconditions,
-            dead: body.dead,
-        },
-        body.tail_commit,
-        body.has_trap,
-    ))
+    body.validate(ctx, binds)?;
+    prove_param_binds(ctx.prog, ctx.region, binds, in_params)?;
+    Ok(Prepared {
+        insert,
+        binds,
+        query,
+        query_binds,
+        fn_sites: cursor_sites,
+        insert_sites,
+    })
 }
 
-type CursorQuery<'a> = (&'a str, &'a [(String, BindSrc)]);
+/// Body 分析结果装配为 CopyLoop（写集与 IN 形参名集在此定稿）。
+fn assemble<'a>(
+    ctx: &Context<'a, '_>,
+    body: body::Body<'a>,
+    parts: Prepared<'a>,
+    in_params: &std::collections::BTreeSet<String>,
+) -> Result<CopyLoop<'a>, SkipReason> {
+    Ok(CopyLoop {
+        query: parts.query,
+        insert: parts.insert,
+        binds: parts.binds,
+        query_binds: parts.query_binds,
+        fn_sites: parts.fn_sites,
+        insert_sites: parts.insert_sites,
+        var_types: &ctx.prog.var_types,
+        record: &ctx.region.record,
+        prog: ctx.prog,
+        allow_filter: ctx.mode == SetOrientedMode::BatchAtomic && body.has_trap,
+        insert_log: body.insert_log,
+        sinks: body.sinks,
+        lookups: body.lookups,
+        tuples: body.tuples,
+        aggs: body.aggs,
+        field_writes: body.field_writes,
+        route: body.route,
+        folded: body.folded,
+        inlined: body.inlined,
+        inline_checks: body.inline_checks,
+        varchar_inputs: body.varchar_inputs,
+        inline_preconditions: body.inline_preconditions,
+        dead: body.dead,
+        arith_writes: body.arith_writes,
+        writes: region::write_set(ctx.prog, ctx.region, ctx.catalog)?,
+        in_params: in_params.clone(),
+    })
+}
+
+/// §4.2 IN 形参投影证明：INSERT 绑定引用 IN 形参时，该变量必须在区域体内
+/// 无任何赋值（Assign/Fetch/SqlQuery INTO），否则逐行取值与形参单值不等价。
+fn prove_param_binds(
+    prog: &IrProg,
+    region: &region::CursorRegion,
+    binds: &[(String, BindSrc)],
+    in_params: &std::collections::BTreeSet<String>,
+) -> Result<(), SkipReason> {
+    for (_, src) in binds {
+        let BindSrc::Var(v) = src else {
+            continue;
+        };
+        if in_params.contains(&v.0.to_ascii_lowercase())
+            && !region::var_invariant_in_region(prog, region, v)
+        {
+            return Err(SkipReason::UnprovenExpression);
+        }
+    }
+    Ok(())
+}
+
+type CursorQuery<'a> = (&'a str, &'a [(String, BindSrc)], &'a [crate::sql::FnSite]);
 
 fn cursor_query<'a>(ctx: &Context<'a, '_>) -> Result<CursorQuery<'a>, SkipReason> {
     let IrStmt::OpenCursor {
@@ -81,10 +151,123 @@ fn cursor_query<'a>(ctx: &Context<'a, '_>) -> Result<CursorQuery<'a>, SkipReason
     else {
         return Err(SkipReason::UnsupportedControlFlow);
     };
-    if !fn_sites.is_empty() {
+    // fn_site 准入：缓存子查询必须整体位于顶层 WHERE 之后（游标过滤
+    // 形态，byfund c_get_data 同型）。SELECT 列表计算列形态超出
+    // shape::select 承载面，保守拒绝（守护测试口径不变）；distinct_sql
+    // 引用其他 sd_fn 缓存表（嵌套下沉）同样拒绝。
+    if !fn_sites.is_empty() && (!sites_in_where(sql, fn_sites) || sites_nested(fn_sites)) {
         return Err(SkipReason::UnresolvedFnSite);
     }
-    Ok((sql, binds))
+    Ok((sql, binds, fn_sites))
+}
+
+/// INSERT 位 fn_site 准入：例程须 PureExpr（确定性无副作用——批写按
+/// DISTINCT 元组去重调用，与解释器逐行调用结果一致）；distinct_sql 须为
+/// 无 FROM 实参数列表（批写改写为 distinct-over-sd_cur）；无嵌套 sd_fn
+/// 依赖。缓存表名改 `sd_bfN`，避免与游标 site 的 `sd_fnN` 冲突。
+fn admit_insert_sites(
+    ctx: &Context<'_, '_>,
+    sites: &[crate::sql::FnSite],
+) -> Result<Vec<super::InsertSite>, SkipReason> {
+    if sites_nested(sites) {
+        return Err(SkipReason::UnresolvedFnSite);
+    }
+    sites
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let pure = matches!(
+                catalog_summary::summarize(ctx.catalog, &s.name),
+                catalog_summary::Summary::PureExpr(_)
+            );
+            if !pure || !select_list_only(&s.distinct_sql) {
+                return Err(SkipReason::UnresolvedFnSite);
+            }
+            Ok(super::InsertSite {
+                orig_table: s.table.clone(),
+                table: format!("sd_bf{i}"),
+                name: s.name.clone(),
+                distinct_sql: s.distinct_sql.clone(),
+                binds: s.binds.clone(),
+                arity: s.args.len(),
+            })
+        })
+        .collect()
+}
+
+/// distinct_sql 仅 SELECT 列表（可选 DISTINCT 关键字）：无 FROM/WHERE/
+/// GROUP/ORDER/LIMIT/JOIN/集合操作等子句（深度 0 判定）。
+fn select_list_only(sql: &str) -> bool {
+    let Some(t) = super::shape::Tokens::new(sql) else {
+        return false;
+    };
+    let w = t.words();
+    if w.first().map(String::as_str) != Some("select") {
+        return false;
+    }
+    let mut i = 1;
+    if w.get(i).is_some_and(|x| x == "distinct") {
+        i += 1;
+    }
+    let mut depth = 0i32;
+    for word in &w[i..] {
+        match word.as_str() {
+            "(" => depth += 1,
+            ")" => depth -= 1,
+            "from" | "where" | "group" | "order" | "limit" | "join" | "inner" | "left"
+            | "right" | "full" | "cross" | "union" | "intersect" | "except" | "having" | "into"
+                if depth == 0 =>
+            {
+                return false
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+/// distinct_sql 内出现任何 `sd_fn*` 标识符即视为嵌套物化依赖，拒绝。
+fn sites_nested(sites: &[crate::sql::FnSite]) -> bool {
+    sites.iter().any(|s| {
+        super::shape::Tokens::new(&s.distinct_sql)
+            .is_some_and(|t| t.words().iter().any(|w| w.starts_with("sd_fn")))
+    })
+}
+
+/// 每个 site 缓存表名的全部出现位置都在顶层 `where` 之后，且确实被引用。
+fn sites_in_where(sql: &str, sites: &[crate::sql::FnSite]) -> bool {
+    let Some(t) = super::shape::Tokens::new(sql) else {
+        return false;
+    };
+    let words = t.words();
+    let mut depth = 0i32;
+    let mut where_pos = None;
+    for (i, w) in words.iter().enumerate() {
+        match w.as_str() {
+            "(" => depth += 1,
+            ")" => depth -= 1,
+            "where" if depth == 0 => {
+                where_pos = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let Some(wp) = where_pos else {
+        return false;
+    };
+    sites.iter().all(|s| {
+        let mut seen = false;
+        for (i, w) in words.iter().enumerate() {
+            if w == &s.table {
+                if i <= wp {
+                    return false;
+                }
+                seen = true;
+            }
+        }
+        seen
+    })
 }
 
 fn invariant_reads_disjoint(

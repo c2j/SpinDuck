@@ -107,6 +107,7 @@ impl Compiler {
                     sql,
                     binds,
                     fn_sites,
+                    buffer_policy: BufferPolicy::Immediate,
                 });
             }
             // 例程体内局部 DDL：CTAS 原文改写为 SqlExec（DuckDB 原生支持
@@ -120,6 +121,7 @@ impl Compiler {
                     sql: unit.text,
                     binds: unit.binds,
                     fn_sites: unit.fn_sites,
+                    buffer_policy: BufferPolicy::Immediate,
                 });
                 self.local_ddl.push(LocalDdlStmt {
                     index: idx,
@@ -136,6 +138,7 @@ impl Compiler {
                     sql,
                     binds: Vec::new(),
                     fn_sites: Vec::new(),
+                    buffer_policy: BufferPolicy::Immediate,
                 });
                 self.local_ddl.push(LocalDdlStmt {
                     index: idx,

@@ -10,7 +10,7 @@
 //! 比较/IN/BETWEEN 两侧值域必须一致且可证（str↔varchar、num↔数值族）。
 
 use super::schema::Table;
-use super::shape::{Name, Tokens};
+use super::shape::{is_cache_arg_col, Name, Tokens};
 use super::{BindSrc, SkipReason};
 use crate::types::SpinType;
 use std::collections::BTreeMap;
@@ -23,6 +23,10 @@ enum Dom {
 }
 
 /// 证明过滤式在全部输入上求值不抛错；通过则原文透传至批写 SQL。
+/// `fn_tables` 为本区域已准入 fn_site 的缓存表名集——WHERE 中形如
+/// `(SELECT sd_v FROM sd_fnN WHERE sd_aK IS NOT DISTINCT FROM (<实参>)…)`
+/// 的参数缓存子查询按 Dom::Str 操作数接纳，其内部实参递归要求全定义
+/// （列/绑定/字面量/substr/嵌套缓存子查询）；表名不在集合内一律拒绝。
 pub(super) fn prove(
     filter: &str,
     source: &Table,
@@ -30,6 +34,7 @@ pub(super) fn prove(
     alias: &Option<Name>,
     binds: &[(String, BindSrc)],
     var_types: &BTreeMap<String, SpinType>,
+    fn_tables: &[String],
 ) -> Result<(), SkipReason> {
     let t = Tokens::new(filter).ok_or(SkipReason::UnprovenQueryTotalness)?;
     let mut p = Prover {
@@ -39,6 +44,7 @@ pub(super) fn prove(
         alias,
         binds,
         var_types,
+        fn_tables,
     };
     p.or_expr()?;
     if !p.t.done() {
@@ -54,6 +60,7 @@ struct Prover<'a> {
     alias: &'a Option<Name>,
     binds: &'a [(String, BindSrc)],
     var_types: &'a BTreeMap<String, SpinType>,
+    fn_tables: &'a [String],
 }
 
 impl Prover<'_> {
@@ -78,7 +85,8 @@ impl Prover<'_> {
         if self.t.take("not") {
             return self.unary();
         }
-        if self.t.take("(") {
+        // `(SELECT …)` 是操作数而非分组——交给 predicate→operand 解析。
+        if !self.t.at_subquery() && self.t.take("(") {
             self.or_expr()?;
             return self.t.take(")").then_some(()).ok_or(bad);
         }
@@ -133,6 +141,10 @@ impl Prover<'_> {
 
     fn operand(&mut self) -> Result<Dom, SkipReason> {
         let bad = SkipReason::UnprovenQueryTotalness;
+        if self.t.at_subquery() {
+            self.t.take("(");
+            return self.select_query();
+        }
         let word = self.t.peek().ok_or(bad)?.to_string();
         if self.t.take("substr") || self.t.take("substring") {
             return self.substr_call();
@@ -174,6 +186,97 @@ impl Prover<'_> {
         Ok(kind_domain(&from.kind))
     }
 
+    /// `(` 已消费的 SELECT 子查询：`SELECT <体>)`，返回值域。
+    fn select_query(&mut self) -> Result<Dom, SkipReason> {
+        let bad = SkipReason::UnprovenQueryTotalness;
+        if !self.t.take("select") {
+            return Err(bad);
+        }
+        let d = self.select_body()?;
+        self.t.take(")").then_some(d).ok_or(bad)
+    }
+
+    /// SELECT 体：`sd_v FROM <已准入缓存表> WHERE …`（参数缓存子查询，
+    /// Dom::Str）或 `(<select-led | 操作数>)` 标量包装（域取内部）。
+    /// 源 SQL `(select fn(…))` 形态改写后即 `(SELECT (SELECT sd_v…))`。
+    fn select_body(&mut self) -> Result<Dom, SkipReason> {
+        let bad = SkipReason::UnprovenQueryTotalness;
+        if self.t.peek() == Some("(") {
+            self.t.take("(");
+            let d = if self.t.peek() == Some("select") {
+                self.t.take("select");
+                let d = self.select_body()?;
+                if !self.t.take(")") {
+                    return Err(bad);
+                }
+                d
+            } else {
+                let d = self.operand()?;
+                if !self.t.take(")") {
+                    return Err(bad);
+                }
+                d
+            };
+            return Ok(d);
+        }
+        self.cache_body()
+    }
+
+    /// fn_site 参数缓存子查询体（`sd_v` 起）：
+    /// `sd_v FROM <已准入缓存表> WHERE sd_aK IS NOT DISTINCT FROM (<实参>)…`。
+    /// 实参只允许全定义操作数（含嵌套缓存子查询）；返回 Dom::Str（sd_v 恒 VARCHAR）。
+    /// 结束于收尾 `)` 之前（由 select_query/包装层消费）。
+    fn cache_body(&mut self) -> Result<Dom, SkipReason> {
+        let bad = SkipReason::UnprovenQueryTotalness;
+        if !self.t.take("sd_v") || !self.t.take("from") {
+            return Err(bad);
+        }
+        let table = self.t.name().ok_or(bad)?;
+        if !self.fn_tables.iter().any(|f| f == &table.0) {
+            return Err(bad);
+        }
+        if !self.t.take("where") {
+            return Err(bad);
+        }
+        loop {
+            let col = self.t.name().ok_or(bad)?;
+            if !is_cache_arg_col(&col.0) {
+                return Err(bad);
+            }
+            if !(self.t.take("is")
+                && self.t.take("not")
+                && self.t.take("distinct")
+                && self.t.take("from")
+                && self.t.take("("))
+            {
+                return Err(bad);
+            }
+            self.arg_operand()?;
+            if !self.t.take(")") {
+                return Err(bad);
+            }
+            if !self.t.take("and") {
+                break;
+            }
+        }
+        Ok(Dom::Str)
+    }
+
+    /// 缓存子查询实参：全定义操作数——裸操作数、括号嵌套或嵌套缓存子查询。
+    fn arg_operand(&mut self) -> Result<(), SkipReason> {
+        let bad = SkipReason::UnprovenQueryTotalness;
+        if self.t.at_subquery() {
+            self.t.take("(");
+            self.select_query()?;
+            return Ok(());
+        }
+        if self.t.take("(") {
+            self.arg_operand()?;
+            return self.t.take(")").then_some(()).ok_or(bad);
+        }
+        self.operand().map(|_| ())
+    }
+
     /// substr/substring 定宽截断（同语义，1-indexed）：首参必须字符串域，
     /// 起始 ≥1、长度 ≥0 的整数字面量。
     fn substr_call(&mut self) -> Result<Dom, SkipReason> {
@@ -209,7 +312,8 @@ impl Prover<'_> {
                 Some(SpinType::Int | SpinType::BigInt | SpinType::Decimal { .. }) => Dom::Num,
                 _ => Dom::Unknown,
             },
-            BindSrc::Field { .. } => Dom::Unknown,
+            // Expr 为行相关表达式，值域不可静态判定。
+            BindSrc::Expr { .. } | BindSrc::Field { .. } => Dom::Unknown,
         }
     }
 }
