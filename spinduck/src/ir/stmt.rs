@@ -444,6 +444,9 @@ impl Compiler {
                 if let Some(l) = &b.label {
                     self.mark(l);
                 }
+                // 嵌套块 DECLARE 段：变量/游标入变量集并生成初始化指令，
+                // 与例程顶层声明同一 declare_decls 口径
+                self.declare_decls(&b.declarations)?;
                 match &b.exception_block {
                     None => self.stmts(&b.body)?,
                     Some(exc) => self.trap_section(&b.body, exc)?,

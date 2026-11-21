@@ -5,7 +5,12 @@ use super::{
     at_text, project_rel, ClosureContext, ClosureDynamic, ClosureMissing, ClosureRef, GraphClosure,
 };
 use crate::error::EngineError;
+use ogsql_parser::ast::plpgsql::PlProcedureCall;
+use ogsql_parser::ast::visitor::{walk_statement, Visitor, VisitorResult};
+use ogsql_parser::ast::{CallFuncStatement, Expr, ObjectName};
+use ogsql_parser::parser::Parser;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
 
 /// 从一个已加载的瘦图和一个入口求闭包。
 ///
@@ -31,6 +36,7 @@ pub fn closure_from_graph(
         seen: BTreeSet::new(),
     };
     walk.run(entry_id);
+    walk.complete_from_ast();
     Ok(GraphClosure {
         target,
         refs: walk.refs.into_iter().collect(),
@@ -57,6 +63,10 @@ impl Walk<'_> {
     fn run(&mut self, entry: usize) {
         let mut queue = VecDeque::new();
         queue.push_back(entry);
+        self.drain(&mut queue);
+    }
+
+    fn drain(&mut self, queue: &mut VecDeque<usize>) {
         while let Some(id) = queue.pop_front() {
             if !self.seen.insert(id) {
                 continue;
@@ -64,8 +74,35 @@ impl Walk<'_> {
             self.note_routine_file(id);
             let edges = self.graph.out.get(&id).cloned().unwrap_or_default();
             for edge in edges {
-                self.apply(id, &edge, &mut queue);
+                self.apply(id, &edge, queue);
             }
+        }
+    }
+
+    /// codeweb 提取器的已知盲区：IF/WHILE 条件、CASE 等表达式位置中的
+    /// 例程调用不产生 `calls_procedure` 边（extractor 的 IF 分支只走
+    /// 分支体，语料 `fnc_get_split_date` 即此形态）。闭包定稿前以 AST
+    /// 全表达式扫描补全：命中图中例程节点而尚未入闭包的例程补入并重走
+    /// BFS，直至不动点；文件读不出/解析失败的保持现状（与 codeweb 同样
+    /// 无法证明，交由执行期缺件门兜底，不静默扩大闭包）。
+    fn complete_from_ast(&mut self) {
+        loop {
+            let files: Vec<String> = self.ddl_routines.iter().cloned().collect();
+            let mut seeds = BTreeSet::new();
+            for rel in files {
+                for name in routine_call_names(&self.ctx.project_root.join(&rel)) {
+                    for (id, key) in self.keys.iter() {
+                        if key == &name && !self.seen.contains(id) {
+                            seeds.insert(*id);
+                        }
+                    }
+                }
+            }
+            if seeds.is_empty() {
+                return;
+            }
+            let mut queue = VecDeque::from_iter(seeds);
+            self.drain(&mut queue);
         }
     }
 
@@ -496,4 +533,53 @@ fn ensure_entry_under_root(
         ));
     }
     Ok(())
+}
+
+/// 例程源文件里全部例程调用名（点分小写，与 `catalog_keys` 同口径）。
+/// 读/解析失败返回空集——补全是尽力而为的完备性修复，失败不扩大闭包。
+fn routine_call_names(path: &Path) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let Ok(sql) = std::fs::read_to_string(path) else {
+        return names;
+    };
+    let (infos, errors) = Parser::parse_sql(&sql);
+    if !errors.is_empty() {
+        return names;
+    }
+    let mut collector = CallNames(&mut names);
+    for info in &infos {
+        walk_statement(&mut collector, &info.statement);
+    }
+    names
+}
+
+fn object_name(name: &ObjectName) -> String {
+    name.iter()
+        .map(|i| i.as_str())
+        .collect::<Vec<_>>()
+        .join(".")
+        .to_ascii_lowercase()
+}
+
+/// 收集表达式/过程调用/ CALL 语句中的例程名；内建函数同样入集，
+/// 由调用方与图中例程键求交集自然过滤。
+struct CallNames<'a>(&'a mut BTreeSet<String>);
+
+impl Visitor for CallNames<'_> {
+    fn visit_expr(&mut self, expr: &Expr) -> VisitorResult {
+        if let Expr::FunctionCall { name, .. } = expr {
+            self.0.insert(object_name(name));
+        }
+        VisitorResult::Continue
+    }
+
+    fn visit_procedure_call(&mut self, call: &PlProcedureCall) -> VisitorResult {
+        self.0.insert(object_name(&call.name));
+        VisitorResult::Continue
+    }
+
+    fn visit_call(&mut self, call: &CallFuncStatement) -> VisitorResult {
+        self.0.insert(object_name(&call.func_name));
+        VisitorResult::Continue
+    }
 }

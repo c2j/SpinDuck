@@ -1235,3 +1235,21 @@ CREATE TABLE par_sys_stock (
     inure_begin_date character varying(8) NOT NULL,
     inure_end_date character varying(8)
 );
+
+-- fnc_com_get_main_xwdm 依赖闭包补齐：两表在任何语料均无基线 DDL，
+-- 与 set_oriented_v3_m0 兼容补丁同口径的最小空表（空表 → v_count=0，
+-- 与原语料"缺表走异常分支兜底 v_count:=0"行为一致）。
+CREATE TABLE par_fund_account_member (
+    fund_code character varying(10),
+    member_code character varying(20),
+    zjzh character varying(50),
+    inure_begin_date character varying(8),
+    inure_end_date character varying(8)
+);
+
+CREATE TABLE par_oper_account_member (
+    member_code character varying(20),
+    member_type character varying(2),
+    inure_begin_date character varying(8),
+    inure_end_date character varying(8)
+);

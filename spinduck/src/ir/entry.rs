@@ -3,8 +3,7 @@
 use crate::error::EngineError;
 use crate::ir::*;
 use crate::rules::RuleRegistry;
-use crate::value::SpinValue;
-use ogsql_parser::ast::plpgsql::{PlBlock, PlStatement};
+use ogsql_parser::ast::plpgsql::{PlBlock, PlDeclaration, PlStatement};
 use ogsql_parser::ast::Expr;
 use std::collections::BTreeSet;
 
@@ -73,72 +72,9 @@ pub fn compile_routine_with_names(
         routine_names: routine_names.clone(),
         ..Default::default()
     };
-    let mut var_types = std::collections::BTreeMap::new();
-    use ogsql_parser::ast::plpgsql::PlDeclaration;
     // 声明段：变量入变量集并生成初始化指令（GaussDB 语义：声明即变量，
     // 未给初值时为 NULL）；游标编译为静态 SQL 待 OPEN 使用
-    for decl in &block.declarations {
-        match decl {
-            PlDeclaration::Cursor(cd) => {
-                let name = cd.name.to_ascii_lowercase();
-                let query_text = match &cd.parsed_query {
-                    Some(q) => ogsql_parser::formatter::SqlFormatter::new().format_statement(q),
-                    None => cd.query.clone(),
-                };
-                let unit = rewrite_sql(&query_text, &c.vars, &c.rules, &c.routine_names)?;
-                c.pending_cursor_sql
-                    .insert(name, (unit.text, unit.binds, unit.fn_sites));
-            }
-            PlDeclaration::Variable(v) => {
-                let name = VarName(v.name.to_ascii_lowercase());
-                c.vars.insert(name.0.clone());
-                // `%ROWTYPE`：记录锚定游标 → 单目标 FETCH INTO 按整行记录赋值
-                if let ogsql_parser::ast::plpgsql::PlDataType::PercentRowType(anchor) = &v.data_type
-                {
-                    c.rowtype_of
-                        .insert(name.0.clone(), anchor.to_ascii_lowercase());
-                }
-                if let ogsql_parser::ast::plpgsql::PlDataType::TypeName(raw) = &v.data_type {
-                    if let Some(ty) = c.rules.spin_type(raw) {
-                        var_types.insert(name.0.clone(), ty);
-                    }
-                }
-                let init = match &v.default {
-                    Some(e) => c.expr(e)?,
-                    None => IrExpr::Const(SpinValue::Null),
-                };
-                c.code.push(IrStmt::Assign {
-                    target: AssignTarget::Var(name),
-                    expr: init,
-                });
-            }
-            // TYPE .. IS TABLE OF / VARRAY：集合类型解释器未实现，编译期显式
-            // 拒绝（ENG-0071，设计 V4 §4.4 Gate 2A）；RECORD/REF CURSOR 暂不涉及。
-            PlDeclaration::Type(
-                ogsql_parser::ast::plpgsql::PlTypeDecl::TableOf { .. }
-                | ogsql_parser::ast::plpgsql::PlTypeDecl::VarrayOf { .. },
-            ) => {
-                return Err(EngineError::invariant(
-                    71,
-                    "TYPE .. IS TABLE OF / VARRAY is not supported",
-                ));
-            }
-            // PRAGMA AUTONOMOUS_TRANSACTION / EXCEPTION_INIT：解释器均未实现
-            // （后者静默丢弃会让 `WHEN <name>` 永不命中）——编译期显式拒绝
-            // （ENG-0071，设计 V4 §4.4 Gate 2A）。其余 PRAGMA 维持忽略。
-            PlDeclaration::Pragma { name, .. }
-                if name.eq_ignore_ascii_case("autonomous_transaction")
-                    || name.eq_ignore_ascii_case("exception_init") =>
-            {
-                return Err(EngineError::invariant(
-                    71,
-                    "PRAGMA AUTONOMOUS_TRANSACTION / EXCEPTION_INIT is not supported",
-                ));
-            }
-            // RECORD/TYPE/PRAGMA/嵌套例程：v1 不影响帧布局（嵌套例程 M9）
-            _ => {}
-        }
-    }
+    c.declare_decls(&block.declarations)?;
     // 例程级 EXCEPTION 段（语料主流形态：`IS BEGIN … EXCEPTION WHEN OTHERS … END;`）
     // 与块级走同一 trap 编译；此前 PlBlock.exception_block 被静默丢弃。
     match &block.exception_block {
@@ -148,7 +84,7 @@ pub fn compile_routine_with_names(
     c.resolve_fixups()?;
     let mut prog = IrProg {
         code: c.code,
-        var_types,
+        var_types: c.var_types,
         local_ddl: c.local_ddl,
     };
     super::writebuf_policy::apply(&mut prog, out_params);
@@ -209,7 +145,19 @@ fn collect_stmt(st: &PlStatement, set: &mut crate::sql::VarScope) {
         PlStatement::Return {
             expression: Some(e),
         } => collect_expr(e, set),
-        PlStatement::Block(b) => collect_slice(&b.body, set),
+        PlStatement::Block(b) => {
+            // 嵌套块 DECLARE 段：与例程顶层同一 declare_decls 口径——
+            // 块内声明的变量/游标必须入变量集，否则块内 SQL 文本中的
+            // 引用残留裸标识符（语料 prc_trd_hz_byfund 的 v_security_id）。
+            for decl in &b.declarations {
+                if let PlDeclaration::Variable(v) = decl {
+                    if let Some(e) = &v.default {
+                        collect_expr(e, set);
+                    }
+                }
+            }
+            collect_slice(&b.body, set);
+        }
         _ => {}
     }
 }

@@ -7,6 +7,7 @@
 
 mod parse;
 mod plans;
+mod scope;
 mod source;
 mod thin;
 mod walk;
@@ -88,7 +89,28 @@ pub struct GraphClosure {
 }
 
 /// JSON `file` 落在 `root` 下时返回剥掉根之后的相对路径（`/` 分隔）。
+///
+/// 词法前缀是快路径；`--dir` 给相对路径或两侧含符号链接时词法必然落空，
+/// 此时对双方做 canonicalize 后再比一次（codeweb 图存的是分析时的绝对
+/// 路径，项目根可能是用户输入的相对/软链形式）。
 pub(super) fn project_rel(root: &Path, file: &str) -> Option<String> {
+    if let Some(rest) = project_rel_lexical(root, file) {
+        return Some(rest);
+    }
+    if !std::path::Path::new(file).is_absolute() {
+        return None;
+    }
+    let canon_root = root.canonicalize().ok()?;
+    let canon_file = std::path::Path::new(file).canonicalize().ok()?;
+    let rest = canon_file.strip_prefix(&canon_root).ok()?;
+    let rest = rest.to_string_lossy().replace('\\', "/");
+    if rest.is_empty() || rest.starts_with('/') || has_parent_segment(&rest) {
+        return None;
+    }
+    Some(rest)
+}
+
+fn project_rel_lexical(root: &Path, file: &str) -> Option<String> {
     let root = root.to_string_lossy().replace('\\', "/");
     let root = root.trim_end_matches('/');
     if root.is_empty() {

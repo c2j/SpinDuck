@@ -4,6 +4,7 @@ use crate::error::EngineError;
 use crate::ir::*;
 use crate::rules::RuleRegistry;
 use crate::runtime::cursor::CursorAttrKind;
+use crate::value::SpinValue;
 use ogsql_parser::ast::plpgsql::PlStatement;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -26,6 +27,8 @@ pub(crate) struct Compiler {
     pub(crate) loop_stack: Vec<(String, String)>, // (start_label, end_label)
     pub(crate) depth: usize,
     pub(crate) synth: usize,
+    /// 变量名 → 推断 SpinType（`%TYPE`/显式类型声明；移交 IrProg）
+    pub(crate) var_types: BTreeMap<String, crate::types::SpinType>,
 }
 
 /// 嵌套深度上限。取 32 而非 64：解析器与编译器递归帧较大，64 层在默认测试栈
@@ -82,6 +85,83 @@ impl Compiler {
                     *target = resolved
                 }
                 _ => return Err(EngineError::invariant(28, "fixup target must be a jump")),
+            }
+        }
+        Ok(())
+    }
+
+    /// DECLARE 段编译（例程顶层块与嵌套 `BEGIN..END` 块共用）：
+    /// 变量入变量集并生成初始化指令（GaussDB 语义：声明即变量，未给
+    /// 初值时为 NULL）；游标编译为静态 SQL 待 OPEN 使用。
+    /// 帧为扁平命名空间：嵌套块声明与外层同名时按同一变量处理
+    /// （初始化指令落在块入口、随块体每次执行重放）。
+    pub(crate) fn declare_decls(
+        &mut self,
+        decls: &[ogsql_parser::ast::plpgsql::PlDeclaration],
+    ) -> Result<(), EngineError> {
+        use ogsql_parser::ast::plpgsql::PlDeclaration;
+        for decl in decls {
+            match decl {
+                PlDeclaration::Cursor(cd) => {
+                    let name = cd.name.to_ascii_lowercase();
+                    let query_text = match &cd.parsed_query {
+                        Some(q) => ogsql_parser::formatter::SqlFormatter::new().format_statement(q),
+                        None => cd.query.clone(),
+                    };
+                    let unit =
+                        rewrite_sql(&query_text, &self.vars, &self.rules, &self.routine_names)?;
+                    self.pending_cursor_sql
+                        .insert(name, (unit.text, unit.binds, unit.fn_sites));
+                }
+                PlDeclaration::Variable(v) => {
+                    let name = VarName(v.name.to_ascii_lowercase());
+                    self.vars.insert(name.0.clone());
+                    // `%ROWTYPE`：记录锚定游标 → 单目标 FETCH INTO 按整行记录赋值
+                    if let ogsql_parser::ast::plpgsql::PlDataType::PercentRowType(anchor) =
+                        &v.data_type
+                    {
+                        self.rowtype_of
+                            .insert(name.0.clone(), anchor.to_ascii_lowercase());
+                    }
+                    if let ogsql_parser::ast::plpgsql::PlDataType::TypeName(raw) = &v.data_type {
+                        if let Some(ty) = self.rules.spin_type(raw) {
+                            self.var_types.insert(name.0.clone(), ty);
+                        }
+                    }
+                    let init = match &v.default {
+                        Some(e) => self.expr(e)?,
+                        None => IrExpr::Const(SpinValue::Null),
+                    };
+                    self.code.push(IrStmt::Assign {
+                        target: AssignTarget::Var(name),
+                        expr: init,
+                    });
+                }
+                // TYPE .. IS TABLE OF / VARRAY：集合类型解释器未实现，编译期显式
+                // 拒绝（ENG-0071，设计 V4 §4.4 Gate 2A）；RECORD/REF CURSOR 暂不涉及。
+                PlDeclaration::Type(
+                    ogsql_parser::ast::plpgsql::PlTypeDecl::TableOf { .. }
+                    | ogsql_parser::ast::plpgsql::PlTypeDecl::VarrayOf { .. },
+                ) => {
+                    return Err(EngineError::invariant(
+                        71,
+                        "TYPE .. IS TABLE OF / VARRAY is not supported",
+                    ));
+                }
+                // PRAGMA AUTONOMOUS_TRANSACTION / EXCEPTION_INIT：解释器均未实现
+                // （后者静默丢弃会让 `WHEN <name>` 永不命中）——编译期显式拒绝
+                // （ENG-0071，设计 V4 §4.4 Gate 2A）。其余 PRAGMA 维持忽略。
+                PlDeclaration::Pragma { name, .. }
+                    if name.eq_ignore_ascii_case("autonomous_transaction")
+                        || name.eq_ignore_ascii_case("exception_init") =>
+                {
+                    return Err(EngineError::invariant(
+                        71,
+                        "PRAGMA AUTONOMOUS_TRANSACTION / EXCEPTION_INIT is not supported",
+                    ));
+                }
+                // RECORD/TYPE/PRAGMA/嵌套例程：v1 不影响帧布局（嵌套例程 M9）
+                _ => {}
             }
         }
         Ok(())

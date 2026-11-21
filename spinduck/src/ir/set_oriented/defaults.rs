@@ -30,9 +30,16 @@ fn constant(tokens: &[String]) -> Option<String> {
         _ => {}
     }
     if let Some(pos) = top_position(t, "::") {
+        let inner = constant(&t[..pos])?;
+        // NULL 的 CAST 目标类型不影响写入值（恒为 NULL）：DuckDB 会把
+        // `NULL::numeric` 物化成带精度的 `CAST(NULL AS DECIMAL(18,3))`，
+        // 与快照原文 `cast(null as decimal)` 必然漂移——归一为 null。
+        if inner == "null" {
+            return Some("null".into());
+        }
         return Some(format!(
             "cast ( {} as {} )",
-            constant(&t[..pos])?,
+            inner,
             cast_type(&t[pos + 1..])?
         ));
     }
@@ -42,9 +49,13 @@ fn constant(tokens: &[String]) -> Option<String> {
     {
         let inside = &t[2..t.len() - 1];
         let pos = top_position(inside, "as")?;
+        let inner = constant(&inside[..pos])?;
+        if inner == "null" {
+            return Some("null".into());
+        }
         return Some(format!(
             "cast ( {} as {} )",
-            constant(&inside[..pos])?,
+            inner,
             cast_type(&inside[pos + 1..])?
         ));
     }

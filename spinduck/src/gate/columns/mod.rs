@@ -22,7 +22,7 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ogsql_parser::ast::plpgsql::{PlBlock, PlDeclaration};
+use ogsql_parser::ast::plpgsql::{PlBlock, PlDeclaration, PlStatement};
 use ogsql_parser::ast::visitor::{
     walk_pl_block, walk_pl_type_decl, walk_statement, Visitor, VisitorResult,
 };
@@ -134,6 +134,22 @@ impl Visitor for PlNames {
             S::CreateFunction(f) => self.add_params(&f.parameters),
             S::CreatePackage(p) => self.add_package_items(&p.items),
             S::CreatePackageBody(p) => self.add_package_items(&p.items),
+            _ => {}
+        }
+        VisitorResult::Continue
+    }
+
+    fn visit_pl_statement(&mut self, stmt: &PlStatement) -> VisitorResult {
+        // FOR 循环变量（Range 计数 / Query·Cursor 记录）是帧变量而非
+        // DECLARE 声明：rec.field 是合法 PL 变量引用，按变量解释跳过
+        // （语料 prc_trd_hz_byfund 的 res.* 曾被误报 BIZ-0152）。
+        match stmt {
+            PlStatement::For(f) => {
+                self.0.insert(f.variable.to_ascii_lowercase());
+            }
+            PlStatement::ForEach(fe) => {
+                self.0.insert(fe.variable.to_ascii_lowercase());
+            }
             _ => {}
         }
         VisitorResult::Continue

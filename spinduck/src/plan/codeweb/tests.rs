@@ -522,3 +522,23 @@ fn should_reject_when_the_entry_catalog_key_is_not_unique() {
         err.message
     );
 }
+
+#[test]
+fn should_match_project_rel_through_canonicalized_paths() {
+    // `compile --dir <相对路径>` 时 project.root 是相对形式，而 codeweb 图
+    // 存的是分析期绝对路径——词法前缀必然落空，须 canonical 双侧比对。
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("proj");
+    std::fs::create_dir_all(real.join("sql")).unwrap();
+    let file = real.join("sql/a.sql");
+    std::fs::write(&file, "select 1").unwrap();
+    // 以"拼接 .. 段"的非规范绝对根模拟相对/未规范化输入：词法剥不出，
+    // canonical 后两侧一致。
+    let detour = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&detour).unwrap();
+    let weird_root = detour.join("..").join("proj");
+    let got = super::project_rel(&weird_root, file.to_str().unwrap());
+    // weird_root 词法上是 tmp/elsewhere/../proj——strip_prefix("tmp/elsewhere/../proj/")
+    // 不命中 file 的 tmp/proj/sql/a.sql；canonical 后 root=tmp/proj 命中。
+    assert_eq!(got.as_deref(), Some("sql/a.sql"));
+}

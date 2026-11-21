@@ -545,3 +545,33 @@ fn should_render_lowercase_oracle_format() {
     assert_eq!(oracle_format_to_strftime("YYYYMMDD"), "%Y%m%d");
     assert_eq!(oracle_format_to_strftime("yyyy-mm-dd"), "%Y-%m-%d");
 }
+
+#[test]
+fn should_bind_variables_declared_in_nested_for_block() {
+    // 语料 PKG_SPLIT_TRADE_STEP3_SH.prc_trd_hz_byfund QFII 段：FOR 循环体内
+    // DECLARE 块声明的变量必须进入变量集——此前 INSERT VALUES 中残留裸
+    // 标识符，DuckDB binder 报 "Referenced column v_security_id was not
+    // found because the FROM clause is missing"。
+    let (ex, log) = Recorder::with_script(&["a"], vec![vec![SpinValue::Int(1)]]);
+    let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+    eng.register(
+        "CREATE OR REPLACE PROCEDURE p_nested IS \
+         BEGIN \
+           FOR r IN (SELECT 1 AS a) LOOP \
+             DECLARE v_sid VARCHAR(20); \
+             BEGIN \
+               v_sid := 'S'; \
+               INSERT INTO out_t(v) VALUES (v_sid); \
+             END; \
+           END LOOP; \
+         END;",
+    )
+    .unwrap();
+    eng.call("p_nested", &[]).unwrap();
+    let calls = log.borrow().clone();
+    let ins = calls
+        .iter()
+        .find(|s| s.contains("insert into out_t"))
+        .expect("INSERT 应下发");
+    assert!(ins.contains("$v_v_sid"), "嵌套块声明变量应绑定：{ins}");
+}

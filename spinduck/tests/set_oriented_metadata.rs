@@ -447,3 +447,56 @@ fn should_normalize_varchar_and_numeric_without_duckdb_and_ignore_varchar_length
 
 #[path = "guard/set_oriented_metadata_drift.rs"]
 mod drift;
+
+#[cfg(feature = "native")]
+#[test]
+fn should_replan_live_when_offline_static_candidate_is_unproven() {
+    // 离线 Static 快照没有执行器：verbatim 游标（聚合/GROUP BY）的
+    // DESCRIBE 列探测、视图定义与对象清单一律不可证 → 候选恒为
+    // Skipped。挂计划后运行期必须以 Runtime 源重证（与 --file 路径
+    // 同一证明器）：证明成功则 Converted，而不是沿用离线保守结论。
+    use spinduck_core::ir::set_oriented::{compile_set_oriented_plans, SetOrientedMode, Status};
+    use spinduck_core::{BindMap, DuckExecutor, Engine};
+    let rules = RuleRegistry::default();
+    let snapshot = SchemaSnapshot::from_codeweb(
+        &export("CREATE TABLE src(id BIGINT); CREATE TABLE dst(id BIGINT, c BIGINT);"),
+        &rules,
+    );
+    let catalog = catalog(
+        "CREATE PROCEDURE agg_copy IS BEGIN \
+        FOR r IN (SELECT id, COUNT(*) AS c FROM src GROUP BY id) LOOP \
+        INSERT INTO dst(id, c) VALUES(r.id, r.c); END LOOP; END;",
+    );
+    let plans =
+        compile_set_oriented_plans(&catalog, &snapshot, SetOrientedMode::BatchAtomic).unwrap();
+    assert!(
+        plans.get("agg_copy").unwrap().is_err(),
+        "verbatim 游标在 Static 快照下必须保守跳过"
+    );
+    let mut eng = Engine::new(Box::new(DuckExecutor::open_in_memory().unwrap()), rules);
+    eng.catalog = catalog;
+    eng.set_oriented = SetOrientedMode::BatchAtomic;
+    eng.attach_set_oriented_plans(plans);
+    eng.attach_schema_snapshot(snapshot);
+    for ddl in [
+        "CREATE TABLE src(id BIGINT)",
+        "CREATE TABLE dst(id BIGINT, c BIGINT)",
+        "INSERT INTO src VALUES (1),(1),(2)",
+        "CREATE TABLE sys_dummy(dummy VARCHAR)",
+        "INSERT INTO sys_dummy VALUES ('X')",
+    ] {
+        eng.ex.execute(ddl, &BindMap::new()).unwrap();
+    }
+    eng.call("agg_copy", &[]).unwrap();
+    let reports = eng.set_oriented_reports();
+    assert!(
+        matches!(reports[0].status, Status::Converted { .. }),
+        "运行期重证必须 Converted: {reports:?}"
+    );
+    let rows = eng
+        .ex
+        .query("SELECT * FROM dst ORDER BY id", &BindMap::new())
+        .unwrap()
+        .fetch_many(10);
+    assert_eq!(rows.len(), 2, "dst 应有两组聚合行: {rows:?}");
+}

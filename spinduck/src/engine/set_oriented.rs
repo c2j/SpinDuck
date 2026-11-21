@@ -295,11 +295,12 @@ impl Engine {
             .filter(|plans| plans.is_current(&ctx))
             .and_then(|plans| plans.get(&routine.name));
         match cached {
-            Some(candidate) => Ok(candidate
-                .as_ref()
-                .map(|p| p.conversion.clone())
-                .map_err(|r| *r)),
-            None => crate::ir::set_oriented::plan(routine, self.ex.as_ref(), &ctx),
+            Some(Ok(candidate)) => Ok(Ok(candidate.conversion.clone())),
+            // 离线 Static 快照没有执行器：verbatim 列探测、视图定义与对象
+            // 清单一律不可证，候选只会是保守 Skipped。运行期 Runtime 源
+            // 持有同一执行器，证明面与未挂计划的 `--file` 路径完全一致——
+            // 以运行期重证为准，证明不了时由同一证明器给出原因。
+            Some(Err(_)) | None => crate::ir::set_oriented::plan(routine, self.ex.as_ref(), &ctx),
         }
     }
 
