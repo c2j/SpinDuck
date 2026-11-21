@@ -251,17 +251,14 @@ impl Compiler {
             PlStatement::For(f) => {
                 // Range → 计数循环；Query → 隐式游标循环（M4c 打开）
                 use ogsql_parser::ast::plpgsql::PlForKind;
-                let var = VarName(f.variable.to_ascii_lowercase());
-                let start = f
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| self.synth_label("for_start"));
-                let end = f
-                    .end_label
-                    .clone()
-                    .unwrap_or_else(|| format!("{start}__end"));
-                self.loop_stack.push((start.clone(), end.clone()));
-                match &f.kind {
+                // 循环变量词法作用域仅覆盖循环体：边界/步长表达式与游标
+                // 查询文本必须在变量绑定前解析——同名外层变量不被遮蔽误读。
+                enum ForPre {
+                    Range(Box<(IrExpr, IrExpr, Option<IrExpr>)>),
+                    Query(Box<crate::ir::CompiledCursorSql>),
+                    Cursor,
+                }
+                let pre = match &f.kind {
                     PlForKind::Range {
                         low,
                         high,
@@ -274,40 +271,17 @@ impl Compiler {
                                 "FOR REVERSE is not supported in v1",
                             ));
                         }
-                        let e_low = self.expr(low)?;
-                        self.code.push(IrStmt::Assign {
-                            target: AssignTarget::Var(var.clone()),
-                            expr: e_low,
-                        });
-                        self.mark(&start);
-                        let cond = IrExpr::Bin {
-                            op: BinOp::Le,
-                            l: Box::new(IrExpr::Var(var.clone())),
-                            r: Box::new(self.expr(high)?),
-                        };
-                        self.jump(&end, Some(cond), false);
-                        self.stmts(&f.body)?;
-                        let step_inc = match step {
-                            Some(s) => self.expr(s)?,
-                            None => IrExpr::Const(SpinValue::Int(1)),
-                        };
-                        self.code.push(IrStmt::Assign {
-                            target: AssignTarget::Var(var.clone()),
-                            expr: IrExpr::Bin {
-                                op: BinOp::Add,
-                                l: Box::new(IrExpr::Var(var.clone())),
-                                r: Box::new(step_inc),
-                            },
-                        });
-                        self.jump(&start, None, true);
+                        ForPre::Range(Box::new((
+                            self.expr(low)?,
+                            self.expr(high)?,
+                            step.as_ref().map(|s| self.expr(s)).transpose()?,
+                        )))
                     }
                     PlForKind::Query {
                         query,
                         parsed_query,
                         using_args,
                     } => {
-                        // FOR rec IN <query>：脱糖为隐式游标（§7.3.4），
-                        // 与显式游标共用 OPEN/FETCH/CLOSE 语义与 %NOTFOUND 判定
                         if !using_args.is_empty() {
                             return Err(EngineError::invariant(
                                 58,
@@ -322,13 +296,74 @@ impl Compiler {
                         };
                         let unit =
                             rewrite_sql(&text, &self.vars, &self.rules, &self.routine_names)?;
+                        ForPre::Query(Box::new((unit.text, unit.binds, unit.fn_sites)))
+                    }
+                    PlForKind::Cursor { arguments, .. } => {
+                        if !arguments.is_empty() {
+                            return Err(EngineError::invariant(
+                                59,
+                                "FOR rec IN cursor(args) is not supported in v1",
+                            ));
+                        }
+                        ForPre::Cursor
+                    }
+                };
+                // 循环变量是循环体词法作用域内的绑定：遮蔽外层同名绑定，
+                // 循环结束回卷映射。
+                let (canon, scoped) = self.vars.declare(&f.variable.to_ascii_lowercase());
+                let var = VarName(canon);
+                let start = f
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| self.synth_label("for_start"));
+                let end = f
+                    .end_label
+                    .clone()
+                    .unwrap_or_else(|| format!("{start}__end"));
+                self.loop_stack.push((start.clone(), end.clone()));
+                match &f.kind {
+                    PlForKind::Range { .. } => {
+                        let ForPre::Range(exprs) = pre else {
+                            unreachable!("pre 与 f.kind 同源")
+                        };
+                        let (e_low, e_high, e_step) = *exprs;
+                        self.code.push(IrStmt::Assign {
+                            target: AssignTarget::Var(var.clone()),
+                            expr: e_low,
+                        });
+                        self.mark(&start);
+                        let cond = IrExpr::Bin {
+                            op: BinOp::Le,
+                            l: Box::new(IrExpr::Var(var.clone())),
+                            r: Box::new(e_high),
+                        };
+                        self.jump(&end, Some(cond), false);
+                        self.stmts(&f.body)?;
+                        let step_inc = e_step.unwrap_or(IrExpr::Const(SpinValue::Int(1)));
+                        self.code.push(IrStmt::Assign {
+                            target: AssignTarget::Var(var.clone()),
+                            expr: IrExpr::Bin {
+                                op: BinOp::Add,
+                                l: Box::new(IrExpr::Var(var.clone())),
+                                r: Box::new(step_inc),
+                            },
+                        });
+                        self.jump(&start, None, true);
+                    }
+                    PlForKind::Query { .. } => {
+                        // FOR rec IN <query>：脱糖为隐式游标（§7.3.4），
+                        // 与显式游标共用 OPEN/FETCH/CLOSE 语义与 %NOTFOUND 判定
+                        let ForPre::Query(unit) = pre else {
+                            unreachable!("pre 与 f.kind 同源")
+                        };
+                        let (sql, binds, fn_sites) = *unit;
                         let cname = self.synth_label("for_cur");
                         self.code.push(IrStmt::OpenCursor {
                             cursor: VarName(cname.clone()),
                             source: CursorSource::Static {
-                                sql: unit.text,
-                                binds: unit.binds,
-                                fn_sites: unit.fn_sites,
+                                sql,
+                                binds,
+                                fn_sites,
                             },
                         });
                         self.for_cursor_loop(&VarName(cname.clone()), &var, &f.body, &start, &end)?;
@@ -336,16 +371,7 @@ impl Compiler {
                             cursor: VarName(cname),
                         });
                     }
-                    PlForKind::Cursor {
-                        cursor_name,
-                        arguments,
-                    } => {
-                        if !arguments.is_empty() {
-                            return Err(EngineError::invariant(
-                                59,
-                                "FOR rec IN cursor(args) is not supported in v1",
-                            ));
-                        }
+                    PlForKind::Cursor { cursor_name, .. } => {
                         let name = match cursor_name {
                             Expr::PlVariable(n) | Expr::ColumnRef(n) => ident_path(n),
                             other => {
@@ -381,6 +407,7 @@ impl Compiler {
                 }
                 self.loop_stack.pop();
                 self.mark(&end);
+                self.vars.restore(&scoped);
             }
             PlStatement::ProcedureCall(pc_stmt) => {
                 let name = ident_path(&pc_stmt.name);
@@ -445,11 +472,16 @@ impl Compiler {
                     self.mark(l);
                 }
                 // 嵌套块 DECLARE 段：变量/游标入变量集并生成初始化指令，
-                // 与例程顶层声明同一 declare_decls 口径
-                self.declare_decls(&b.declarations)?;
+                // 与例程顶层声明同一 declare_decls 口径；块结束逆序回卷
+                // 变量映射——内层遮蔽变量离开块后不再可见（PL/SQL 词法
+                // 作用域；处理器体在回卷前编译，仍可见块内变量）。
+                let restores = self.declare_decls(&b.declarations)?;
                 match &b.exception_block {
                     None => self.stmts(&b.body)?,
                     Some(exc) => self.trap_section(&b.body, exc)?,
+                }
+                for r in restores.iter().rev() {
+                    self.vars.restore(r);
                 }
             }
             PlStatement::Execute(sp) => {

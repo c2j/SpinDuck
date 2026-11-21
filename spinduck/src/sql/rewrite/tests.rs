@@ -2,9 +2,8 @@
 
 use crate::ir::VarName;
 use crate::sql::rewrite::{apply_ast_transforms, rewrite_tokens, SqlBindSrc};
-use std::collections::BTreeSet;
 
-fn vars(items: &[&str]) -> BTreeSet<String> {
+fn vars(items: &[&str]) -> crate::sql::VarScope {
     items.iter().map(|s| s.to_string()).collect()
 }
 

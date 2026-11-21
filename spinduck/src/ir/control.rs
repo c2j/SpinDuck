@@ -91,15 +91,17 @@ impl Compiler {
     }
 
     /// DECLARE 段编译（例程顶层块与嵌套 `BEGIN..END` 块共用）：
-    /// 变量入变量集并生成初始化指令（GaussDB 语义：声明即变量，未给
+    /// 变量绑定入变量集并生成初始化指令（GaussDB 语义：声明即变量，未给
     /// 初值时为 NULL）；游标编译为静态 SQL 待 OPEN 使用。
-    /// 帧为扁平命名空间：嵌套块声明与外层同名时按同一变量处理
-    /// （初始化指令落在块入口、随块体每次执行重放）。
+    /// 嵌套块声明与外层同名时按词法作用域遮蔽：内层变量获得独立规范名，
+    /// 块内引用解析到内层槽位，返回的 [`VarRestore`] 列表须在块编译结束
+    /// 后逆序 [`VarScope::restore`]（例程顶层调用方忽略返回值）。
     pub(crate) fn declare_decls(
         &mut self,
         decls: &[ogsql_parser::ast::plpgsql::PlDeclaration],
-    ) -> Result<(), EngineError> {
+    ) -> Result<Vec<crate::sql::VarRestore>, EngineError> {
         use ogsql_parser::ast::plpgsql::PlDeclaration;
+        let mut restores = Vec::new();
         for decl in decls {
             match decl {
                 PlDeclaration::Cursor(cd) => {
@@ -114,8 +116,9 @@ impl Compiler {
                         .insert(name, (unit.text, unit.binds, unit.fn_sites));
                 }
                 PlDeclaration::Variable(v) => {
-                    let name = VarName(v.name.to_ascii_lowercase());
-                    self.vars.insert(name.0.clone());
+                    let (canon, restore) = self.vars.declare(&v.name.to_ascii_lowercase());
+                    restores.push(restore);
+                    let name = VarName(canon);
                     // `%ROWTYPE`：记录锚定游标 → 单目标 FETCH INTO 按整行记录赋值
                     if let ogsql_parser::ast::plpgsql::PlDataType::PercentRowType(anchor) =
                         &v.data_type
@@ -164,7 +167,22 @@ impl Compiler {
                 _ => {}
             }
         }
-        Ok(())
+        Ok(restores)
+    }
+
+    /// PL 变量面名 → 帧规范名（嵌套遮蔽后的唯一槽位；未登记原样返回）。
+    pub(crate) fn var_name(&self, path: &str) -> VarName {
+        let s = path.to_ascii_lowercase();
+        if let Some(c) = self.vars.resolve_opt(&s) {
+            return VarName(c.to_string());
+        }
+        // 限定路径（`rec.field`）：首段命中变量映射时仅替换首段。
+        if let Some((head, tail)) = s.split_once('.') {
+            if let Some(c) = self.vars.resolve_opt(head) {
+                return VarName(format!("{c}{tail}"));
+            }
+        }
+        VarName(s)
     }
 
     /// FOR 隐式游标循环体：FETCH → %NOTFOUND 退出 → 循环体 → 回跳。

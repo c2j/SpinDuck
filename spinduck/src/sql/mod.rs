@@ -12,7 +12,7 @@ pub use sqlfn::{plan_sites, FnSite};
 
 pub use rewrite::{
     apply_ast_transforms, oracle_format_to_strftime, rewrite_concat, rewrite_tokens,
-    rewrite_tokens_with_rules, strip_update_alias, SqlUnit, VarScope,
+    rewrite_tokens_with_rules, strip_update_alias, SqlUnit, VarRestore, VarScope,
 };
 
 pub use patterns::apply_text_patterns;

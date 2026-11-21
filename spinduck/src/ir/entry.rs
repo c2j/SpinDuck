@@ -64,7 +64,9 @@ pub fn compile_routine_with_names(
 ) -> Result<IrProg, EngineError> {
     let mut vars = collect_var_names(&block.body);
     for v in extra_vars {
-        vars.insert(v.to_ascii_lowercase());
+        // 例程参数/OUT 形参是顶层绑定：declare 登记 bound，供嵌套
+        // DECLARE 同名遮蔽判定；顶层作用域不回卷。
+        vars.declare(&v.to_ascii_lowercase());
     }
     let mut c = Compiler {
         vars,
@@ -72,9 +74,10 @@ pub fn compile_routine_with_names(
         routine_names: routine_names.clone(),
         ..Default::default()
     };
-    // 声明段：变量入变量集并生成初始化指令（GaussDB 语义：声明即变量，
-    // 未给初值时为 NULL）；游标编译为静态 SQL 待 OPEN 使用
-    c.declare_decls(&block.declarations)?;
+    // 声明段：变量绑定入变量集并生成初始化指令（GaussDB 语义：声明即
+    // 变量，未给初值时为 NULL）；游标编译为静态 SQL 待 OPEN 使用。
+    // 顶层块作用域覆盖整个例程体，无需回卷。
+    let _ = c.declare_decls(&block.declarations)?;
     // 例程级 EXCEPTION 段（语料主流形态：`IS BEGIN … EXCEPTION WHEN OTHERS … END;`）
     // 与块级走同一 trap 编译；此前 PlBlock.exception_block 被静默丢弃。
     match &block.exception_block {
