@@ -2,7 +2,7 @@
 #![cfg(feature = "native")]
 
 use spinduck_core::exec::SqlExecutor;
-use spinduck_core::ir::set_oriented::{SetOrientedMode, SkipReason, Status};
+use spinduck_core::ir::set_oriented::{SetOrientedMode, Status};
 use spinduck_core::value::SpinValue;
 use spinduck_core::{
     BindMap, DuckExecutor, Engine, EngineError, ExecOutcome, RowStream, RuleRegistry,
@@ -254,6 +254,8 @@ fn should_reject_sys_dummy_block_when_not_total_and_verify_decimal_mul_sub() {
     scenario_view_lookup();
     scenario_inline_lookup_args();
     scenario_inline_derived_or();
+    scenario_dec_wide_guard();
+    scenario_dec_wide_fallback();
 }
 
 /// fnc_grp_mode：SQL 上下文下沉例程（游标 WHERE 内 fn_site 同型）。
@@ -635,7 +637,8 @@ fn scenario_unproven_case_branch() {
     assert_eq!(actual2.outs, expected2.outs, "OUT 形参须与 Off 一致");
 }
 
-/// ③ 乘减宽度 >38：计划期 UnprovenExpression，不留运行期溢出。
+/// ③ 乘减宽度 >38：静态精度超内核上限不再计划期拒绝——改由值域
+/// 守卫准入，干净数据 Converted 且与 Off 逐行一致；脏数据回退见⑬。
 /// cjje DECIMAL(30,2) * org DECIMAL(30,8)：乘积精度 30+30+1=61 > 38。
 fn scenario_decimal_overflow() {
     let ddl3: Vec<&str> = BASE_DDL
@@ -663,14 +666,12 @@ fn scenario_decimal_overflow() {
 
     let mut eng3 = engine_with(&ddl3, SetOrientedMode::BatchAtomic);
     let actual3 = eng3.call("caller_dummy", &args()).unwrap();
-    assert_eq!(
-        eng3.set_oriented_reports()[0].status,
-        Status::Skipped {
-            reason: SkipReason::UnprovenExpression
-        },
-        "乘减超宽必须计划期拒绝: {:?}",
-        eng3.set_oriented_reports()
-    );
+    let Status::Converted { .. } = eng3.set_oriented_reports()[0].status.clone() else {
+        panic!(
+            "乘减超宽干净数据必须值域守卫 Converted: {:?}",
+            eng3.set_oriented_reports()
+        );
+    };
     assert_eq!(dst_rows(&eng3), expected_rows3, "退回后结果须与 Off 一致");
     assert_eq!(actual3.outs, expected3.outs);
 }
@@ -728,8 +729,8 @@ fn scenario_inline_lookup_args() {
             "INSERT INTO dim_t VALUES \
                ('S1','A','K','hit1'),('S2','B','K','hit2'),('S1','A','X','no')",
             "INSERT INTO cur_rows VALUES \
-               ('S1',1.00,0,0,'a'),('S2',2.00,0,0,'b'),\
-               ('S3',3.00,0,0,'c'),('S4',4.00,0,0,'d')",
+               ('S1',1.00,0,0,'A'),('S2',2.00,0,0,'B'),\
+               ('S3',3.00,0,0,'Q'),('S4',4.00,0,0,'X')",
         ])
         .collect();
     let routines = [fnc_dim(), caller_inline_lookup()];
@@ -757,12 +758,14 @@ fn fnc_dtop() -> &'static str {
     "CREATE FUNCTION fnc_dtop(p_k VARCHAR, p_kind VARCHAR, p_flag VARCHAR)
      RETURN VARCHAR IS
        v_x VARCHAR2(20);
+       v_k2 VARCHAR2(20);
      BEGIN
+       v_k2 := p_flag || '0';
        BEGIN
          SELECT val INTO v_x FROM (
            SELECT val, val2, flag2 FROM dim_t2
            WHERE k = p_k
-             AND (kind = p_kind OR kind = 'Z' OR kind = p_flag)
+             AND (kind = p_kind OR kind = 'Z' OR kind = v_k2)
            ORDER BY flag2 DESC
          ) LIMIT 1;
        EXCEPTION WHEN OTHERS THEN v_x := 'D'; END;
@@ -777,7 +780,7 @@ fn caller_inline_derived() -> &'static str {
      BEGIN
        p_o_succeed := '0';
        FOR r IN SELECT security_id, cjje, tag FROM cur_rows LOOP
-         v_x := fnc_dtop(r.security_id, p_kind, 'K');
+         v_x := fnc_dtop(r.security_id, r.tag, r.tag);
          BEGIN
            INSERT INTO dst_rows(security_id, yj, tag)
              VALUES (r.security_id, r.cjje, v_x);
@@ -786,8 +789,9 @@ fn caller_inline_derived() -> &'static str {
      END;"
 }
 
-/// ⑪ 派生 Top-1 多列内层 + OR 等值组：p_kind='A' 时 S1 命中
-/// flag2 最大的 'Z' 行（vz1）、S2 命中 va2、S3/S4 落兜底 'D'。
+/// ⑪ 派生 Top-1 多列内层 + OR 等值组（含表达式实参
+/// p_flag||'0'）：S1 {A,Z,A0}→vz1、S2 {B,Z,B0}→vb20、
+/// S3 {Q,Z,Q0}→vq3、S4 无行→'D'。
 fn scenario_inline_derived_or() {
     let ddl: Vec<&str> = BASE_DDL
         .iter()
@@ -805,11 +809,11 @@ fn scenario_inline_derived_or() {
                val2 VARCHAR, flag2 INTEGER)",
             "INSERT INTO dim_t2 VALUES \
                ('S1','A','va1','x1',2),('S1','B','vb1','x2',5),\
-               ('S1','Z','vz1','x3',9),('S2','A','va2','y1',1),\
-               ('S3','Q','vq3','z1',7)",
+               ('S1','Z','vz1','x3',9),('S2','A','va2','y1',1),('S2','B','vb2','y2',8),('S2','B0','vb20','y3',9),\
+               ('S3','Q','vq3','z1',7),('S3','Q0','vq30','z2',3)",
             "INSERT INTO cur_rows VALUES \
-               ('S1',1.00,0,0,'a'),('S2',2.00,0,0,'b'),\
-               ('S3',3.00,0,0,'c'),('S4',4.00,0,0,'d')",
+               ('S1',1.00,0,0,'A'),('S2',2.00,0,0,'B'),\
+               ('S3',3.00,0,0,'Q'),('S4',4.00,0,0,'X')",
         ])
         .collect();
     let routines = [fnc_dtop(), caller_inline_derived()];
@@ -829,4 +833,91 @@ fn scenario_inline_derived_or() {
     };
     assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
     assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
+}
+
+/// DECIMAL(38,x) 聚合列 + `字段 + CASE` 混合算术（byfund `cjje +
+/// CASE fffs WHEN '0' THEN accrual ELSE 0 END` 同型）：静态精度证明
+/// 超 38 时按值域守卫放行——守卫滤掉的行必然也过不了目标 TRY_CAST，
+/// 与解释器 trap 跳过同一批行。覆盖相消（9e29 + -9e29 = 0 可写）、
+/// 真溢出（1.8e30 双侧同跳）、普通行三种结局。
+fn caller_dec_wide() -> &'static str {
+    "CREATE OR REPLACE PROCEDURE caller_dec_wide(p_o_succeed OUT VARCHAR2) IS
+     BEGIN
+       p_o_succeed := '0';
+       FOR r IN SELECT a.grp AS g, coalesce(SUM(a.v1),0) AS cjje,
+               coalesce(SUM(a.v2),0) AS acc, a.flag AS fffs
+               FROM cur2 a GROUP BY a.grp, a.flag ORDER BY MAX(CASE WHEN a.v1 > 1e20 THEN 1 ELSE 0 END), a.grp LOOP
+         BEGIN
+           INSERT INTO dst_rows(security_id, yj, tag)
+             VALUES (r.g,
+                     r.cjje + CASE r.fffs WHEN '0' THEN r.acc ELSE 0 END,
+                     'd');
+         EXCEPTION WHEN OTHERS THEN NULL; END;
+       END LOOP;
+     END;"
+}
+
+/// ⑫ DECIMAL(38,8) 宽列值域守卫（干净数据）：Converted 且逐行同 Off。
+/// GA 相消行（9e29 + -9e29 = 0）专门验证守卫不误杀范围内大值。
+fn scenario_dec_wide_guard() {
+    let ddl: Vec<&str> = BASE_DDL
+        .iter()
+        .copied()
+        .chain([
+            "CREATE TABLE cur2(grp VARCHAR, v1 DECIMAL(38,8), \
+               v2 DECIMAL(38,8), flag VARCHAR)",
+            "INSERT INTO cur2 VALUES \
+               ('GA','9e29','-9e29','0'),('GC','100.25','50.5','1'),\
+               ('GD','10.5','20.25','0')",
+        ])
+        .collect();
+    let routines = [caller_dec_wide()];
+    let mut off = engine_with_routines(&ddl, SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_dec_wide", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 3, "Off 语义基线: {expected_rows:?}");
+
+    let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_dec_wide", &args()).unwrap();
+    let Status::Converted { .. } = eng.set_oriented_reports()[0].status.clone() else {
+        panic!(
+            "DECIMAL 宽列值域守卫必须 Converted: {:?}",
+            eng.set_oriented_reports()
+        );
+    };
+    assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
+}
+
+/// ⑬ 同表达式含真溢出行（GB: 9e29+9e29 超 DECIMAL(38,8) 值域）：
+/// 解释器按行 INSERT 触发内核溢出→ROLLBACK 全部已写行；批写无法逐行
+/// 复现回滚，bad_rows 入口守卫必须令整个区域回退——两侧结果一致
+/// （ORDER BY 保证 GB 最后，其前全部回滚 → dst 为空）。
+fn scenario_dec_wide_fallback() {
+    let ddl: Vec<&str> = BASE_DDL
+        .iter()
+        .copied()
+        .chain([
+            "CREATE TABLE cur2(grp VARCHAR, v1 DECIMAL(38,8), \
+               v2 DECIMAL(38,8), flag VARCHAR)",
+            "INSERT INTO cur2 VALUES \
+               ('GA','9e29','-9e29','0'),('GB','9e29','9e29','0'),\
+               ('GC','100.25','50.5','1'),('GD','10.5','20.25','0')",
+        ])
+        .collect();
+    let routines = [caller_dec_wide()];
+    let mut off = engine_with_routines(&ddl, SetOrientedMode::Off, &routines);
+    let off_result = off.call("caller_dec_wide", &args());
+    let off_rows = dst_rows(&off);
+
+    let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
+    let eng_result = eng.call("caller_dec_wide", &args());
+    assert!(
+        matches!(eng.set_oriented_reports()[0].status, Status::Skipped { .. }),
+        "含溢出行必须回退: {:?}",
+        eng.set_oriented_reports()
+    );
+    // 回退跑同一解释器：成败与落库结果必须与 Off 完全一致。
+    assert_eq!(eng_result.is_ok(), off_result.is_ok(), "成败须一致");
+    assert_eq!(dst_rows(&eng), off_rows, "回退后结果须与 Off 一致");
 }

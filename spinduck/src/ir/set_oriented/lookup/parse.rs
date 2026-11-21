@@ -10,8 +10,8 @@ mod tuple;
 pub(crate) use tuple::parse_tuple_total;
 
 use super::{
-    BindSrc, CaseElse, CaseSink, Correlation, CorrelationOp, InFilter, InList, LookupQuery, Name,
-    SkipReason, Top1, VarName,
+    BindSrc, CaseElse, CaseSink, Correlation, CorrelationOp, InFilter, InList, InListItem,
+    LookupQuery, Name, SkipReason, Top1, VarName,
 };
 use crate::value::SpinValue;
 use tokens::LiteralTokens;
@@ -24,11 +24,10 @@ use tokens::LiteralTokens;
 pub(crate) fn parse_total(
     sql: &str,
     var: VarName,
-    default: SpinValue,
+    default_sql: String,
     binds: &[(String, BindSrc)],
     record: &VarName,
 ) -> Result<LookupQuery, SkipReason> {
-    let default_sql = fallback_sql(&default)?;
     let mut t = LiteralTokens::new(sql).ok_or(SkipReason::UnprovenQueryTotalness)?;
     let bad = SkipReason::UnprovenQueryTotalness;
     if !t.take("select") {
@@ -67,6 +66,7 @@ pub(crate) fn parse_total(
         nvl_default,
         filter: predicates.sql(),
         default_sql,
+        default_var: None,
         correlations: predicates.correlations,
         in_filters: predicates.in_filters,
         in_lists: predicates.in_lists,
@@ -194,6 +194,7 @@ fn parse_derived_top1(
         nvl_default: None,
         filter: predicates.sql(),
         default_sql: String::new(),
+        default_var: None,
         correlations: predicates.correlations,
         in_filters: predicates.in_filters,
         in_lists: predicates.in_lists,
@@ -289,7 +290,7 @@ fn parse_where(
         {
             parse_between(t, binds, record, &mut result)?;
         } else if t.peek() == Some("(") {
-            parse_or_group(t, binds, &mut result)?;
+            parse_or_group(t, binds, record, &mut result)?;
         } else {
             parse_column_predicate(t, binds, record, &mut result)?;
         }
@@ -325,6 +326,7 @@ fn parse_between(
                 .parts
                 .push(format!("{ph} BETWEEN {} AND {}", lo.sql(), hi.sql()));
         }
+        BindSrc::Expr { .. } => return Err(bad),
         BindSrc::Field { rec, field } => {
             if rec != record {
                 return Err(bad);
@@ -341,21 +343,32 @@ fn parse_between(
     Ok(())
 }
 
-/// 等值 OR 组：`(列 = 操作数 OR 列 = 操作数 ...)`——同列多操作数，
-/// 操作数限字面量或 Var 绑定占位符（Field 相关键不支持析取，拒绝）。
-/// 整体作为单个 AND 项输出（自带括号）；逐析取 `=` 对 NULL 的排除
-/// 语义与 AND 连接的谓词串一致。
+/// 等值析取组：`(列 = 操作数 OR 列 = 操作数 ...)`。
+/// - 全部操作数为逐行项（游标字段绑定 / 表达式实参 / 字面量）→
+///   等价改写 `列 IN (项, ...)`（`x=a OR x=b` 与 `x IN (a,b)` 的
+///   NULL 逐析取排除语义一致），交 LATERAL 渲染；
+/// - 全部操作数为静态项（字面量 / Var 绑定占位符）→ 保持括号 OR
+///   作为单个 AND 项（自带括号）；
+/// - 混合逐行与静态、Field 相关键与异列析取一律保守拒绝。
 fn parse_or_group(
     t: &mut LiteralTokens,
     binds: &[(String, BindSrc)],
+    record: &VarName,
     result: &mut WhereClause,
 ) -> Result<(), SkipReason> {
     let bad = SkipReason::UnprovenQueryTotalness;
     if !t.take("(") {
         return Err(bad);
     }
+    /// 析取操作数：逐行项（IN-list）或静态项（OR parts）。
+    enum OrItem {
+        Field(Name),
+        Expr { sql: String, field: String },
+        Lit(String),
+        Static(String),
+    }
     let mut col: Option<Name> = None;
-    let mut disjuncts = Vec::new();
+    let mut items = Vec::new();
     loop {
         let c = t.column().ok_or(bad)?;
         match &col {
@@ -366,19 +379,27 @@ fn parse_or_group(
         if !t.take("=") {
             return Err(bad);
         }
-        let operand = if t.peek().is_some_and(|w| w.starts_with("$v_")) {
+        let item = if t.peek().is_some_and(|w| w.starts_with("$v_")) {
             let w = t.peek().ok_or(bad)?.to_string();
-            let found = binds.iter().find(|(p, _)| **p == w);
-            let Some((_, BindSrc::Var(v))) = found else {
-                return Err(bad);
-            };
             t.take(&w);
-            result.binds.push((w.clone(), BindSrc::Var(v.clone())));
-            w
+            match binds.iter().find(|(p, _)| **p == w) {
+                Some((_, BindSrc::Expr { sql, field })) => OrItem::Expr {
+                    sql: sql.clone(),
+                    field: field.clone(),
+                },
+                Some((_, BindSrc::Field { rec, field })) if rec == record => {
+                    OrItem::Field(Name(field.clone()))
+                }
+                Some((_, src @ BindSrc::Var(_))) => {
+                    result.binds.push((w.clone(), src.clone()));
+                    OrItem::Static(w)
+                }
+                _ => return Err(bad),
+            }
         } else {
-            t.literal().ok_or(bad)?
+            OrItem::Lit(t.literal().ok_or(bad)?)
         };
-        disjuncts.push(format!("{} = {}", c.sql(), operand));
+        items.push(item);
         if !t.take("or") {
             break;
         }
@@ -386,7 +407,44 @@ fn parse_or_group(
     if !t.take(")") {
         return Err(bad);
     }
-    result.parts.push(format!("({})", disjuncts.join(" OR ")));
+    let column = col.ok_or(bad)?;
+    let per_row = items.iter().all(|i| !matches!(i, OrItem::Static(_)));
+    let all_static = items
+        .iter()
+        .all(|i| matches!(i, OrItem::Lit(_) | OrItem::Static(_)));
+    if per_row {
+        let mut in_items = Vec::with_capacity(items.len());
+        for i in items {
+            in_items.push(match i {
+                OrItem::Field(f) => InListItem::Field(f),
+                OrItem::Expr { sql, field } => InListItem::Expr {
+                    sql,
+                    base_field: Name(field),
+                },
+                OrItem::Lit(s) => InListItem::Lit(s),
+                OrItem::Static(_) => return Err(bad),
+            });
+        }
+        result.in_lists.push(InList {
+            column,
+            items: in_items,
+        });
+    } else if all_static {
+        let disjuncts = items
+            .iter()
+            .map(|i| {
+                let operand = match i {
+                    OrItem::Lit(s) | OrItem::Static(s) => s.as_str(),
+                    _ => return None,
+                };
+                Some(format!("{} = {}", column.sql(), operand))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(bad)?;
+        result.parts.push(format!("({})", disjuncts.join(" OR ")));
+    } else {
+        return Err(bad);
+    }
     Ok(())
 }
 

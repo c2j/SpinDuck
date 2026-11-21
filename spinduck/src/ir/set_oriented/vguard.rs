@@ -10,7 +10,6 @@ use super::shape::{Name, Tokens};
 use super::{SkipReason, VarName};
 use crate::error::EngineError;
 use crate::ir::{AssignTarget, IrProg, IrStmt, TrapEntry};
-use crate::value::SpinValue;
 
 /// 视图证明产物：投影列证据（视图形状）+ 底表名与底表结构
 /// （写集相交复核与入口漂移复核用）。
@@ -361,7 +360,7 @@ pub(super) fn carryover_group_at(
     };
     // 查询不可全定义解析时回落 None 交后续识别器（形状放宽后命中面变大，
     // 解析失败不得短路分派——与识别顺序的"首个匹配生效"约定一致）。
-    let Ok(mut query) = parse_total(sql, var, SpinValue::Null, binds, &region.record) else {
+    let Ok(mut query) = parse_total(sql, var, "NULL".to_string(), binds, &region.record) else {
         return Ok(None);
     };
     if query.correlations.iter().any(|c| c.op != CorrelationOp::Eq) {

@@ -24,22 +24,17 @@ fn string_value(expr: &IrExpr, region: &CopyLoop<'_>, env: &ProjEnv<'_>) -> bool
             if let Some((_, value)) = region.folded.iter().find(|(v, _)| v == var) {
                 return matches!(value, SpinValue::Str(_) | SpinValue::Null);
             }
-            env.lookups
+            if env
+                .lookups
                 .iter()
                 .find(|lookup| &lookup.var == var)
-                .is_some_and(|lookup| {
-                    let hit = match &lookup.case_sink {
-                        Some(case) => {
-                            matches!(&case.else_value, super::lookup::CaseElse::Field(f) if string_field(&f.0, env))
-                                && case
-                                    .whens
-                                    .iter()
-                                    .all(|(_, field)| string_field(&field.0, env))
-                        }
-                        None => lookup.kind == "varchar",
-                    };
-                    hit && (lookup.filter_on_miss || string_literal(&lookup.render.default_sql))
-                })
+                .is_some_and(|lookup| lookup_string(lookup, env, 0))
+            {
+                return true;
+            }
+            // 声明类型 Varchar 的槽位（含 IN 形参，`remember_param_types`
+            // 已并入 var_types）写入时强制 coerce，值域恒为 str/NULL。
+            region.var_types.get(&var.0) == Some(&crate::types::SpinType::Varchar)
         }
         IrExpr::Bin {
             op: BinOp::Concat, ..
@@ -88,6 +83,32 @@ pub(super) fn total(expr: &IrExpr, region: &CopyLoop<'_>, env: &ProjEnv<'_>) -> 
         }
         _ => false,
     }
+}
+
+/// 查找结果变量的字符串值证明：命中侧按 kind/case_sink 判定；
+/// 兜底侧字面量直接判，查找变量兜底递归到内层查找（嵌套 Lookup
+/// 兜底，依赖拓扑已防环，depth 仅为防御上限）。
+fn lookup_string(lookup: &super::lookup::ResolvedLookup, env: &ProjEnv<'_>, depth: usize) -> bool {
+    let hit = match &lookup.case_sink {
+        Some(case) => {
+            matches!(&case.else_value, super::lookup::CaseElse::Field(f) if string_field(&f.0, env))
+                && case
+                    .whens
+                    .iter()
+                    .all(|(_, field)| string_field(&field.0, env))
+        }
+        None => lookup.kind == "varchar",
+    };
+    hit && (lookup.filter_on_miss
+        || match &lookup.default_var {
+            Some(dv) if depth < 8 => env
+                .lookups
+                .iter()
+                .find(|d| &d.var == dv)
+                .is_some_and(|d| lookup_string(d, env, depth + 1)),
+            Some(_) => false,
+            None => string_literal(&lookup.render.default_sql),
+        })
 }
 
 fn string_field(field: &str, env: &ProjEnv<'_>) -> bool {

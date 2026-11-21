@@ -28,9 +28,11 @@ pub(super) fn generate(
     let cur_scan = copy::cur_scan(&inputs.select, &inputs.cur);
     let mut resolved = match resolve::resolve_lookups(ex, ctx.catalog, &copy.lookups, &cur_scan)? {
         Ok(r) => r,
-        Err(reason) => return Ok(Err(reason)),
+        Err(reason) => {
+            return Ok(Err(reason));
+        }
     };
-    if let Err(reason) = hoist(copy, ex, ctx.catalog, region, &mut resolved)? {
+    if let Err(reason) = hoist(copy, ex, ctx.catalog, region, &cur_scan, &mut resolved)? {
         return Ok(Err(reason));
     }
     if let Err(reason) = resolve::substitute_lookup_refs(&mut resolved) {
@@ -50,12 +52,16 @@ pub(super) fn generate(
     }
     let resolved_tuples = match resolve::resolve_tuples(ex, &copy.tuples, resolved.len() + 1)? {
         Ok(t) => t,
-        Err(reason) => return Ok(Err(reason)),
+        Err(reason) => {
+            return Ok(Err(reason));
+        }
     };
     let resolved_aggs =
         match resolve::resolve_aggs(ex, &copy.aggs, resolved.len() + resolved_tuples.len() + 1)? {
             Ok(a) => a,
-            Err(reason) => return Ok(Err(reason)),
+            Err(reason) => {
+                return Ok(Err(reason));
+            }
         };
     if !matches_snapshot(
         ex,
@@ -154,6 +160,7 @@ fn hoist(
     ex: &schema::Source<'_>,
     catalog: &crate::catalog::RoutineCatalog,
     region: &region::CursorRegion,
+    cur_scan: &str,
     resolved: &mut resolve::HoistedLookups,
 ) -> Result<Result<(), SkipReason>, EngineError> {
     catalog_summary::resolve_locals(&mut copy.inlined);
@@ -167,11 +174,15 @@ fn hoist(
             safe_vars.insert(v);
         }
     }
+    let lookup_vars: std::collections::BTreeSet<VarName> =
+        resolved.iter().map(|(l, _)| l.var.clone()).collect();
     let hctx = resolve::HoistCtx {
         ex,
         catalog,
         record: copy.record,
         safe_vars: &safe_vars,
+        lookup_vars: &lookup_vars,
+        cur_scan,
     };
     let mut next_index = resolved.len() + 1;
     for expr in copy

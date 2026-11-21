@@ -12,6 +12,9 @@ pub(super) struct ProjEnv<'a> {
     pub ctes: &'a mut Vec<String>,
     pub joins: &'a mut Vec<String>,
     pub expr_guards: &'a mut Vec<String>,
+    /// 内核域守卫（DOUBLE 域幅值谓词，永不抛错）：arith/CASE 值域
+    /// 溢出时登记，write_projections 汇总进 kernel_row_guard 入口准入。
+    pub kernel_guards: Vec<String>,
 }
 
 pub(super) fn numeric_projection(
@@ -33,6 +36,10 @@ pub(super) fn numeric_projection(
     Ok(expr::BoundExpr {
         value: inline_projection(region, &column, value, env)?,
         domain: expr::Domain::Numeric,
+        // 内联表达式含查找代入/字段引用，未逐点证明无 DECIMAL 算术：
+        // 保守不给 DOUBLE 域渲染与安全标记（外层守卫自然拒绝）。
+        dbl: None,
+        safe: false,
     })
 }
 
@@ -145,8 +152,9 @@ fn checked_value_at(
         check_evaluation_at(region, (var, r), env, reachable)?;
     }
     check_case_evaluations(region, value, env, reachable)?;
-    let (text, binds) =
-        crate::sql::render::expr_to_scalar_sql_binds(expr).ok_or(SkipReason::UnprovenExpression)?;
+    let Some((text, binds)) = crate::sql::render::expr_to_scalar_sql_binds(expr) else {
+        return Err(SkipReason::UnprovenExpression);
+    };
     let mut guard_ctes: Vec<String> = Vec::new();
     let mut guard_joins: Vec<String> = Vec::new();
     // 长占位符优先，避免 `$v_x` 误伤 `$v_x__f`；单遍引号感知替换，
@@ -291,6 +299,8 @@ fn inline_binding(
                 crate::sql::render::const_to_sql(c).ok_or(SkipReason::UnprovenExpression)
             }
         }
+        // Expr 绑定仅存于 lookup 文法内部产物，不进入区域投影绑定。
+        BindSrc::Expr { .. } => Err(SkipReason::UnprovenExpression),
     }
 }
 

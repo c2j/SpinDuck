@@ -312,7 +312,8 @@ impl Prover<'_> {
                 Some(SpinType::Int | SpinType::BigInt | SpinType::Decimal { .. }) => Dom::Num,
                 _ => Dom::Unknown,
             },
-            BindSrc::Field { .. } => Dom::Unknown,
+            // Expr 为行相关表达式，值域不可静态判定。
+            BindSrc::Expr { .. } | BindSrc::Field { .. } => Dom::Unknown,
         }
     }
 }

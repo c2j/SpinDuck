@@ -24,7 +24,9 @@ impl<'a> Body<'a> {
         match handler_calls(ctx, &shape)? {
             HandlerCalls::AllNoop => return Ok(None),
             HandlerCalls::Effectful => {}
-            HandlerCalls::Unproven => return Err(SkipReason::UnsupportedCall),
+            HandlerCalls::Unproven => {
+                return Err(SkipReason::UnsupportedCall);
+            }
         }
         if self.insert_stmt.is_some() {
             return Err(SkipReason::UnsupportedWrite);

@@ -245,7 +245,12 @@ fn apply_assign(
 }
 
 /// `$v_` 绑定 → 实参表达式（env 代入后）。
-fn bind_args(binds: &[(String, BindSrc)], env: &[(String, IrExpr)]) -> Vec<(String, IrExpr)> {
+/// `BindSrc::Expr` 仅存于 lookup 文法内部，不出现在 IR 绑定；出现即形态破坏，
+/// 保守返回 None 交回调用方放弃折叠。
+fn bind_args(
+    binds: &[(String, BindSrc)],
+    env: &[(String, IrExpr)],
+) -> Option<Vec<(String, IrExpr)>> {
     binds
         .iter()
         .map(|(ph, src)| {
@@ -255,8 +260,9 @@ fn bind_args(binds: &[(String, BindSrc)], env: &[(String, IrExpr)]) -> Vec<(Stri
                     rec: rec.clone(),
                     field: field.clone(),
                 },
+                BindSrc::Expr { .. } => return None,
             };
-            (ph.clone(), subst_env(arg, env))
+            Some((ph.clone(), subst_env(arg, env)))
         })
         .collect()
 }
@@ -388,7 +394,7 @@ fn fold_trap(
     let shape = trap_shape(code, pc)?;
     let mut henv = env.clone();
     fold_span(catalog, prog, visiting, checks, &mut henv, code, &shape)?;
-    let args = bind_args(shape.binds, env);
+    let args = bind_args(shape.binds, env)?;
     for (k, var) in shape.targets.iter().enumerate() {
         let key = var.0.to_ascii_lowercase();
         let (_, default) = henv.iter().find(|(n, _)| *n == key)?;

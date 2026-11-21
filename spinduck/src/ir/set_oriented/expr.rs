@@ -10,6 +10,11 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) struct GuardedExpr {
     pub expr: String,
     pub guard: String,
+    /// 守卫可能遮蔽内核域行级错误（DECIMAL 算术/转换值域溢出）：
+    /// 解释器按行 INSERT 遇内核错误会 ROLLBACK 全部已写行，批写单
+    /// 内核域守卫（DOUBLE 求值、永不抛错）：与 `guard` 分离——坏行
+    /// COUNT 必须先用它裁决，否则守卫查询自身求值溢出算术会内核报错。
+    pub kernel_guard: String,
 }
 
 /// 证明表达式在全部输入上求值不抛错，并生成目标列级守卫。
@@ -22,15 +27,16 @@ pub(super) fn prove(
 ) -> Result<GuardedExpr, SkipReason> {
     let mut t = Tokens::new(parameter).ok_or(SkipReason::UnprovenWriteCompleteness)?;
     let (select, source) = source;
-    let mut p = Parser::new(&mut t, region, select, source, resolve);
-    let (expr, _) = p.expr()?;
+    let mut p = Parser::new(&mut t, region, select, source, resolve, Some(to));
+    let node = p.expr()?;
     if !p.t.done() {
         return Err(SkipReason::UnprovenWriteCompleteness);
     }
-    let mut result = at_write_sink(expr, to);
+    let mut result = at_write_sink(node.sql, to);
     if !p.guards.is_empty() {
         result.guard = format!("({}) AND ({})", p.guards.join(") AND ("), result.guard);
     }
+    result.kernel_guard = p.kernel_guards.join(" AND ");
     Ok(result)
 }
 
@@ -46,17 +52,22 @@ pub(super) fn render_arg(
     resolve: &mut impl FnMut(&VarName) -> Result<BoundExpr, SkipReason>,
 ) -> Result<String, SkipReason> {
     let mut t = Tokens::new(text).ok_or(SkipReason::UnprovenWriteCompleteness)?;
-    let mut p = Parser::new(&mut t, region, select, source, resolve);
-    let (expr, _) = p.expr()?;
-    if !p.t.done() || !p.guards.is_empty() {
+    let mut p = Parser::new(&mut t, region, select, source, resolve, None);
+    let node = p.expr()?;
+    if !p.t.done() || !p.guards.is_empty() || !p.kernel_guards.is_empty() {
         return Err(SkipReason::UnprovenWriteCompleteness);
     }
-    Ok(expr)
+    Ok(node.sql)
 }
 
 pub(super) struct BoundExpr {
     pub value: GuardedExpr,
     pub domain: Domain,
+    /// 值的 DOUBLE 域守卫渲染（None = 无法证明守卫求值安全）。
+    pub dbl: Option<String>,
+    /// `value.expr` 不含可抛错 DECIMAL 算术（守卫 COUNT 可直接求值、
+    /// CASE 操作数比较保持精确语义）。
+    pub safe: bool,
 }
 
 pub(super) fn at_write_sink(expr: String, to: &Column) -> GuardedExpr {
@@ -67,7 +78,11 @@ pub(super) fn at_write_sink(expr: String, to: &Column) -> GuardedExpr {
     } else {
         format!("({expr}) IS NOT NULL AND ({cast})")
     };
-    GuardedExpr { expr, guard }
+    GuardedExpr {
+        expr,
+        guard,
+        kernel_guard: String::new(),
+    }
 }
 
 /// PL 整数除法下沉（设计 §4.5 情形 A / §4.6）：精确 `//`（禁浮点/TRUNC），
@@ -83,7 +98,11 @@ pub(super) fn pl_division(lhs_field: &str, rhs_field: &str, to: &Column) -> Guar
     if !to.nullable {
         guard = format!("{expr} IS NOT NULL AND ({guard})");
     }
-    GuardedExpr { expr, guard }
+    GuardedExpr {
+        expr,
+        guard,
+        kernel_guard: String::new(),
+    }
 }
 
 struct Parser<'a> {
@@ -97,6 +116,65 @@ struct Parser<'a> {
     var_types: &'a BTreeMap<String, SpinType>,
     resolve: &'a mut dyn FnMut(&VarName) -> Result<BoundExpr, SkipReason>,
     guards: Vec<String>,
+    /// 内核域守卫（DOUBLE 求值）：与 `guards` 分离，供坏行 COUNT 先行裁决。
+    kernel_guards: Vec<String>,
+    /// 写汇列（prove 路径）：DECIMAL 算术值域溢出守卫的目标值域证明依据；
+    /// render_arg 无写汇，恒 None（溢出一律拒绝）。
+    to: Option<&'a Column>,
+}
+
+/// 解析节点的四路渲染：值域 SQL / 值域 / 安全性 / DOUBLE 域守卫渲染。
+/// `dbl` 让外层算术的值域守卫可以对**任意**操作数（含内含 DECIMAL
+/// 算术的 Var 绑定）做 DOUBLE 域模长计算——守卫求值永不触发内核
+/// 溢出，故不再需要"操作数 total"限制。
+struct Node {
+    /// 写值/比较用 SQL：可含 DECIMAL 算术（仅批写在准入后求值）。
+    sql: String,
+    domain: Domain,
+    /// `sql` 不含可抛错 DECIMAL 算术：守卫 COUNT 可直接求值，且可作
+    /// CASE 操作数（比较须精确语义，DOUBLE 域会引入舍入误判）。
+    safe: bool,
+    /// DOUBLE 域同义渲染（永不抛错）；None = 无法证明守卫求值安全。
+    dbl: Option<String>,
+}
+
+impl Node {
+    /// 安全叶子的 DOUBLE 域渲染：数值域 CAST（恒成功）、Other 域
+    /// TRY_CAST（坏值→NULL，与写汇 TRY_CAST 的 NULL 传播一致；
+    /// Other 域本不可入算术，dbl 仅在 CAST 包装后间接参与守卫）。
+    fn dbl_for(sql: &str, domain: Domain) -> Option<String> {
+        if domain.is_numeric() {
+            Some(format!("CAST(({sql}) AS DOUBLE)"))
+        } else {
+            Some(format!("TRY_CAST(({sql}) AS DOUBLE)"))
+        }
+    }
+
+    /// 安全数值叶子：sql 可直接进守卫，dbl 取 CAST/TRY_CAST AS DOUBLE。
+    fn leaf(sql: String, domain: Domain) -> Self {
+        let dbl = Self::dbl_for(&sql, domain);
+        Self {
+            sql,
+            domain,
+            safe: true,
+            dbl,
+        }
+    }
+
+    /// 安全非数值叶子（字符串/Other 域）：TRY_CAST DOUBLE 域渲染。
+    fn other(sql: String) -> Self {
+        Self {
+            dbl: Self::dbl_for(&sql, Domain::Other),
+            sql,
+            domain: Domain::Other,
+            safe: true,
+        }
+    }
+
+    /// 两侧 DOUBLE 域渲染按算符组合；任一缺失则整体缺失。
+    fn combine_dbl(l: &Option<String>, r: &Option<String>, op: char) -> Option<String> {
+        Some(format!("({} {} {})", l.as_ref()?, r.as_ref()?, op))
+    }
 }
 
 impl<'a> Parser<'a> {
@@ -106,6 +184,7 @@ impl<'a> Parser<'a> {
         select: &'a Select,
         source: &'a Table,
         resolve: &'a mut dyn FnMut(&VarName) -> Result<BoundExpr, SkipReason>,
+        to: Option<&'a Column>,
     ) -> Self {
         Self {
             t,
@@ -118,10 +197,13 @@ impl<'a> Parser<'a> {
             var_types: region.var_types,
             resolve,
             guards: Vec::new(),
+            kernel_guards: Vec::new(),
+            to,
         }
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 pub(super) enum Domain {
     Numeric,
     Decimal { precision: u8, scale: u8 },
@@ -210,9 +292,31 @@ impl Domain {
 
     /// CASE/多分支结果域：同族合并（DECIMAL 按 combine，Numeric/Other 同类
     /// 直通），跨族拒绝。
-    fn unify(self, rhs: Self) -> Result<Self, SkipReason> {
+    pub(super) fn unify(self, rhs: Self) -> Result<Self, SkipReason> {
         match (self, rhs) {
-            (a @ Self::Decimal { .. }, b @ Self::Decimal { .. }) => a.combine(b),
+            // CASE 分支合并是值域并集而非算术：标度取大者、整数位取
+            // 各分支最大值，不加 combine 的 +1 进位余量。
+            (
+                Self::Decimal {
+                    precision: p,
+                    scale: s,
+                },
+                Self::Decimal {
+                    precision: q,
+                    scale: t,
+                },
+            ) => {
+                let scale = s.max(t);
+                let int = (i64::from(p) - i64::from(s)).max(i64::from(q) - i64::from(t));
+                let precision = int + i64::from(scale);
+                if precision > 38 {
+                    return Err(SkipReason::UnprovenWriteCompleteness);
+                }
+                Ok(Self::Decimal {
+                    precision: precision as u8,
+                    scale,
+                })
+            }
             (Self::Numeric, Self::Numeric) => Ok(Self::Numeric),
             (Self::Other, Self::Other) => Ok(Self::Other),
             _ => Err(SkipReason::UnprovenWriteCompleteness),
@@ -222,58 +326,149 @@ impl Domain {
 
 impl Parser<'_> {
     /// 加法层：`+`/`-` 同级左结合，域按 DECIMAL 证明合并。
-    fn expr(&mut self) -> Result<(String, Domain), SkipReason> {
-        let (mut out, mut domain) = self.product()?;
+    fn expr(&mut self) -> Result<Node, SkipReason> {
+        let mut lhs = self.product()?;
         loop {
             let subtract = self.t.take("-");
             if !subtract && !self.t.take("+") {
                 break;
             }
-            let (rhs, rhs_domain) = self.product()?;
-            domain = domain.combine(rhs_domain)?;
-            out = if subtract {
-                format!("({out} - {rhs})")
-            } else {
-                format!("({out} + {rhs})")
-            };
+            let rhs = self.product()?;
+            let op = if subtract { '-' } else { '+' };
+            match lhs.domain.combine(rhs.domain) {
+                Ok(d) => lhs.domain = d,
+                Err(reason) => {
+                    lhs.domain = self
+                        .overflow_guard(&lhs, &rhs, op, lhs.domain, rhs.domain)
+                        .ok_or(reason)?;
+                }
+            }
+            lhs.dbl = Node::combine_dbl(&lhs.dbl, &rhs.dbl, op);
+            lhs.sql = format!("({} {op} {})", lhs.sql, rhs.sql);
+            lhs.safe = false;
         }
-        Ok((out, domain))
+        Ok(lhs)
     }
 
     /// 乘法层：`*`（DECIMAL 域证明）与 `/`（数值域）同级左结合。
-    fn product(&mut self) -> Result<(String, Domain), SkipReason> {
-        let (mut out, mut domain) = self.term()?;
+    fn product(&mut self) -> Result<Node, SkipReason> {
+        let mut lhs = self.term()?;
         loop {
             if self.t.take("*") {
-                let (rhs, rhs_domain) = self.term()?;
-                domain = domain.product(rhs_domain)?;
-                out = format!("({out} * {rhs})");
+                let rhs = self.term()?;
+                match lhs.domain.product(rhs.domain) {
+                    Ok(d) => lhs.domain = d,
+                    Err(reason) => {
+                        lhs.domain = self
+                            .overflow_guard(&lhs, &rhs, '*', lhs.domain, rhs.domain)
+                            .ok_or(reason)?;
+                    }
+                }
+                lhs.dbl = Node::combine_dbl(&lhs.dbl, &rhs.dbl, '*');
+                lhs.sql = format!("({} * {})", lhs.sql, rhs.sql);
+                lhs.safe = false;
             } else if self.t.take("/") {
-                let (rhs, rhs_domain) = self.term()?;
-                if !domain.is_numeric() || !rhs_domain.is_numeric() {
+                let rhs = self.term()?;
+                if !lhs.domain.is_numeric() || !rhs.domain.is_numeric() {
                     return Err(SkipReason::UnprovenWriteCompleteness);
                 }
-                out = format!("{out} / {rhs}");
-                domain = Domain::Numeric;
+                // `/` 结果 DOUBLE 域、除零得 inf 不抛错：safe 继承操作数。
+                lhs.dbl = Node::combine_dbl(&lhs.dbl, &rhs.dbl, '/');
+                lhs.sql = format!("{}/{}", lhs.sql, rhs.sql);
+                lhs.domain = Domain::Numeric;
+                lhs.safe = lhs.safe && rhs.safe;
             } else {
                 break;
             }
         }
-        Ok((out, domain))
+        Ok(lhs)
     }
 
-    fn term(&mut self) -> Result<(String, Domain), SkipReason> {
+    /// DECIMAL `+`/`-`/`*` 静态精度证明超 38 时的值域守卫：内核结果
+    /// 类型恒为 DECIMAL(38, scale_res)（`+`/`-` 标度取大者、`*` 标度
+    /// 相加且须 ≤36 使整数位 ≥2），仅当 |结果| 越出值域才抛错。
+    /// 守卫以操作数的 DOUBLE 域渲染重算模长——不求值 DECIMAL 算术，
+    /// 故对含未证算术的 Var 绑定同样安全；越界行在解释器中是内核
+    /// 错误（ROLLBACK 全部已写行），批写无法逐行复现，故计入内核域
+    /// 坏行守卫要求 bad_rows==0 入口准入。
+    /// 一致性前提：目标列整数位 +2 ≤ 内核整数位，保证守卫滤掉的行
+    /// 必然也过不了目标 TRY_CAST（语义上本就该跳过/回退）。
+    /// 任一操作数缺 DOUBLE 域渲染时无法证明守卫求值安全，保守拒绝。
+    fn overflow_guard(
+        &mut self,
+        lhs: &Node,
+        rhs: &Node,
+        op: char,
+        lhs_domain: Domain,
+        rhs_domain: Domain,
+    ) -> Option<Domain> {
+        let (Domain::Decimal { scale: s, .. }, Domain::Decimal { scale: t, .. }) =
+            (lhs_domain, rhs_domain)
+        else {
+            return None;
+        };
+        let (Some(dl), Some(dr)) = (&lhs.dbl, &rhs.dbl) else {
+            return None;
+        };
+        let scale_res = match op {
+            '+' | '-' => s.max(t),
+            '*' => {
+                let sum = i64::from(s) + i64::from(t);
+                if sum > 36 {
+                    return None;
+                }
+                sum as u8
+            }
+            _ => return None,
+        };
+        let kernel_int = 38 - i64::from(scale_res);
+        if kernel_int < 2 {
+            return None;
+        }
+        let to = self.to?;
+        let kind = to.kind.to_ascii_lowercase();
+        let inner = kind
+            .strip_prefix("decimal(")
+            .and_then(|k| k.strip_suffix(')'))?;
+        let (p, s) = inner.split_once(',')?;
+        let (Ok(p), Ok(s)) = (p.trim().parse::<i64>(), s.trim().parse::<i64>()) else {
+            return None;
+        };
+        if p - s + 2 > kernel_int {
+            return None;
+        }
+        let mag = match op {
+            '+' => format!("abs({dl} + {dr})"),
+            '-' => format!("abs({dl} - {dr})"),
+            _ => format!("abs({dl} * {dr})"),
+        };
+        self.kernel_guards.push(format!(
+            "(({dl}) IS NULL) OR (({dr}) IS NULL) OR ({mag} < 1e{})",
+            kernel_int - 1
+        ));
+        Some(Domain::Decimal {
+            precision: 38,
+            scale: scale_res,
+        })
+    }
+
+    fn term(&mut self) -> Result<Node, SkipReason> {
         let bad = SkipReason::UnprovenWriteCompleteness;
         let word = self.t.peek().ok_or(bad)?.to_string();
         if self.t.at_subquery() {
             return self.cache_subquery();
         }
         if self.t.take("(") {
-            let (inner, num) = self.expr()?;
+            let inner = self.expr()?;
             return self
                 .t
                 .take(")")
-                .then_some((format!("({inner})"), num))
+                .then(|| Node {
+                    sql: format!("({})", inner.sql),
+                    domain: inner.domain,
+                    safe: inner.safe,
+                    dbl: inner.dbl,
+                })
                 .ok_or(bad);
         }
         if self.t.take("round") {
@@ -296,11 +491,11 @@ impl Parser<'_> {
         }
         if word.starts_with('\'') {
             self.t.take(&word);
-            return Ok((word, Domain::Other));
+            return Ok(Node::other(word));
         }
         if numeric_literal(&word) {
             self.t.take(&word);
-            return Ok((word.clone(), literal_domain(&word)));
+            return Ok(Node::leaf(word.clone(), literal_domain(&word)));
         }
         Err(bad)
     }
@@ -308,35 +503,73 @@ impl Parser<'_> {
     /// 简单式 CASE：`CASE <operand> WHEN <字面量> THEN <expr>… ELSE <expr> END`。
     /// operand/WHEN 只作比较不产出结果域；THEN/ELSE 域按 unify 合并。
     /// 搜索式 CASE（无 operand）不支持，保守拒绝。
-    fn case_call(&mut self) -> Result<(String, Domain), SkipReason> {
+    fn case_call(&mut self) -> Result<Node, SkipReason> {
         let bad = SkipReason::UnprovenWriteCompleteness;
-        let (operand, _) = self.expr()?;
-        let mut whens = Vec::new();
+        let operand = self.expr()?;
+        let mut whens: Vec<(String, Node)> = Vec::new();
         let mut domain: Option<Domain> = None;
         while self.t.take("when") {
             let w = self.when_literal()?;
             if !self.t.take("then") {
                 return Err(bad);
             }
-            let (then_sql, then_domain) = self.expr()?;
+            let then = self.expr()?;
             domain = Some(match domain {
-                None => then_domain,
-                Some(d) => d.unify(then_domain)?,
+                None => then.domain,
+                Some(d) => d.unify(then.domain)?,
             });
-            whens.push(format!("WHEN {w} THEN {then_sql}"));
+            whens.push((w, then));
         }
         if whens.is_empty() || !self.t.take("else") {
             return Err(bad);
         }
-        let (else_sql, else_domain) = self.expr()?;
+        let els = self.expr()?;
         if !self.t.take("end") {
             return Err(bad);
         }
-        let domain = domain.ok_or(bad)?.unify(else_domain)?;
-        Ok((
-            format!("CASE {operand} {} ELSE {else_sql} END", whens.join(" ")),
+        let domain = domain.ok_or(bad)?.unify(els.domain)?;
+        // DOUBLE 域 CASE：操作数比较沿用原值域 sql（精确语义），
+        // 要求 operand.safe；分支取 DOUBLE 渲染。操作数含未证算术
+        // 时无法保证分支选择一致，dbl 缺失 → 外层守卫保守拒绝。
+        let mut dbl = None;
+        if domain.is_numeric() && operand.safe {
+            let mut segs = Vec::new();
+            let mut ok = true;
+            for (w, b) in &whens {
+                match &b.dbl {
+                    Some(d) => segs.push(format!("WHEN {w} THEN {d}")),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                if let Some(d) = &els.dbl {
+                    dbl = Some(format!(
+                        "CASE {} {} ELSE {d} END",
+                        operand.sql,
+                        segs.join(" ")
+                    ));
+                }
+            }
+        }
+        let safe = operand.safe && whens.iter().all(|(_, b)| b.safe) && els.safe;
+        Ok(Node {
+            sql: format!(
+                "CASE {} {} ELSE {} END",
+                operand.sql,
+                whens
+                    .iter()
+                    .map(|(w, b)| format!("WHEN {w} THEN {}", b.sql))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                els.sql
+            ),
             domain,
-        ))
+            safe,
+            dbl,
+        })
     }
 
     /// WHEN 值仅允许字符串/数值字面量（比较操作数不作表达式展开）。
@@ -352,12 +585,12 @@ impl Parser<'_> {
 
     /// `CAST(<expr> AS DECIMAL(p,s))`：改写 TRY_CAST + 行级守卫复现
     /// 解释器"转换失败→语句错误→trap 跳过"语义；仅支持 DECIMAL 目标。
-    fn cast_call(&mut self) -> Result<(String, Domain), SkipReason> {
+    fn cast_call(&mut self) -> Result<Node, SkipReason> {
         let bad = SkipReason::UnprovenWriteCompleteness;
         if !self.t.take("(") {
             return Err(bad);
         }
-        let (inner, _) = self.expr()?;
+        let inner = self.expr()?;
         if !self.t.take("as") || !self.t.take("decimal") || !self.t.take("(") {
             return Err(bad);
         }
@@ -375,66 +608,93 @@ impl Parser<'_> {
         if precision > 38 || scale > precision {
             return Err(bad);
         }
-        let rendered = format!("TRY_CAST(({inner}) AS DECIMAL({p}, {s}))");
-        self.guards
-            .push(format!("({inner}) IS NULL OR ({rendered}) IS NOT NULL"));
-        Ok((rendered, Domain::Decimal { precision, scale }))
+        let rendered = format!("TRY_CAST(({}) AS DECIMAL({p}, {s}))", inner.sql);
+        self.guards.push(format!(
+            "({}) IS NULL OR ({rendered}) IS NOT NULL",
+            inner.sql
+        ));
+        // TRY_CAST 永不抛错；dbl 沿用内层（DECIMAL(p,s) 收窄只减精度，
+        // 模长上界不变；TRY_CAST 失败→NULL 方向保守）。
+        Ok(Node {
+            sql: rendered,
+            domain: Domain::Decimal { precision, scale },
+            safe: inner.safe,
+            dbl: inner.dbl,
+        })
     }
 
-    fn abs_call(&mut self) -> Result<(String, Domain), SkipReason> {
+    fn abs_call(&mut self) -> Result<Node, SkipReason> {
         let bad = SkipReason::UnprovenWriteCompleteness;
         if !self.t.take("(") {
             return Err(bad);
         }
-        let ph = self.t.peek().ok_or(bad)?.to_string();
-        let (field, domain) = self.bind_field(&ph)?;
+        let inner = self.expr()?;
         // DECIMAL 的正负值域对称；整数最小值的 abs 可能溢出，不能照搬。
-        if !matches!(domain, Domain::Decimal { .. }) || !self.t.take(")") {
+        if !matches!(inner.domain, Domain::Decimal { .. }) || !self.t.take(")") {
             return Err(bad);
         }
-        Ok((format!("abs(sd_cur.{})", Name(field).sql()), domain))
+        Ok(Node {
+            dbl: inner.dbl.map(|d| format!("abs({d})")),
+            sql: format!("abs({})", inner.sql),
+            domain: inner.domain,
+            safe: inner.safe,
+        })
     }
 
-    fn round_call(&mut self) -> Result<(String, Domain), SkipReason> {
+    fn round_call(&mut self) -> Result<Node, SkipReason> {
         let bad = SkipReason::UnprovenWriteCompleteness;
         if !self.t.take("(") {
             return Err(bad);
         }
-        let (inner, num) = self.expr()?;
-        if !num.is_numeric() || !self.t.take(",") {
+        let inner = self.expr()?;
+        if !inner.domain.is_numeric() || !self.t.take(",") {
             return Err(bad);
         }
         let k = self.t.number().ok_or(bad)?;
-        self.t
-            .take(")")
-            .then_some((format!("round({inner}, {k})"), Domain::Numeric))
-            .ok_or(bad)
+        if !self.t.take(")") {
+            return Err(bad);
+        }
+        Ok(Node {
+            dbl: inner.dbl.map(|d| format!("round({d}, {k})")),
+            sql: format!("round({}, {k})", inner.sql),
+            domain: Domain::Numeric,
+            safe: inner.safe,
+        })
     }
 
     /// concat 对白名单标量类型一律安全（隐式 VARCHAR 转换不抛错），
     /// 结果属字符串域；NULL 语义与 Off 的 concat_null_as_empty 改写逐字一致。
-    fn concat_call(&mut self) -> Result<(String, Domain), SkipReason> {
+    fn concat_call(&mut self) -> Result<Node, SkipReason> {
         let bad = SkipReason::UnprovenWriteCompleteness;
         if !self.t.take("(") {
             return Err(bad);
         }
-        let (first, _) = self.expr()?;
-        let mut args = vec![first];
+        let mut args = vec![self.expr()?];
         while self.t.take(",") {
-            let (arg, _) = self.expr()?;
-            args.push(arg);
+            args.push(self.expr()?);
         }
         if !self.t.take(")") {
             return Err(bad);
         }
-        Ok((format!("concat({})", args.join(", ")), Domain::Other))
+        Ok(Node {
+            sql: format!(
+                "concat({})",
+                args.iter()
+                    .map(|a| a.sql.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            domain: Domain::Other,
+            safe: args.iter().all(|a| a.safe),
+            dbl: None,
+        })
     }
 
     /// INSERT 位 fn_site 参数缓存子查询叶：`(SELECT sd_v FROM sd_fnN
     /// WHERE sd_aK IS NOT DISTINCT FROM (<实参>)…)`——表名按已准入
     /// InsertSite 改写 `sd_bfN`，实参递归走表达式语法（`$v_` 占位符
     /// → sd_cur 列 / 行级表达式 / IN 形参占位符）。结果域 VARCHAR。
-    fn cache_subquery(&mut self) -> Result<(String, Domain), SkipReason> {
+    fn cache_subquery(&mut self) -> Result<Node, SkipReason> {
         let bad = SkipReason::UnprovenWriteCompleteness;
         if !(self.t.take("(")
             && self.t.take("select")
@@ -451,6 +711,7 @@ impl Parser<'_> {
             return Err(bad);
         }
         let mut conds = Vec::new();
+        let mut args_safe = true;
         loop {
             let col = self.t.name().ok_or(bad)?;
             if !is_cache_arg_col(&col.0) {
@@ -464,46 +725,69 @@ impl Parser<'_> {
             {
                 return Err(bad);
             }
-            let (arg, _) = self.expr()?;
+            let arg = self.expr()?;
             if !self.t.take(")") {
                 return Err(bad);
             }
-            conds.push(format!("{} IS NOT DISTINCT FROM ({arg})", col.sql()));
+            args_safe &= arg.safe;
+            conds.push(format!("{} IS NOT DISTINCT FROM ({})", col.sql(), arg.sql));
             if !self.t.take("and") {
                 break;
             }
         }
         self.t
             .take(")")
-            .then(|| {
-                (
-                    format!(
-                        "(SELECT sd_v FROM {} WHERE {})",
-                        site.table,
-                        conds.join(" AND ")
-                    ),
-                    Domain::Other,
-                )
+            .then(|| Node {
+                sql: format!(
+                    "(SELECT sd_v FROM {} WHERE {})",
+                    site.table,
+                    conds.join(" AND ")
+                ),
+                domain: Domain::Other,
+                safe: args_safe,
+                dbl: None,
             })
             .ok_or(bad)
     }
 
-    fn binding(&mut self, word: &str) -> Result<(String, Domain), SkipReason> {
+    fn binding(&mut self, word: &str) -> Result<Node, SkipReason> {
         if let Some((_, BindSrc::Var(var))) = self.binds.iter().find(|(p, _)| p == word) {
             // 循环不变 IN 形参：占位符原样保留，运行期随 plan.binds 解析。
             if self.in_params.contains(&var.0.to_ascii_lowercase()) {
                 self.t.take(word);
-                return Ok((word.to_string(), type_domain(self.var_types, var)));
+                let domain = type_domain(self.var_types, var);
+                return Ok(Node {
+                    dbl: Node::dbl_for(word, domain),
+                    sql: word.to_string(),
+                    domain,
+                    safe: true,
+                });
             }
             let bound = (self.resolve)(var)?;
             self.t.take(word);
             if !bound.value.guard.is_empty() {
                 self.guards.push(bound.value.guard);
             }
-            return Ok((format!("({})", bound.value.expr), bound.domain));
+            // 绑定值自带的内核域守卫（如 ArithWrite 内部溢出算术）
+            // 上浮为本表达式的内核守卫——入口准入统一裁决。
+            if !bound.value.kernel_guard.is_empty() {
+                self.kernel_guards.push(bound.value.kernel_guard);
+            }
+            return Ok(Node {
+                sql: format!("({})", bound.value.expr),
+                domain: bound.domain,
+                safe: bound.safe,
+                dbl: bound.dbl,
+            });
         }
         let (field, domain) = self.bind_field(word)?;
-        Ok((format!("sd_cur.{}", Name(field).sql()), domain))
+        let col = format!("sd_cur.{}", Name(field).sql());
+        Ok(Node {
+            dbl: Node::dbl_for(&col, domain),
+            sql: col,
+            domain,
+            safe: true,
+        })
     }
 
     /// 绑定必须解析为游标记录字段；数值域标志供 `/` 的无抛错证明裁决。
@@ -554,7 +838,11 @@ pub(super) fn pl_concat(lhs_field: &str, rhs_field: &str, to: &Column) -> Guarde
     } else {
         format!("{expr} IS NOT NULL AND ({cast})")
     };
-    GuardedExpr { expr, guard }
+    GuardedExpr {
+        expr,
+        guard,
+        kernel_guard: String::new(),
+    }
 }
 
 /// PL Int/Int 除法等价前提：源列必须是整数族（SpinValue::Int 域）。

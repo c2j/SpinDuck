@@ -90,6 +90,8 @@ fn bind_reads(binds: &[(String, BindSrc)], out: &mut BTreeSet<VarName>) {
             BindSrc::Field { rec, .. } => {
                 out.insert(rec.clone());
             }
+            // Expr 绑定不含帧变量读（其基字段属游标记录，非 IR 变量）。
+            BindSrc::Expr { .. } => {}
         }
     }
 }

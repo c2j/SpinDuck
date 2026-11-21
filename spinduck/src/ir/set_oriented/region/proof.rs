@@ -66,7 +66,9 @@ pub(crate) fn reject_prefix_effects(
         }
         match stmt {
             IrStmt::PushTrap { .. } | IrStmt::PopTrap => {}
-            IrStmt::CallRoutine { .. } => return Err(SkipReason::UnsupportedCall),
+            IrStmt::CallRoutine { .. } => {
+                return Err(SkipReason::UnsupportedCall);
+            }
             IrStmt::Raise { .. } => return Err(SkipReason::ExceptionScopePresent),
             IrStmt::SqlExecDynamic { .. }
             | IrStmt::OpenCursor {
@@ -277,6 +279,8 @@ pub(crate) fn collect_stmt_reads(stmt: &IrStmt, out: &mut BTreeSet<VarName>) {
                     crate::ir::BindSrc::Field { rec, .. } => {
                         out.insert(rec.clone());
                     }
+                    // Expr 绑定不含帧变量读（其基字段属游标记录，非 IR 变量）。
+                    crate::ir::BindSrc::Expr { .. } => {}
                 }
             }
         }

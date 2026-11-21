@@ -134,6 +134,7 @@ pub(super) fn resolve_one(
             view_prelude: view_dep.as_ref().map(|d| d.prelude.clone()),
             view_bases: view_dep.map(|d| d.base_names).unwrap_or_default(),
             filter_binds: lq.filter_binds.clone(),
+            default_var: lq.default_var.clone(),
         },
         tables,
     )))
@@ -160,6 +161,7 @@ fn resolve_case(
             view_prelude: None,
             view_bases: Vec::new(),
             filter_binds: lq.filter_binds.clone(),
+            default_var: lq.default_var.clone(),
         },
         if lq.table.0 == "sys_dummy" {
             Vec::new()
@@ -249,6 +251,11 @@ pub(super) struct HoistCtx<'a, 'b> {
     pub catalog: &'a RoutineCatalog,
     pub record: &'a VarName,
     pub safe_vars: &'a std::collections::BTreeSet<VarName>,
+    /// 已解析查找的结果变量集（default 为查找变量时允许 $v_ 占位引用）。
+    pub lookup_vars: &'a std::collections::BTreeSet<VarName>,
+    /// 区域游标扫描 SQL（verbatim 原文/普通投影）：LATERAL Top-1
+    /// 并列守卫的 sd_cur 来源；空串 = 无游标形状（该类查找拒绝）。
+    pub cur_scan: &'a str,
 }
 
 /// 内联表达式中的函数内查找（§4.3 A7）关系化提升：把每个 `IrExpr::Lookup`
@@ -301,11 +308,32 @@ fn hoist_walk(
             args,
             default,
         } => {
-            let lq = lookup::parse_inline(query, args, default, ctx.record, ctx.safe_vars)?;
+            // 兜底表达式可能内嵌 Lookup（内联例程的 WHEN OTHERS 分支）：
+            // 先递归提升为 __sd_lkN，外层 default 以 $v_ 占位引用，
+            // 由 substitute_lookup_refs 逐行代入内层 CASE。
+            let default = hoist_walk(ctx, default, next, acc)?;
+            let mut lookup_vars = ctx.lookup_vars.clone();
+            lookup_vars.extend(acc.iter().map(|(l, _)| l.var.clone()));
+            let ictx = lookup::InlineCtx {
+                record: ctx.record,
+                safe_vars: ctx.safe_vars,
+                lookup_vars: &lookup_vars,
+            };
+            let lq = match lookup::parse_inline(query, args, &default, &ictx) {
+                Ok(lq) => lq,
+                Err(r) => {
+                    return Err(HoistFail::Skip(r));
+                }
+            };
             let idx = *next;
             *next += 1;
-            let (mut resolved, tables) =
-                resolve_one(ctx.ex, ctx.catalog, &lq, idx, "")?.map_err(HoistFail::Skip)?;
+            let inner = resolve_one(ctx.ex, ctx.catalog, &lq, idx, ctx.cur_scan)?;
+            let (mut resolved, tables) = match inner {
+                Ok(x) => x,
+                Err(r) => {
+                    return Err(HoistFail::Skip(r));
+                }
+            };
             let var = VarName(format!("__sd_lk{idx}"));
             resolved.var = var.clone();
             resolved.group = idx;
@@ -429,6 +457,10 @@ pub(super) fn substitute_lookup_refs(
         r.join = r.join.map(|s| substitute_binds(&s, &repls));
         r.hit = substitute_binds(&r.hit, &repls);
         r.value = substitute_binds(&r.value, &repls);
+        // 内联 Lookup 的兜底可为查找变量（$v_<var> 占位）：同样逐行代入
+        // 内层 CASE（hit→value 否则内层自身兜底），依赖经 render_refs
+        // 计入拓扑序。
+        r.default_sql = substitute_binds(&r.default_sql, &repls);
         if let Some(tg) = &r.tie_guard {
             r.tie_guard = Some(inject_tie_guard(
                 &substitute_binds(tg, &repls),
@@ -479,12 +511,20 @@ fn topo_dfs(
 /// 渲染文本（join/hit/value/tie_guard）引用的查找变量下标：精确提取 `$v_<ident>`
 /// 占位符并与查找变量名求交（形参绑定/游标字段不在 vars 中，自然忽略）。
 fn render_refs(r: &lookup::LookupRender, vars: &[VarName]) -> Vec<usize> {
+    // 字段间以空格分隔：占位符标识符止于非标识字符，防跨字段粘连
+    // （如 default_sql 末尾的 $v_<var> 与 join 起始的 LEFT 合并为
+    // "__sd_lkNLEFT" 而漏识别依赖）。
     let mut text = r.hit.clone();
+    text.push(' ');
     text.push_str(&r.value);
+    text.push(' ');
+    text.push_str(&r.default_sql);
     if let Some(j) = &r.join {
+        text.push(' ');
         text.push_str(j);
     }
     if let Some(t) = &r.tie_guard {
+        text.push(' ');
         text.push_str(t);
     }
     let mut out = Vec::new();

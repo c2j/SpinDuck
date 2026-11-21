@@ -11,6 +11,10 @@ pub enum BindSrc {
     Var(VarName),
     /// 记录变量.字段（运行期从帧内 RECORD 取字段值）
     Field { rec: VarName, field: String },
+    /// 内联表达式实参（仅 lookup 全定义文法内部使用）：预渲染的逐行
+    /// SQL（引用 sd_cur.字段）与唯一基字段名（类型对齐证据）。不进入
+    /// 运行期绑定表，仅供 IN-list 等值析取项消费。
+    Expr { sql: String, field: String },
 }
 
 impl BindSrc {

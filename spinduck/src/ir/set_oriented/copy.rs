@@ -44,6 +44,7 @@ pub(super) fn copy_sql(
         ctes: &mut ctes,
         joins: &mut joins,
         expr_guards: &mut expr_guards,
+        kernel_guards: Vec::new(),
     };
     inputs::prove(region, &env)?;
     for l in lookups.iter().filter(|l| l.filter_on_miss) {
@@ -53,15 +54,27 @@ pub(super) fn copy_sql(
     for (var, value) in &region.inline_checks {
         inline::check_evaluation(region, (var, value), &mut env)?;
     }
-    let (projections, write_guards) = write_projections(region, insert, target, &mut env)?;
+    let (projections, write_guards, kernel_guards) =
+        write_projections(region, insert, target, &mut env)?;
     let fn_preludes = fn_distincts(region, select, source, &mut env)?;
-    badrow::push_bad_row_guard(
-        region,
-        (&write_guards, &ctes, &joins),
+    // 内核域守卫必须先于写守卫坏行计数：COUNT 求值顺序保证溢出行
+    // 先触发整体回退，写守卫 COUNT 不会对含溢出算术的行求值。
+    badrow::kernel_row_guard(
+        &kernel_guards,
         select,
         source,
+        (&ctes, &joins),
         &mut expr_guards,
     );
+    if region.insert_log || !kernel_guards.is_empty() {
+        badrow::bad_row_guard(
+            &write_guards,
+            select,
+            source,
+            (&ctes, &joins),
+            &mut expr_guards,
+        );
+    }
     guards.extend(write_guards);
     if select
         .sources
@@ -187,14 +200,18 @@ fn distinct_args(sql: &str) -> Result<Vec<String>, SkipReason> {
     Ok(items)
 }
 
+/// 写投影产物：SELECT 列 / 行级守卫 / 内核域守卫。
+type WriteProjections = (Vec<String>, Vec<String>, Vec<String>);
+
 fn write_projections(
     region: &CopyLoop<'_>,
     insert: &shape::Insert,
     target: &Table,
     env: &mut ProjEnv<'_>,
-) -> Result<(Vec<String>, Vec<String>), SkipReason> {
+) -> Result<WriteProjections, SkipReason> {
     let mut projections = Vec::new();
     let mut guards = Vec::new();
+    let mut kernel_guards = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for (name, parameter) in insert.columns.iter().zip(&insert.parameters) {
         if !seen.insert(&name.0) {
@@ -207,11 +224,15 @@ fn write_projections(
             .ok_or(SkipReason::UnknownObjectDependency)?;
         let guarded = projection(region, parameter, to, env)?;
         projections.push(guarded.expr);
+        if !guarded.kernel_guard.is_empty() {
+            kernel_guards.push(guarded.kernel_guard);
+        }
         if !guarded.guard.is_empty() {
             guards.push(guarded.guard);
         }
     }
-    Ok((projections, guards))
+    kernel_guards.append(&mut env.kernel_guards);
+    Ok((projections, guards, kernel_guards))
 }
 
 fn prove_omitted_columns(insert: &shape::Insert, target: &Table) -> Result<(), SkipReason> {
@@ -240,10 +261,7 @@ fn projection(
 ) -> Result<expr::GuardedExpr, SkipReason> {
     if let Some(field) = single_field(region, parameter) {
         if !region.allow_filter {
-            return Ok(expr::GuardedExpr {
-                expr: field_projection(env.select, env.source, to, &field)?,
-                guard: String::new(),
-            });
+            return field_projection(env.select, env.source, to, &field);
         }
     } else if let Some((_, BindSrc::Var(v))) = region.binds.iter().find(|(p, _)| p == parameter) {
         if let Some(w) = region.arith_writes.iter().find(|w| w.var == *v) {
@@ -283,13 +301,42 @@ fn expression_var(
     env: &mut ProjEnv<'_>,
 ) -> Result<expr::BoundExpr, SkipReason> {
     let bad = SkipReason::UnprovenWriteCompleteness;
-    if region.var_types.get(&var.0) == Some(&crate::types::SpinType::Varchar) {
-        return Err(bad);
-    }
     if let Some((_, value)) = region.inlined.iter().find(|(v, _)| v == var) {
         return inline::numeric_projection(region, (var, value), env);
     }
-    let lq = env.lookups.iter().find(|l| &l.var == var).ok_or(bad)?;
+    let Some(lq) = env.lookups.iter().find(|l| &l.var == var) else {
+        return Err(bad);
+    };
+    // ArithWrite 覆写变量：值 = CASE WHEN cond THEN arith ELSE 原值，
+    // 须先于查找分支判定（同名变量同时存在于 lookups）。
+    if let Some(write) = region.arith_writes.iter().find(|w| w.var == *var) {
+        return arith::value_binding(region, write, env);
+    }
+    // 兜底（非跳行）查找：CASE 操作数/比较等非数值位置的值来源——
+    // 命中取值/落空兜底自渲染，Other 域使算术合并自然拒绝误用。
+    if !lq.filter_on_miss && lq.case_sink.is_none() {
+        let members: Vec<_> = env.lookups.iter().filter(|l| l.group == lq.group).collect();
+        let hits = group_hits(&members, env.select, env.source)?;
+        for member in &members {
+            register_lookup(member, env.lookups, env.ctes, env.joins);
+        }
+        return Ok(expr::BoundExpr {
+            value: expr::GuardedExpr {
+                expr: format!(
+                    "CASE WHEN {hits} THEN {} ELSE {} END",
+                    lq.render.value, lq.render.default_sql
+                ),
+                guard: String::new(),
+                kernel_guard: String::new(),
+            },
+            domain: expr::Domain::Other,
+            dbl: None,
+            safe: true,
+        });
+    }
+    if region.var_types.get(&var.0) == Some(&crate::types::SpinType::Varchar) {
+        return Err(bad);
+    }
     if !lq.filter_on_miss
         || lq.case_sink.is_some()
         || !expr::Domain::of(&lq.kind).is_numeric()
@@ -311,8 +358,11 @@ fn expression_var(
         value: expr::GuardedExpr {
             expr: lq.render.value.clone(),
             guard: hits,
+            kernel_guard: String::new(),
         },
         domain: expr::Domain::Numeric,
+        dbl: Some(format!("CAST(({}) AS DOUBLE)", lq.render.value)),
+        safe: true,
     })
 }
 
@@ -350,6 +400,7 @@ fn lookup_projection(
             lq.render.value, lq.render.default_sql
         ),
         guard: String::new(),
+        kernel_guard: String::new(),
     })
 }
 
@@ -366,6 +417,7 @@ fn guarded_choice(hits: &str, value: String, default: &str, to: &Column) -> expr
             "CASE WHEN {hits} THEN ({}) ELSE ({}) END",
             selected.guard, fallback.guard
         ),
+        kernel_guard: String::new(),
     }
 }
 
@@ -493,12 +545,27 @@ fn field_projection(
     source: &Table,
     to: &Column,
     field: &Name,
-) -> Result<String, SkipReason> {
+) -> Result<expr::GuardedExpr, SkipReason> {
     let from = source_column(select, source, field)?;
-    if from.kind != to.kind || (from.nullable && !to.nullable) {
-        return Err(SkipReason::UnprovenTargetConstraints);
+    let expr = format!("sd_cur.{}", field.sql());
+    if from.kind == to.kind && !(from.nullable && !to.nullable) {
+        return Ok(expr::GuardedExpr {
+            expr,
+            guard: String::new(),
+            kernel_guard: String::new(),
+        });
     }
-    Ok(format!("sd_cur.{}", field.sql()))
+    // DECIMAL→DECIMAL 窄化/可空性收紧：批写隐式 cast 与解释器同内核语义，
+    // 越界或 NULL 违例行由内核域守卫计数、非零整体回退复现解释器错误。
+    if from.kind.starts_with("decimal(") && to.kind.starts_with("decimal(") {
+        let sink = expr::at_write_sink(expr.clone(), to);
+        return Ok(expr::GuardedExpr {
+            expr,
+            guard: String::new(),
+            kernel_guard: sink.guard,
+        });
+    }
+    Err(SkipReason::UnprovenTargetConstraints)
 }
 
 pub(super) fn source_column<'a>(
@@ -558,6 +625,7 @@ fn tuple_projection(
             t.hit, slot.value, slot.default_sql
         ),
         guard: String::new(),
+        kernel_guard: String::new(),
     }))
 }
 

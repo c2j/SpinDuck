@@ -44,7 +44,13 @@ pub(crate) fn mixed_fallback_group_at(
         let IrStmt::SqlQuery { sql, binds, .. } = &prog.code[q.pc] else {
             return Ok(None);
         };
-        let query = parse_total(sql, q.var.clone(), q.default.clone(), binds, &region.record)?;
+        let query = parse_total(
+            sql,
+            q.var.clone(),
+            super::parse::fallback_sql(&q.default)?,
+            binds,
+            &region.record,
+        )?;
         if writes.contains(&query.table.0)
             || query.in_filters.iter().any(|f| writes.contains(&f.table.0))
         {

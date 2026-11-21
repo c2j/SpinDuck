@@ -100,15 +100,25 @@ impl Engine {
         // 回退时解释器会重新物化——例程纯度已证，仅多一次去重调用。
         let mut preluded = false;
         if plan.preludes_first && !plan.fn_preludes.is_empty() {
-            crate::runtime::interp::materialize_fn_preludes(
-                &plan.fn_preludes,
-                frame,
-                self.ex.as_ref(),
-                sink,
-                &self.catalog,
-                &routine.prog.var_types,
-            )?;
-            preluded = true;
+            // INSERT 位前导的 distinct-over-sd_cur 查询可内嵌 sd_vwN
+            // 查找 CTE——fn 前导先于视图物化，须先物化一次；例程调用
+            // 可回滚会话临时表，视图在 fn 后由下方步骤再物化（幂等）。
+            // 物化失败则 fn 前导不可跑（distinct 引用 sd_vwN），跳过
+            // 物化——下方视图步骤同样失败，走既有回退。
+            let views_ready = plan.view_preludes.is_empty()
+                || !plan.fn_preludes.iter().any(|p| p.needs_sd_cur)
+                || self.materialize_views(plan).is_ok();
+            if views_ready {
+                crate::runtime::interp::materialize_fn_preludes(
+                    &plan.fn_preludes,
+                    frame,
+                    self.ex.as_ref(),
+                    sink,
+                    &self.catalog,
+                    &routine.prog.var_types,
+                )?;
+                preluded = true;
+            }
         }
         // 视图物化前导：先于入口守卫（守卫可内嵌 sd_vwN 派生表），且在
         // fn 物化之后——例程调用可回滚会话本地建表，视图表必须最后建。
