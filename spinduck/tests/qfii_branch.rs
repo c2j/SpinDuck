@@ -4,31 +4,12 @@
 //! Off 与 BatchAtomic 两模式结果逐行全等。此前嵌套 DECLARE 变量
 //! （v_fund_code/v_security_id/v_seat_id）未绑定导致 INSERT 引用裸
 //! 标识符，QFII 输出为零且源行未标成功——本测试锁定该回归。
-use spinduck_core::exec::{ExecOutcome, RowStream, SqlExecutor};
 use spinduck_core::ir::set_oriented::SetOrientedMode;
 use spinduck_core::project::ProjectConfig;
 use spinduck_core::verify::deploy_project;
-use spinduck_core::{BindMap, DuckExecutor, Engine, EngineError, RuleRegistry, SpinValue};
+use spinduck_core::{BindMap, DuckExecutor, Engine, RuleRegistry, SpinValue};
 use std::collections::BTreeMap;
 use std::path::Path;
-
-struct DE(DuckExecutor);
-impl SqlExecutor for DE {
-    fn query(&self, sql: &str, binds: &BindMap) -> Result<RowStream, EngineError> {
-        let r = self.0.query(sql, binds);
-        if r.is_err() && sql.contains("cjje") {
-            eprintln!("FAILSQL>>> {sql}");
-        }
-        r
-    }
-    fn execute(&self, sql: &str, binds: &BindMap) -> Result<ExecOutcome, EngineError> {
-        let r = self.0.execute(sql, binds);
-        if r.is_err() && sql.contains("cjje") {
-            eprintln!("FAILSQL>>> {sql}");
-        }
-        r
-    }
-}
 
 const SEED: &str = "\
 INSERT INTO dic_all_kind(operation_kind, kind_id, kind_name) VALUES ('split_data_flag','qfii_dealer_date','20200101');\
@@ -47,7 +28,7 @@ fn deploy(mode: SetOrientedMode) -> Engine {
     let rules = RuleRegistry::default()
         .with_project_rules(&project.rules_files)
         .unwrap();
-    let mut eng = Engine::new(Box::new(DE(DuckExecutor::open_in_memory().unwrap())), rules);
+    let mut eng = Engine::new(Box::new(DuckExecutor::open_in_memory().unwrap()), rules);
     deploy_project(&mut eng, &project).unwrap();
     // deploy_project 会带入项目默认数据集（purchase 种子）：清空与
     // byfund/QFII 链路相关的表，避免 purchase 种子行干扰本场景。

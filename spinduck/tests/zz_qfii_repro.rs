@@ -17,8 +17,7 @@ fn run(routine: &str) {
         eng.ex.execute(sql, &BindMap::new()).unwrap();
     }
     eng.register(routine).unwrap();
-    let r = eng.call("p_test", &[SpinValue::Null]);
-    eprintln!("call result: {r:?}");
+    eng.call("p_test", &[SpinValue::Null]).unwrap();
 }
 
 #[test]
