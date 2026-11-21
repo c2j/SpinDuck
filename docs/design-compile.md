@@ -404,6 +404,26 @@ IR 失败不阻止计划落盘：关系清单仍然成立，`deploy` 会在 `reg
 > 就被拒绝，库文件不会出现，不再走到注册那一步。落地前本段描述仍是 deploy 的当前行为；本段其余部分
 > （IR 失败不进 `[[missing]]`、退出码 1）继续有效。
 
+### 体检范围（2026-11-19，V51）
+
+项目态体检的**引用/列检查（Gate 1B）与 stub prepare（Gate 2B）只覆盖入口链可达例程**；
+例程体的 IR 编译失败（`eng.register`，Gate 1A）与顶层 DDL 拒绝（Gate 2A）保持**文件级**——
+一个包文件里任何例程编译不过，文件仍然红。可达集与 `call` 缺件门同一条 BFS
+（`plan::closure::reachable_routines`，目标起 `walk_chain`）；目标在目录解析失败时退回
+文件级全检（不静默缩小红面）。
+
+动机（考题语料实测，V51）：`PKG_SPLIT_TRADE_STEP3_SH.sql` 里同包兄弟过程
+`prc_trd_hz_byfund` 不被默认入口 `prc_trd_deal_purchase` 调用，其依赖资产随退役用例
+`case_corpus_hz_byfund` 移出语料；文件级体检把这段"运行期永远执行不到"的 SQL 全量
+翻出来红掉（failed=42），而 `call` 缺件门（入口链口径）是绿的——两层口径不一致。
+范围收窄后两层同口径；语料侧同时逐字补回依赖资产（见 `golden/case_corpus_purchase`
+的 `sql/ddl/tables.sql` 与 `sql/routines/1_FNC_*.sql`，来源 `4327506^`），
+纵深防御入口切换场景。
+
+三条 1B 误报随本轮修复（均有语料形态背书）：游标/局部记录的 `%TYPE`/`%ROWTYPE` 锚
+按 PL 局部名跳过；`rownum` 伪列按内核已知伪列跳过（改写面 `rownum_first_row` 兜底）；
+无别名派生表的裸列按 V1 保守口径归 `Cols::Unknown`（模块头既有口径的落实）。
+
 ### 与 `deploy`、`call` 的衔接
 
 `deploy` 不改判定顺序：`[[missing]]` 非空 → 退出码 1，打印 `MISS`，不开库。它不读 `[[ref]]`、不读 `[[dynamic]]`、不调用 codeweb。文件清单仍是 `sources.ddl_routines` 与 `sources.ddl_tables`。视图文件继续靠现有的「路径落在 views 目录 / `creates_view()`」分流，不靠 `[[ref]].kind` 重排下发顺序。
@@ -698,3 +718,4 @@ pub fn build(
 13. **性能范围只限于「谁做关系扫描」。** 不改循环内 `COMMIT`，不改 sqlfn 物化，不把包函数放进宏。路径模式继续每文件一个 Engine。项目模式对闭包源文件用一个 Engine。
 14. **包名从 `contains_routine` 恢复，目录键等于 `register_statement_named` 写入的全串。** JSON 的 procedure/function 节点没有 package 字段。不自洽是两个不同的 package 节点端点，不是两条边记录；同一对端点的重复边在 `drop_identical_duplicate_edges` 之后已经不在。包成员的键是包 `ObjectName` 的每一段加成员名（`engine.rs` 153–167 行）：`CREATE PACKAGE BODY schema.pkg` 的 `proc` 是 `schema.pkg.proc`。无包有 schema 则为 `{schema}.{name}`，schema 内的 `.` 保留；都没有则为裸 `name`。这三条都不调用 `normalize`。不唯一时环境错误，不把同名过程绑到任意一个包。`ddl_routines` 来自这些节点的 JSON `file` 剥掉 SpinDuck 项目根；剥不出的非入口是 `MISS routine`，剥不出的入口是 `ENV-0030`。
 15. **codeweb 二进制不写死 `/Users/c2j/dev/tools_bin/codeweb`。** 顺序是 `--codeweb-bin`、`SPINDUCK_CODEWEB`、`PATH`。该绝对路径只是本机核对用的安装位置。
+16. **体检范围 = 入口链可达例程；文件级只保留编译健康（V51，2026-11-19，人批准）。** Gate 1B 引用/列检查与 Gate 2B stub prepare 只查入口链可达例程（与 `call` 缺件门同一条 BFS）；Gate 1A register 失败与 Gate 2A 拒绝保持文件级。动机与误报修复见「体检范围」小节。`case_corpus_purchase` 同步逐字补回 `prc_trd_hz_byfund`/`fnc_com_get_seat_para` 的依赖资产（`4327506^`，含 Key Decision 11 点名的 `par_sys_marketrate`——那张表当年"不写进缺件期望"的判定不变，本轮是把它声明进语料 DDL，两件事不冲突）。

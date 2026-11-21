@@ -410,3 +410,75 @@ fn should_exit_1_when_compile_with_entry_flag_cannot_find_a_codeweb_project() {
     assert!(out.contains("[ENV-0030]"), "{out}");
     assert!(out.contains("未找到 codeweb 项目"), "{out}");
 }
+
+// ------------------------------------------------------- 体检范围：入口链（design-compile「体检范围」C）
+
+/// 同文件两个独立例程：`prc_main`（入口，干净）不调用 `prc_gap`（写入未声明列）。
+/// 体检只对入口链可达例程做引用/prepare 检查——同文件不可达例程的坏 SQL 不判
+/// FAIL；例程体 IR 编译失败仍由 register 面按文件把守（另一条契约）。
+const ROUTINES_SIBLING_GAP: &str = "CREATE OR REPLACE PROCEDURE prc_gap IS
+BEGIN
+  INSERT INTO t_missing (nope) VALUES (1);
+END;
+/
+
+CREATE OR REPLACE PROCEDURE prc_main IS
+  v_n INT;
+BEGIN
+  SELECT COUNT(*) INTO v_n FROM t_a;
+END;
+/
+";
+
+const DDL_SIBLING: &str = "CREATE TABLE t_a (id INT);\nCREATE TABLE t_missing (id INT);\n";
+
+fn sibling_gap_project(dir: &std::path::Path) {
+    write(dir, "spinduck.toml", PROJECT_PLAN);
+    write(dir, "sql/routines/10_main.sql", ROUTINES_SIBLING_GAP);
+    write(dir, "sql/ddl/tables.sql", DDL_SIBLING);
+}
+
+fn sibling_gap_graph(file: &str) -> serde_json::Value {
+    cw_graph(
+        serde_json::json!([
+            {"id": 1, "type": "procedure", "name": "prc_gap", "file": file},
+            {"id": 2, "type": "procedure", "name": "prc_main", "file": file},
+            {"id": 3, "type": "table", "name": "t_a"},
+            {"id": 4, "type": "table", "name": "t_missing"}
+        ]),
+        serde_json::json!([
+            {"source": 2, "target": 3, "type": "table_access", "modes": ["read"], "file": file, "line": 1},
+            {"source": 1, "target": 4, "type": "table_access", "modes": ["write"], "file": file, "line": 0}
+        ]),
+    )
+}
+
+#[test]
+fn should_skip_unreachable_sibling_routine_when_scoping_ir_health_to_the_entry_chain() {
+    // 入口 prc_main：prc_gap 不可达，其坏 SQL（未声明列 nope）不判 FAIL。
+    // 计划面同样不收它（闭包到不了），missing=0。
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    sibling_gap_project(root);
+    let file = abs_file(&root.join("sql/routines/10_main.sql"));
+    let (code, out) =
+        compile_project_in_process(root, &["prc_main"], None, false, sibling_gap_graph(&file));
+    assert_eq!(code, EXIT_OK, "不可达同文件例程的坏 SQL 不得判 FAIL: {out}");
+    assert!(
+        out.contains("compile: entries=1 missing=0 failed=0 dynamic=0"),
+        "{out}"
+    );
+}
+
+#[test]
+fn should_fail_when_the_bad_sql_is_in_the_reached_routine() {
+    // 门的另一半（同夹具换入口）：prc_gap 可达即体检，必红——门不得永绿。
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    sibling_gap_project(root);
+    let file = abs_file(&root.join("sql/routines/10_main.sql"));
+    let (code, out) =
+        compile_project_in_process(root, &["prc_gap"], None, false, sibling_gap_graph(&file));
+    assert_eq!(code, EXIT_FAIL, "可达例程的坏 SQL 必须判 FAIL: {out}");
+    assert!(out.contains("FAIL sql/routines/10_main.sql"), "{out}");
+}

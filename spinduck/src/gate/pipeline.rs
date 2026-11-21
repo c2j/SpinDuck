@@ -61,7 +61,13 @@ pub struct GateRun {
 /// 执行 Stage 1–4。`files` 顺序即处理顺序；`skip_reject` 为 register
 /// 已报 Gate 2A 的文件——其顶层拒绝不重复收集，但文件仍参与
 /// 快照构建与引用检查（例程体编译失败不应吞掉同文件有效 DDL）。
-pub fn run(files: &[GateFile], skip_reject: &std::collections::BTreeSet<String>) -> GateRun {
+/// `scope` = 入口链可达例程集（design-compile「体检范围」）：`Some`
+/// 时范围外的独立例程与包成员不进 Stage 3A 检查；`None` = 文件级全检。
+pub fn run(
+    files: &[GateFile],
+    skip_reject: &std::collections::BTreeSet<String>,
+    scope: Option<&std::collections::BTreeSet<String>>,
+) -> GateRun {
     let mut parsed: Vec<(&str, Vec<Statement>)> = Vec::with_capacity(files.len());
     let mut parse_failed = Vec::new();
     // Stage 1.5：Gate 2A 顶层 DDL 拒绝——纯 DDL 文件不经 eng.register，
@@ -110,8 +116,8 @@ pub fn run(files: &[GateFile], skip_reject: &std::collections::BTreeSet<String>)
     let mut findings = Vec::new();
     for (rel, stmts) in &parsed {
         for st in stmts {
-            collect_refs(rel, st, &snapshot, &mut findings);
-            collect_cols(rel, st, &snapshot, &mut findings);
+            collect_refs(rel, st, &snapshot, scope, &mut findings);
+            collect_cols(rel, st, &snapshot, scope, &mut findings);
         }
     }
     findings.sort();
@@ -140,8 +146,14 @@ fn schema_error_run(
     }
 }
 
-fn collect_refs(rel: &str, st: &Statement, snap: &SchemaSnapshot, out: &mut Vec<GateFinding>) {
-    for m in check_statement(st, snap) {
+fn collect_refs(
+    rel: &str,
+    st: &Statement,
+    snap: &SchemaSnapshot,
+    scope: Option<&std::collections::BTreeSet<String>>,
+    out: &mut Vec<GateFinding>,
+) {
+    for m in check_statement(st, snap, scope) {
         out.push(GateFinding {
             file: rel.to_string(),
             object: m.object,
@@ -150,8 +162,14 @@ fn collect_refs(rel: &str, st: &Statement, snap: &SchemaSnapshot, out: &mut Vec<
     }
 }
 
-fn collect_cols(rel: &str, st: &Statement, snap: &SchemaSnapshot, out: &mut Vec<GateFinding>) {
-    for m in check_columns(st, snap) {
+fn collect_cols(
+    rel: &str,
+    st: &Statement,
+    snap: &SchemaSnapshot,
+    scope: Option<&std::collections::BTreeSet<String>>,
+    out: &mut Vec<GateFinding>,
+) {
+    for m in check_columns(st, snap, scope) {
         out.push(GateFinding {
             file: rel.to_string(),
             object: col_object(&m),
@@ -181,7 +199,72 @@ mod tests {
     }
 
     fn run_all(files: &[GateFile]) -> GateRun {
-        run(files, &BTreeSet::new())
+        run(files, &BTreeSet::new(), None)
+    }
+
+    #[test]
+    fn should_scope_package_findings_to_reachable_members() {
+        // 体检口径（design-compile「体检范围」）：入口链不可达的包成员不进
+        // 1B 引用/列检查；可达成员照常上报；`None` = 维持文件级全检（旧行为）。
+        let pkg = "CREATE OR REPLACE PACKAGE BODY pkg IS \
+                   PROCEDURE prc_in IS BEGIN \
+                     INSERT INTO t_declared VALUES (1); \
+                     INSERT INTO t_ghost_in VALUES (1); \
+                   END; \
+                   PROCEDURE prc_out IS BEGIN \
+                     INSERT INTO t_ghost_out VALUES (1); \
+                   END; \
+                   END pkg;";
+        let files = [
+            file("sql/ddl/tables.sql", "CREATE TABLE t_declared(a INT);"),
+            file("sql/routines/pkg.sql", pkg),
+        ];
+        let scope: BTreeSet<String> = ["pkg.prc_in".to_string()].into();
+        let scoped = run(&files, &BTreeSet::new(), Some(&scope));
+        let objs: Vec<&str> = scoped.findings.iter().map(|f| f.object.as_str()).collect();
+        assert!(objs.contains(&"t_ghost_in"), "可达成员照常上报: {objs:?}");
+        assert!(
+            !objs.contains(&"t_ghost_out"),
+            "不可达成员不得上报: {objs:?}"
+        );
+        let all = run(&files, &BTreeSet::new(), None);
+        let objs_all: Vec<&str> = all.findings.iter().map(|f| f.object.as_str()).collect();
+        assert!(
+            objs_all.contains(&"t_ghost_in") && objs_all.contains(&"t_ghost_out"),
+            "无口径时维持文件级全检: {objs_all:?}"
+        );
+    }
+
+    #[test]
+    fn should_scope_standalone_routine_findings_to_reachable_entries() {
+        // 独立例程不同文件形态：不可达例程（prc_out）的坏 SQL 不上报，
+        // 可达例程（prc_in）照常。
+        let files = [
+            file("sql/ddl/tables.sql", "CREATE TABLE t_declared(a INT);"),
+            file(
+                "sql/routines/p_in.sql",
+                "CREATE PROCEDURE prc_in IS BEGIN \
+                 INSERT INTO t_declared VALUES (1); END;",
+            ),
+            file(
+                "sql/routines/p_out.sql",
+                "CREATE PROCEDURE prc_out IS BEGIN \
+                 INSERT INTO t_ghost_out VALUES (1); END;",
+            ),
+        ];
+        let scope: BTreeSet<String> = ["prc_in".to_string()].into();
+        let scoped = run(&files, &BTreeSet::new(), Some(&scope));
+        assert!(
+            scoped.findings.is_empty(),
+            "不可达例程不得上报: {:?}",
+            scoped.findings
+        );
+        let all = run(&files, &BTreeSet::new(), None);
+        assert!(
+            all.findings.iter().any(|f| f.object == "t_ghost_out"),
+            "无口径时照常上报: {:?}",
+            all.findings
+        );
     }
 
     #[test]
@@ -280,6 +363,7 @@ mod tests {
                 file("b.sql", "ALTER TABLE t1 ADD COLUMN c2 INT;"),
             ],
             &skip,
+            None,
         );
         assert!(run.rejected.is_empty(), "{:?}", run.rejected);
         assert!(run.schema_error.is_none(), "{:?}", run.schema_error);

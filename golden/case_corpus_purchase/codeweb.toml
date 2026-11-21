@@ -1,0 +1,12 @@
+# 研发态内嵌 codeweb 的项目标记（plans.rs::codeweb_project_root 向上发现本文件）。
+# 门店：compile --analyze 用 [analysis].paths 做增量分析；store 落在
+# .codeweb/（gitignore），首次分析自动建立，不入库。
+[project]
+name = "case_corpus_purchase"
+
+[analysis]
+paths = ["sql/"]
+
+[store]
+path = ".codeweb/store.bincode"
+format = "bincode"

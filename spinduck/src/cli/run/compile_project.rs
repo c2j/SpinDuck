@@ -283,6 +283,8 @@ fn ir_failures(
         let cache_dir = project.root.join(&project.home_dir).join("ir-cache");
         let mut eng = Engine::new(Box::new(NoopExecutor), rules.clone());
         eng.ir_cache = Some(crate::ir_cache::IrCache::open(&cache_dir, &stamp));
+        // Pass 1：登记全部闭包文件，记录新入目录的例程（文件 → 例程名）。
+        let mut new_routines: Vec<(String, String)> = Vec::new();
         for (rel, text) in &texts {
             let before: BTreeSet<String> = eng.catalog.names().into_iter().collect();
             if let Err(err) = eng.register(text) {
@@ -296,12 +298,27 @@ fn ir_failures(
                 .into_iter()
                 .filter(|n| !before.contains(n))
             {
-                if let Some(r) = eng.catalog.lookup(&name) {
-                    collect_prog_sqls(rel, &name, &r.prog, &missing_by_from, &mut gate_sqls);
-                }
+                new_routines.push((rel.clone(), name));
             }
         }
-        let gate = gate_failures(project, plans, &failed_rels);
+        // 体检范围（design-compile「体检范围」C）：入口链可达例程集，与
+        // `call` 缺件门同一条 BFS；目标解析失败（例程文件 register 失败
+        // 等）退回 `None` = 文件级全检兜底，不静默缩小红面。
+        let scope =
+            crate::plan::closure::reachable_routines(&eng, plans.iter().map(|p| p.target.clone()));
+        // Pass 2：范围内的例程才进 2B prepare 输入。
+        for (rel, name) in &new_routines {
+            if scope
+                .as_ref()
+                .is_some_and(|s| !s.contains(&name.to_ascii_lowercase()))
+            {
+                continue;
+            }
+            if let Some(r) = eng.catalog.lookup(name) {
+                collect_prog_sqls(rel, name, &r.prog, &missing_by_from, &mut gate_sqls);
+            }
+        }
+        let gate = gate_failures(project, plans, &failed_rels, scope.as_ref());
         failed.extend(gate.findings);
         failed.extend(gate.rejected);
         if let Some(snap) = gate.snapshot {
@@ -310,7 +327,7 @@ fn ir_failures(
             )?);
         }
     } else {
-        let gate = gate_failures(project, plans, &failed_rels);
+        let gate = gate_failures(project, plans, &failed_rels, None);
         failed.extend(gate.findings);
         failed.extend(gate.rejected);
     }
@@ -439,6 +456,7 @@ fn gate_failures(
     project: &ProjectConfig,
     plans: &[RunPlan],
     skip_reject: &BTreeSet<String>,
+    scope: Option<&BTreeSet<String>>,
 ) -> GateOutcome {
     let mut seen = BTreeSet::new();
     let mut gate_rels: Vec<&str> = Vec::new();
@@ -465,7 +483,7 @@ fn gate_failures(
             })
         })
         .collect();
-    let run = crate::gate::pipeline::run(&files, skip_reject);
+    let run = crate::gate::pipeline::run(&files, skip_reject, scope);
     let mut out = Vec::new();
     if let Some((rel, err)) = run.schema_error {
         out.push((rel, err));

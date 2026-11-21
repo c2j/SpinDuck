@@ -10,7 +10,7 @@ pub mod prepare;
 pub mod schema;
 
 use crate::error::EngineError;
-use ogsql_parser::ast::Statement;
+use ogsql_parser::ast::{ObjectName, Statement};
 
 /// 返回被拒绝语句的类别标签；`None` = 放行（常规 DDL 由 load/deploy 通道执行）。
 fn denied_kind(st: &Statement) -> Option<&'static str> {
@@ -68,6 +68,27 @@ pub(crate) fn reject_unsupported_ddl(st: &Statement) -> Result<(), EngineError> 
         )),
         None => Ok(()),
     }
+}
+
+/// 例程名归一（ObjectName → 点分小写全名）：`pkg.prc` / 裸 `prc` 两种
+/// 书写形态统一成目录键口径（目录键是小写全名）。
+pub(crate) fn routine_key(name: &ObjectName) -> String {
+    name.iter()
+        .map(|i| i.value.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// 体检范围命中：例程名（全名或尾段）在可达集内。尾段近似与
+/// `plan::closure::kernel_has` 同口径——闭包写 `pkg.prc`、登记是
+/// `pkg.prc`，两侧都截尾比对；范围过滤是"少检"方向，宁可多命中。
+pub(crate) fn scope_hit(scope: &std::collections::BTreeSet<String>, name: &ObjectName) -> bool {
+    let full = routine_key(name);
+    if scope.contains(&full) {
+        return true;
+    }
+    let tail = full.rsplit('.').next().unwrap_or(&full);
+    scope.iter().any(|e| e.rsplit('.').next() == Some(tail))
 }
 
 /// 语句声明的表对象名（`CreateTable`/`CreateTableAs`，含例程体内
