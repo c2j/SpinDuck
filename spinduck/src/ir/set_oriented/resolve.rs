@@ -446,9 +446,11 @@ pub(super) fn substitute_lookup_refs(
             let ph = format!("$v_{}", vars[d].0);
             repls.push((
                 ph.clone(),
-                format!(
-                    "CASE WHEN {} THEN {} ELSE {} END",
-                    renders[d].hit, renders[d].value, renders[d].default_sql
+                super::lookup::typed_case(
+                    &renders[d].hit,
+                    &renders[d].value,
+                    &renders[d].default_sql,
+                    &resolved[d].0.kind,
                 ),
             ));
             r.guard_binds.retain(|(p, _)| p != &ph);

@@ -2,7 +2,7 @@
 
 use super::schema::{self, Table};
 use super::shape::Name;
-use super::{BindSrc, OptimizeCtx, SkipReason};
+use super::{BindSrc, OptimizeCtx, SkipReason, VarName};
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
 
@@ -39,6 +39,16 @@ pub(crate) struct ViewPrelude {
     pub sql: String,
 }
 
+/// 批写后标量出口（miss 仿真处理器赋值回填）：批写成功后、后缀续跑
+/// 前执行；返回行时把各列值按 `targets` 顺序写回帧，无行保持批写前值。
+/// 多个出口按查找程序序应用（后写覆盖先写）。
+#[derive(Clone)]
+pub(crate) struct MissOut {
+    pub targets: Vec<VarName>,
+    pub sql: String,
+    pub binds: Vec<(String, BindSrc)>,
+}
+
 /// 结构准入与 SQL 生成的产物；入口守卫与后缀组装消费它。
 #[derive(Clone)]
 pub(crate) struct ConversionPlan {
@@ -71,6 +81,9 @@ pub(crate) struct ConversionPlan {
     /// 内联表达式入口无抛错守卫 SQL（期望 COUNT = 0，§4.5-2）：以 TRY_
     /// 全定义预筛全部源行，任一行结果为 NULL（坏输入或 NULL 输入）即退回。
     pub(super) expr_guards: Vec<BoundGuard>,
+    /// miss 仿真标量出口（NO_DATA_FOUND 处理器赋值回填）：批写成功后
+    /// 按程序序执行，返回行时写回帧变量。
+    pub(crate) miss_outs: Vec<MissOut>,
 }
 
 pub(super) type BoundGuard = (String, Vec<(String, BindSrc)>);

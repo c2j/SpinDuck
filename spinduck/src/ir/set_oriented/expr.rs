@@ -173,7 +173,7 @@ impl Node {
 
     /// 两侧 DOUBLE 域渲染按算符组合；任一缺失则整体缺失。
     fn combine_dbl(l: &Option<String>, r: &Option<String>, op: char) -> Option<String> {
-        Some(format!("({} {} {})", l.as_ref()?, r.as_ref()?, op))
+        Some(format!("({} {} {})", l.as_ref()?, op, r.as_ref()?))
     }
 }
 

@@ -410,8 +410,10 @@ fn lookup_case(v: &VarName, env: &mut ProjEnv<'_>) -> Result<String, SkipReason>
     for member in &members {
         register_lookup(member, env.lookups, env.ctes, env.joins);
     }
-    Ok(format!(
-        "CASE WHEN {hits} THEN {} ELSE {} END",
-        lq.render.value, lq.render.default_sql
+    Ok(super::super::lookup::typed_case(
+        &hits,
+        &lq.render.value,
+        &lq.render.default_sql,
+        &lq.kind,
     ))
 }

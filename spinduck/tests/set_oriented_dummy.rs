@@ -256,6 +256,160 @@ fn should_reject_sys_dummy_block_when_not_total_and_verify_decimal_mul_sub() {
     scenario_inline_derived_or();
     scenario_dec_wide_guard();
     scenario_dec_wide_fallback();
+    scenario_miss_emu();
+    scenario_miss_fallbacks();
+}
+
+/// byfund c_get_data 同型：NO_DATA_FOUND 保护的 SELECT INTO +
+/// 处理器逐行覆写 OUT 参数 + INTO 变量循环外常量初始化（carryover）。
+fn caller_miss() -> &'static str {
+    "CREATE OR REPLACE PROCEDURE caller_miss(p_o_succeed OUT VARCHAR2) IS
+       v_kind VARCHAR2(4);
+     BEGIN
+       p_o_succeed := '0';
+       FOR r IN SELECT security_id, amt, tag FROM cur_rows LOOP
+         BEGIN
+           SELECT bond_kind INTO v_kind
+             FROM bond_para
+            WHERE security_id = r.security_id;
+         EXCEPTION
+           WHEN no_data_found THEN
+             p_o_succeed := 'no:' || r.security_id;
+           WHEN too_many_rows THEN
+             p_o_succeed := 'many:' || r.security_id;
+           WHEN OTHERS THEN
+             p_o_succeed := 'err:' || r.security_id;
+         END;
+         INSERT INTO dst_rows(security_id, yj, tag)
+           VALUES (r.security_id, r.amt, r.tag || ':' || v_kind);
+       END LOOP;
+     END;"
+}
+
+fn miss_ddl(bond_rows: &[&str], cur_rows: &[&str]) -> Vec<String> {
+    let mut ddl: Vec<String> = BASE_DDL
+        .iter()
+        .map(|s| s.to_string())
+        .map(|s| {
+            if s.starts_with("CREATE TABLE cur_rows") {
+                "CREATE TABLE cur_rows(security_id VARCHAR, amt DECIMAL(15,2), \
+                   tag VARCHAR)"
+                    .to_string()
+            } else {
+                s
+            }
+        })
+        .collect();
+    ddl.push("CREATE TABLE bond_para(security_id VARCHAR, bond_kind VARCHAR)".into());
+    if !bond_rows.is_empty() {
+        ddl.push(format!(
+            "INSERT INTO bond_para VALUES {}",
+            bond_rows.join(",")
+        ));
+    }
+    ddl.push(format!(
+        "INSERT INTO cur_rows VALUES {}",
+        cur_rows.join(",")
+    ));
+    ddl
+}
+
+fn miss_refs(ddl: &[String]) -> Vec<&str> {
+    ddl.iter().map(String::as_str).collect()
+}
+
+/// miss 仿真全 miss + 处理器赋值逐行均匀：Converted，carryover 初值
+/// 与"最后失败行"处理器结果经批写后标量出口回填，逐行同 Off。
+fn scenario_miss_emu() {
+    let ddl = miss_ddl(
+        &[],
+        &["('S9',10.50,'a')", "('S9',20.25,'b')", "('S9',30.75,'c')"],
+    );
+    let routines = [caller_miss()];
+    let mut off = engine_with_routines(&miss_refs(&ddl), SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_miss", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 3, "Off 语义基线: {expected_rows:?}");
+    assert_eq!(
+        expected.outs.get("p_o_succeed"),
+        Some(&SpinValue::Str("no:S9".into())),
+        "Off 基线 OUT: {:?}",
+        expected.outs
+    );
+
+    let mut eng = engine_with_routines(&miss_refs(&ddl), SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_miss", &args()).unwrap();
+    let Status::Converted { .. } = eng.set_oriented_reports()[0].status.clone() else {
+        panic!(
+            "全 miss 均匀必须 Converted: {:?}",
+            eng.set_oriented_reports()
+        );
+    };
+    assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
+}
+
+/// miss 仿真回退面：命中/落空混合（carryover 次序不可批量刻画）、
+/// 维度重复（too_many_rows）、处理器赋值逐行非均匀——均须 Skipped
+/// 且结果与 Off 逐行一致。
+fn scenario_miss_fallbacks() {
+    // 混合命中/落空。
+    let ddl = miss_ddl(&["('S1','K1')"], &["('S1',10.50,'a')", "('S2',20.25,'b')"]);
+    let routines = [caller_miss()];
+    let mut off = engine_with_routines(&miss_refs(&ddl), SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_miss", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    let mut eng = engine_with_routines(&miss_refs(&ddl), SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_miss", &args()).unwrap();
+    assert!(
+        !matches!(
+            eng.set_oriented_reports()[0].status,
+            Status::Converted { .. }
+        ),
+        "混合命中/落空必须回退: {:?}",
+        eng.set_oriented_reports()
+    );
+    assert_eq!(dst_rows(&eng), expected_rows);
+    assert_eq!(actual.outs, expected.outs, "回退后 OUT 须与 Off 一致");
+
+    // 维度重复（too_many_rows）。
+    let ddl = miss_ddl(
+        &["('S1','K1')", "('S1','K2')"],
+        &["('S1',10.50,'a')", "('S2',20.25,'b')"],
+    );
+    let mut off = engine_with_routines(&miss_refs(&ddl), SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_miss", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    let mut eng = engine_with_routines(&miss_refs(&ddl), SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_miss", &args()).unwrap();
+    assert!(
+        !matches!(
+            eng.set_oriented_reports()[0].status,
+            Status::Converted { .. }
+        ),
+        "维度重复必须回退: {:?}",
+        eng.set_oriented_reports()
+    );
+    assert_eq!(dst_rows(&eng), expected_rows);
+    assert_eq!(actual.outs, expected.outs, "回退后 OUT 须与 Off 一致");
+
+    // 全 miss 但处理器赋值逐行不同（security_id 不同 → 消息不同）。
+    let ddl = miss_ddl(&[], &["('S1',10.50,'a')", "('S2',20.25,'b')"]);
+    let mut off = engine_with_routines(&miss_refs(&ddl), SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_miss", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    let mut eng = engine_with_routines(&miss_refs(&ddl), SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_miss", &args()).unwrap();
+    assert!(
+        !matches!(
+            eng.set_oriented_reports()[0].status,
+            Status::Converted { .. }
+        ),
+        "处理器赋值非均匀必须回退: {:?}",
+        eng.set_oriented_reports()
+    );
+    assert_eq!(dst_rows(&eng), expected_rows);
+    assert_eq!(actual.outs, expected.outs, "回退后 OUT 须与 Off 一致");
 }
 
 /// fnc_grp_mode：SQL 上下文下沉例程（游标 WHERE 内 fn_site 同型）。

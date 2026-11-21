@@ -21,6 +21,18 @@ use super::{BindSrc, SkipReason, VarName};
 use crate::ir::{AssignTarget, IrExpr, IrProg, IrStmt};
 use crate::value::SpinValue;
 
+/// `CASE WHEN hit THEN value ELSE default END` 的类型统一渲染：
+/// DuckDB 1.5.5 拒绝 INTEGER_LITERAL 与 VARCHAR 混排的 CASE（解释器
+/// SpinValue 无静态类型，命中列型与兜底字面量型可不同）——两分支
+/// TRY_CAST 到查找列声明类型，与写汇 `at_write_sink`/`guarded_choice`
+/// 同口径；兜底坏值→NULL 与写汇 TRY_CAST 的 NULL 传播一致。
+pub(super) fn typed_case(hit: &str, value: &str, default: &str, kind: &str) -> String {
+    let ty = kind.to_ascii_uppercase();
+    format!(
+        "CASE WHEN {hit} THEN TRY_CAST(({value}) AS {ty}) ELSE TRY_CAST(({default}) AS {ty}) END"
+    )
+}
+
 /// 维表列与游标字段的关联比较。
 pub(super) struct Correlation {
     pub dim_column: Name,
@@ -138,6 +150,43 @@ pub(super) struct LookupQuery {
     /// §3.5 零异常入口守卫（V3-5）：处理器不改写 INTO 变量（跨行残留），
     /// 命中基数由入口守卫在运行期裁决——0/多行整段退回原解释器。
     pub entry_guard: bool,
+    /// NO_DATA_FOUND miss 仿真证据（入口守卫放宽到"全命中或全 miss"）：
+    /// INTO 变量 miss 值 = 循环外 Const 初值（渲染进 default_sql）；
+    /// no_data_found 处理器标量赋值改批写后标量出口回填。命中/落空
+    /// 混合、处理器赋值逐行非均匀、目标变量被区域后续写/读时不构造。
+    pub miss_emu: Option<MissEmu>,
+}
+
+/// miss 仿真证据（见 [`LookupQuery::miss_emu`]）。
+#[derive(Clone)]
+pub(super) struct MissEmu {
+    /// INTO 变量初始化常量的 SQL 字面量（miss 时 carryover 值）。
+    pub init_sql: String,
+    /// no_data_found 处理器标量赋值（逐行结果，批写后标量出口回填）。
+    pub assigns: Vec<MissAssign>,
+    /// 查找 pc：miss_out 按程序序应用（后写覆盖先写）。
+    pub pc: usize,
+}
+
+/// 处理器单条标量赋值的批量渲染：目标变量 + 逐行 SQL + 运行期绑定。
+/// SQL 中游标记录字段已替换为 `_cur."列"`，形参等不变量保留 `$v_`
+/// 占位由 binds 运行期解析。
+#[derive(Clone)]
+pub(super) struct MissAssign {
+    pub var: VarName,
+    pub sql: String,
+    pub binds: Vec<(String, BindSrc)>,
+}
+
+/// 批写后标量出口（miss 仿真处理器赋值回填）：存在 miss 行时取回
+/// 处理器赋值结果写回帧；无 miss 行时变量保持批写前值。
+#[derive(Clone)]
+pub(super) struct MissOut {
+    /// 查找 pc：多个出口按程序序应用（后写覆盖先写）。
+    pub pc: usize,
+    pub targets: Vec<VarName>,
+    pub sql: String,
+    pub binds: Vec<(String, BindSrc)>,
 }
 
 /// 多 OUT 查找函数（§3.2 LookupTuple）的调用方绑定：单条
@@ -215,6 +264,11 @@ pub(super) struct LookupRender {
     /// 并列守卫须随行的形参绑定（LATERAL 静态过滤含 BETWEEN 等）；
     /// 入口守卫从运行帧解析这些绑定后求值（其余渲染器无守卫绑定）。
     pub guard_binds: Vec<(String, BindSrc)>,
+    /// miss 仿真入口守卫（期望求值 = 0）：命中/落空混合拒绝 +
+    /// 处理器赋值逐行结果非均匀拒绝。绑定与 tie_guard 同口径。
+    pub miss_guards: Vec<(String, Vec<(String, BindSrc)>)>,
+    /// 批写后标量出口（miss 仿真处理器赋值回填）。
+    pub miss_out: Option<MissOut>,
 }
 
 /// 结构解析 + 模式识别后的已解析查找（generate 期填充 schema 证据）。

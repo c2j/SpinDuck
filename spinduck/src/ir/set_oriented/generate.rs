@@ -252,13 +252,21 @@ fn finish(
         resolved.iter().map(|(l, _)| l.clone()).collect();
     let top1_guards: Vec<entry::BoundGuard> = resolved
         .iter()
-        .filter_map(|(l, _)| {
+        .flat_map(|(l, _)| {
             l.render
                 .tie_guard
                 .clone()
                 .map(|g| (g, l.render.guard_binds.clone()))
+                .into_iter()
+                .chain(l.render.miss_guards.iter().cloned())
         })
         .collect();
+    // miss 仿真标量出口：按查找程序序应用（后写覆盖先写）。
+    let mut miss_outs: Vec<lookup::MissOut> = projections
+        .iter()
+        .filter_map(|l| l.render.miss_out.clone())
+        .collect();
+    miss_outs.sort_by_key(|m| m.pc);
     let route_guards = route_guards(copy, &resolved)?;
     let tuple_views: Vec<lookup::ResolvedTuple> =
         resolved_tuples.iter().map(|(t, _)| t.clone()).collect();
@@ -349,6 +357,14 @@ fn finish(
         top1_guards,
         route_guards,
         expr_guards,
+        miss_outs: miss_outs
+            .into_iter()
+            .map(|m| entry::MissOut {
+                targets: m.targets,
+                sql: m.sql,
+                binds: m.binds,
+            })
+            .collect(),
     })
 }
 

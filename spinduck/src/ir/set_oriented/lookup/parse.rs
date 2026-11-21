@@ -76,6 +76,7 @@ pub(crate) fn parse_total(
         filter_on_miss: false,
         filter_binds: predicates.binds,
         entry_guard: false,
+        miss_emu: None,
     })
 }
 
@@ -204,6 +205,7 @@ fn parse_derived_top1(
         filter_on_miss: false,
         filter_binds: predicates.binds,
         entry_guard: false,
+        miss_emu: None,
     })
 }
 

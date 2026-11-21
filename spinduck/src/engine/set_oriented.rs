@@ -178,6 +178,18 @@ impl Engine {
                     )?;
                 }
                 let rows = self.exec_region_sql(plan, frame, sink)?;
+                // miss 仿真标量出口：NO_DATA_FOUND 处理器赋值回填——
+                // 存在 miss 行时取回逐行（均匀性已由入口守卫证明）
+                // 处理器赋值结果写回帧；无 miss 行保持批写前值。
+                for mo in &plan.miss_outs {
+                    let bm = crate::runtime::interp::resolve_binds(&mo.binds, frame)?;
+                    let mut stream = self.ex.query(&mo.sql, &bm)?;
+                    if let Some(row) = stream.fetch_many(1).into_iter().next() {
+                        for (var, val) in mo.targets.iter().zip(row) {
+                            frame.set(var, val);
+                        }
+                    }
+                }
                 self.commit_region_tail(plan, rows, sink)?;
                 Ok(None)
             }

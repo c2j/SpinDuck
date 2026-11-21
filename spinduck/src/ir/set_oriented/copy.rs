@@ -322,10 +322,7 @@ fn expression_var(
         }
         return Ok(expr::BoundExpr {
             value: expr::GuardedExpr {
-                expr: format!(
-                    "CASE WHEN {hits} THEN {} ELSE {} END",
-                    lq.render.value, lq.render.default_sql
-                ),
+                expr: lookup::typed_case(&hits, &lq.render.value, &lq.render.default_sql, &lq.kind),
                 guard: String::new(),
                 kernel_guard: String::new(),
             },
@@ -395,10 +392,7 @@ fn lookup_projection(
         return Ok(value);
     }
     Ok(expr::GuardedExpr {
-        expr: format!(
-            "CASE WHEN {hits} THEN {} ELSE {} END",
-            lq.render.value, lq.render.default_sql
-        ),
+        expr: lookup::typed_case(&hits, &lq.render.value, &lq.render.default_sql, &lq.kind),
         guard: String::new(),
         kernel_guard: String::new(),
     })

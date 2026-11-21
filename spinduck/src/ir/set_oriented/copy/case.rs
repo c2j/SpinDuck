@@ -70,9 +70,11 @@ fn operand_sql(
             for member in &omembers {
                 register_lookup(member, env.lookups, env.ctes, env.joins);
             }
-            Ok(format!(
-                "CASE WHEN {ohits} THEN {} ELSE {} END",
-                operand.render.value, operand.render.default_sql
+            Ok(lookup::typed_case(
+                &ohits,
+                &operand.render.value,
+                &operand.render.default_sql,
+                &operand.kind,
             ))
         }
         None => {

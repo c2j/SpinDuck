@@ -3,13 +3,13 @@
 //! 命中基数由入口守卫在运行期裁决：恰 1 行放行集合 SQL，0/多行整段
 //! 退回原解释器（保留 too_many_rows/no_data_found 语义）。
 
-use super::lookup::{parse_total, CorrelationOp, LookupQuery, LookupRender};
+use super::lookup::{parse_total, CorrelationOp, LookupQuery, LookupRender, MissOut};
 use super::region::{self, CursorRegion};
 use super::schema::{self, Source, Table};
 use super::shape::{Name, Tokens};
-use super::{SkipReason, VarName};
+use super::{BindSrc, SkipReason, VarName};
 use crate::error::EngineError;
-use crate::ir::{AssignTarget, IrProg, IrStmt, TrapEntry};
+use crate::ir::{AssignTarget, IrExpr, IrProg, IrStmt, TrapEntry};
 
 /// 视图证明产物：投影列证据（视图形状）+ 底表名与底表结构
 /// （写集相交复核与入口漂移复核用）。
@@ -201,16 +201,113 @@ pub(super) fn render(
         Some(d) => format!("CASE WHEN {alias}.sd_val IS NULL THEN {d} ELSE {alias}.sd_val END"),
         None => format!("{alias}.sd_val"),
     };
+    // miss 仿真（证据齐备）：守卫放宽为 dup-only + 混合/均匀守卫，
+    // miss 行取值 = INTO 变量初始化常量（经 default_sql 渲染进
+    // `CASE WHEN hit THEN value ELSE init END`）；处理器赋值由
+    // 批写后标量出口回填。
+    let (tie_guard, default_sql, miss_guards, miss_out) = match &lq.miss_emu {
+        Some(emu) => {
+            let (dup, guards, out) = miss_guards(lq, table, cur_scan, &dims, &filter, emu);
+            (dup, emu.init_sql.clone(), guards, out)
+        }
+        None => (
+            Some(guard_sql(lq, table, cur_scan, &dims, &filter)),
+            lq.default_sql.clone(),
+            Vec::new(),
+            None,
+        ),
+    };
     Ok(LookupRender {
         cte: None,
         join: Some(join_sql(lq, table, &alias, &dims, &ons, &filter)),
         hit: format!("{alias}.sd_hit = 1"),
         value,
-        default_sql: lq.default_sql.clone(),
+        default_sql,
         key_checks,
-        tie_guard: Some(guard_sql(lq, table, cur_scan, &dims, &filter)),
+        tie_guard,
         guard_binds: lq.filter_binds.clone(),
+        miss_guards,
+        miss_out,
     })
+}
+
+/// miss 仿真守卫组 + 标量出口（期望求值均 = 0 / 有 miss 行才取回）：
+///   - dup：维度组 >1 行（too_many_rows）整段退回；
+///   - mixed：命中与落空并存（carryover 次序无法用初值刻画）退回；
+///   - uniform：no_data_found 赋值逐行结果非均匀（"最后失败行胜出"
+///     语义无法用任意行代表）退回。
+fn miss_guards(
+    lq: &LookupQuery,
+    table: &Table,
+    cur_scan: &str,
+    dims: &[String],
+    filter: &str,
+    emu: &super::lookup::MissEmu,
+) -> (
+    Option<String>,
+    Vec<super::entry::BoundGuard>,
+    Option<MissOut>,
+) {
+    let scan = guard_scan(lq, table, cur_scan, dims, filter);
+    let dup = format!("SELECT COUNT(*) {scan} WHERE COALESCE(_b.__cnt, 0) > 1");
+    let mixed = format!(
+        "SELECT CAST((COUNT(*) FILTER (WHERE _b.__cnt IS NULL) > 0 AND COUNT(*) FILTER (WHERE _b.__cnt IS NOT NULL) > 0) AS BIGINT) {scan}"
+    );
+    // 守卫/出口 SQL 内嵌 cur_scan，其 $v_ 参数与 tie_guard 同口径取
+    // lq.filter_binds；处理器赋值的帧变量绑定在此之上去重合并。
+    let mut guards = vec![(mixed, lq.filter_binds.clone())];
+    let mut out = None;
+    if !emu.assigns.is_empty() {
+        let exprs = emu
+            .assigns
+            .iter()
+            .map(|a| a.sql.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut binds: Vec<(String, BindSrc)> = lq.filter_binds.clone();
+        for a in &emu.assigns {
+            for b in &a.binds {
+                if !binds.iter().any(|(p, _)| p == &b.0) {
+                    binds.push(b.clone());
+                }
+            }
+        }
+        guards.push((
+            format!(
+                "SELECT CAST(COUNT(*) > 1 AS BIGINT) FROM (SELECT DISTINCT {exprs} {scan} WHERE _b.__cnt IS NULL) _u"
+            ),
+            binds.clone(),
+        ));
+        out = Some(MissOut {
+            pc: emu.pc,
+            targets: emu.assigns.iter().map(|a| a.var.clone()).collect(),
+            sql: format!("SELECT {exprs} {scan} WHERE _b.__cnt IS NULL LIMIT 1"),
+            binds,
+        });
+    }
+    (Some(dup), guards, out)
+}
+
+/// 守卫共用的 FROM..ON 尾段：`(cur_scan) _cur LEFT JOIN`（维度分组
+/// 计数子查询）`_b ON 关联键`——与 guard_sql 同口径。
+fn guard_scan(
+    lq: &LookupQuery,
+    table: &Table,
+    cur_scan: &str,
+    dims: &[String],
+    filter: &str,
+) -> String {
+    let group_by = dims.join(", ");
+    let g_ons = lq
+        .correlations
+        .iter()
+        .map(|c| format!("_b.{} = _cur.{}", c.dim_column.sql(), c.cursor_field.sql()))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!(
+        "FROM ({cur_scan}) _cur LEFT JOIN (SELECT {group_by}, COUNT(*) AS __cnt FROM {}{filter} GROUP BY {group_by}) _b ON {g_ons}",
+        table.qualified
+    )
 }
 
 /// 关联键证据：逐键 (维表键列类型, 游标字段) + JOIN/守卫共用的维度列。
@@ -338,6 +435,195 @@ pub(super) fn carryover_group(
     Some((v.clone(), join))
 }
 
+/// 单语句写出的标量变量（与 liveout::stmt_writes 同口径，含
+/// CallRoutine OUT/INOUT 目标写回）。
+fn stmt_var_writes(stmt: &IrStmt, out: &mut std::collections::BTreeSet<VarName>) {
+    match stmt {
+        IrStmt::Assign {
+            target: AssignTarget::Var(v),
+            ..
+        } => {
+            out.insert(v.clone());
+        }
+        IrStmt::Fetch { targets, .. } | IrStmt::SqlQuery { into: targets, .. } => {
+            for t in targets {
+                if let AssignTarget::Var(v) = t {
+                    out.insert(v.clone());
+                }
+            }
+        }
+        IrStmt::CallRoutine { out_targets, .. } => {
+            for t in out_targets.iter().flatten() {
+                if let AssignTarget::Var(v) = t {
+                    out.insert(v.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// INTO 变量初始化常量证明：全程序写点恰为 {循环外 Const Assign,
+/// 本查询 INTO（pc+1）}；初始化值渲染为 SQL 字面量。任一其它写点
+/// 或区域内重赋值 = None（carryover 语义无法用单值刻画）。
+fn into_init_sql(
+    prog: &IrProg,
+    pc: usize,
+    region: &CursorRegion,
+    into_var: &VarName,
+) -> Option<String> {
+    let mut init = None;
+    for (wpc, stmt) in prog.code.iter().enumerate() {
+        let in_region = (region.open_pc..=region.close_pc).contains(&wpc);
+        match stmt {
+            IrStmt::Assign {
+                target: AssignTarget::Var(v),
+                expr,
+            } if v == into_var => {
+                if in_region {
+                    return None;
+                }
+                let IrExpr::Const(c) = expr else {
+                    return None;
+                };
+                if init.is_some() {
+                    return None;
+                }
+                init = crate::sql::render::const_to_sql(c);
+            }
+            IrStmt::Fetch { targets, .. } => {
+                if targets
+                    .iter()
+                    .any(|t| matches!(t, AssignTarget::Var(v) if v == into_var))
+                {
+                    return None;
+                }
+            }
+            IrStmt::SqlQuery { into, .. } => {
+                if into
+                    .iter()
+                    .any(|t| matches!(t, AssignTarget::Var(v) if v == into_var))
+                    && wpc != pc + 1
+                {
+                    return None;
+                }
+            }
+            IrStmt::CallRoutine { out_targets, .. }
+                if out_targets
+                    .iter()
+                    .flatten()
+                    .any(|t| matches!(t, AssignTarget::Var(v) if v == into_var)) =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+    }
+    init
+}
+
+/// miss 仿真证据构建（`LookupQuery::miss_emu`）：仅当 no_data_found
+/// 处理器存在且全部副作用可批量仿真时返回 Some——
+///   1. INTO 变量除本查询外全程序仅一次循环外 Const 初始化；
+///   2. no_data_found 体内标量赋值可渲染为逐行 SQL，引用变量均为
+///      区域外不变量（形参/前缀局部量），记录字段限本游标记录；
+///   3. 赋值目标变量在续跑点（join）之后无任何写（否则逐行覆写
+///      次序无法用单值回填刻画）。
+///
+/// 任一不满足 = None（保持恰 1 行守卫，miss/多行整段退回）。
+fn miss_emulation(
+    prog: &IrProg,
+    pc: usize,
+    entries: &[TrapEntry],
+    region: &CursorRegion,
+    into_var: &VarName,
+    join: usize,
+) -> Option<super::lookup::MissEmu> {
+    let entry = entries
+        .iter()
+        .find(|e| e.conds.iter().any(|c| c == "no_data_found"))?;
+    let init_sql = into_init_sql(prog, pc, region, into_var)?;
+    // 区域内行变体变量集：处理器表达式引用即拒绝（逐行值无法绑定）。
+    let mut row_vars = std::collections::BTreeSet::new();
+    row_vars.insert(into_var.clone());
+    for stmt in &prog.code[region.open_pc..=region.close_pc] {
+        stmt_var_writes(stmt, &mut row_vars);
+    }
+    // 续跑点之后的写集：处理器目标变量被覆写则整组仿真放弃。
+    // 例外处理器体内的写只在异常路径执行——批写守卫保证成功路径不触发
+    // （否则区域整体已回退），不计入 tail。
+    let mut trap_pcs = std::collections::BTreeSet::new();
+    if join <= region.close_pc {
+        for stmt in &prog.code[join..=region.close_pc] {
+            if let IrStmt::PushTrap { entries } = stmt {
+                for e in entries {
+                    trap_pcs.extend(e.body_start..e.body_end);
+                }
+            }
+        }
+    }
+    let mut tail_vars = std::collections::BTreeSet::new();
+    let mut tail_reads = std::collections::BTreeSet::new();
+    if join <= region.close_pc {
+        for (i, stmt) in prog.code[join..=region.close_pc].iter().enumerate() {
+            if !trap_pcs.contains(&(join + i)) {
+                stmt_var_writes(stmt, &mut tail_vars);
+                region::collect_stmt_reads(stmt, &mut tail_reads);
+            }
+        }
+    }
+    let mut assigns = Vec::new();
+    for stmt in &prog.code[entry.body_start..entry.body_end] {
+        // 处理器体仅允许 Nop 与标量变量赋值（与 writebuf_policy 的
+        // handler_stmt_skip_equivalent 同口径）：CallRoutine/SqlExec/
+        // 记录字段写/控制流等副作用无法批量仿真，一律拒绝。
+        let IrStmt::Assign {
+            target: AssignTarget::Var(t),
+            expr,
+        } = stmt
+        else {
+            if !matches!(stmt, IrStmt::Nop) {
+                return None;
+            }
+            continue;
+        };
+        // 目标变量被续跑段写（次序不可回填）或被续跑段读取（批写已
+        // 按处理器前值求值，回填太晚）均拒绝。
+        if tail_vars.contains(t) || tail_reads.contains(t) {
+            return None;
+        }
+        let (text, ebinds) = crate::sql::render::expr_to_scalar_sql_binds(expr)?;
+        let mut repls = Vec::with_capacity(ebinds.len());
+        let mut kept = Vec::with_capacity(ebinds.len());
+        for (ph, src) in ebinds {
+            match src {
+                BindSrc::Field { rec, field } if rec == region.record => {
+                    repls.push((ph, format!("_cur.{}", Name(field).sql())));
+                }
+                BindSrc::Var(v) => {
+                    if v.0.starts_with("__") || row_vars.contains(&v) {
+                        return None;
+                    }
+                    kept.push((ph, BindSrc::Var(v)));
+                }
+                _ => return None,
+            }
+        }
+        repls.sort_by_key(|(ph, _)| std::cmp::Reverse(ph.len()));
+        let sql = super::substitute_binds(&text, &repls);
+        assigns.push(super::lookup::MissAssign {
+            var: t.clone(),
+            sql,
+            binds: kept,
+        });
+    }
+    Some(super::lookup::MissEmu {
+        init_sql,
+        assigns,
+        pc,
+    })
+}
+
 /// 识别 pc 处的零异常守卫查找（§3.5 V3-5）：保护区恰 1 条 SELECT INTO，
 /// 处理器不写 INTO 变量（异常路径保留跨行残留值），续跑落点在处理器块
 /// 之后。解析复用 parse_total（兜底常量取 Null——守卫保证恰 1 行命中，
@@ -367,6 +653,10 @@ pub(super) fn carryover_group_at(
         return Err(SkipReason::UnprovenQueryTotalness);
     }
     query.entry_guard = true;
+    // NO_DATA_FOUND miss 仿真：证据齐备时放宽守卫至"全命中或全 miss"，
+    // miss 行的 carryover 初值与处理器赋值由渲染/标量出口批量等价。
+    let into_var = query.var.clone();
+    query.miss_emu = miss_emulation(prog, pc, entries, region, &into_var, resume);
     let writes = region::write_set(prog, region, catalog)?;
     if writes.contains(&query.table.0)
         || query.in_filters.iter().any(|f| writes.contains(&f.table.0))
