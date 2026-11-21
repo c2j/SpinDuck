@@ -26,6 +26,12 @@ CORPUS="$REPO_ROOT/golden/case_corpus_purchase"
 PKG_SQL="$SCRIPT_DIR/sql"
 ARTIFACT="$REPO_ROOT/docs/goals/artifacts/set-oriented-v3-golden.json"
 BIN="${SPINDUCK_BIN:-$REPO_ROOT/spinduck/target/debug/spinduck}"
+# 未显式指定二进制时自行构建：artifact 的 git_head 记录 HEAD，
+# 被测二进制必须与该版本源码一致（评审口径）。
+if [ -z "${SPINDUCK_BIN:-}" ]; then
+  (cd "$REPO_ROOT/spinduck" && cargo build --features cli --quiet) \
+    || { echo "[v3golden] CLI 构建失败" >&2; exit 1; }
+fi
 N="${N:-100000}"
 STEP_BUDGET="${STEP_BUDGET:-100000000}"
 OG_CONTAINER="${OG_CONTAINER:-sd-og70}"
@@ -270,16 +276,21 @@ EOF
   docker cp "$WORK/export_ref.sql" "$OG_CONTAINER:/tmp/hz_export.sql"
   gsql_exec -f /tmp/hz_export.sql >/dev/null
   for t in cjqs vent mid qf; do
-    docker cp "$OG_CONTAINER:/tmp/hz_ref_$t.csv" "$WORK/ref_$t.csv" 2>/dev/null || true
+    docker cp "$OG_CONTAINER:/tmp/hz_ref_$t.csv" "$WORK/ref_$t.csv" \
+      || { echo "[v3golden] 参照导出缺失 $t" >&2; exit 1; }
   done
 fi
 
 # ---- 5. 一致性断言 + artifact ----
 python3 - "$WORK" "$N" "$BIN" "$OFF_MS" "${ON_MS:-0}" "${SP_MS:-0}" "$OG_CONTAINER" \
+  "${SKIP_GAUSS:-0}" \
   > "$WORK/consistency.txt" 2>&1 <<'PY' || true
 import json,csv,sys,os,re
 from decimal import Decimal
 w=sys.argv[1]; n=int(sys.argv[2])
+# 参照模式（SKIP_GAUSS!=1）下四份参照 CSV 必须全部存在且参与比对，
+# 缺失即 FAIL——不得以 Off==On 冒充三方一致。
+ref_mode = len(sys.argv) > 8 and sys.argv[8] != '1'
 # 数值单元格归一：openGauss 数字文本输出省略前导零（.50），SpinDuck 输出 0.50；
 # 值等价故按 Decimal 规范化。前导零整数（如 '0501' 编码列）保持原文不动。
 NUM=re.compile(r'^[+-]?(\d+\.?\d*|\.\d+)$')
@@ -306,6 +317,9 @@ for t in ['cjqs','vent','mid','qf']:
     if ref is not None:
         line+=f"  off==ref:{off==ref} on==ref:{on==ref}"
         eq = eq and off==ref
+    elif ref_mode:
+        line+="  ref=<缺失>"
+        eq = False
     print(line); ok = ok and eq
 print("CONSISTENT=" + ("OK" if ok else "FAIL"))
 PY
@@ -330,6 +344,7 @@ doc={
  "batch_atomic_matches_gauss":True,
  "method":"prc_trd_hz_byfund 100k 三方对账：openGauss 7.0.0-RC3 CALL vs "
          "SpinDuck Off vs BatchAtomic；四表全列排序逐行全等；"
+         "9 个依赖函数以确定性桩替换（桩两侧同源，非真实依赖链全量验收）；"
          "run_golden.sh 复现",
 }
 import os; os.makedirs(os.path.dirname(path),exist_ok=True)

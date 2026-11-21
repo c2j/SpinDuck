@@ -402,10 +402,83 @@ fn scan_stmt_writes(
                 ..
             } => out.opaque = true,
             IrStmt::SqlExecDynamic { .. } => out.opaque = true,
-            IrStmt::CallRoutine { name, .. } => {
+            IrStmt::CallRoutine { name, args, .. } => {
                 scan_routine_writes(catalog, name, visiting, out);
+                for arg in args {
+                    scan_expr_writes(arg, catalog, visiting, out);
+                }
+            }
+            IrStmt::Assign { expr, .. }
+            | IrStmt::Perform { expr }
+            | IrStmt::FoldedQuery { expr, .. } => {
+                scan_expr_writes(expr, catalog, visiting, out);
+            }
+            IrStmt::JumpIf { cond, .. } | IrStmt::JumpIfNot { cond, .. } => {
+                scan_expr_writes(cond, catalog, visiting, out);
+            }
+            IrStmt::Raise {
+                message: Some(expr),
+            }
+            | IrStmt::Return { value: Some(expr) } => {
+                scan_expr_writes(expr, catalog, visiting, out);
             }
             _ => {}
+        }
+    }
+}
+
+/// 表达式树内的例程调用同样有写副作用：`w := fn()` / `IF fn() THEN`
+/// 等形态的 FuncCall 命中目录例程时递归累计其写集（内建标量函数
+/// 由内核求值、无表写，不展开）。子表达式一律下钻。
+fn scan_expr_writes(
+    expr: &IrExpr,
+    catalog: &crate::catalog::RoutineCatalog,
+    visiting: &mut Vec<String>,
+    out: &mut WriteScan,
+) {
+    match expr {
+        IrExpr::Const(_) | IrExpr::Var(_) | IrExpr::Field { .. } | IrExpr::CursorAttr { .. } => {}
+        IrExpr::Bin { l, r, .. } => {
+            scan_expr_writes(l, catalog, visiting, out);
+            scan_expr_writes(r, catalog, visiting, out);
+        }
+        IrExpr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            if let Some(e) = operand {
+                scan_expr_writes(e, catalog, visiting, out);
+            }
+            for (cond, value) in whens {
+                scan_expr_writes(cond, catalog, visiting, out);
+                scan_expr_writes(value, catalog, visiting, out);
+            }
+            if let Some(e) = else_expr {
+                scan_expr_writes(e, catalog, visiting, out);
+            }
+        }
+        IrExpr::Not(inner) | IrExpr::IsNull(inner) => {
+            scan_expr_writes(inner, catalog, visiting, out);
+        }
+        IrExpr::FuncCall { name, args, .. } => {
+            if catalog.lookup(name).is_some() {
+                scan_routine_writes(catalog, name, visiting, out);
+            }
+            for arg in args {
+                scan_expr_writes(arg, catalog, visiting, out);
+            }
+        }
+        IrExpr::SqlFn { args, .. } => {
+            for arg in args {
+                scan_expr_writes(arg, catalog, visiting, out);
+            }
+        }
+        IrExpr::Lookup { args, default, .. } => {
+            for (_, arg) in args {
+                scan_expr_writes(arg, catalog, visiting, out);
+            }
+            scan_expr_writes(default, catalog, visiting, out);
         }
     }
 }

@@ -261,6 +261,8 @@ fn should_reject_sys_dummy_block_when_not_total_and_verify_decimal_mul_sub() {
     scenario_view_cast_fallback();
     scenario_const_view();
     scenario_mixed_trap_skip();
+    scenario_volatile_nested_view();
+    scenario_prefix_fn_write();
 }
 
 /// byfund c_get_data 同型：NO_DATA_FOUND 保护的 SELECT INTO +
@@ -1229,4 +1231,127 @@ fn scenario_dec_wide_fallback() {
     // 回退跑同一解释器：成败与落库结果必须与 Off 完全一致。
     assert_eq!(eng_result.is_ok(), off_result.is_ok(), "成败须一致");
     assert_eq!(dst_rows(&eng), off_rows, "回退后结果须与 Off 一致");
+}
+
+/// ⑭ 传递易变视图（PR#59 二轮评审）：根视图 v_vol 仅包装内层视图
+/// dim_inner，nextval 隐藏在依赖链深处。物化前移探测与区域入口物化
+/// 各消费一次序列 → BatchAtomic 结果漂移；依赖链上任何一层含
+/// 非确定性调用都必须在任何物化前拒绝。
+fn caller_volatile_view() -> &'static str {
+    "CREATE OR REPLACE PROCEDURE caller_volatile_view(p_o_succeed OUT VARCHAR2) IS
+       v_x DECIMAL(20,6);
+     BEGIN
+       p_o_succeed := '0';
+       FOR r IN SELECT id, tag FROM cur_num LOOP
+         BEGIN
+           SELECT v.val INTO v_x FROM v_vol v WHERE v.id = r.id;
+         EXCEPTION WHEN OTHERS THEN v_x := 7; END;
+         INSERT INTO dst_rows(security_id, yj, tag)
+           VALUES (r.tag, v_x, r.tag);
+       END LOOP;
+     END;"
+}
+
+fn scenario_volatile_nested_view() {
+    let ddl: Vec<&str> = BASE_DDL
+        .iter()
+        .copied()
+        .chain([
+            "CREATE TABLE cur_num(id DECIMAL(10,0), tag VARCHAR)",
+            "CREATE TABLE dim_base(id DECIMAL(10,0), raw VARCHAR)",
+            "CREATE SEQUENCE review_seq",
+            "CREATE VIEW dim_inner AS SELECT id, CAST(nextval('review_seq') AS DECIMAL(20,6)) AS val FROM dim_base",
+            "CREATE VIEW v_vol AS SELECT id, val FROM dim_inner",
+            "INSERT INTO dim_base VALUES (1,'x'),(2,'y')",
+            "INSERT INTO cur_num VALUES (1,'a'),(2,'b')",
+        ])
+        .collect();
+    let routines = [caller_volatile_view()];
+    let mut off = engine_with_routines(&ddl, SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_volatile_view", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 2, "Off 语义基线: {expected_rows:?}");
+
+    let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_volatile_view", &args()).unwrap();
+    assert!(
+        matches!(
+            eng.set_oriented_reports()[0].status,
+            Status::Skipped {
+                reason: SkipReason::UnprovenQueryTotalness
+            }
+        ),
+        "传递易变视图必须在物化前拒绝: {:?}",
+        eng.set_oriented_reports()
+    );
+    assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
+}
+
+/// ⑮ 前缀表达式内例程写（PR#59 二轮评审）：`w := review_mutate()` 的
+/// 函数体向视图底表插入坏行。写集扫描若忽略 Assign 表达式中的
+/// FuncCall，前移探测会漏检——探测在前缀执行前成功、入口物化时
+/// 才撞坏行，中止事务。函数表达式副作用必须计入前缀写集。
+fn review_mutate() -> &'static str {
+    "CREATE FUNCTION review_mutate() RETURN NUMBER IS
+     BEGIN
+       INSERT INTO dim_base VALUES (2,'bad');
+       RETURN 1;
+     END;"
+}
+
+fn caller_prefix_fn_write() -> &'static str {
+    "CREATE OR REPLACE PROCEDURE caller_prefix_fn_write(p_o_succeed OUT VARCHAR2) IS
+       w NUMBER;
+       v_x DECIMAL(20,6);
+     BEGIN
+       p_o_succeed := '0';
+       w := review_mutate();
+       FOR r IN SELECT id, tag FROM cur_num LOOP
+         BEGIN
+           SELECT v.val INTO v_x FROM v_cast v WHERE v.id = r.id;
+         EXCEPTION WHEN OTHERS THEN v_x := 7; END;
+         INSERT INTO dst_rows(security_id, yj, tag)
+           VALUES (r.tag, v_x, r.tag);
+       END LOOP;
+     END;"
+}
+
+fn scenario_prefix_fn_write() {
+    let ddl: Vec<&str> = BASE_DDL
+        .iter()
+        .copied()
+        .chain([
+            "CREATE TABLE cur_num(id DECIMAL(10,0), tag VARCHAR)",
+            "CREATE TABLE dim_base(id DECIMAL(10,0), raw VARCHAR)",
+            "CREATE VIEW v_cast AS SELECT id, CAST(raw AS DECIMAL(20,6)) AS val FROM dim_base",
+            "INSERT INTO dim_base VALUES (1,'10')",
+            "INSERT INTO cur_num VALUES (1,'a')",
+        ])
+        .collect();
+    let routines = [review_mutate(), caller_prefix_fn_write()];
+    let mut off = engine_with_routines(&ddl, SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_prefix_fn_write", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 1, "Off 语义基线: {expected_rows:?}");
+
+    let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
+    let eng_result = eng.call("caller_prefix_fn_write", &args());
+    assert!(
+        matches!(
+            eng.set_oriented_reports()[0].status,
+            Status::Skipped {
+                reason: SkipReason::TargetReadDependency
+            }
+        ),
+        "前缀例程写视图底表必须拒绝转换: {:?}",
+        eng.set_oriented_reports()
+    );
+    assert!(eng_result.is_ok(), "回退后调用须成功: {eng_result:?}");
+    assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
+    assert_eq!(
+        expected.outs,
+        eng_result.unwrap().outs,
+        "OUT 形参须与 Off 一致"
+    );
 }

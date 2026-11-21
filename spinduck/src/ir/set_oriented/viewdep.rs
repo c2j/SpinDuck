@@ -84,7 +84,9 @@ pub(super) fn materialize(
     let mut visited = HashSet::from([view.0.clone()]);
     let mut bases: Vec<(Name, Table)> = Vec::new();
     let mut base_names: Vec<Name> = Vec::new();
-    if let Err(reason) = collect_bases(ex, &sql, &tables, &views, &mut visited, &mut bases)? {
+    if let Err(reason) =
+        collect_bases(ex, catalog, &sql, &tables, &views, &mut visited, &mut bases)?
+    {
         return Ok(Err(reason));
     }
     for (name, _) in &bases {
@@ -147,6 +149,7 @@ fn deterministic(sql: &str, catalog: &RoutineCatalog) -> Result<(), SkipReason> 
 /// 不命中对象名；同名误中只会多登记底表（过近似安全方向）。
 fn collect_bases(
     ex: &Source<'_>,
+    catalog: &RoutineCatalog,
     sql: &str,
     tables: &HashSet<String>,
     views: &HashMap<String, String>,
@@ -173,7 +176,13 @@ fn collect_bases(
             let Some(nested) = views.get(&candidate) else {
                 continue;
             };
-            match collect_bases(ex, nested, tables, views, visited, bases)? {
+            // 依赖链每一层都要过确定性证明：nextval/random 等易变调用
+            // 可藏在内层视图里，根视图 deterministic 只扫自身文本。
+            // 物化会按行消费序列/熵，多次物化（探测+入口）结果漂移。
+            if let Err(reason) = deterministic(nested, catalog) {
+                return Ok(Err(reason));
+            }
+            match collect_bases(ex, catalog, nested, tables, views, visited, bases)? {
                 Ok(()) => {}
                 Err(reason) => return Ok(Err(reason)),
             }
