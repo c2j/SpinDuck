@@ -14,7 +14,9 @@ golden/
 ├── case_split_agg/                ← 用例 1：聚合管线（toy，自建例程）
 ├── case_corpus_stock_kind/        ← 用例 2：语料级（考题基线函数逐字）
 ├── case_corpus_min_tax/           ← 用例 3：语料级（考题基线函数逐字）
-└── case_corpus_purchase/          ← 用例 4：语料级（黄金层比函数 + 过程断言集）
+├── case_corpus_purchase/          ← 用例 4：语料级（黄金层比函数 + 过程断言集）
+├── pr48_set_oriented_verify/      ← 集合化能力边界验证包（PR #48）
+└── v3_set_oriented_verify/        ← 集合化实战验证包（PR #59：purchase/byfund 三方对比）
 ```
 
 每个用例目录即一个 **§12.1 项目模式单元**（`spinduck.toml` 声明项目资产与可调用面
