@@ -249,16 +249,21 @@ impl Compiler {
                 self.code.push(IrStmt::CloseCursor { cursor: cname });
             }
             PlStatement::For(f) => {
-                // Range → 计数循环；Query → 隐式游标循环（M4c 打开）
-                use ogsql_parser::ast::plpgsql::PlForKind;
+                // Range → 计数循环；Query → 隐式游标循环（M4c 打开）。
                 // 循环变量词法作用域仅覆盖循环体：边界/步长表达式与游标
-                // 查询文本必须在变量绑定前解析——同名外层变量不被遮蔽误读。
-                enum ForPre {
-                    Range(Box<(IrExpr, IrExpr, Option<IrExpr>)>),
-                    Query(Box<crate::ir::CompiledCursorSql>),
-                    Cursor,
-                }
-                let pre = match &f.kind {
+                // 查询文本必须在变量绑定前解析（同名外层变量不被遮蔽误读），
+                // 各分支先预编译再 declare，循环结束回卷映射。
+                use ogsql_parser::ast::plpgsql::PlForKind;
+                let start = f
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| self.synth_label("for_start"));
+                let end = f
+                    .end_label
+                    .clone()
+                    .unwrap_or_else(|| format!("{start}__end"));
+                self.loop_stack.push((start.clone(), end.clone()));
+                match &f.kind {
                     PlForKind::Range {
                         low,
                         high,
@@ -271,62 +276,11 @@ impl Compiler {
                                 "FOR REVERSE is not supported in v1",
                             ));
                         }
-                        ForPre::Range(Box::new((
-                            self.expr(low)?,
-                            self.expr(high)?,
-                            step.as_ref().map(|s| self.expr(s)).transpose()?,
-                        )))
-                    }
-                    PlForKind::Query {
-                        query,
-                        parsed_query,
-                        using_args,
-                    } => {
-                        if !using_args.is_empty() {
-                            return Err(EngineError::invariant(
-                                58,
-                                "FOR rec IN query USING is not supported in v1",
-                            ));
-                        }
-                        let text = match parsed_query {
-                            Some(st) => {
-                                ogsql_parser::formatter::SqlFormatter::new().format_statement(st)
-                            }
-                            None => query.clone(),
-                        };
-                        let unit =
-                            rewrite_sql(&text, &self.vars, &self.rules, &self.routine_names)?;
-                        ForPre::Query(Box::new((unit.text, unit.binds, unit.fn_sites)))
-                    }
-                    PlForKind::Cursor { arguments, .. } => {
-                        if !arguments.is_empty() {
-                            return Err(EngineError::invariant(
-                                59,
-                                "FOR rec IN cursor(args) is not supported in v1",
-                            ));
-                        }
-                        ForPre::Cursor
-                    }
-                };
-                // 循环变量是循环体词法作用域内的绑定：遮蔽外层同名绑定，
-                // 循环结束回卷映射。
-                let (canon, scoped) = self.vars.declare(&f.variable.to_ascii_lowercase());
-                let var = VarName(canon);
-                let start = f
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| self.synth_label("for_start"));
-                let end = f
-                    .end_label
-                    .clone()
-                    .unwrap_or_else(|| format!("{start}__end"));
-                self.loop_stack.push((start.clone(), end.clone()));
-                match &f.kind {
-                    PlForKind::Range { .. } => {
-                        let ForPre::Range(exprs) = pre else {
-                            unreachable!("pre 与 f.kind 同源")
-                        };
-                        let (e_low, e_high, e_step) = *exprs;
+                        let e_low = self.expr(low)?;
+                        let e_high = self.expr(high)?;
+                        let e_step = step.as_ref().map(|s| self.expr(s)).transpose()?;
+                        let (canon, scoped) = self.vars.declare(&f.variable.to_ascii_lowercase());
+                        let var = VarName(canon);
                         self.code.push(IrStmt::Assign {
                             target: AssignTarget::Var(var.clone()),
                             expr: e_low,
@@ -349,29 +303,56 @@ impl Compiler {
                             },
                         });
                         self.jump(&start, None, true);
+                        self.vars.restore(&scoped);
                     }
-                    PlForKind::Query { .. } => {
+                    PlForKind::Query {
+                        query,
+                        parsed_query,
+                        using_args,
+                    } => {
                         // FOR rec IN <query>：脱糖为隐式游标（§7.3.4），
                         // 与显式游标共用 OPEN/FETCH/CLOSE 语义与 %NOTFOUND 判定
-                        let ForPre::Query(unit) = pre else {
-                            unreachable!("pre 与 f.kind 同源")
+                        if !using_args.is_empty() {
+                            return Err(EngineError::invariant(
+                                58,
+                                "FOR rec IN query USING is not supported in v1",
+                            ));
+                        }
+                        let text = match parsed_query {
+                            Some(st) => {
+                                ogsql_parser::formatter::SqlFormatter::new().format_statement(st)
+                            }
+                            None => query.clone(),
                         };
-                        let (sql, binds, fn_sites) = *unit;
+                        let unit =
+                            rewrite_sql(&text, &self.vars, &self.rules, &self.routine_names)?;
+                        let (canon, scoped) = self.vars.declare(&f.variable.to_ascii_lowercase());
+                        let var = VarName(canon);
                         let cname = self.synth_label("for_cur");
                         self.code.push(IrStmt::OpenCursor {
                             cursor: VarName(cname.clone()),
                             source: CursorSource::Static {
-                                sql,
-                                binds,
-                                fn_sites,
+                                sql: unit.text,
+                                binds: unit.binds,
+                                fn_sites: unit.fn_sites,
                             },
                         });
                         self.for_cursor_loop(&VarName(cname.clone()), &var, &f.body, &start, &end)?;
                         self.code.push(IrStmt::CloseCursor {
                             cursor: VarName(cname),
                         });
+                        self.vars.restore(&scoped);
                     }
-                    PlForKind::Cursor { cursor_name, .. } => {
+                    PlForKind::Cursor {
+                        cursor_name,
+                        arguments,
+                    } => {
+                        if !arguments.is_empty() {
+                            return Err(EngineError::invariant(
+                                59,
+                                "FOR rec IN cursor(args) is not supported in v1",
+                            ));
+                        }
                         let name = match cursor_name {
                             Expr::PlVariable(n) | Expr::ColumnRef(n) => ident_path(n),
                             other => {
@@ -392,6 +373,8 @@ impl Compiler {
                                     format!("FOR rec IN {name}: cursor query not compiled"),
                                 )
                             })?;
+                        let (canon, scoped) = self.vars.declare(&f.variable.to_ascii_lowercase());
+                        let var = VarName(canon);
                         let cname = VarName(name.clone());
                         self.code.push(IrStmt::OpenCursor {
                             cursor: cname.clone(),
@@ -403,11 +386,11 @@ impl Compiler {
                         });
                         self.for_cursor_loop(&cname, &var, &f.body, &start, &end)?;
                         self.code.push(IrStmt::CloseCursor { cursor: cname });
+                        self.vars.restore(&scoped);
                     }
                 }
                 self.loop_stack.pop();
                 self.mark(&end);
-                self.vars.restore(&scoped);
             }
             PlStatement::ProcedureCall(pc_stmt) => {
                 let name = ident_path(&pc_stmt.name);
@@ -480,9 +463,7 @@ impl Compiler {
                     None => self.stmts(&b.body)?,
                     Some(exc) => self.trap_section(&b.body, exc)?,
                 }
-                for r in restores.iter().rev() {
-                    self.vars.restore(r);
-                }
+                self.apply_restores(&restores);
             }
             PlStatement::Execute(sp) => {
                 // EXECUTE IMMEDIATE：统一走动态管线（与 OPEN FOR 同口径，

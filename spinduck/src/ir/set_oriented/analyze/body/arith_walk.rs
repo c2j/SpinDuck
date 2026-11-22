@@ -164,32 +164,36 @@ fn lookup_binds_invariant(expr: &IrExpr, in_params: &std::collections::BTreeSet<
         .all(|v| in_params.contains(&v.0.to_ascii_lowercase()))
 }
 
+/// 算术门判定的只读上下文（AGENTS §3：参数超 5 封装结构体）。
+pub(super) struct ArithGateCtx<'a> {
+    pub prog: &'a IrProg,
+    pub lookups: &'a [lookup::LookupQuery],
+    pub record: &'a VarName,
+    pub inlined: &'a [(VarName, IrExpr)],
+    pub in_params: &'a std::collections::BTreeSet<String>,
+}
+
 /// IF 门整体判定：内联变量代入 + 条件形态 + 变量绑定 + 门体恰一条乘/减赋值。
-#[allow(clippy::too_many_arguments)]
 pub(super) fn gate(
-    prog: &IrProg,
+    ctx: &ArithGateCtx<'_>,
     pc: usize,
     cond: &IrExpr,
-    lookups: &[lookup::LookupQuery],
-    record: &VarName,
-    inlined: &[(VarName, IrExpr)],
-    in_params: &std::collections::BTreeSet<String>,
 ) -> Option<(VarName, IrExpr, IrExpr)> {
-    let cond = subst_inlined(cond, inlined);
+    let cond = subst_inlined(cond, ctx.inlined);
     let IrStmt::Assign {
         target: AssignTarget::Var(v),
         expr,
-    } = &prog.code[pc + 1]
+    } = &ctx.prog.code[pc + 1]
     else {
         return None;
     };
-    let expr = subst_inlined(expr, inlined);
+    let expr = subst_inlined(expr, ctx.inlined);
     if !cond_shape(&cond)
-        || !vars_bound(&cond, lookups)
-        || !lookup_binds_invariant(&cond, in_params)
-        || !expr_shape(&expr, record)
-        || !vars_bound(&expr, lookups)
-        || !lookup_binds_invariant(&expr, in_params)
+        || !vars_bound(&cond, ctx.lookups)
+        || !lookup_binds_invariant(&cond, ctx.in_params)
+        || !expr_shape(&expr, ctx.record)
+        || !vars_bound(&expr, ctx.lookups)
+        || !lookup_binds_invariant(&expr, ctx.in_params)
     {
         return None;
     }
@@ -213,15 +217,14 @@ impl<'a> Body<'a> {
         {
             return None;
         }
-        let (var, cond, expr) = gate(
-            ctx.prog,
-            pc,
-            cond,
-            &self.lookups,
-            &ctx.region.record,
-            &self.inlined,
-            &ctx.in_params,
-        )?;
+        let gate_ctx = ArithGateCtx {
+            prog: ctx.prog,
+            lookups: &self.lookups,
+            record: &ctx.region.record,
+            inlined: &self.inlined,
+            in_params: &ctx.in_params,
+        };
+        let (var, cond, expr) = gate(&gate_ctx, pc, cond)?;
         self.gate = Some((Gate::Arith { cond, var, expr }, to));
         Some(pc + 2)
     }

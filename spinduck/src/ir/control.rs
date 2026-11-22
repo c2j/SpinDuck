@@ -31,6 +31,17 @@ pub(crate) struct Compiler {
     pub(crate) var_types: BTreeMap<String, crate::types::SpinType>,
 }
 
+/// DECLARE 段一次声明的回卷信息：离开声明块时还原变量映射
+/// （[`crate::sql::VarRestore`]）或游标编译产物（同名游标在嵌套
+/// 块/重入例程间不得串改）。
+pub(crate) enum DeclRestore {
+    Var(crate::sql::VarRestore),
+    Cursor {
+        name: String,
+        prev: Option<CompiledCursorSql>,
+    },
+}
+
 /// 嵌套深度上限。取 32 而非 64：解析器与编译器递归帧较大，64 层在默认测试栈
 /// （2 MiB）下会栈溢出（abort），护栏必须先于溢出生效（tests/compiler_contracts.rs
 /// 锁定 31 通过 / 32 拒绝）。
@@ -99,7 +110,7 @@ impl Compiler {
     pub(crate) fn declare_decls(
         &mut self,
         decls: &[ogsql_parser::ast::plpgsql::PlDeclaration],
-    ) -> Result<Vec<crate::sql::VarRestore>, EngineError> {
+    ) -> Result<Vec<DeclRestore>, EngineError> {
         use ogsql_parser::ast::plpgsql::PlDeclaration;
         let mut restores = Vec::new();
         for decl in decls {
@@ -112,12 +123,14 @@ impl Compiler {
                     };
                     let unit =
                         rewrite_sql(&query_text, &self.vars, &self.rules, &self.routine_names)?;
-                    self.pending_cursor_sql
-                        .insert(name, (unit.text, unit.binds, unit.fn_sites));
+                    let prev = self
+                        .pending_cursor_sql
+                        .insert(name.clone(), (unit.text, unit.binds, unit.fn_sites));
+                    restores.push(DeclRestore::Cursor { name, prev });
                 }
                 PlDeclaration::Variable(v) => {
                     let (canon, restore) = self.vars.declare(&v.name.to_ascii_lowercase());
-                    restores.push(restore);
+                    restores.push(DeclRestore::Var(restore));
                     let name = VarName(canon);
                     // `%ROWTYPE`：记录锚定游标 → 单目标 FETCH INTO 按整行记录赋值
                     if let ogsql_parser::ast::plpgsql::PlDataType::PercentRowType(anchor) =
@@ -168,6 +181,23 @@ impl Compiler {
             }
         }
         Ok(restores)
+    }
+
+    /// 离开声明块：逆序应用 DECLARE 段的回卷信息（变量映射 + 游标产物）。
+    pub(crate) fn apply_restores(&mut self, restores: &[DeclRestore]) {
+        for r in restores.iter().rev() {
+            match r {
+                DeclRestore::Var(v) => self.vars.restore(v),
+                DeclRestore::Cursor { name, prev } => match prev {
+                    Some(sql) => {
+                        self.pending_cursor_sql.insert(name.clone(), sql.clone());
+                    }
+                    None => {
+                        self.pending_cursor_sql.remove(name);
+                    }
+                },
+            }
+        }
     }
 
     /// PL 变量面名 → 帧规范名（嵌套遮蔽后的唯一槽位；未登记原样返回）。

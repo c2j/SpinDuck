@@ -1,3 +1,13 @@
+//! 回归守护（AGENTS §4.3）：byfund 语料区域 0（c_get_data）的
+//! 集合化端到端等价性。
+//!
+//! 锁定两条不变量：
+//! 1. 提交进仓库的 `datasets_byfund` 种子上，区域 0 必须
+//!    `BatchAtomic Converted`，且 OUT 形参 + 全部用户表行集与 Off
+//!    逐行全等（业务成功断言，非"两模式同错"）。
+//! 2. 规模化数据（克隆明细行 ×500 → 约 1000 个分组）上仍必须
+//!    `Converted`——防止规模增长后静默回退成 Skipped。
+
 #![cfg(feature = "native")]
 use spinduck_core::exec::{ExecOutcome, RowStream, SqlExecutor};
 use spinduck_core::ir::set_oriented::{SetOrientedMode, Status};
@@ -91,7 +101,7 @@ fn snapshot(eng: &Engine) -> BTreeMap<String, Vec<String>> {
 /// 真实 purchase 语料端到端：byfund 区域 0（c_get_data）必须
 /// BatchAtomic Converted，且 OUT 形参 + 全部用户表行集与 Off 逐行全等。
 #[test]
-fn probe() {
+fn should_convert_byfund_region0_and_match_off_row_for_row() {
     let mut off = deploy_seeded(SetOrientedMode::Off);
     let expected = off
         .call("pkg_split_trade_step3_sh.prc_trd_hz_byfund", &args())
@@ -114,5 +124,42 @@ fn probe() {
         snapshot(&eng),
         expected_state,
         "全部用户表须与 Off 逐行全等"
+    );
+}
+
+/// 规模化守护：把 2 行明细克隆为约 1000 个 GROUP BY 分组
+/// （`bs` 在分组键内且 `to_number(bs)` 参与计算，取值须保持数值形态）。
+/// 只跑 BatchAtomic：规模化下的 Off 逐行解释器耗时不属于 CI 预算；
+/// 小规模种子已由上一测试锁定 Off/Batch 逐行全等。
+#[test]
+fn should_stay_converted_on_byfund_region0_at_scale() {
+    let mut eng = deploy_seeded(SetOrientedMode::BatchAtomic);
+    // 每行克隆 500 份、bs 取 '10'..'509'：2 行 × 500 = 1000 个分组。
+    eng.ex
+        .execute(
+            "INSERT INTO mid_yjqs_detail              SELECT * EXCLUDE (range) REPLACE (CAST(9 + range AS VARCHAR) AS bs)              FROM mid_yjqs_detail, range(500)              WHERE bcrq = '20250715' AND scdm = '001'",
+            &BindMap::new(),
+        )
+        .unwrap();
+    let groups: i64 = eng
+        .ex
+        .query(
+            "SELECT count(*) FROM (               SELECT fund_code, xwdm, bs, security_id, stock_kind                FROM mid_yjqs_detail WHERE bcrq = '20250715' AND scdm = '001'                GROUP BY 1,2,3,4,5)",
+            &BindMap::new(),
+        )
+        .unwrap()
+        .fetch_many(1)[0][0]
+        .as_str_loose()
+        .parse()
+        .unwrap();
+    assert!(groups >= 1000, "克隆应产生 >=1000 分组，实际 {groups}");
+
+    eng.call("pkg_split_trade_step3_sh.prc_trd_hz_byfund", &args())
+        .unwrap();
+    let reports = eng.set_oriented_reports();
+    assert_eq!(reports.len(), 1, "仅区域 0 应产生报告: {reports:?}");
+    assert!(
+        matches!(reports[0].status, Status::Converted { .. }),
+        "规模化数据下区域 0 不得回退为 Skipped: {reports:?}"
     );
 }
