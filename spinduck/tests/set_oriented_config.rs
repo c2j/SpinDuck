@@ -33,7 +33,7 @@ mod cli {
     }
 
     #[test]
-    fn should_override_project_mode_from_cli_and_preserve_batch_skip_policy() {
+    fn should_override_project_mode_from_cli_and_convert_under_batch_commit() {
         for (configured, flags, expected) in [
             (true, vec!["--set-oriented=off"], "CALL copy_rows OK\n"),
             (
@@ -49,7 +49,7 @@ mod cli {
             (
                 false,
                 vec!["--set-oriented=batch-atomic", "--batch-commit"],
-                "SET_ORIENTED copy_rows skipped reason=BatchCommitEnabled\nCALL copy_rows OK\n",
+                "SET_ORIENTED copy_rows converted\nCALL copy_rows OK\n",
             ),
         ] {
             let root = fixture(configured);

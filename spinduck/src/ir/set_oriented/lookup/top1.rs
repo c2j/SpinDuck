@@ -131,6 +131,8 @@ pub(super) fn render_top1(
         key_checks: vec![(key.kind.clone(), corr.cursor_field.clone())],
         tie_guard: Some(tie_guard),
         guard_binds: lq.filter_binds.clone(),
+        miss_guards: Vec::new(),
+        miss_out: None,
     })
 }
 
@@ -194,5 +196,7 @@ pub(super) fn render_top1_lateral(
         key_checks,
         tie_guard: Some(tie_guard),
         guard_binds: lq.filter_binds.clone(),
+        miss_guards: Vec::new(),
+        miss_out: None,
     })
 }

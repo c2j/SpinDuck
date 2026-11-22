@@ -1,18 +1,22 @@
 //! 函数体的顺序赋值、条件与兜底查找折叠。
 
+use super::sqlcols::select_list_parts;
 use super::{arg_total, provably_str_null, pure_expr, subst_env, CallChecks, InlinedCall};
 use super::{AssignTarget, IrExpr, IrProg, IrStmt, RoutineCatalog, SpinType, VarName};
+use crate::catalog::{ParamMode, RoutineParam};
 use crate::ir::BindSrc;
 
 /// 在顺序代入的同时保留槽位安装与被消去求值的证明义务。
 pub(super) fn fold_body(
     catalog: &RoutineCatalog,
     prog: &IrProg,
+    params: &[RoutineParam],
     visiting: &mut Vec<String>,
 ) -> Option<InlinedCall> {
     BodyFolder {
         catalog,
         prog,
+        params,
         visiting,
         env: Vec::new(),
         checks: CallChecks::default(),
@@ -24,6 +28,7 @@ pub(super) fn fold_body(
 struct BodyFolder<'a> {
     catalog: &'a RoutineCatalog,
     prog: &'a IrProg,
+    params: &'a [RoutineParam],
     visiting: &'a mut Vec<String>,
     env: Vec<(String, IrExpr)>,
     checks: CallChecks,
@@ -62,8 +67,22 @@ impl BodyFolder<'_> {
         if matches!(self.result, Some(IrExpr::Const(_))) && !constant_body_total(self.prog) {
             return None;
         }
+        let mut outs = Vec::new();
+        for (idx, p) in self.params.iter().enumerate() {
+            match p.mode {
+                ParamMode::In => {}
+                ParamMode::InOut => return None,
+                ParamMode::Out => {
+                    let key = p.name.to_ascii_lowercase();
+                    if let Some((_, expr)) = self.env.iter().find(|(k, _)| *k == key) {
+                        outs.push((idx, expr.clone()));
+                    }
+                }
+            }
+        }
         Some(InlinedCall {
             expr: self.result?,
+            outs,
             checks: self.checks,
         })
     }
@@ -88,13 +107,16 @@ impl BodyFolder<'_> {
     }
 
     fn lookup(&mut self, pc: usize) -> Option<usize> {
-        let (key, lookup, next) =
-            fold_lookup(self.catalog, &self.prog.code, pc, &self.env, self.visiting)?;
-        if self.prog.var_types.get(&key) == Some(&SpinType::Varchar) {
-            self.checks.varchar_inputs.push(lookup.clone());
-        }
-        write_env(&mut self.env, key, lookup);
-        Some(next)
+        let prog = self.prog;
+        fold_trap(
+            self.catalog,
+            prog,
+            self.visiting,
+            &mut self.checks,
+            &mut self.env,
+            &prog.code,
+            pc,
+        )
     }
 
     fn conditional(&mut self, pc: usize, cond: &IrExpr, to: usize) -> Option<()> {
@@ -222,53 +244,43 @@ fn apply_assign(
     Some(())
 }
 
-fn fold_lookup(
-    catalog: &RoutineCatalog,
-    code: &[IrStmt],
-    pc: usize,
+/// `$v_` 绑定 → 实参表达式（env 代入后）。
+/// `BindSrc::Expr` 仅存于 lookup 文法内部，不出现在 IR 绑定；出现即形态破坏，
+/// 保守返回 None 交回调用方放弃折叠。
+fn bind_args(
+    binds: &[(String, BindSrc)],
     env: &[(String, IrExpr)],
-    visiting: &mut Vec<String>,
-) -> Option<(String, IrExpr, usize)> {
-    let IrStmt::SqlQuery {
-        sql,
-        binds,
-        into,
-        fn_sites,
-    } = code.get(pc + 1)?
-    else {
-        return None;
-    };
-    if !fn_sites.is_empty() {
-        return None;
-    }
-    let [AssignTarget::Var(var)] = into.as_slice() else {
-        return None;
-    };
-    let (default, resume) = lookup_handler(code, pc, var)?;
-    let default = subst_env(default.clone(), env);
-    if !pure_expr(catalog, &default, visiting) {
-        return None;
-    }
-    let mut args = Vec::with_capacity(binds.len());
-    for (ph, src) in binds {
-        let arg = match src {
-            BindSrc::Var(v) => IrExpr::Var(v.clone()),
-            BindSrc::Field { rec, field } => IrExpr::Field {
-                rec: rec.clone(),
-                field: field.clone(),
-            },
-        };
-        args.push((ph.clone(), subst_env(arg, env)));
-    }
-    let lookup = IrExpr::Lookup {
-        query: sql.clone(),
-        args,
-        default: Box::new(default),
-    };
-    Some((var.0.to_ascii_lowercase(), lookup, resume))
+) -> Option<Vec<(String, IrExpr)>> {
+    binds
+        .iter()
+        .map(|(ph, src)| {
+            let arg = match src {
+                BindSrc::Var(v) => IrExpr::Var(v.clone()),
+                BindSrc::Field { rec, field } => IrExpr::Field {
+                    rec: rec.clone(),
+                    field: field.clone(),
+                },
+                BindSrc::Expr { .. } => return None,
+            };
+            Some((ph.clone(), subst_env(arg, env)))
+        })
+        .collect()
 }
 
-fn lookup_handler<'a>(code: &'a [IrStmt], pc: usize, var: &VarName) -> Option<(&'a IrExpr, usize)> {
+/// trap 形态解构结果（均借用 `code`）。
+struct TrapShape<'a> {
+    sql: &'a str,
+    binds: &'a [(String, BindSrc)],
+    targets: Vec<VarName>,
+    columns: Vec<String>,
+    from_pos: usize,
+    resume: usize,
+    body: (usize, usize),
+}
+
+/// `PushTrap(others)` + `SqlQuery INTO` + `PopTrap` + `Jump(rejoin)` 形态识别；
+/// handler 段非空且以 `Jump(rejoin)` 收束。任一环节不可证 → None。
+fn trap_shape<'a>(code: &'a [IrStmt], pc: usize) -> Option<TrapShape<'a>> {
     let IrStmt::PushTrap { entries } = code.get(pc)? else {
         return None;
     };
@@ -278,9 +290,24 @@ fn lookup_handler<'a>(code: &'a [IrStmt], pc: usize, var: &VarName) -> Option<(&
     if !entry.conds.iter().all(|c| c.eq_ignore_ascii_case("others")) {
         return None;
     }
-    let (start, end) = (entry.body_start, entry.body_end);
-    if end != start + 1 || end >= code.len() {
+    let IrStmt::SqlQuery {
+        sql,
+        binds,
+        into,
+        fn_sites,
+    } = code.get(pc + 1)?
+    else {
         return None;
+    };
+    if !fn_sites.is_empty() || into.is_empty() {
+        return None;
+    }
+    let mut targets = Vec::with_capacity(into.len());
+    for t in into {
+        let AssignTarget::Var(v) = t else {
+            return None;
+        };
+        targets.push(v.clone());
     }
     if !matches!(code.get(pc + 2), Some(IrStmt::PopTrap)) {
         return None;
@@ -288,18 +315,112 @@ fn lookup_handler<'a>(code: &'a [IrStmt], pc: usize, var: &VarName) -> Option<(&
     let IrStmt::Jump(resume) = code.get(pc + 3)? else {
         return None;
     };
-    let IrStmt::Assign {
-        target: AssignTarget::Var(handler_var),
-        expr,
-    } = code.get(start)?
-    else {
-        return None;
-    };
-    if !handler_var.0.eq_ignore_ascii_case(&var.0) {
+    let resume = *resume;
+    let (bstart, bend) = (entry.body_start, entry.body_end);
+    if bend >= code.len() || bend <= bstart {
         return None;
     }
-    if !matches!(code.get(end), Some(IrStmt::Jump(target)) if target == resume) {
+    if !matches!(code.get(bend), Some(IrStmt::Jump(t)) if *t == resume) {
         return None;
     }
-    Some((expr, *resume))
+    let (columns, from_pos) = select_list_parts(sql)?;
+    if columns.len() != targets.len() {
+        return None;
+    }
+    Some(TrapShape {
+        sql,
+        binds,
+        targets,
+        columns,
+        from_pos,
+        resume,
+        body: (bstart, bend),
+    })
+}
+
+/// handler 段顺序折叠：Nop 跳过、Assign 代入、嵌套 PushTrap 递归；
+/// 赋值目标必须属于本层 INTO 目标集（否则条件写回无法用 env 表达 → None）；
+/// 其余语句形态（含段内无条件跳转）→ None。
+fn fold_span(
+    catalog: &RoutineCatalog,
+    prog: &IrProg,
+    visiting: &mut Vec<String>,
+    checks: &mut CallChecks,
+    env: &mut Vec<(String, IrExpr)>,
+    code: &[IrStmt],
+    shape: &TrapShape<'_>,
+) -> Option<()> {
+    let allowed: std::collections::BTreeSet<String> = shape
+        .targets
+        .iter()
+        .map(|v| v.0.to_ascii_lowercase())
+        .collect();
+    let (mut i, end) = shape.body;
+    while i < end {
+        match &code[i] {
+            IrStmt::Nop => i += 1,
+            IrStmt::Assign {
+                target: AssignTarget::Var(v),
+                expr,
+            } => {
+                if !allowed.contains(&v.0.to_ascii_lowercase()) {
+                    return None;
+                }
+                apply_assign(catalog, env, v, expr, visiting)?;
+                i += 1;
+            }
+            IrStmt::PushTrap { .. } => {
+                i = fold_trap(catalog, prog, visiting, checks, env, code, i)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(())
+}
+
+/// trap 保护段折叠：handler 段在克隆 env 上折叠（嵌套 trap 递归、普通赋值
+/// 为条件兜底）；每个 INTO 目标生成独立 `Lookup`——query 包装为单列
+/// `SELECT <col> FROM (<原SQL>)`，default 取 handler 折叠后该变量的值。
+/// 返回 rejoin 目标 pc；形态不可证 → None。
+fn fold_trap(
+    catalog: &RoutineCatalog,
+    prog: &IrProg,
+    visiting: &mut Vec<String>,
+    checks: &mut CallChecks,
+    env: &mut Vec<(String, IrExpr)>,
+    code: &[IrStmt],
+    pc: usize,
+) -> Option<usize> {
+    let shape = trap_shape(code, pc)?;
+    let mut henv = env.clone();
+    fold_span(catalog, prog, visiting, checks, &mut henv, code, &shape)?;
+    let args = bind_args(shape.binds, env)?;
+    for (k, var) in shape.targets.iter().enumerate() {
+        let key = var.0.to_ascii_lowercase();
+        let (_, default) = henv.iter().find(|(n, _)| *n == key)?;
+        if !pure_expr(catalog, default, visiting) {
+            return None;
+        }
+        // 单目标保持原 SQL 逐字（下游 parse_inline/parse_total 文法约束）；
+        // 多目标按原列文本拼接单列 SELECT，保留 FROM 起的全部子句。
+        let query = if shape.targets.len() == 1 {
+            shape.sql.to_string()
+        } else {
+            format!(
+                "SELECT {} {}",
+                shape.columns[k],
+                &shape.sql[shape.from_pos..]
+            )
+        };
+        let lookup = IrExpr::Lookup {
+            query,
+            args: args.clone(),
+            default: Box::new(default.clone()),
+        };
+        if prog.var_types.get(&key) == Some(&SpinType::Varchar) {
+            checks.varchar_inputs.push(lookup.clone());
+        }
+        write_env(env, key, lookup);
+    }
+    Some(shape.resume)
 }

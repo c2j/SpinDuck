@@ -81,7 +81,10 @@ pub fn schema_snapshot(
 ) -> Result<crate::ir::set_oriented::metadata::SchemaSnapshot, EngineError> {
     let proj =
         codeweb::embed::EmbeddedProject::open_exact(codeweb_root).map_err(map_codeweb_err)?;
-    let export = proj.export_table_schemas().map_err(map_codeweb_err)?;
+    let mut export = proj.export_table_schemas().map_err(map_codeweb_err)?;
+    // codeweb 全局降级收窄：视图/例程文件的"未建模语句"不改基表结构，
+    // 逐文件复核白名单后按表/按文件定责；无法定性的诊断保持全局拒绝。
+    super::scope::scope_export_diagnostics(&mut export);
     Ok(crate::ir::set_oriented::metadata::SchemaSnapshot::from_codeweb(&export, rules))
 }
 

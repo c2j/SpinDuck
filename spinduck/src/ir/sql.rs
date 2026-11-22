@@ -107,6 +107,7 @@ impl Compiler {
                     sql,
                     binds,
                     fn_sites,
+                    buffer_policy: BufferPolicy::Immediate,
                 });
             }
             // 例程体内局部 DDL：CTAS 原文改写为 SqlExec（DuckDB 原生支持
@@ -120,6 +121,7 @@ impl Compiler {
                     sql: unit.text,
                     binds: unit.binds,
                     fn_sites: unit.fn_sites,
+                    buffer_policy: BufferPolicy::Immediate,
                 });
                 self.local_ddl.push(LocalDdlStmt {
                     index: idx,
@@ -136,6 +138,7 @@ impl Compiler {
                     sql,
                     binds: Vec::new(),
                     fn_sites: Vec::new(),
+                    buffer_policy: BufferPolicy::Immediate,
                 });
                 self.local_ddl.push(LocalDdlStmt {
                     index: idx,
@@ -260,16 +263,16 @@ impl Compiler {
 
     pub(crate) fn assign_target(&mut self, e: &Expr) -> Result<AssignTarget, EngineError> {
         match e {
-            Expr::PlVariable(name) => Ok(AssignTarget::Var(VarName(ident_path(name)))),
+            Expr::PlVariable(name) => Ok(AssignTarget::Var(self.var_name(&ident_path(name)))),
             Expr::ColumnRef(name) => {
                 // 首段为帧内记录变量 → RecordField（§3.2 消歧；M2 帧为编译期可见集合）
                 if name.len() == 2 {
                     Ok(AssignTarget::Field {
-                        rec: VarName(ident0(name)),
+                        rec: self.var_name(&ident0(name)),
                         field: ident1(name),
                     })
                 } else {
-                    Ok(AssignTarget::Var(VarName(ident_path(name))))
+                    Ok(AssignTarget::Var(self.var_name(&ident_path(name))))
                 }
             }
             other => Err(EngineError::invariant(

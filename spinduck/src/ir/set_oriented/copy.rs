@@ -1,17 +1,23 @@
 //! 已证明 CopyLoop 的批写 SQL 生成与写入边界守卫。
 
+mod agg_proj;
+mod arith;
+mod badrow;
 mod case;
 mod inline;
 mod inputs;
 
 use super::schema::{Column, Default, Table};
 use super::shape::{self, Name};
-use super::{expr, lookup, substitute_binds, BindSrc, CopyLoop, SinkOp, SkipReason};
+use super::{agg, entry, expr, lookup, substitute_binds, BindSrc, CopyLoop, SinkOp, SkipReason};
+use badrow::sd_cur_cte;
 use inline::{inline_projection, ProjEnv};
 
 pub(super) struct CopySql {
     pub sql: String,
     pub expr_guards: Vec<String>,
+    /// INSERT 位 fn_site 的 distinct-over-sd_cur 前导查询（needs_sd_cur）。
+    pub fn_preludes: Vec<entry::FnPrelude>,
 }
 
 pub(super) fn copy_sql(
@@ -19,6 +25,8 @@ pub(super) fn copy_sql(
     shapes: (&shape::Select, &shape::Insert),
     tables: (&Table, &Table),
     lookups: &[lookup::ResolvedLookup],
+    tuples: &[lookup::ResolvedTuple],
+    aggs: &[agg::ResolvedAgg],
 ) -> Result<CopySql, SkipReason> {
     let (select, insert) = shapes;
     let (source, target) = tables;
@@ -31,9 +39,12 @@ pub(super) fn copy_sql(
         select,
         source,
         lookups,
+        tuples,
+        aggs,
         ctes: &mut ctes,
         joins: &mut joins,
         expr_guards: &mut expr_guards,
+        kernel_guards: Vec::new(),
     };
     inputs::prove(region, &env)?;
     for l in lookups.iter().filter(|l| l.filter_on_miss) {
@@ -43,7 +54,27 @@ pub(super) fn copy_sql(
     for (var, value) in &region.inline_checks {
         inline::check_evaluation(region, (var, value), &mut env)?;
     }
-    let (projections, write_guards) = write_projections(region, insert, target, &mut env)?;
+    let (projections, write_guards, kernel_guards) =
+        write_projections(region, insert, target, &mut env)?;
+    let fn_preludes = fn_distincts(region, select, source, &mut env)?;
+    // 内核域守卫必须先于写守卫坏行计数：COUNT 求值顺序保证溢出行
+    // 先触发整体回退，写守卫 COUNT 不会对含溢出算术的行求值。
+    badrow::kernel_row_guard(
+        &kernel_guards,
+        select,
+        source,
+        (&ctes, &joins),
+        &mut expr_guards,
+    );
+    if region.insert_log || !kernel_guards.is_empty() {
+        badrow::bad_row_guard(
+            &write_guards,
+            select,
+            source,
+            (&ctes, &joins),
+            &mut expr_guards,
+        );
+    }
     guards.extend(write_guards);
     if select
         .sources
@@ -59,17 +90,128 @@ pub(super) fn copy_sql(
         projections,
         (guards, ctes, joins),
     );
-    Ok(CopySql { sql, expr_guards })
+    Ok(CopySql {
+        sql,
+        expr_guards,
+        fn_preludes,
+    })
 }
+
+/// INSERT 位 fn_site 的 distinct-over-sd_cur 前导查询：实参按投影
+/// 环境渲染（`$v_` → sd_cur 列 / 行级表达式 / IN 形参占位符），CTE/join
+/// 与主批写同口径；渲染后仍残留的 `$v_` 占位符按 site.binds 回填，
+/// 运行期由物化前导从帧解析。
+fn fn_distincts(
+    region: &CopyLoop<'_>,
+    select: &shape::Select,
+    source: &Table,
+    env: &mut ProjEnv<'_>,
+) -> Result<Vec<entry::FnPrelude>, SkipReason> {
+    region
+        .insert_sites
+        .iter()
+        .map(|site| {
+            let args = distinct_args(&site.distinct_sql)?;
+            if args.len() != site.arity {
+                return Err(SkipReason::UnresolvedFnSite);
+            }
+            let mut rendered = Vec::with_capacity(args.len());
+            for arg in &args {
+                rendered.push(expr::render_arg(
+                    arg,
+                    region,
+                    env.select,
+                    env.source,
+                    &mut |v| expression_var(region, v, env),
+                )?);
+            }
+            let with = std::iter::once(sd_cur_cte(select, source))
+                .chain(env.ctes.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let join_sql = if env.joins.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", env.joins.join(" "))
+            };
+            let sql = format!(
+                "WITH {with} SELECT DISTINCT {} FROM sd_cur{join_sql}",
+                rendered.join(", ")
+            );
+            let tokens = shape::Tokens::new(&sql).ok_or(SkipReason::UnprovenWriteCompleteness)?;
+            let words = tokens.words();
+            let binds = site
+                .binds
+                .iter()
+                .filter(|(ph, _)| words.iter().any(|w| w == ph))
+                .cloned()
+                .collect();
+            Ok(entry::FnPrelude {
+                table: site.table.clone(),
+                name: site.name.clone(),
+                distinct_sql: sql,
+                binds,
+                arity: site.arity,
+                needs_sd_cur: true,
+            })
+        })
+        .collect()
+}
+
+/// distinct_sql 的 SELECT 列表项：`select [distinct] item (, item)*`，
+/// 顶层逗号切分，词法 token 以空格重组（analyze 已证无 FROM 子句）。
+fn distinct_args(sql: &str) -> Result<Vec<String>, SkipReason> {
+    let bad = SkipReason::UnresolvedFnSite;
+    let t = shape::Tokens::new(sql).ok_or(bad)?;
+    let w = t.words();
+    if w.first().map(String::as_str) != Some("select") {
+        return Err(bad);
+    }
+    let mut i = 1;
+    if w.get(i).is_some_and(|x| x == "distinct") {
+        i += 1;
+    }
+    let mut items = Vec::new();
+    let mut cur: Vec<&str> = Vec::new();
+    let mut depth = 0i32;
+    for word in &w[i..] {
+        match word.as_str() {
+            "(" => {
+                depth += 1;
+                cur.push(word);
+            }
+            ")" => {
+                depth -= 1;
+                cur.push(word);
+            }
+            "," if depth == 0 => {
+                items.push(cur.join(" "));
+                cur = Vec::new();
+            }
+            _ => cur.push(word),
+        }
+    }
+    if !cur.is_empty() {
+        items.push(cur.join(" "));
+    }
+    if items.is_empty() {
+        return Err(bad);
+    }
+    Ok(items)
+}
+
+/// 写投影产物：SELECT 列 / 行级守卫 / 内核域守卫。
+type WriteProjections = (Vec<String>, Vec<String>, Vec<String>);
 
 fn write_projections(
     region: &CopyLoop<'_>,
     insert: &shape::Insert,
     target: &Table,
     env: &mut ProjEnv<'_>,
-) -> Result<(Vec<String>, Vec<String>), SkipReason> {
+) -> Result<WriteProjections, SkipReason> {
     let mut projections = Vec::new();
     let mut guards = Vec::new();
+    let mut kernel_guards = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for (name, parameter) in insert.columns.iter().zip(&insert.parameters) {
         if !seen.insert(&name.0) {
@@ -82,11 +224,15 @@ fn write_projections(
             .ok_or(SkipReason::UnknownObjectDependency)?;
         let guarded = projection(region, parameter, to, env)?;
         projections.push(guarded.expr);
+        if !guarded.kernel_guard.is_empty() {
+            kernel_guards.push(guarded.kernel_guard);
+        }
         if !guarded.guard.is_empty() {
             guards.push(guarded.guard);
         }
     }
-    Ok((projections, guards))
+    kernel_guards.append(&mut env.kernel_guards);
+    Ok((projections, guards, kernel_guards))
 }
 
 fn prove_omitted_columns(insert: &shape::Insert, target: &Table) -> Result<(), SkipReason> {
@@ -115,22 +261,34 @@ fn projection(
 ) -> Result<expr::GuardedExpr, SkipReason> {
     if let Some(field) = single_field(region, parameter) {
         if !region.allow_filter {
-            return Ok(expr::GuardedExpr {
-                expr: field_projection(env.select, env.source, to, &field)?,
-                guard: String::new(),
-            });
+            return field_projection(env.select, env.source, to, &field);
         }
     } else if let Some((_, BindSrc::Var(v))) = region.binds.iter().find(|(p, _)| p == parameter) {
+        if let Some(w) = region.arith_writes.iter().find(|w| w.var == *v) {
+            return arith::projection(region, w, to, env);
+        }
         if let Some(lq) = env.lookups.iter().find(|l| &l.var == v) {
             return lookup_projection(region, lq, to, env);
         }
         if let Some((_, ie)) = region.inlined.iter().find(|(iv, _)| iv == v) {
             return inline_projection(region, to, (v, ie), env);
         }
+        if let Some(g) = tuple_projection(to, v, env)? {
+            return Ok(g);
+        }
+        // §4.2：循环不变 IN 形参按占位符投影，值域守卫与写汇同口径。
+        if region.in_params.contains(&v.0.to_ascii_lowercase()) {
+            return Ok(expr::at_write_sink(parameter.to_string(), to));
+        }
         return sink_projection(region, env.select, env.source, to, v);
     }
     if !region.allow_filter {
         return Err(SkipReason::UnsupportedWrite);
+    }
+    if let Some(field) = single_field(region, parameter) {
+        if let Some(g) = agg_proj::agg_projection(region, to, &field, env)? {
+            return Ok(g);
+        }
     }
     expr::prove(parameter, region, (env.select, env.source), to, &mut |v| {
         expression_var(region, v, env)
@@ -143,13 +301,39 @@ fn expression_var(
     env: &mut ProjEnv<'_>,
 ) -> Result<expr::BoundExpr, SkipReason> {
     let bad = SkipReason::UnprovenWriteCompleteness;
-    if region.var_types.get(&var.0) == Some(&crate::types::SpinType::Varchar) {
-        return Err(bad);
-    }
     if let Some((_, value)) = region.inlined.iter().find(|(v, _)| v == var) {
         return inline::numeric_projection(region, (var, value), env);
     }
-    let lq = env.lookups.iter().find(|l| &l.var == var).ok_or(bad)?;
+    let Some(lq) = env.lookups.iter().find(|l| &l.var == var) else {
+        return Err(bad);
+    };
+    // ArithWrite 覆写变量：值 = CASE WHEN cond THEN arith ELSE 原值，
+    // 须先于查找分支判定（同名变量同时存在于 lookups）。
+    if let Some(write) = region.arith_writes.iter().find(|w| w.var == *var) {
+        return arith::value_binding(region, write, env);
+    }
+    // 兜底（非跳行）查找：CASE 操作数/比较等非数值位置的值来源——
+    // 命中取值/落空兜底自渲染，Other 域使算术合并自然拒绝误用。
+    if !lq.filter_on_miss && lq.case_sink.is_none() {
+        let members: Vec<_> = env.lookups.iter().filter(|l| l.group == lq.group).collect();
+        let hits = group_hits(&members, env.select, env.source)?;
+        for member in &members {
+            register_lookup(member, env.lookups, env.ctes, env.joins);
+        }
+        return Ok(expr::BoundExpr {
+            value: expr::GuardedExpr {
+                expr: lookup::typed_case(&hits, &lq.render.value, &lq.render.default_sql, &lq.kind),
+                guard: String::new(),
+                kernel_guard: String::new(),
+            },
+            domain: expr::Domain::Other,
+            dbl: None,
+            safe: true,
+        });
+    }
+    if region.var_types.get(&var.0) == Some(&crate::types::SpinType::Varchar) {
+        return Err(bad);
+    }
     if !lq.filter_on_miss
         || lq.case_sink.is_some()
         || !expr::Domain::of(&lq.kind).is_numeric()
@@ -171,8 +355,11 @@ fn expression_var(
         value: expr::GuardedExpr {
             expr: lq.render.value.clone(),
             guard: hits,
+            kernel_guard: String::new(),
         },
         domain: expr::Domain::Numeric,
+        dbl: Some(format!("CAST(({}) AS DOUBLE)", lq.render.value)),
+        safe: true,
     })
 }
 
@@ -194,28 +381,7 @@ fn lookup_projection(
         register_lookup(member, env.lookups, env.ctes, env.joins);
     }
     if let Some(cs) = &lq.case_sink {
-        let operand = env
-            .lookups
-            .iter()
-            .find(|l| l.var == cs.operand)
-            .ok_or(SkipReason::UnprovenExpression)?;
-        let value = case::value(
-            cs,
-            &operand.render.value,
-            env.select,
-            env.source,
-            (to, region.allow_filter),
-        )?;
-        if region.allow_filter {
-            return Ok(guarded_choice(&hits, value, &lq.render.default_sql, to));
-        }
-        return Ok(expr::GuardedExpr {
-            expr: format!(
-                "CASE WHEN {hits} THEN {value} ELSE {} END",
-                lq.render.default_sql
-            ),
-            guard: String::new(),
-        });
+        return case::sink(region, lq, cs, hits, to, env);
     }
     if lq.filter_on_miss {
         if !region.allow_filter {
@@ -226,11 +392,9 @@ fn lookup_projection(
         return Ok(value);
     }
     Ok(expr::GuardedExpr {
-        expr: format!(
-            "CASE WHEN {hits} THEN {} ELSE {} END",
-            lq.render.value, lq.render.default_sql
-        ),
+        expr: lookup::typed_case(&hits, &lq.render.value, &lq.render.default_sql, &lq.kind),
         guard: String::new(),
+        kernel_guard: String::new(),
     })
 }
 
@@ -247,6 +411,7 @@ fn guarded_choice(hits: &str, value: String, default: &str, to: &Column) -> expr
             "CASE WHEN {hits} THEN ({}) ELSE ({}) END",
             selected.guard, fallback.guard
         ),
+        kernel_guard: String::new(),
     }
 }
 
@@ -264,11 +429,7 @@ fn render_copy(
     } else {
         format!(" WHERE ({})", guards.join(") AND ("))
     };
-    let where_clause = match &select.filter {
-        Some(f) => format!(" WHERE {f}"),
-        None => String::new(),
-    };
-    let sd_cur = format!("sd_cur AS ({}{where_clause})", sd_cur_scan(select, source));
+    let sd_cur = sd_cur_cte(select, source);
     let with = std::iter::once(sd_cur)
         .chain(ctes)
         .collect::<Vec<_>>()
@@ -306,6 +467,15 @@ pub(super) fn sd_cur_scan(select: &shape::Select, source: &Table) -> String {
         None => source.qualified.clone(),
     };
     format!("SELECT {proj} FROM {from_clause}")
+}
+
+/// 守卫内嵌的游标行集：verbatim 游标即原文（含 WHERE/GROUP BY——守卫
+/// 针对解释器实际 FETCH 的行集）；普通游标为省略 WHERE 的全源扫描。
+pub(super) fn cur_scan(select: &shape::Select, cur: &Table) -> String {
+    match &select.verbatim {
+        Some(v) => v.clone(),
+        None => sd_cur_scan(select, cur),
+    }
 }
 
 fn register_lookup(
@@ -369,15 +539,30 @@ fn field_projection(
     source: &Table,
     to: &Column,
     field: &Name,
-) -> Result<String, SkipReason> {
+) -> Result<expr::GuardedExpr, SkipReason> {
     let from = source_column(select, source, field)?;
-    if from.kind != to.kind || (from.nullable && !to.nullable) {
-        return Err(SkipReason::UnprovenTargetConstraints);
+    let expr = format!("sd_cur.{}", field.sql());
+    if from.kind == to.kind && !(from.nullable && !to.nullable) {
+        return Ok(expr::GuardedExpr {
+            expr,
+            guard: String::new(),
+            kernel_guard: String::new(),
+        });
     }
-    Ok(format!("sd_cur.{}", field.sql()))
+    // DECIMAL→DECIMAL 窄化/可空性收紧：批写隐式 cast 与解释器同内核语义，
+    // 越界或 NULL 违例行由内核域守卫计数、非零整体回退复现解释器错误。
+    if from.kind.starts_with("decimal(") && to.kind.starts_with("decimal(") {
+        let sink = expr::at_write_sink(expr.clone(), to);
+        return Ok(expr::GuardedExpr {
+            expr,
+            guard: String::new(),
+            kernel_guard: sink.guard,
+        });
+    }
+    Err(SkipReason::UnprovenTargetConstraints)
 }
 
-fn source_column<'a>(
+pub(super) fn source_column<'a>(
     select: &shape::Select,
     source: &'a Table,
     field: &Name,
@@ -393,6 +578,49 @@ fn source_column<'a>(
         .iter()
         .find(|c| c.name == *src)
         .ok_or(SkipReason::UnknownObjectDependency)
+}
+
+/// LookupTuple 槽位投影（§3.2）：`CASE WHEN sd_cnt = 1 THEN <列> ELSE <兜底>`；
+/// 共享派生表/连接按别名去重登记，相关键类型对齐与查找同口径。
+fn tuple_projection(
+    to: &Column,
+    v: &super::VarName,
+    env: &mut ProjEnv<'_>,
+) -> Result<Option<expr::GuardedExpr>, SkipReason> {
+    let Some((t, slot)) = env
+        .tuples
+        .iter()
+        .find_map(|t| t.slots.iter().find(|s| s.var == *v).map(|s| (t, s)))
+    else {
+        return Ok(None);
+    };
+    for (key_kind, cursor_field) in &t.key_checks {
+        let from = source_column(env.select, env.source, cursor_field)?;
+        if &from.kind != key_kind {
+            return Err(SkipReason::UnprovenTargetConstraints);
+        }
+    }
+    if let Some(kind) = &slot.kind {
+        if *kind != to.kind || (slot.nullable && !to.nullable) {
+            return Err(SkipReason::UnprovenTargetConstraints);
+        }
+    } else if slot.nullable && !to.nullable {
+        return Err(SkipReason::UnprovenTargetConstraints);
+    }
+    if !env.ctes.contains(&t.cte) {
+        env.ctes.push(t.cte.clone());
+    }
+    if !env.joins.contains(&t.join) {
+        env.joins.push(t.join.clone());
+    }
+    Ok(Some(expr::GuardedExpr {
+        expr: format!(
+            "CASE WHEN {} THEN {} ELSE {} END",
+            t.hit, slot.value, slot.default_sql
+        ),
+        guard: String::new(),
+        kernel_guard: String::new(),
+    }))
 }
 
 fn sink_projection(

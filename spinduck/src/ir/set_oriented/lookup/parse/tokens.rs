@@ -75,11 +75,13 @@ impl LiteralTokens {
     pub(super) fn skip_alias(&mut self) {
         self.take("as");
         let is_alias = self.peek().is_some_and(|w| {
-            w != "where"
-                && w != "order"
-                && w.chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            !matches!(
+                w,
+                "where" | "order" | "limit" | "group" | "having" | "union" | "intersect" | "except"
+            ) && w
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         });
         if is_alias {
             self.name();

@@ -249,9 +249,11 @@ impl Compiler {
                 self.code.push(IrStmt::CloseCursor { cursor: cname });
             }
             PlStatement::For(f) => {
-                // Range → 计数循环；Query → 隐式游标循环（M4c 打开）
+                // Range → 计数循环；Query → 隐式游标循环（M4c 打开）。
+                // 循环变量词法作用域仅覆盖循环体：边界/步长表达式与游标
+                // 查询文本必须在变量绑定前解析（同名外层变量不被遮蔽误读），
+                // 各分支先预编译再 declare，循环结束回卷映射。
                 use ogsql_parser::ast::plpgsql::PlForKind;
-                let var = VarName(f.variable.to_ascii_lowercase());
                 let start = f
                     .label
                     .clone()
@@ -275,6 +277,10 @@ impl Compiler {
                             ));
                         }
                         let e_low = self.expr(low)?;
+                        let e_high = self.expr(high)?;
+                        let e_step = step.as_ref().map(|s| self.expr(s)).transpose()?;
+                        let (canon, scoped) = self.vars.declare(&f.variable.to_ascii_lowercase());
+                        let var = VarName(canon);
                         self.code.push(IrStmt::Assign {
                             target: AssignTarget::Var(var.clone()),
                             expr: e_low,
@@ -283,14 +289,11 @@ impl Compiler {
                         let cond = IrExpr::Bin {
                             op: BinOp::Le,
                             l: Box::new(IrExpr::Var(var.clone())),
-                            r: Box::new(self.expr(high)?),
+                            r: Box::new(e_high),
                         };
                         self.jump(&end, Some(cond), false);
                         self.stmts(&f.body)?;
-                        let step_inc = match step {
-                            Some(s) => self.expr(s)?,
-                            None => IrExpr::Const(SpinValue::Int(1)),
-                        };
+                        let step_inc = e_step.unwrap_or(IrExpr::Const(SpinValue::Int(1)));
                         self.code.push(IrStmt::Assign {
                             target: AssignTarget::Var(var.clone()),
                             expr: IrExpr::Bin {
@@ -300,6 +303,7 @@ impl Compiler {
                             },
                         });
                         self.jump(&start, None, true);
+                        self.vars.restore(&scoped);
                     }
                     PlForKind::Query {
                         query,
@@ -322,6 +326,8 @@ impl Compiler {
                         };
                         let unit =
                             rewrite_sql(&text, &self.vars, &self.rules, &self.routine_names)?;
+                        let (canon, scoped) = self.vars.declare(&f.variable.to_ascii_lowercase());
+                        let var = VarName(canon);
                         let cname = self.synth_label("for_cur");
                         self.code.push(IrStmt::OpenCursor {
                             cursor: VarName(cname.clone()),
@@ -335,6 +341,7 @@ impl Compiler {
                         self.code.push(IrStmt::CloseCursor {
                             cursor: VarName(cname),
                         });
+                        self.vars.restore(&scoped);
                     }
                     PlForKind::Cursor {
                         cursor_name,
@@ -366,6 +373,8 @@ impl Compiler {
                                     format!("FOR rec IN {name}: cursor query not compiled"),
                                 )
                             })?;
+                        let (canon, scoped) = self.vars.declare(&f.variable.to_ascii_lowercase());
+                        let var = VarName(canon);
                         let cname = VarName(name.clone());
                         self.code.push(IrStmt::OpenCursor {
                             cursor: cname.clone(),
@@ -377,6 +386,7 @@ impl Compiler {
                         });
                         self.for_cursor_loop(&cname, &var, &f.body, &start, &end)?;
                         self.code.push(IrStmt::CloseCursor { cursor: cname });
+                        self.vars.restore(&scoped);
                     }
                 }
                 self.loop_stack.pop();
@@ -412,6 +422,7 @@ impl Compiler {
                     sql: unit.text,
                     binds: unit.binds,
                     fn_sites: Vec::new(),
+                    buffer_policy: BufferPolicy::Immediate,
                 });
             }
             PlStatement::Raise(ra) => {
@@ -443,10 +454,16 @@ impl Compiler {
                 if let Some(l) = &b.label {
                     self.mark(l);
                 }
+                // 嵌套块 DECLARE 段：变量/游标入变量集并生成初始化指令，
+                // 与例程顶层声明同一 declare_decls 口径；块结束逆序回卷
+                // 变量映射——内层遮蔽变量离开块后不再可见（PL/SQL 词法
+                // 作用域；处理器体在回卷前编译，仍可见块内变量）。
+                let restores = self.declare_decls(&b.declarations)?;
                 match &b.exception_block {
                     None => self.stmts(&b.body)?,
                     Some(exc) => self.trap_section(&b.body, exc)?,
                 }
+                self.apply_restores(&restores);
             }
             PlStatement::Execute(sp) => {
                 // EXECUTE IMMEDIATE：统一走动态管线（与 OPEN FOR 同口径，

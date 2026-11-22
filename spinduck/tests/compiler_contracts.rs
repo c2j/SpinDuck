@@ -545,3 +545,90 @@ fn should_render_lowercase_oracle_format() {
     assert_eq!(oracle_format_to_strftime("YYYYMMDD"), "%Y%m%d");
     assert_eq!(oracle_format_to_strftime("yyyy-mm-dd"), "%Y-%m-%d");
 }
+
+#[test]
+fn should_bind_variables_declared_in_nested_for_block() {
+    // 语料 PKG_SPLIT_TRADE_STEP3_SH.prc_trd_hz_byfund QFII 段：FOR 循环体内
+    // DECLARE 块声明的变量必须进入变量集——此前 INSERT VALUES 中残留裸
+    // 标识符，DuckDB binder 报 "Referenced column v_security_id was not
+    // found because the FROM clause is missing"。
+    let (ex, log) = Recorder::with_script(&["a"], vec![vec![SpinValue::Int(1)]]);
+    let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+    eng.register(
+        "CREATE OR REPLACE PROCEDURE p_nested IS \
+         BEGIN \
+           FOR r IN (SELECT 1 AS a) LOOP \
+             DECLARE v_sid VARCHAR(20); \
+             BEGIN \
+               v_sid := 'S'; \
+               INSERT INTO out_t(v) VALUES (v_sid); \
+             END; \
+           END LOOP; \
+         END;",
+    )
+    .unwrap();
+    eng.call("p_nested", &[]).unwrap();
+    let calls = log.borrow().clone();
+    let ins = calls
+        .iter()
+        .find(|s| s.contains("insert into out_t"))
+        .expect("INSERT 应下发");
+    assert!(ins.contains("$v_v_sid"), "嵌套块声明变量应绑定：{ins}");
+}
+
+#[test]
+fn should_keep_outer_variable_when_nested_block_shadows_it() {
+    // PL/SQL 词法作用域：内层 DECLARE x 遮蔽外层 x 仅在块内有效，
+    // 块结束后外层 x 保留原值。此前嵌套声明并入扁平变量空间，
+    // 内层初始化泄漏到外层（评审复现：应返回 7 而非 99/100）。
+    let (ex, _log) = Recorder::with_script(&["a"], vec![vec![SpinValue::Int(1)]]);
+    let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+    eng.register(
+        "CREATE OR REPLACE PROCEDURE p_shadow(p_o OUT INTEGER) IS \
+         x INTEGER := 7; \
+         BEGIN \
+           DECLARE x INTEGER := 99; \
+           BEGIN \
+             x := x + 1; \
+           END; \
+           p_o := x; \
+         END;",
+    )
+    .unwrap();
+    let r = eng.call("p_shadow", &[SpinValue::Null]).unwrap();
+    assert_eq!(
+        r.outs.get("p_o"),
+        Some(&SpinValue::Int(7)),
+        "内层遮蔽不得污染外层变量: {:?}",
+        r.outs
+    );
+}
+
+#[test]
+fn should_bind_inner_and_outer_sql_refs_to_their_own_slots() {
+    // 同名遮蔽变量在 SQL 文本中的绑定必须分槽：块内 INSERT 绑内层值，
+    // 块后 INSERT 绑外层值（占位符同名 $v_v，绑定目标不同）。
+    let (ex, log) = Recorder::with_script(&["a"], vec![vec![SpinValue::Int(1)]]);
+    let mut eng = Engine::new(Box::new(ex), RuleRegistry::default());
+    eng.register(
+        "CREATE OR REPLACE PROCEDURE p_bind IS \
+         v VARCHAR(10) := 'OUTER'; \
+         BEGIN \
+           DECLARE v VARCHAR(10) := 'INNER'; \
+           BEGIN \
+             INSERT INTO t(x) VALUES (v); \
+           END; \
+           INSERT INTO t(x) VALUES (v); \
+         END;",
+    )
+    .unwrap();
+    eng.call("p_bind", &[]).unwrap();
+    let calls = log.borrow().clone();
+    let ins: Vec<&String> = calls
+        .iter()
+        .filter(|s| s.contains("insert into t"))
+        .collect();
+    assert_eq!(ins.len(), 2, "应有两条 INSERT: {calls:?}");
+    assert!(ins[0].contains("=INNER"), "块内应绑内层值: {}", ins[0]);
+    assert!(ins[1].contains("=OUTER"), "块后应绑外层值: {}", ins[1]);
+}

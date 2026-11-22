@@ -70,7 +70,7 @@ fn eval_args(
         let v = match args.get(i) {
             Some(ir_a) => {
                 let mut env_ = EvalEnv {
-                    frame: env.frame,
+                    frame: &mut *env.frame,
                     ex: env.ex,
                     cat: env.cat,
                     depth: env.depth,

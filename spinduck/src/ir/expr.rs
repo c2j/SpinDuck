@@ -19,12 +19,12 @@ impl Compiler {
                         up.to_ascii_lowercase()
                     ))));
                 }
-                Ok(IrExpr::Var(VarName(path)))
+                Ok(IrExpr::Var(self.var_name(&path)))
             }
             Expr::ColumnRef(name) => {
                 if name.len() == 2 {
                     Ok(IrExpr::Field {
-                        rec: VarName(ident0(name)),
+                        rec: self.var_name(&ident0(name)),
                         field: ident1(name),
                     })
                 } else {
@@ -37,7 +37,7 @@ impl Compiler {
                         ))));
                     }
                     // 单段标识符在 PL 表达式中仍按变量解释（§3.2 消歧同源）
-                    Ok(IrExpr::Var(VarName(path)))
+                    Ok(IrExpr::Var(self.var_name(&path)))
                 }
             }
             Expr::BinaryOp { left, op, right } => Ok(IrExpr::Bin {

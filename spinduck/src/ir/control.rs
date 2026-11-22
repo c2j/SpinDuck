@@ -4,6 +4,7 @@ use crate::error::EngineError;
 use crate::ir::*;
 use crate::rules::RuleRegistry;
 use crate::runtime::cursor::CursorAttrKind;
+use crate::value::SpinValue;
 use ogsql_parser::ast::plpgsql::PlStatement;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -26,6 +27,19 @@ pub(crate) struct Compiler {
     pub(crate) loop_stack: Vec<(String, String)>, // (start_label, end_label)
     pub(crate) depth: usize,
     pub(crate) synth: usize,
+    /// 变量名 → 推断 SpinType（`%TYPE`/显式类型声明；移交 IrProg）
+    pub(crate) var_types: BTreeMap<String, crate::types::SpinType>,
+}
+
+/// DECLARE 段一次声明的回卷信息：离开声明块时还原变量映射
+/// （[`crate::sql::VarRestore`]）或游标编译产物（同名游标在嵌套
+/// 块/重入例程间不得串改）。
+pub(crate) enum DeclRestore {
+    Var(crate::sql::VarRestore),
+    Cursor {
+        name: String,
+        prev: Option<CompiledCursorSql>,
+    },
 }
 
 /// 嵌套深度上限。取 32 而非 64：解析器与编译器递归帧较大，64 层在默认测试栈
@@ -85,6 +99,120 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// DECLARE 段编译（例程顶层块与嵌套 `BEGIN..END` 块共用）：
+    /// 变量绑定入变量集并生成初始化指令（GaussDB 语义：声明即变量，未给
+    /// 初值时为 NULL）；游标编译为静态 SQL 待 OPEN 使用。
+    /// 嵌套块声明与外层同名时按词法作用域遮蔽：内层变量获得独立规范名，
+    /// 块内引用解析到内层槽位，返回的 [`VarRestore`] 列表须在块编译结束
+    /// 后逆序 [`VarScope::restore`]（例程顶层调用方忽略返回值）。
+    pub(crate) fn declare_decls(
+        &mut self,
+        decls: &[ogsql_parser::ast::plpgsql::PlDeclaration],
+    ) -> Result<Vec<DeclRestore>, EngineError> {
+        use ogsql_parser::ast::plpgsql::PlDeclaration;
+        let mut restores = Vec::new();
+        for decl in decls {
+            match decl {
+                PlDeclaration::Cursor(cd) => {
+                    let name = cd.name.to_ascii_lowercase();
+                    let query_text = match &cd.parsed_query {
+                        Some(q) => ogsql_parser::formatter::SqlFormatter::new().format_statement(q),
+                        None => cd.query.clone(),
+                    };
+                    let unit =
+                        rewrite_sql(&query_text, &self.vars, &self.rules, &self.routine_names)?;
+                    let prev = self
+                        .pending_cursor_sql
+                        .insert(name.clone(), (unit.text, unit.binds, unit.fn_sites));
+                    restores.push(DeclRestore::Cursor { name, prev });
+                }
+                PlDeclaration::Variable(v) => {
+                    let (canon, restore) = self.vars.declare(&v.name.to_ascii_lowercase());
+                    restores.push(DeclRestore::Var(restore));
+                    let name = VarName(canon);
+                    // `%ROWTYPE`：记录锚定游标 → 单目标 FETCH INTO 按整行记录赋值
+                    if let ogsql_parser::ast::plpgsql::PlDataType::PercentRowType(anchor) =
+                        &v.data_type
+                    {
+                        self.rowtype_of
+                            .insert(name.0.clone(), anchor.to_ascii_lowercase());
+                    }
+                    if let ogsql_parser::ast::plpgsql::PlDataType::TypeName(raw) = &v.data_type {
+                        if let Some(ty) = self.rules.spin_type(raw) {
+                            self.var_types.insert(name.0.clone(), ty);
+                        }
+                    }
+                    let init = match &v.default {
+                        Some(e) => self.expr(e)?,
+                        None => IrExpr::Const(SpinValue::Null),
+                    };
+                    self.code.push(IrStmt::Assign {
+                        target: AssignTarget::Var(name),
+                        expr: init,
+                    });
+                }
+                // TYPE .. IS TABLE OF / VARRAY：集合类型解释器未实现，编译期显式
+                // 拒绝（ENG-0071，设计 V4 §4.4 Gate 2A）；RECORD/REF CURSOR 暂不涉及。
+                PlDeclaration::Type(
+                    ogsql_parser::ast::plpgsql::PlTypeDecl::TableOf { .. }
+                    | ogsql_parser::ast::plpgsql::PlTypeDecl::VarrayOf { .. },
+                ) => {
+                    return Err(EngineError::invariant(
+                        71,
+                        "TYPE .. IS TABLE OF / VARRAY is not supported",
+                    ));
+                }
+                // PRAGMA AUTONOMOUS_TRANSACTION / EXCEPTION_INIT：解释器均未实现
+                // （后者静默丢弃会让 `WHEN <name>` 永不命中）——编译期显式拒绝
+                // （ENG-0071，设计 V4 §4.4 Gate 2A）。其余 PRAGMA 维持忽略。
+                PlDeclaration::Pragma { name, .. }
+                    if name.eq_ignore_ascii_case("autonomous_transaction")
+                        || name.eq_ignore_ascii_case("exception_init") =>
+                {
+                    return Err(EngineError::invariant(
+                        71,
+                        "PRAGMA AUTONOMOUS_TRANSACTION / EXCEPTION_INIT is not supported",
+                    ));
+                }
+                // RECORD/TYPE/PRAGMA/嵌套例程：v1 不影响帧布局（嵌套例程 M9）
+                _ => {}
+            }
+        }
+        Ok(restores)
+    }
+
+    /// 离开声明块：逆序应用 DECLARE 段的回卷信息（变量映射 + 游标产物）。
+    pub(crate) fn apply_restores(&mut self, restores: &[DeclRestore]) {
+        for r in restores.iter().rev() {
+            match r {
+                DeclRestore::Var(v) => self.vars.restore(v),
+                DeclRestore::Cursor { name, prev } => match prev {
+                    Some(sql) => {
+                        self.pending_cursor_sql.insert(name.clone(), sql.clone());
+                    }
+                    None => {
+                        self.pending_cursor_sql.remove(name);
+                    }
+                },
+            }
+        }
+    }
+
+    /// PL 变量面名 → 帧规范名（嵌套遮蔽后的唯一槽位；未登记原样返回）。
+    pub(crate) fn var_name(&self, path: &str) -> VarName {
+        let s = path.to_ascii_lowercase();
+        if let Some(c) = self.vars.resolve_opt(&s) {
+            return VarName(c.to_string());
+        }
+        // 限定路径（`rec.field`）：首段命中变量映射时仅替换首段。
+        if let Some((head, tail)) = s.split_once('.') {
+            if let Some(c) = self.vars.resolve_opt(head) {
+                return VarName(format!("{c}{tail}"));
+            }
+        }
+        VarName(s)
     }
 
     /// FOR 隐式游标循环体：FETCH → %NOTFOUND 退出 → 循环体 → 回跳。

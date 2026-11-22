@@ -3,14 +3,17 @@
 
 mod body;
 mod expand;
+mod sqlcols;
 mod subst;
 #[cfg(test)]
 mod tests;
+mod tuple;
 
 use body::fold_body;
 use expand::expand_calls;
 pub(super) use subst::subst_env;
 pub(super) use subst::{resolve_locals, subst_var};
+pub(super) use tuple::{tuple_query, CallSite};
 
 use super::{AssignTarget, BinOp, IrExpr, IrProg, IrStmt, VarName};
 use crate::catalog::{ParamMode, RoutineCatalog, RoutineKind};
@@ -60,8 +63,16 @@ fn summarize_inner(catalog: &RoutineCatalog, name: &str, visiting: &mut Vec<Stri
             _ => Summary::Impure,
         };
     }
-    match fold_body(catalog, &r.prog, visiting) {
-        Some(call) if pure_expr(catalog, &call.expr, visiting) => Summary::PureExpr(call),
+    match fold_body(catalog, &r.prog, &r.params, visiting) {
+        Some(call)
+            if pure_expr(catalog, &call.expr, visiting)
+                && call
+                    .outs
+                    .iter()
+                    .all(|(_, e)| pure_expr(catalog, e, visiting)) =>
+        {
+            Summary::PureExpr(call)
+        }
         _ => Summary::Impure,
     }
 }
@@ -178,6 +189,8 @@ pub(crate) fn call_is_noop(
 #[derive(Debug, Clone)]
 pub(crate) struct InlinedCall {
     pub expr: IrExpr,
+    /// OUT 形参写回表达式：形参下标 → 体内 env 表达式（形参空间，待实参代入）。
+    pub outs: Vec<(usize, IrExpr)>,
     pub checks: CallChecks,
 }
 
@@ -193,7 +206,7 @@ fn bind_body(
     params: &[crate::catalog::RoutineParam],
     args: &[IrExpr],
     checks: &mut CallChecks,
-) -> IrExpr {
+) -> (IrExpr, Vec<(usize, IrExpr)>) {
     checks.varchar_inputs.extend(
         body.checks
             .varchar_inputs
@@ -206,7 +219,12 @@ fn bind_body(
             .into_iter()
             .map(|expr| subst::subst_params(expr, params, args)),
     );
-    subst::subst_params(body.expr, params, args)
+    let outs = body
+        .outs
+        .into_iter()
+        .map(|(i, e)| (i, subst::subst_params(e, params, args)))
+        .collect();
+    (subst::subst_params(body.expr, params, args), outs)
 }
 
 fn installed_args(
@@ -232,7 +250,7 @@ fn installed_args(
             .ok()
             .map(IrExpr::Const),
             _ => {
-                if param.ty == Some(SpinType::Varchar) {
+                if param.ty == Some(SpinType::Varchar) && matches!(param.mode, ParamMode::In) {
                     varchar_inputs.push(arg.clone());
                 }
                 Some(arg.clone())
@@ -253,15 +271,23 @@ pub(super) fn inline_pure_call(
         return None;
     };
     let r = catalog.lookup(name)?;
-    if r.params.iter().any(|p| !matches!(p.mode, ParamMode::In)) {
+    if r.params.iter().any(|p| matches!(p.mode, ParamMode::InOut)) {
         return None;
     }
     if args.len() != r.params.len() || !args.iter().all(arg_total) {
         return None;
     }
+    // OUT 实参是写回目标，必须是变量；IN 形参实参全定义已由 arg_total 保证。
+    if r.params
+        .iter()
+        .zip(args)
+        .any(|(p, a)| matches!(p.mode, ParamMode::Out) && !matches!(a, IrExpr::Var(_)))
+    {
+        return None;
+    }
     let mut checks = CallChecks::default();
     let args = installed_args(catalog, name, args, &mut checks.varchar_inputs)?;
-    let expr = bind_body(body, &r.params, &args, &mut checks);
+    let (expr, mut outs) = bind_body(body, &r.params, &args, &mut checks);
     let expr = expand_calls(
         catalog,
         expr,
@@ -269,8 +295,17 @@ pub(super) fn inline_pure_call(
         0,
         &mut checks,
     )?;
+    for (_, e) in &mut outs {
+        *e = expand_calls(
+            catalog,
+            std::mem::replace(e, IrExpr::Const(SpinValue::Null)),
+            &mut vec![name.to_ascii_lowercase()],
+            0,
+            &mut checks,
+        )?;
+    }
     expand_checks(catalog, name, &mut checks)?;
-    Some(InlinedCall { expr, checks })
+    Some(InlinedCall { expr, outs, checks })
 }
 
 fn expand_checks(catalog: &RoutineCatalog, name: &str, checks: &mut CallChecks) -> Option<()> {

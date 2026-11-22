@@ -522,3 +522,83 @@ fn should_reject_when_the_entry_catalog_key_is_not_unique() {
         err.message
     );
 }
+
+#[test]
+fn should_match_project_rel_through_canonicalized_paths() {
+    // `compile --dir <相对路径>` 时 project.root 是相对形式，而 codeweb 图
+    // 存的是分析期绝对路径——词法前缀必然落空，须 canonical 双侧比对。
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("proj");
+    std::fs::create_dir_all(real.join("sql")).unwrap();
+    let file = real.join("sql/a.sql");
+    std::fs::write(&file, "select 1").unwrap();
+    // 以"拼接 .. 段"的非规范绝对根模拟相对/未规范化输入：词法剥不出，
+    // canonical 后两侧一致。
+    let detour = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&detour).unwrap();
+    let weird_root = detour.join("..").join("proj");
+    let got = super::project_rel(&weird_root, file.to_str().unwrap());
+    // weird_root 词法上是 tmp/elsewhere/../proj——strip_prefix("tmp/elsewhere/../proj/")
+    // 不命中 file 的 tmp/proj/sql/a.sql；canonical 后 root=tmp/proj 命中。
+    assert_eq!(got.as_deref(), Some("sql/a.sql"));
+}
+
+#[test]
+fn should_scope_ast_completion_to_closure_members_and_cover_dynamic_sql() {
+    // 评审复现：AST 补全必须按**可达例程**扫描——同文件未入闭包的
+    // 包成员（unrelated）的调用不得成为入口依赖种子；同时字符串
+    // 字面量内的动态 SQL 调用（fnc_dyn）必须被补全。
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_string_lossy().into_owned();
+    std::fs::create_dir_all(format!("{root}/sql")).unwrap();
+    std::fs::write(
+        format!("{root}/sql/pkg.sql"),
+        "CREATE PACKAGE BODY pkg IS\n\
+         v_sql VARCHAR(100);\n\
+         v_n INTEGER;\n\
+         PROCEDURE entry IS\n\
+         BEGIN\n\
+           v_sql := 'SELECT fnc_dyn(x) FROM t';\n\
+           NULL;\n\
+         END;\n\
+         PROCEDURE unrelated IS\n\
+         BEGIN\n\
+           v_n := unrelated_fn();\n\
+         END;\n\
+         END pkg;\n/\n",
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{root}/sql/fn.sql"),
+        "CREATE FUNCTION unrelated_fn RETURN INTEGER IS BEGIN RETURN 1; END;\n/\n",
+    )
+    .unwrap();
+    std::fs::write(
+        format!("{root}/sql/dyn.sql"),
+        "CREATE FUNCTION fnc_dyn RETURN INTEGER IS BEGIN RETURN 1; END;\n/\n",
+    )
+    .unwrap();
+    let json = doc(
+        &format!(
+            r#"{{"id":1,"type":"package","name":"pkg","file":"{root}/sql/pkg.sql","line":1}},
+               {{"id":2,"type":"procedure","name":"entry","file":"{root}/sql/pkg.sql","line":3}},
+               {{"id":3,"type":"procedure","name":"unrelated","file":"{root}/sql/pkg.sql","line":10}},
+               {{"id":4,"type":"function","name":"unrelated_fn","file":"{root}/sql/fn.sql","line":1}},
+               {{"id":5,"type":"function","name":"fnc_dyn","file":"{root}/sql/dyn.sql","line":1}}"#
+        ),
+        r#"{"source":1,"target":2,"type":"contains_routine"},
+           {"source":1,"target":3,"type":"contains_routine"}"#,
+    );
+    let got = close(&json, "pkg.entry", &root, &[]).unwrap();
+    assert!(
+        got.ddl_routines.contains(&"sql/dyn.sql".to_string()),
+        "动态 SQL 字符串内的 fnc_dyn 必须入闭包: {:?}",
+        got.ddl_routines
+    );
+    assert!(
+        !got.ddl_routines.contains(&"sql/fn.sql".to_string()),
+        "未入闭包成员 unrelated 的调用不得成为种子: {:?}",
+        got.ddl_routines
+    );
+    assert!(got.missing.is_empty(), "{:?}", got.missing);
+}

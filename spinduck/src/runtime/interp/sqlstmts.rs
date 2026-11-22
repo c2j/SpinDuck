@@ -114,7 +114,7 @@ fn write_into(
 
 fn eval_expr(env: &mut Env<'_>, expr: &IrExpr) -> Result<SpinValue, EngineError> {
     let mut env_ = EvalEnv {
-        frame: env.frame,
+        frame: &mut *env.frame,
         ex: env.ex,
         cat: env.cat,
         depth: env.depth,

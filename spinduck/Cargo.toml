@@ -168,6 +168,14 @@ path = "tests/guard/guard_set_oriented_sqlfn_assign.rs"
 name = "guard_set_oriented_corpus"
 path = "tests/guard/guard_set_oriented_corpus.rs"
 
+[[test]]
+name = "guard_ir_cursor_scoping"
+path = "tests/guard/guard_ir_cursor_scoping.rs"
+
+[[test]]
+name = "guard_set_oriented_byfund_corpus"
+path = "tests/guard/guard_set_oriented_byfund_corpus.rs"
+
 # CLI 契约层（AGENTS §4.1）跑真 `[[bin]] spinduck`，该 bin 要 `cli` feature。用
 # required-features 而非 `#![cfg]`：后者在 `--features native` 下收集 0 条 = "跳过即绿"。
 # CI 的 Test job 因此单步 `cargo test --features cli`（cli ⊇ native，覆盖面只增不减，

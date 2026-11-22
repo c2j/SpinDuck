@@ -64,11 +64,16 @@ fn should_preserve_output_parameter_aliasing_cursor_record() {
     let result = optimized.call("copy_rows", &[SpinValue::Null]).unwrap();
     assert_eq!(result.outs, expected_result.outs);
     assert_eq!(rows(&optimized), expected());
-    assert_eq!(
-        optimized.set_oriented_reports()[0].status,
-        spinduck_core::ir::set_oriented::Status::Skipped {
-            reason: spinduck_core::ir::set_oriented::SkipReason::LiveOutState,
-        }
+    // PL/SQL 词法作用域：FOR 循环变量是隐式声明、遮蔽同名 OUT 参数，
+    // FETCH 写入循环变量槽位而非参数——编译期别名已消解，集合化
+    // Converted 与 Off 逐行相等（outs/rows 断言见上）。
+    assert!(
+        matches!(
+            optimized.set_oriented_reports()[0].status,
+            spinduck_core::ir::set_oriented::Status::Converted { .. }
+        ),
+        "FOR 变量遮蔽 OUT 参数后别名已消解，应 Converted: {:?}",
+        optimized.set_oriented_reports()[0].status
     );
 }
 

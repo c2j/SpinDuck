@@ -154,6 +154,20 @@ fn should_not_flag_pl_variable_as_column() {
 }
 
 #[test]
+fn should_not_flag_for_record_fields_as_columns() {
+    // FOR rec IN (query) 的记录变量不是 DECLARE 声明，但 rec.field
+    // 是合法 PL 变量引用（语料 PKG_SPLIT_TRADE_STEP3_SH.prc_trd_hz_byfund
+    // 的 res.* 共 18 处曾被误报 BIZ-0152 missing object）。
+    let snap = snap_of("CREATE TABLE t1(a INT, b INT)");
+    let sql = "CREATE OR REPLACE PROCEDURE p IS BEGIN \
+               FOR r IN (SELECT a, b FROM t1) LOOP \
+                 INSERT INTO t1(a) VALUES (r.a); \
+                 UPDATE t1 SET b = r.b WHERE a = r.a; \
+               END LOOP; END;";
+    assert!(missing(sql, &snap).is_empty(), "{:?}", missing(sql, &snap));
+}
+
+#[test]
 fn should_check_columns_inside_embedded_sql() {
     let snap = snap_of("CREATE TABLE t1(a INT)");
     let sql = "CREATE OR REPLACE PROCEDURE p IS BEGIN \

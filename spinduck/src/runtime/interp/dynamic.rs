@@ -42,54 +42,155 @@ pub(super) fn prepare_dynamic_sql(
     Ok((unit.text, sites))
 }
 
+/// 单站物化产物（阶段一）：distinct 元组查询 + 逐元组例程调用的字面量行。
+struct SiteRows {
+    table: String,
+    arity: usize,
+    items: Vec<Vec<String>>,
+}
+
+/// 阶段一：解析绑定 → distinct 元组查询 → 逐元组 `call_routine_value`，
+/// 结果只收集为字面量行（不建表）。例程求值可触发异常处理器
+/// reset_session→ROLLBACK，事务性回退会撤销已发出的 CREATE OR REPLACE
+/// TEMP（目录 DDL 参与事务），故全部站点求值完成后才统一建表（阶段二）。
+fn eval_site(
+    table: &str,
+    name: &str,
+    distinct_sql: &str,
+    binds_src: &[(String, crate::ir::BindSrc)],
+    arity: usize,
+    env: &mut Env<'_>,
+) -> Result<SiteRows, EngineError> {
+    let max = crate::sql::sqlfn::MAX_TUPLES;
+    let binds = resolve_binds(binds_src, env.frame)?;
+    let mut st = env.ex.query(distinct_sql, &binds)?;
+    let rows = st.fetch_many(max + 1);
+    if rows.len() > max {
+        return Err(EngineError::business(
+            157,
+            format!("例程 {name} 的 SQL 上下文参数元组超过上界 {max}"),
+        ));
+    }
+    let mut items_all = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let v = crate::runtime::interp::routine::call_routine_value(env, name, row)?;
+        let mut items = vec![sql_literal(&v)];
+        items.extend(row.iter().map(sql_literal));
+        items_all.push(items);
+    }
+    Ok(SiteRows {
+        table: table.to_string(),
+        arity,
+        items: items_all,
+    })
+}
+
+/// 阶段二：统一 CREATE OR REPLACE TEMP + 分块 INSERT（求值全成功后执行，
+/// 回退无可撤销对象）。列名用 sd_ 保留前缀（与 plan::cache_subquery 同口径）。
+fn write_site(site: &SiteRows, ex: &dyn crate::exec::SqlExecutor) -> Result<(), EngineError> {
+    let mut cols = vec!["sd_v VARCHAR".to_string()];
+    for j in 0..site.arity {
+        cols.push(format!("sd_a{j} VARCHAR"));
+    }
+    ex.execute(
+        &format!(
+            "CREATE OR REPLACE TEMP TABLE {} ({})",
+            site.table,
+            cols.join(", ")
+        ),
+        &BindMap::new(),
+    )?;
+    for chunk in site.items.chunks(500) {
+        let tuples: Vec<String> = chunk
+            .iter()
+            .map(|items| format!("({})", items.join(", ")))
+            .collect();
+        ex.execute(
+            &format!("INSERT INTO {} VALUES {}", site.table, tuples.join(", ")),
+            &BindMap::new(),
+        )?;
+    }
+    Ok(())
+}
+
 /// SQL 上下文例程调用下沉物化（§8.3 路径②）。
 ///
 /// 语句文本中的调用点已在编译期替换为参数缓存子查询；此处在执行前逐元组
-/// 调用例程、填充缓存表（拓扑序保证依赖表先建）。
+/// 调用例程、填充缓存表。`sites` 已按拓扑序排列（依赖方在被依赖方之后），
+/// 外层站点的 distinct 查询可内嵌内层缓存表——必须逐站点
+/// 「求值 → 建表 → 重写全部已建表」交错执行：求值依赖方前其前驱表已存在，
+/// 例程求值触发的 reset_session→ROLLBACK 又可能撤销已建表，重写恢复。
 pub(super) fn materialize_fn_sites(
     sites: &[crate::sql::FnSite],
     env: &mut Env<'_>,
 ) -> Result<(), EngineError> {
-    let max = crate::sql::sqlfn::MAX_TUPLES;
+    let mut written: Vec<SiteRows> = Vec::with_capacity(sites.len());
     for site in sites {
-        let binds = resolve_binds(&site.binds, env.frame)?;
-        let mut st = env.ex.query(&site.distinct_sql, &binds)?;
-        let rows = st.fetch_many(max + 1);
-        if rows.len() > max {
-            return Err(EngineError::business(
-                157,
-                format!("例程 {} 的 SQL 上下文参数元组超过上界 {max}", site.name),
-            ));
-        }
-        let arity = site.args.len();
-        // 列名用 sd_ 保留前缀（与 plan::cache_subquery 同口径，避开 PL 变量命名空间）
-        let mut cols = vec!["sd_v VARCHAR".to_string()];
-        for j in 0..arity {
-            cols.push(format!("sd_a{j} VARCHAR"));
-        }
-        env.ex.execute(
-            &format!(
-                "CREATE OR REPLACE TEMP TABLE {} ({})",
-                site.table,
-                cols.join(", ")
-            ),
-            &BindMap::new(),
+        let rows = eval_site(
+            &site.table,
+            &site.name,
+            &site.distinct_sql,
+            &site.binds,
+            site.args.len(),
+            env,
         )?;
-        for chunk in rows.chunks(500) {
-            let mut tuples = Vec::with_capacity(chunk.len());
-            for row in chunk {
-                let v = crate::runtime::interp::routine::call_routine_value(env, &site.name, row)?;
-                let mut items = vec![sql_literal(&v)];
-                for cell in row {
-                    items.push(sql_literal(cell));
-                }
-                tuples.push(format!("({})", items.join(", ")));
-            }
-            env.ex.execute(
-                &format!("INSERT INTO {} VALUES {}", site.table, tuples.join(", ")),
-                &BindMap::new(),
-            )?;
+        write_site(&rows, env.ex)?;
+        for prev in &written {
+            write_site(prev, env.ex)?;
         }
+        written.push(rows);
+    }
+    Ok(())
+}
+
+/// 集合化区域的 fn_site 物化前导（`ConversionPlan::fn_preludes`）：
+/// 与解释器 OpenCursor 时点同口径的物化——任一失败直接上抛
+/// EngineError（与解释路径同点失败，绝不部分物化后续跑批写）。
+///
+/// `needs_sd_cur` 前导（INSERT 位）的 distinct 查询内嵌 `sd_cur`，其
+/// WHERE 中的游标缓存子查询依赖基础前导（游标 site）的表已存在——
+/// 分两相位：先处理基础前导，再处理依赖方。相位内与相位间统一按
+/// 「求值 → 建表 → 重写全部已建表」交错执行：嵌套站点的依赖表先于
+/// 依赖方求值存在，例程求值的会话回滚撤销的缓存表逐站点重写恢复
+/// （重写不重复例程调用，字面量行已在内存）。任一失败直接上抛
+/// EngineError（与解释路径同点失败，绝不部分物化后续跑批写）。
+pub(crate) fn materialize_fn_preludes(
+    preludes: &[crate::ir::set_oriented::FnPrelude],
+    frame: &mut crate::runtime::Frame,
+    ex: &dyn crate::exec::SqlExecutor,
+    sink: &mut dyn crate::exec::TraceSink,
+    cat: &crate::catalog::RoutineCatalog,
+    var_types: &std::collections::BTreeMap<String, crate::types::SpinType>,
+) -> Result<(), EngineError> {
+    let mut env = Env {
+        frame,
+        ex,
+        sink,
+        cat,
+        depth: 0,
+        budget: super::DEFAULT_STEP_BUDGET,
+        batch: false,
+        wbuf: None,
+        current_error: None,
+        last_write_rows: 0,
+        var_types,
+    };
+    let (base, dep): (Vec<_>, Vec<_>) = preludes.iter().partition(|p| !p.needs_sd_cur);
+    let mut written: Vec<SiteRows> = Vec::with_capacity(preludes.len());
+    for p in base.iter().chain(dep.iter()) {
+        let rows = eval_site(
+            &p.table,
+            &p.name,
+            &p.distinct_sql,
+            &p.binds,
+            p.arity,
+            &mut env,
+        )?;
+        write_site(&rows, ex)?;
+        for prev in &written {
+            write_site(prev, ex)?;
+        }
+        written.push(rows);
     }
     Ok(())
 }

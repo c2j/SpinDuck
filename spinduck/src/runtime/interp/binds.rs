@@ -45,6 +45,14 @@ pub(crate) fn resolve_binds(
                     }
                 }
             }
+            // Expr 绑定仅存于 lookup 全定义文法内部（IN-list 项渲染），
+            // 不携带运行期值；到达此处即编译产物破坏，按不变量报错。
+            crate::ir::BindSrc::Expr { .. } => {
+                return Err(EngineError::invariant(
+                    44,
+                    format!("expr bind {} has no runtime value", ph),
+                ));
+            }
         };
         m.insert(ph.clone(), v);
     }

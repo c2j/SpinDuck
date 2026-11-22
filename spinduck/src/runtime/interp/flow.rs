@@ -92,7 +92,7 @@ fn eval_expr(env: &mut Env<'_>, expr: &IrExpr) -> Result<SpinValue, EngineError>
 /// 求值环境（帧 + 接缝 + 目录 + 深度）。
 fn eval_env<'e>(env: &'e mut Env<'_>) -> EvalEnv<'e> {
     EvalEnv {
-        frame: env.frame,
+        frame: &mut *env.frame,
         ex: env.ex,
         cat: env.cat,
         depth: env.depth,

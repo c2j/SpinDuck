@@ -1,6 +1,8 @@
 //! 当前事务内的表结构证据：原生标量表，解析 DEFAULT 子句为常量/非常量证据
 //! （省略列准入与漂移比对），拒绝复杂约束（PK/CHECK/COLLATE 等）。
 
+use std::collections::{HashMap, HashSet};
+
 use super::metadata::SchemaSnapshot;
 use super::shape::{Name, Tokens};
 use crate::error::EngineError;
@@ -36,6 +38,9 @@ pub(super) enum Source<'a> {
     Static(&'a SchemaSnapshot),
 }
 
+/// 对象名清单：(普通表名集合, 视图名→定义 SQL)。
+pub(super) type ObjectNames = (HashSet<String>, HashMap<String, String>);
+
 impl Source<'_> {
     pub(super) fn load(&self, name: &Name) -> Result<Option<Table>, EngineError> {
         match self {
@@ -44,11 +49,39 @@ impl Source<'_> {
         }
     }
 
+    /// 视图定义原文（§3.5 V3-5 全定义证明输入）；非视图 = None。
+    pub(super) fn view_sql(&self, name: &Name) -> Result<Option<String>, EngineError> {
+        match self {
+            Self::Runtime(ex) => view_sql(*ex, name),
+            Self::Static(_) => Ok(None),
+        }
+    }
+
     pub(super) fn sys_dummy_ok(&self) -> Result<bool, EngineError> {
         match self {
             Self::Runtime(ex) => sys_dummy_ok(*ex),
             // 数据基数不是静态事实，必须延迟到区域入口检查。
             Self::Static(_) => Ok(true),
+        }
+    }
+
+    /// 当前库/模式对象名清单：(普通表名集合, 视图名→定义 SQL)——
+    /// 视图物化依赖提取的候选集（token 命中才逐个取证，过近似安全）。
+    /// Static 快照无执行器 → None。
+    pub(super) fn object_names(&self) -> Result<Option<ObjectNames>, EngineError> {
+        match self {
+            Self::Runtime(ex) => object_names(*ex).map(Some),
+            Self::Static(_) => Ok(None),
+        }
+    }
+
+    /// verbatim 游标输出列 schema 探测：`DESCRIBE` 改写后（绑定占位符与
+    /// fn_site 缓存子查询置 NULL）的原文查询。Static 快照无执行器 → None，
+    /// 调用方按不可证处理。探测失败同样返回 None（保守回退而非报错）。
+    pub(super) fn probe_columns(&self, sql: &str) -> Result<Option<Vec<Column>>, EngineError> {
+        match self {
+            Self::Runtime(ex) => probe_columns(*ex, sql),
+            Self::Static(_) => Ok(None),
         }
     }
 
@@ -219,6 +252,51 @@ fn canonical_runtime_type(ty: &str, rules: &RuleRegistry) -> String {
     }
 }
 
+/// duckdb_tables/duckdb_views 一次取回当前库/模式对象名（小写键）。
+fn object_names(ex: &dyn SqlExecutor) -> Result<ObjectNames, EngineError> {
+    let mut tables = HashSet::new();
+    let mut stream = ex.query(
+        "SELECT table_name FROM duckdb_tables() \
+         WHERE database_name = current_database() AND schema_name = current_schema()",
+        &BindMap::new(),
+    )?;
+    for row in stream.fetch_many(4096) {
+        if let [SpinValue::Str(name)] = row.as_slice() {
+            tables.insert(name.to_ascii_lowercase());
+        }
+    }
+    let mut views = HashMap::new();
+    let mut stream = ex.query(
+        "SELECT view_name, sql FROM duckdb_views() \
+         WHERE database_name = current_database() AND schema_name = current_schema()",
+        &BindMap::new(),
+    )?;
+    for row in stream.fetch_many(4096) {
+        if let [SpinValue::Str(name), SpinValue::Str(sql)] = row.as_slice() {
+            views.insert(name.to_ascii_lowercase(), sql.clone());
+        }
+    }
+    Ok((tables, views))
+}
+
+/// 视图定义原文（duckdb_views().sql，限当前库/模式）；非视图或不存在 = None。
+pub(super) fn view_sql(ex: &dyn SqlExecutor, name: &Name) -> Result<Option<String>, EngineError> {
+    let binds = BindMap::from([("$table".into(), SpinValue::Str(name.0.clone()))]);
+    let mut stream = ex.query(
+        "SELECT sql FROM duckdb_views() WHERE lower(view_name) = $table \
+         AND database_name = current_database() AND schema_name = current_schema()",
+        &binds,
+    )?;
+    let rows = stream.fetch_many(2);
+    let [row] = rows.as_slice() else {
+        return Ok(None);
+    };
+    match row.as_slice() {
+        [SpinValue::Str(sql)] => Ok(Some(sql.clone())),
+        _ => Ok(None),
+    }
+}
+
 pub(super) fn load(ex: &dyn SqlExecutor, name: &Name) -> Result<Option<Table>, EngineError> {
     let binds = BindMap::from([("$table".into(), SpinValue::Str(name.0.clone()))]);
     let mut stream = ex.query(
@@ -249,6 +327,41 @@ pub(super) fn load(ex: &dyn SqlExecutor, name: &Name) -> Result<Option<Table>, E
         .collect::<Vec<_>>()
         .join(".");
     Ok(Some(Table { qualified, columns }))
+}
+
+/// verbatim 游标输出列探测：`DESCRIBE (<改写后原文>)` 返回
+/// (column_name, column_type, null, …) 行；词法化/查询/行形态任一
+/// 不符即 None（调用方按不可证回退）。列名/kind 小写归一与 Tokens
+/// 口径一致；kind 原样保留 `decimal(p,s)` 供 Domain/守卫证明。
+fn probe_columns(ex: &dyn SqlExecutor, sql: &str) -> Result<Option<Vec<Column>>, EngineError> {
+    let Some(rewritten) = super::shape::probe_sql(sql) else {
+        return Ok(None);
+    };
+    let mut stream = match ex.query(&format!("DESCRIBE ({rewritten})"), &BindMap::new()) {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    let mut columns = Vec::new();
+    loop {
+        let chunk = stream.fetch_many(1024);
+        if chunk.is_empty() {
+            break;
+        }
+        for row in chunk {
+            let [SpinValue::Str(name), SpinValue::Str(kind), SpinValue::Str(nullable), ..] =
+                row.as_slice()
+            else {
+                return Ok(None);
+            };
+            columns.push(Column {
+                name: Name(name.to_ascii_lowercase()),
+                kind: kind.to_ascii_lowercase(),
+                nullable: nullable == "YES",
+                default: None,
+            });
+        }
+    }
+    Ok(Some(columns))
 }
 
 fn column_name(t: &mut Tokens) -> Option<Name> {
