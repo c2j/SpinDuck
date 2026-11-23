@@ -280,6 +280,12 @@ fn eval_plan_guards(
                 };
             }
         } else {
+            // 帧槽位同样过 F1/F3 闸：命中 prelude/宏名时报更精确的
+            // Unchecked 原因（frame-bound 之外的第二重缺面）。
+            outcome.state = match guard_block_reason(slot.sql(), &preludes, macro_names) {
+                Some(reason) => GuardState::Unchecked(reason),
+                None => GuardState::Unchecked(UncheckedReason::FrameBound),
+            };
             has_unchecked = true;
         }
         guards.push(outcome);
@@ -653,6 +659,196 @@ mod tests {
             scan.guards[5].state,
             GuardState::Failed(SkipReason::UnsupportedControlFlow)
         ));
+    }
+
+    /// caller_view_lookup 例程（与 tests/set_oriented_dummy.rs 同源）：
+    /// UNION ALL 视图查找 → view_preludes → preludes_first。
+    const VIEW_LOOKUP: &str = "CREATE OR REPLACE PROCEDURE caller_view_lookup(\
+        p_o_succeed OUT VARCHAR2) IS \
+        v_x VARCHAR2(20); \
+        BEGIN \
+          p_o_succeed := '0'; \
+          FOR r IN SELECT security_id, cjje, tag FROM cur_rows LOOP \
+            BEGIN \
+              SELECT v.val INTO v_x FROM v_dim v WHERE v.k = r.security_id; \
+            EXCEPTION WHEN OTHERS THEN v_x := 'D'; END; \
+            INSERT INTO dst_rows(security_id, yj, tag) \
+              VALUES (r.security_id, r.cjje, v_x); \
+          END LOOP; \
+        END;";
+
+    fn tcol(name: &str, ty: &str, canonical: SpinType) -> ColumnMetadata {
+        ColumnMetadata {
+            name: name.into(),
+            source_type: ty.into(),
+            canonical_type: Some(canonical),
+            nullable: true,
+            default_expr_raw: None,
+        }
+    }
+
+    fn tmeta(name: &str, cols: Vec<ColumnMetadata>) -> TableMetadata {
+        TableMetadata {
+            name: vec![name.to_string()],
+            columns: cols,
+            constraints: Vec::new(),
+            indexes: Vec::new(),
+            indexes_complete: true,
+            has_opaque_ddl: false,
+        }
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn should_mark_view_prelude_dependent_guards_unchecked() {
+        // 5/6（F1 端到端）：视图查找例程 → preludes_first 计划；守卫 SQL
+        // 命中 sd_vwN → Unchecked(prelude-dependent)，verdict 上限 Conditional，
+        // reason 不得由被拦守卫导出。
+        use crate::types::SpinType::*;
+        let c = |n: &str, ty: &str, ct: SpinType| tcol(n, ty, ct);
+        let d152 = || Decimal {
+            precision: 15,
+            scale: 2,
+        };
+        let d206 = || Decimal {
+            precision: 20,
+            scale: 6,
+        };
+        let vc = || Varchar;
+        let tables = vec![
+            tmeta(
+                "cur_rows",
+                vec![
+                    c("security_id", "VARCHAR", vc()),
+                    c("cjje", "DECIMAL(15,2)", d152()),
+                    c("yj11", "DECIMAL(15,2)", d152()),
+                    c("yj12", "DECIMAL(15,2)", d152()),
+                    c("tag", "VARCHAR", vc()),
+                ],
+            ),
+            tmeta(
+                "dst_rows",
+                vec![
+                    c("security_id", "VARCHAR", vc()),
+                    c("yj", "DECIMAL(20,6)", d206()),
+                    c("tag", "VARCHAR", vc()),
+                ],
+            ),
+            tmeta(
+                "dim_a",
+                vec![c("k", "VARCHAR", vc()), c("val", "VARCHAR", vc())],
+            ),
+            tmeta(
+                "dim_b",
+                vec![c("k", "VARCHAR", vc()), c("val", "VARCHAR", vc())],
+            ),
+            tmeta(
+                "v_dim",
+                vec![c("k", "VARCHAR", vc()), c("val", "VARCHAR", vc())],
+            ),
+        ];
+        let ex = crate::DuckExecutor::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE cur_rows(security_id VARCHAR, cjje DECIMAL(15,2), \
+               yj11 DECIMAL(15,2), yj12 DECIMAL(15,2), tag VARCHAR)",
+            "CREATE TABLE dst_rows(security_id VARCHAR, yj DECIMAL(20,6), tag VARCHAR)",
+            "CREATE TABLE dim_a(k VARCHAR, val VARCHAR)",
+            "CREATE TABLE dim_b(k VARCHAR, val VARCHAR)",
+            "CREATE VIEW v_dim AS SELECT k, val FROM dim_a \
+               UNION ALL SELECT k, val FROM dim_b",
+            "CREATE TABLE sys_dummy AS SELECT 1 AS x",
+            "INSERT INTO dim_a VALUES ('K1','va1'),('K2','va2')",
+            "INSERT INTO dim_b VALUES ('K3','vb3'),('K1','vb1')",
+            "INSERT INTO cur_rows VALUES \
+               ('K1',1.00,0,0,'a'),('K2',2.00,0,0,'b'),\
+               ('K3',3.00,0,0,'c'),('K4',4.00,0,0,'d')",
+        ] {
+            ex.execute(sql, &BindMap::new()).unwrap();
+        }
+        let catalog = compile_sources(&[VIEW_LOOKUP], RuleRegistry::default())
+            .unwrap()
+            .catalog;
+        let admit = AdmitInput {
+            snapshot: SchemaSnapshot {
+                tables,
+                diagnostics: Vec::new(),
+                fingerprint: "t".into(),
+            },
+            executor: Some(Box::new(ex)),
+            macro_names: BTreeSet::new(),
+        };
+        for mode in [SetOrientedMode::Strict, SetOrientedMode::BatchAtomic] {
+            let verdicts =
+                admit_verify(&catalog, &admit, mode, &["caller_view_lookup".into()]).unwrap();
+            assert_eq!(verdicts.len(), 1, "{mode:?}");
+            let v = &verdicts[0];
+            assert_eq!(v.verdict, Verdict::Conditional, "{mode:?}: {v:?}");
+            assert_eq!(v.confidence, Confidence::Firm, "{mode:?}");
+            // preludes_first 计划：引用 sd_vwN/sd_cur 的守卫标
+            // Unchecked(prelude-dependent)；其余帧守卫 frame-bound；
+            // 静态面全 Passed；无 Failed → reason 不由缺面守卫导出。
+            let prelude = v
+                .guards
+                .iter()
+                .find(|g| {
+                    matches!(
+                        g.state,
+                        GuardState::Unchecked(UncheckedReason::PreludeDependent)
+                    ) && g.sql.as_deref().is_some_and(|s| s.contains("sd_vw"))
+                })
+                .unwrap_or_else(|| panic!("{mode:?} 缺 prelude-dependent 守卫: {v:?}"));
+            assert!(prelude.sql.as_deref().unwrap().contains("sd_cur"));
+            assert!(
+                v.guards
+                    .iter()
+                    .all(|g| !matches!(g.state, GuardState::Failed(_))),
+                "{mode:?}: {v:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn should_mark_macro_dependent_static_guard_unchecked() {
+        // 6（F3 端到端）：静态守卫 SQL 命中 macro_names →
+        // Unchecked(macro-dependent)，不下发求值，verdict 不导出其 reason。
+        use super::super::schema::Column;
+        let ex = crate::DuckExecutor::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE sys_dummy AS SELECT 1",
+            "CREATE TABLE s (id BIGINT)",
+            "CREATE TABLE t (id BIGINT)",
+        ] {
+            ex.execute(sql, &BindMap::new()).unwrap();
+        }
+        let col = || Column {
+            name: super::super::shape::Name("id".into()),
+            kind: "bigint".into(),
+            nullable: true,
+            default: None,
+        };
+        let mut plan = entry_plan();
+        plan.source_table.columns = vec![col()];
+        plan.target_table.columns = vec![col()];
+        plan.route_guards = vec!["SELECT my_macro(id) FROM t".into()];
+        let catalog = catalog();
+        let ctx = OptimizeCtx {
+            mode: SetOrientedMode::Strict,
+            batch_commit: false,
+            rules: catalog.sql_rules(),
+            snapshot: None,
+            catalog: &catalog,
+        };
+        let macros: BTreeSet<String> = ["my_macro".to_string()].into_iter().collect();
+        let scan = eval_plan_guards(&plan, &ex, &ctx, &macros).unwrap();
+        let route = scan.guards.last().unwrap();
+        assert_eq!(route.kind, GuardKind::Route);
+        assert!(matches!(
+            route.state,
+            GuardState::Unchecked(UncheckedReason::MacroDependent)
+        ));
+        assert!(scan.first_failed.is_none());
+        assert!(scan.has_unchecked);
     }
 
     /// 最小 ConversionPlan（仅供 prelude_names/guard_block_reason 测试）。
