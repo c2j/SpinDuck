@@ -5274,3 +5274,33 @@ $ …（无旗标）                                                     → 判
   `--on-skip` 是 CLI 专属旗标；库内嵌消费者仍读 `set_oriented_reports()`。
 - 不声称覆盖 Converted 路径的前移观感：本轮契约只锁 Skipped 判定行；
   Converted 行同走同一回调，文本形态 `SET_ORIENTED <r> converted`。
+
+## V53 G5 重测：purchase switch 两象限当前行为（设计 v3.1 §12.4/§12.7）
+
+PR-5 第一步取证（先于任何 D7 实现）。夹具：
+`tests/set_oriented_purchase_switch.rs`，进程内内核部署
+`golden/case_corpus_purchase`（仓内 seed `swh_all_kind.kind_id='0'`），
+`UPDATE swh_all_kind` 翻转 ON 象限（语料资产零改动），
+`prc_trd_deal_purchase('20250715', null)` 两次调用各取一份
+`set_oriented_reports`（= `SET_ORIENTED` 行同一数据源）。
+
+实测（commit 基线 = PR-4 `fcceda5`）：
+
+| mode | switch='0'（OFF） | switch='1'（ON） |
+| :--- | :--- | :--- |
+| Strict | `Skipped(TransactionBoundaryInsideLoop)` | 同左（更早门槛先拒，到不了 route 守卫） |
+| BatchAtomic | `Converted`（批写 SQL 产出） | `Skipped(UnsupportedControlFlow)` → 解释回退 |
+
+- OFF→ON→OFF 三连调 verdict 序列可复现（off2 == off）。
+- **门 1 基线**：BatchAtomic OFF 的 `Converted.sql` 与 ON 的
+  `Skipped(UnsupportedControlFlow)` 即「逐字一致」对照面；D7 合入后
+  OFF 象限必须逐字不变，ON 象限预期改为选 then 臂 Converted。
+- Strict 象限对 D7 无增量（route 守卫不可达），D7 收益面 =
+  BatchAtomic。
+
+### V53.1 不声称
+
+- 不声称 ON 象限业务等价（门 3 四象限等价需 §12.7 数据前置，
+  ON 臂批写 vs 逐行解释的 `dat_trd_repurchase` 比对尚未跑）。
+- 不声称 `--admit` 面输出：本轮只取运行期 reports；compile --admit
+  的 purchase 判定行待 CLI 层补测。
