@@ -5240,3 +5240,37 @@ allowed warnings）全部通过；`cargo test --features gauss`（A 模式容器
   是 4 列最小投影，与这份 38 列视图不是同一份定义，不能互替。
 - 不声称服务器语料与仓库一致：真机 `routines=6 missing=0` 的状态是服务器侧本地补件
   产生的；本轮把等价补件正式入库后，两侧应重新对齐（服务器重跑 compile 以仓库为准）。
+
+## V52 call --on-skip 判定行前移（设计 v3.1 §5 B2，D8 路线 A）
+
+### V52.1 契约证据（tests/cli/call.rs::should_print_skip_line_and_fail_only_under_on_skip_error）
+
+fixture：临时 duckdb 仅建 `source_rows`/`target_rows`、无 `sys_dummy` →
+`copy_rows`（游标 FOR + INSERT）计划期 `Skipped(UnknownObjectDependency)`，
+解释器回退跑通 `CALL copy_rows OK`。四态实测：
+
+```text
+$ spinduck call --file copy_rows.sql --db t.duckdb --set-oriented=strict \
+      --on-skip=report copy_rows
+SET_ORIENTED copy_rows skipped reason=UnknownObjectDependency   ← 裁决点即时行
+CALL copy_rows OK                                                rc=0
+
+$ … --on-skip=error copy_rows                                    → 同上行 + rc=1
+$ … --on-skip=error --on-skip-error-if unknown-object-dependency \
+      copy_rows                                                  → rc=0
+$ …（无旗标）                                                     → 判定行事后渲染不变
+```
+
+即时行由 `Engine::on_set_oriented_report` 回调在 `push_report` 内同步写出；
+回调为 `'static` 闭包直写 `std::io::stdout()`（绕过非 `'static` 的 `out`
+借用），仅 `--on-skip` 激活时安装。`--on-skip-error-if` 名单口径 =
+`SkipReason::as_str` kebab 形式，与 `spinduck-admit/1` 工件 reason 一致。
+项目键 `[engine].set_oriented_on_skip = "report"|"error"`，CLI `--on-skip`
+优先于项目（与 set_oriented mode 同优先级）。
+
+### V52.2 不声称
+
+- 不声称即时行可被 `run_str`/库内嵌 `out` 缓冲捕获：回调直写进程 stdout，
+  `--on-skip` 是 CLI 专属旗标；库内嵌消费者仍读 `set_oriented_reports()`。
+- 不声称覆盖 Converted 路径的前移观感：本轮契约只锁 Skipped 判定行；
+  Converted 行同走同一回调，文本形态 `SET_ORIENTED <r> converted`。
