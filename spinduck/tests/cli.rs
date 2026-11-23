@@ -43,6 +43,8 @@ mod call;
 mod compare;
 #[path = "cli/compile.rs"]
 mod compile;
+#[path = "cli/compile_admit.rs"]
+mod compile_admit;
 #[path = "cli/compile_entry.rs"]
 mod compile_entry;
 #[path = "cli/compile_manifest.rs"]
@@ -223,6 +225,10 @@ pub(crate) fn compile_project_in_process(
         analyze: false,
         codeweb_project: None,
         sync_manifest,
+        admit: None,
+        db: None,
+        set_oriented: None,
+        admit_record: None,
     };
     let mut buf = Vec::new();
     let result = spinduck_core::cli::compile_project_with_source(opts, &export, &mut buf);

@@ -17,6 +17,7 @@ mod snapshot;
 use batch::parse_batch;
 use call::parse_call;
 use compile::parse_compile;
+pub use compile::AdmitMode;
 use exec::{parse_explain, parse_materialize, parse_sync};
 use project::parse_deploy;
 use snapshot::{parse_compare, parse_query};
@@ -44,6 +45,14 @@ pub enum Command {
         codeweb_project: Option<PathBuf>,
         /// 同步运行态快照（`conf/spinduck.runtime.toml`），默认关。
         sync_manifest: bool,
+        /// `--admit[=report|error]`：集合化判定开关（强制配 `--db`，D9）。
+        admit: Option<AdmitMode>,
+        /// admit 的数据面库文件（`--db`）。
+        db: Option<PathBuf>,
+        /// `--set-oriented[=mode]`：覆盖 `[engine].set_oriented`（CLI > 项目）。
+        set_oriented: Option<crate::ir::set_oriented::SetOrientedMode>,
+        /// `--admit-record <f>`：判定工件输出路径（显式给才写）。
+        admit_record: Option<PathBuf>,
     },
     /// 规则文件探针（版本锚定检查）。
     RulesProbe { path: PathBuf },
@@ -229,7 +238,10 @@ pub fn usage() -> &'static str {
      \x20 compile <path>...               语料编译体检（递归 *.sql）\n\
      \x20 compile [--dir <项目目录>] [--schema <名>] [--entry <routine>]...\n\
      \x20      [--analyze] [--codeweb-project <dir>] [--sync-manifest]\n\
+     \x20      [--admit[=report|error] --db <f> [--set-oriented[=off|strict|batch-atomic]]\n\
+     \x20       [--admit-record <f>]]\n\
      \x20                                项目态：进程内嵌 codeweb 取图，按入口落盘计划并 IR 体检；\n\
+     \x20                                --admit 做集合化判定（强制 --db；=error 时 firm skipped 判红）；\n\
      \x20                                --analyze 取图前允许增量分析（store 缺失/过期时自动补）；\n\
      \x20                                --sync-manifest 同步运行态快照 conf/spinduck.runtime.toml\n\
      \x20 rules probe <rules.toml>        规则文件版本锚定检查\n\

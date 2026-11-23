@@ -6,6 +6,7 @@
 
 pub(crate) mod call;
 mod compile;
+mod compile_admit;
 mod compile_project;
 pub(crate) mod io;
 
@@ -14,7 +15,9 @@ use compile::{compile_cmd, explain_cmd};
 use compile_project::compile_project_cmd;
 #[cfg(test)]
 pub(crate) use compile_project::compile_with_source;
-pub use compile_project::{compile_project_with_source, ProjectCompile};
+pub use compile_project::{
+    compile_project_admit_with_source, compile_project_with_source, ProjectCompile,
+};
 use io::{cmd_materialize, cmd_sync, materialize_cmd, sync_cmd};
 
 use crate::cli::args::{parse, usage, Command};
@@ -86,6 +89,10 @@ pub(crate) fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError
             analyze,
             codeweb_project,
             sync_manifest,
+            admit,
+            db,
+            set_oriented,
+            admit_record,
         } => compile_project_cmd(
             ProjectCompile {
                 dir,
@@ -94,6 +101,10 @@ pub(crate) fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError
                 analyze,
                 codeweb_project,
                 sync_manifest,
+                admit,
+                db,
+                set_oriented,
+                admit_record,
             },
             out,
         ),
@@ -127,6 +138,15 @@ pub(crate) fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError
 
 pub(super) fn io_err(e: std::io::Error) -> EngineError {
     EngineError::env(13, format!("stdout: {e}"))
+}
+
+/// `SET_ORIENTED`/`ADMIT` 判定行共用片段（设计 v3.1 §3.2 同源铁律：
+/// 两个前缀必须出自同一格式化函数，判定口径不允许两套）。
+pub(crate) fn skipped_reason_body(
+    routine: &str,
+    reason: crate::ir::set_oriented::SkipReason,
+) -> String {
+    format!("{routine} skipped reason={reason:?}")
 }
 
 #[cfg(test)]

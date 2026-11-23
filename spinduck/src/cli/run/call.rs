@@ -471,8 +471,8 @@ fn render_set_oriented_reports(
             Status::Converted { .. } => writeln!(out, "SET_ORIENTED {} converted", report.routine),
             Status::Skipped { reason } => writeln!(
                 out,
-                "SET_ORIENTED {} skipped reason={reason:?}",
-                report.routine
+                "SET_ORIENTED {}",
+                super::skipped_reason_body(&report.routine, *reason)
             ),
         }
         .map_err(io_err)?;
@@ -614,6 +614,10 @@ mod tests {
             analyze: false,
             codeweb_project: None,
             sync_manifest: false,
+            admit: None,
+            db: None,
+            set_oriented: None,
+            admit_record: None,
         };
         let plan_code = crate::cli::compile_project_with_source(opts, &export, &mut plan_buf)
             .unwrap_or_else(|e| panic!("{}", e.message));

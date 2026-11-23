@@ -1,5 +1,6 @@
 //! 受限静态游标集合化；保留原始 IR，离线候选在调用入口同事务复核。
 
+pub mod admit;
 mod agg;
 mod analyze;
 mod candidate;
@@ -109,6 +110,34 @@ pub enum SkipReason {
     /// MAX_TUPLES），Converted 计划绝不原样穿透（设计 §4.2）。
     UnresolvedFnSite,
     DynamicSql,
+}
+
+impl SkipReason {
+    /// 工件 `reason=` 取值（snake-kebab；设计 v3.1 D6，自 admit 工件起为长期契约）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedControlFlow => "unsupported-control-flow",
+            Self::ExceptionScopePresent => "exception-scope-present",
+            Self::TransactionBoundaryInsideLoop => "transaction-boundary-inside-loop",
+            Self::BatchCommitEnabled => "batch-commit-enabled",
+            Self::LiveOutState => "live-out-state",
+            Self::UnsupportedWrite => "unsupported-write",
+            Self::TargetReadDependency => "target-read-dependency",
+            Self::UnknownObjectDependency => "unknown-object-dependency",
+            Self::UnprovenExpression => "unproven-expression",
+            Self::UnprovenTargetConstraints => "unproven-target-constraints",
+            Self::UnprovenRollbackScope => "unproven-rollback-scope",
+            Self::UnprovenWriteCompleteness => "unproven-write-completeness",
+            Self::NonDeterministicDefault => "non-deterministic-default",
+            Self::UnprovenSysDummyInvariant => "unproven-sys-dummy-invariant",
+            Self::UnprovenQueryTotalness => "unproven-query-totalness",
+            Self::AmbiguousTop1Tie => "ambiguous-top1-tie",
+            Self::UnsupportedCall => "unsupported-call",
+            Self::MultiOutCallImpure => "multi-out-call-impure",
+            Self::UnresolvedFnSite => "unresolved-fn-site",
+            Self::DynamicSql => "dynamic-sql",
+        }
+    }
 }
 
 /// 一次调用实际选择的优化状态。
@@ -226,47 +255,50 @@ pub(crate) fn plan(
     ex: &dyn SqlExecutor,
     ctx: &OptimizeCtx<'_>,
 ) -> Result<Result<entry::ConversionPlan, SkipReason>, EngineError> {
-    plan_from(routine, &schema::Source::Runtime(ex), ctx)
+    plan_from(routine, &schema::Source::Runtime(ex), ctx).map(|r| r.map_err(|e| e.reason))
 }
 
 fn plan_from(
     routine: &CompiledRoutine,
     source: &schema::Source<'_>,
     ctx: &OptimizeCtx<'_>,
-) -> Result<Result<entry::ConversionPlan, SkipReason>, EngineError> {
+) -> Result<Result<entry::ConversionPlan, PlanRejection>, EngineError> {
     let mode = ctx.mode;
     // §2.2-3：仅 BatchAtomic × --batch-commit 解除互斥——区域集合 SQL 不经
     // WriteBuffer，TxCommit trace 照发但实际提交延迟到 call_with_sink 出口；
     // Strict 仍拒绝（提交快照语义不允许合并）。
     let selected = if ctx.batch_commit && mode != SetOrientedMode::BatchAtomic {
-        Err(SkipReason::BatchCommitEnabled)
+        Err(PlanRejection::firm(SkipReason::BatchCommitEnabled))
     } else {
         match v2_admit(&routine.prog, mode, ctx.catalog) {
-            Err(reason) => Err(reason),
+            Err(reason) => Err(PlanRejection::firm(reason)),
             Ok(region) => {
                 if !source.sys_dummy_ok()? {
-                    Err(SkipReason::UnknownObjectDependency)
+                    Err(PlanRejection::firm(SkipReason::UnknownObjectDependency))
                 } else if routine
                     .params
                     .iter()
                     .any(|p| p.name.eq_ignore_ascii_case(&region.record.0))
                 {
-                    Err(SkipReason::LiveOutState)
+                    Err(PlanRejection::firm(SkipReason::LiveOutState))
                 } else {
                     // §4.2：IN 形参是调用方给定的循环不变输入，可作批写投影；
                     // OUT/INOUT 形参有回写语义，不在此列。
                     let in_params = in_param_names(routine);
                     match analyze_region(&routine.prog, &region, mode, ctx.catalog, &in_params) {
-                        Err(reason) => Err(reason),
+                        Err(reason) => Err(PlanRejection::firm(reason)),
                         Ok((mut copy, tail, has_trap)) => {
                             // 下沉/查找变量若是 OUT/INOUT 形参，出口写回不可消除
                             if live_param_hit(&copy, routine) {
-                                Err(SkipReason::LiveOutState)
+                                Err(PlanRejection::firm(SkipReason::LiveOutState))
                             } else {
                                 match generate(&mut copy, source, ctx, &region, tail)? {
-                                    Err(reason) => {
-                                        Err(rollback_scope_reason(mode, has_trap, reason))
-                                    }
+                                    Err(reason) => Err(PlanRejection {
+                                        reason: rollback_scope_reason(mode, has_trap, reason),
+                                        // generate 消费 Source 探测：Static 下拒因
+                                        // 可能由探测缺口导出（admit F2 → conservative）。
+                                        probe_suspect: matches!(source, schema::Source::Static(_)),
+                                    }),
                                     Ok(p) => Ok(p),
                                 }
                             }
@@ -277,6 +309,75 @@ fn plan_from(
         }
     };
     Ok(selected)
+}
+
+/// 入口守卫类别（admit 报告元数据，设计 v3.1 §4.1/§6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardKind {
+    /// sys_dummy 单行不变量。
+    SysDummy,
+    /// 运行期结构漂移复核（逐表）。
+    Drift,
+    /// 编译期快照一致性复核。
+    Snapshot,
+    /// Top-1 并列一致性。
+    Top1Tie,
+    /// IF 路由分支不可达证明。
+    Route,
+    /// 内联表达式全定义守卫。
+    ExprTotalness,
+}
+
+impl GuardKind {
+    /// 工件 `kind=` 值（snake-kebab，§6 契约）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SysDummy => "sys-dummy",
+            Self::Drift => "drift",
+            Self::Snapshot => "snapshot",
+            Self::Top1Tie => "top1-tie",
+            Self::Route => "route",
+            Self::ExprTotalness => "expr-totalness",
+        }
+    }
+
+    /// stdout `guard=` 值（§3.2 逐字规格）。
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            Self::SysDummy => "sys-dummy",
+            Self::Drift => "drift",
+            Self::Snapshot => "snapshot",
+            Self::Top1Tie => "top1",
+            Self::Route => "route",
+            Self::ExprTotalness => "expr",
+        }
+    }
+}
+
+/// 入口守卫求值面：Static 槽位 admit 可脱离帧全量求值；Frame 槽位
+/// 依赖运行帧绑定，无帧上下文时只能 Unchecked。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardScope {
+    Static,
+    Frame,
+}
+
+/// L1 拒因的取证档位（admit F2）：`probe_suspect` = 该拒因可能由
+/// 静态快照探测缺口导出（generate 阶段 × `Source::Static`），admit
+/// 记 `conservative`；其余一律 firm。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlanRejection {
+    pub reason: SkipReason,
+    pub probe_suspect: bool,
+}
+
+impl PlanRejection {
+    fn firm(reason: SkipReason) -> Self {
+        Self {
+            reason,
+            probe_suspect: false,
+        }
+    }
 }
 
 /// 集合化产物引用了例程形参：该变量的值须随 OUT/INOUT 回写，无法消除。
