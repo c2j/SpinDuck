@@ -877,6 +877,7 @@ mod tests {
             route_guards: Vec::new(),
             expr_guards: Vec::new(),
             miss_outs: Vec::new(),
+            discriminator: None,
         }
     }
 

@@ -77,7 +77,9 @@ fn should_exempt_unreachable_then_reads_from_group_local_dead_proof() {
         eng.set_oriented_reports()[0]
     );
 
-    // THEN 可达种子：op='X' 命中 kind='1' → v_route='1'，守卫失败 → 退回解释。
+    // D7 双臂：THEN 臂对仅 ELSE 写入的 v_ct 按「本臂恒 NULL」折叠
+    // （CASE NULL WHEN → 恒取 ELSE 支），两臂均可证 → Converted。
+    // 判别值 '1' → 选 THEN 臂批写，与解释执行逐行一致。
     let seed = "INSERT INTO route_tab VALUES ('1', 'X')";
     let mut baseline = setup_copy_partial_then(seed);
     baseline.call("copy_partial_then", &[]).unwrap();
@@ -86,11 +88,16 @@ fn should_exempt_unreachable_then_reads_from_group_local_dead_proof() {
     eng.set_oriented = SetOrientedMode::BatchAtomic;
     eng.call("copy_partial_then", &[]).unwrap();
     assert_eq!(rows_copy_partial_then(&eng), expected);
-    assert_eq!(
-        eng.set_oriented_reports()[0].status,
-        Status::Skipped {
-            reason: SkipReason::UnsupportedControlFlow
-        }
+    assert!(
+        matches!(
+            eng.set_oriented_reports()[0].status,
+            Status::Converted {
+                arm: Some(Arm::Then),
+                ..
+            }
+        ),
+        "report: {:?}",
+        eng.set_oriented_reports()[0]
     );
 }
 fn setup_copy_inlist(seeds: &[&str]) -> Engine {

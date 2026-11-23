@@ -220,9 +220,11 @@ fn rows_copy_route(eng: &Engine) -> Vec<Vec<SpinValue>> {
 #[test]
 fn should_route_else_branch_when_invariant_kind_guard_proves_then_unreachable() {
     // 设计 §4.3 区域入口循环不变探针：v_kind 由兜底查找求得（0 行/多行 →
-    // '0'，命中 NULL 保留），入口以 (v_kind = '1') IS NOT TRUE 三值判据
-    // 证明 THEN 分支不可达后才选用 ELSE 集合化计划；v_kind = '1' 为真时
-    // 无损退回原区域解释执行（绝不静默假定未注册调用必报错）。
+    // '0'，命中 NULL 保留），IF v_kind = '1' 双臂路由。
+    // D7 双臂：THEN 臂 `INSERT ... VALUES (r.a + 1000)` 的表达式写在
+    // 臂内无残余 trap 可证「无需坏行过滤」→ 臂生成 UnsupportedWrite，
+    // 按「单臂失败整体失败」整个区域拒绝转换（与判别数据无关，
+    // 解释器回退后行集仍与 Off 全等）。
     for seed in [
         "INSERT INTO swh_all_kind VALUES ('1', 'OTHER')",
         "INSERT INTO swh_all_kind VALUES ('0', 'X')",
@@ -237,11 +239,11 @@ fn should_route_else_branch_when_invariant_kind_guard_proves_then_unreachable() 
         eng.set_oriented = SetOrientedMode::BatchAtomic;
         eng.call("copy_route", &[]).unwrap();
         assert_eq!(rows_copy_route(&eng), expected, "seed: {seed}");
-        assert!(
-            matches!(
-                eng.set_oriented_reports()[0].status,
-                Status::Converted { .. }
-            ),
+        assert_eq!(
+            eng.set_oriented_reports()[0].status,
+            Status::Skipped {
+                reason: SkipReason::UnsupportedWrite
+            },
             "seed: {seed}, report: {:?}",
             eng.set_oriented_reports()[0]
         );
@@ -259,7 +261,7 @@ fn should_route_else_branch_when_invariant_kind_guard_proves_then_unreachable() 
     assert_eq!(
         eng.set_oriented_reports()[0].status,
         Status::Skipped {
-            reason: SkipReason::UnsupportedControlFlow
+            reason: SkipReason::UnsupportedWrite
         }
     );
 }

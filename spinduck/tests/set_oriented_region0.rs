@@ -80,7 +80,7 @@ fn should_convert_region0_of_byfund_and_match_off_on_small_corpus() {
     );
     // bcrq 投影必须是 IN 形参 p_i_date 的占位符本身（§4.2 第 7 列），
     // 不是与之值相等的游标字段。
-    let Status::Converted { sql } = &reports[0].status else {
+    let Status::Converted { sql, .. } = &reports[0].status else {
         unreachable!("上方已断言 Converted")
     };
     assert!(

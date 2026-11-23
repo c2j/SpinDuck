@@ -254,16 +254,22 @@ fn rows_copy_if_trap(eng: &Engine) -> Vec<Vec<SpinValue>> {
 
 #[test]
 fn should_route_invariant_if_inside_const_fallback_trap() {
-    // 设计 §4.3 + §4.4 B1：WHEN OTHERS 常量兜底闭包的主线含 IF 路由——
-    // 条件为循环不变兜底查找变量 v_route = '1'，入口以三值判据证明 THEN
-    // 不可达后仅集合化 ELSE 兜底查找组；处理器同序重置全部组成员（全量
-    // 兜底）。v_route = '1' 为真时无损退回解释执行（THEN 写 'U'）。
-    // THEN 不可达：ELSE 相关查找命中取 AA/BB，K3 落空兜底 '0'。
-    for seed in [
-        "INSERT INTO route_tab VALUES ('1', 'OTHER')",
-        "INSERT INTO route_tab VALUES ('0', 'X')",
-        "INSERT INTO route_tab VALUES (NULL, 'X')",
-        "INSERT INTO route_tab VALUES ('0', 'X'), ('1', 'X')",
+    // 设计 §4.3 + §4.4 B1 + D7：条件为循环不变兜底查找变量
+    // v_route = '1' 的 IF 路由——THEN 写 'U'、ELSE 走兜底查找组。
+    // D7 双臂：THEN/ELSE 各自独立分析，运行期判别式选臂。判别值落兜底
+    // '0'（0 行/多行）→ ELSE 臂 Converted；判别值 NULL →
+    // RouteDiscriminatorNotTotal 整段回退解释执行（行集仍与 Off 全等）。
+    for (seed, arm) in [
+        (
+            "INSERT INTO route_tab VALUES ('1', 'OTHER')",
+            Some(Arm::Else),
+        ),
+        ("INSERT INTO route_tab VALUES ('0', 'X')", Some(Arm::Else)),
+        ("INSERT INTO route_tab VALUES (NULL, 'X')", None),
+        (
+            "INSERT INTO route_tab VALUES ('0', 'X'), ('1', 'X')",
+            Some(Arm::Else),
+        ),
     ] {
         let mut baseline = setup_copy_if_trap(seed);
         baseline.call("copy_if_trap", &[]).unwrap();
@@ -276,16 +282,28 @@ fn should_route_invariant_if_inside_const_fallback_trap() {
         eng.set_oriented = SetOrientedMode::BatchAtomic;
         eng.call("copy_if_trap", &[]).unwrap();
         assert_eq!(rows_copy_if_trap(&eng), expected, "seed: {seed}");
-        assert!(
-            matches!(
-                eng.set_oriented_reports()[0].status,
-                Status::Converted { .. }
+        let report = &eng.set_oriented_reports()[0];
+        match arm {
+            Some(a) => assert!(
+                matches!(
+                    report.status,
+                    Status::Converted {
+                        arm: Some(got),
+                        ..
+                    } if got == a
+                ),
+                "seed: {seed}, report: {report:?}"
             ),
-            "seed: {seed}, report: {:?}",
-            eng.set_oriented_reports()[0]
-        );
+            None => assert_eq!(
+                report.status,
+                Status::Skipped {
+                    reason: SkipReason::RouteDiscriminatorNotTotal
+                },
+                "seed: {seed}"
+            ),
+        }
     }
-    // THEN 可达：v_route = '1' → 入口守卫失败，退回解释执行写 'U'。
+    // THEN 可达：判别值 '1' → 选 THEN 臂批写 'U'，与解释执行逐行一致。
     let seed = "INSERT INTO route_tab VALUES ('1', 'X')";
     let mut baseline = setup_copy_if_trap(seed);
     baseline.call("copy_if_trap", &[]).unwrap();
@@ -296,11 +314,16 @@ fn should_route_invariant_if_inside_const_fallback_trap() {
     eng.set_oriented = SetOrientedMode::BatchAtomic;
     eng.call("copy_if_trap", &[]).unwrap();
     assert_eq!(rows_copy_if_trap(&eng), expected);
-    assert_eq!(
-        eng.set_oriented_reports()[0].status,
-        Status::Skipped {
-            reason: SkipReason::UnsupportedControlFlow
-        }
+    assert!(
+        matches!(
+            eng.set_oriented_reports()[0].status,
+            Status::Converted {
+                arm: Some(Arm::Then),
+                ..
+            }
+        ),
+        "report: {:?}",
+        eng.set_oriented_reports()[0]
     );
 }
 fn setup_copy_partial(seed: &str) -> Engine {

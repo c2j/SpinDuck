@@ -10,7 +10,7 @@
 
 use spinduck_core::engine::Engine;
 use spinduck_core::exec::BindMap;
-use spinduck_core::ir::set_oriented::{SetOrientedMode, Status};
+use spinduck_core::ir::set_oriented::{Arm, SetOrientedMode, Status};
 use spinduck_core::project::ProjectConfig;
 use spinduck_core::rules::RuleRegistry;
 use spinduck_core::sql::DuckExecutor;
@@ -45,6 +45,55 @@ fn call_purchase(eng: &mut Engine) -> Vec<Status> {
         .iter()
         .map(|r| r.status.clone())
         .collect()
+}
+
+/// 一次调用的可观察结果：`dat_trd_repurchase` 全行（确定性序）+
+/// `p_o_succeed` OUT 值——四象限等价门的比对面。
+fn observe(eng: &mut Engine, kind_id: Option<&str>) -> (String, String, Vec<Status>) {
+    match kind_id {
+        Some(k) => set_switch(eng, k),
+        None => {
+            eng.ex
+                .execute(
+                    "DELETE FROM swh_all_kind WHERE operation_kind='COMMISSION_SWITCH'",
+                    &BindMap::new(),
+                )
+                .expect("删除 switch 行");
+        }
+    }
+    let args = [SpinValue::Str("20250715".to_string()), SpinValue::Null];
+    let r = eng
+        .call("pkg_split_trade_step3_sh.prc_trd_deal_purchase", &args)
+        .expect("例程调用");
+    let succeed = r
+        .outs
+        .get("p_o_succeed")
+        .map(|v| format!("{v:?}"))
+        .unwrap_or_default();
+    let mut rs = eng
+        .ex
+        .query(
+            "SELECT * FROM dat_trd_repurchase ORDER BY security_id, purchase_no",
+            &BindMap::new(),
+        )
+        .expect("产物表读取");
+    let rows = rs
+        .fetch_many(1000)
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|v| format!("{v:?}"))
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let statuses = eng
+        .set_oriented_reports()
+        .iter()
+        .map(|r| r.status.clone())
+        .collect();
+    (rows, succeed, statuses)
 }
 
 fn set_switch(eng: &mut Engine, kind_id: &str) {
@@ -102,20 +151,29 @@ fn g5_retest_purchase_switch_off_then_on() {
                     );
                 }
             }
-            // BatchAtomic：OFF 证 THEN 不可达 → Converted；ON 守卫拒 →
-            // Skipped(UnsupportedControlFlow) 走解释回退（33.9s 静默退回的来源）。
+            // BatchAtomic + D7 双臂（§12.3/§12.6）：route 形状命中后
+            // 两臂独立走查+生成，判别式在运行期选臂——OFF 象限选
+            // ELSE、ON 象限选 THEN，均 Converted 且 arm 标签可断言
+            // （测试 17 的同源口径：ADMIT 与 SET_ORIENTED 一致）。
+            // 双臂引入前的基线（V53）：ON = Skipped(UnsupportedControlFlow)。
             SetOrientedMode::BatchAtomic => {
                 assert!(
-                    off.iter().all(|s| matches!(s, Status::Converted { .. })),
+                    off.iter().all(|s| matches!(
+                        s,
+                        Status::Converted {
+                            arm: Some(Arm::Else),
+                            ..
+                        }
+                    )),
                     "{}",
                     describe(&off)
                 );
                 assert!(
-                    on.iter().any(|s| matches!(
+                    on.iter().all(|s| matches!(
                         s,
-                        Status::Skipped {
-                            reason:
-                                spinduck_core::ir::set_oriented::SkipReason::UnsupportedControlFlow
+                        Status::Converted {
+                            arm: Some(Arm::Then),
+                            ..
                         }
                     )),
                     "{}",
@@ -123,6 +181,52 @@ fn g5_retest_purchase_switch_off_then_on() {
                 );
             }
             SetOrientedMode::Off => unreachable!("Off 不产生报告"),
+        }
+    }
+}
+
+/// D7 四象限等价门（§12.6 测试 16 / §12.7 门 3）：BatchAtomic 双臂批写
+/// 与 Off 解释器在同一 fixture 上逐值比对 `dat_trd_repurchase` 全列 +
+/// `p_o_succeed`。象限：`'0'`→ELSE 臂、`'1'`→THEN 臂、缺席行→查找
+/// miss 兜底值域。NULL 判别值象限在本 fixture 不可达——`kind_id`
+/// 列 NOT NULL 约束 + miss 兜底为非 NULL 常量；NotTotal 路径由
+/// 单测（合成判别式）覆盖。
+#[test]
+fn d7_purchase_batch_matches_interpreter_all_quadrants() {
+    for (label, kind_id) in [("else", Some("0")), ("then", Some("1")), ("absent", None)] {
+        // 基线：Off = 纯解释器（零集合化）。
+        let mut off_eng = purchase_engine();
+        off_eng.set_oriented = SetOrientedMode::Off;
+        let (off_rows, off_succeed, _) = observe(&mut off_eng, kind_id);
+        // 对照：BatchAtomic = D7 双臂。
+        let mut ba_eng = purchase_engine();
+        ba_eng.set_oriented = SetOrientedMode::BatchAtomic;
+        let (ba_rows, ba_succeed, statuses) = observe(&mut ba_eng, kind_id);
+        assert_eq!(
+            ba_rows, off_rows,
+            "{label} 象限 dat_trd_repurchase 与解释器不一致"
+        );
+        assert_eq!(
+            ba_succeed, off_succeed,
+            "{label} 象限 p_o_succeed 与解释器不一致"
+        );
+        let arm = statuses.iter().find_map(|s| match s {
+            Status::Converted { arm, .. } => Some(*arm),
+            _ => None,
+        });
+        let skipped = statuses.iter().find_map(|s| match s {
+            Status::Skipped { reason } => Some(*reason),
+            _ => None,
+        });
+        match label {
+            "else" => assert_eq!(arm, Some(Some(Arm::Else)), "{label}: {statuses:?}"),
+            "then" => assert_eq!(arm, Some(Some(Arm::Then)), "{label}: {statuses:?}"),
+            "absent" => {
+                // miss 兜底值进 ELSE 值域或判 NotTotal——两者都须与
+                // 解释器逐值一致（上面已锁），此处只锁不静默 Converted。
+                assert!(arm.is_some() || skipped.is_some(), "{label}: {statuses:?}");
+            }
+            _ => unreachable!(),
         }
     }
 }

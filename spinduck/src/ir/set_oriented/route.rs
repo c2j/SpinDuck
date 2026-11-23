@@ -48,6 +48,25 @@ pub(super) fn static_cond(folded: &SpinValue, lit: &SpinValue) -> Option<bool> {
     }
 }
 
+/// D7 判别式 SQL（§12.3(d)）：臂标签在 SQL 侧产出——判别值 NULL →
+/// `-1`（运行期判 `RouteDiscriminatorNotTotal`）；`= lit` → `0`
+/// （THEN 臂）；其余非 NULL → `1`（ELSE 臂值域补集）。比较走 SQL
+/// `=` 语义，与原 IF 条件同源；与 [`guard`] 共用同一份渲染证据与
+/// `key_checks.is_empty()` 前提。当前单 route ⇒ 单 THEN 臂。
+pub(super) fn discriminator(l: &ResolvedLookup, lit: &str) -> Result<String, SkipReason> {
+    if !l.render.key_checks.is_empty() {
+        return Err(SkipReason::UnsupportedControlFlow);
+    }
+    let inner = format!(
+        "CASE WHEN {} THEN {} ELSE {} END",
+        l.render.hit, l.render.value, l.render.default_sql
+    );
+    Ok(format!(
+        "SELECT CASE WHEN ({inner}) IS NULL THEN -1 \
+         WHEN ({inner}) = {lit} THEN 0 ELSE 1 END"
+    ))
+}
+
 /// 入口守卫 SQL：查找值（命中 NULL 保留、0/多行落兜底）与常量等值
 /// 的三值否定，期望 TRUE；守卫自身全定义不抛错。
 pub(super) fn guard(l: &ResolvedLookup, lit: &str) -> Result<String, SkipReason> {

@@ -294,7 +294,28 @@ fn finish(
         .filter_map(|l| l.render.miss_out.clone())
         .collect();
     miss_outs.sort_by_key(|m| m.pc);
-    let route_guards = route_guards(copy, &resolved)?;
+    // D7 双臂（§12.3）：ELSE 臂不再需要「THEN 不可达」守卫——改由
+    // 运行期判别式取值选臂；`discriminator.sql` 与 route 守卫共用
+    // 同一份查找渲染证据。臂计划本体由 plan_from 另行 generate 后填入。
+    let (route_guards, discriminator) = if copy.dual_arm {
+        let (v, lit) = copy
+            .route
+            .as_ref()
+            .ok_or(SkipReason::UnsupportedControlFlow)?;
+        let (l, _) = resolved
+            .iter()
+            .find(|(l, _)| &l.var == v)
+            .ok_or(SkipReason::UnsupportedControlFlow)?;
+        (
+            Vec::new(),
+            Some(entry::Discriminator {
+                sql: route::discriminator(l, lit)?,
+                arms: Vec::new(),
+            }),
+        )
+    } else {
+        (route_guards(copy, &resolved)?, None)
+    };
     let tuple_views: Vec<lookup::ResolvedTuple> =
         resolved_tuples.iter().map(|(t, _)| t.clone()).collect();
     let agg_views: Vec<super::agg::ResolvedAgg> =
@@ -392,6 +413,7 @@ fn finish(
                 binds: m.binds,
             })
             .collect(),
+        discriminator,
     })
 }
 

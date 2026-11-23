@@ -1,7 +1,7 @@
 //! 维表 SqlQuery 关系化守护（V2 设计 §4.4 B1）。
 #![cfg(feature = "native")]
 
-use spinduck_core::ir::set_oriented::{SetOrientedMode, SkipReason, Status};
+use spinduck_core::ir::set_oriented::{Arm, SetOrientedMode, SkipReason, Status};
 use spinduck_core::{BindMap, DuckExecutor, Engine, RuleRegistry, SpinValue};
 
 fn engine() -> Engine {

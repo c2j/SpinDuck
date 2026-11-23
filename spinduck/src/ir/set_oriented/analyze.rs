@@ -25,13 +25,60 @@ struct Prepared<'a> {
     insert_sites: Vec<super::InsertSite>,
 }
 
+/// route 决策点（D7 双臂走查的 divert 输入；§12.3(b)）。
+#[derive(Clone, Copy)]
+pub(super) enum RouteSite {
+    /// branch() 形态：`JumpIfNot` pc 与 ELSE 入口 `to`。
+    Branch { pc: usize, to: usize },
+    /// trap() `fallback_if_group` 形态：PushTrap pc、ELSE 入口
+    /// `else_start`（SqlQuery 组首语句）、汇合后 `resume_pc`。
+    TrapGroup {
+        push_pc: usize,
+        else_start: usize,
+        resume_pc: usize,
+    },
+}
+
+/// 一次区域走查的产物：CopyLoop + 尾部标志 +（D7）route 决策点。
+pub(super) struct RegionAnalysis<'a> {
+    pub copy: CopyLoop<'a>,
+    pub tail_commit: bool,
+    pub has_trap: bool,
+    /// route 决策点；D7 双臂走查的 divert 输入。
+    pub route_site: Option<RouteSite>,
+}
+
 pub(super) fn analyze_region<'a>(
     prog: &'a IrProg,
     region: &'a region::CursorRegion,
     mode: SetOrientedMode,
     catalog: &crate::catalog::RoutineCatalog,
     in_params: &std::collections::BTreeSet<String>,
-) -> Result<(CopyLoop<'a>, bool, bool), SkipReason> {
+) -> Result<RegionAnalysis<'a>, SkipReason> {
+    analyze_walk(prog, region, mode, catalog, in_params, None)
+}
+
+/// D7 双臂 THEN 臂走查（§12.3(b)）：同一区域、同一入口状态快照下
+/// 独立产出臂计划；失败由调用方决定整体拒绝（单臂失败 = 整体失败）。
+pub(super) fn analyze_then_arm<'a>(
+    prog: &'a IrProg,
+    region: &'a region::CursorRegion,
+    mode: SetOrientedMode,
+    catalog: &crate::catalog::RoutineCatalog,
+    in_params: &std::collections::BTreeSet<String>,
+    route_site: RouteSite,
+) -> Result<RegionAnalysis<'a>, SkipReason> {
+    analyze_walk(prog, region, mode, catalog, in_params, Some(route_site))
+}
+
+fn analyze_walk<'a>(
+    prog: &'a IrProg,
+    region: &'a region::CursorRegion,
+    mode: SetOrientedMode,
+    catalog: &crate::catalog::RoutineCatalog,
+    in_params: &std::collections::BTreeSet<String>,
+    route_site: Option<RouteSite>,
+) -> Result<RegionAnalysis<'a>, SkipReason> {
     let ctx = Context {
         prog,
         region,
@@ -39,11 +86,20 @@ pub(super) fn analyze_region<'a>(
         catalog,
         in_params: in_params.clone(),
     };
-    let body = body::Body::walk(&ctx)?;
+    let body = match route_site {
+        Some(site) => body::Body::walk_then(&ctx, site)?,
+        None => body::Body::walk(&ctx)?,
+    };
+    let route_site = body.route_site;
     let parts = prepare(&ctx, &body, in_params)?;
     let flags = (body.tail_commit, body.has_trap);
     let copy = assemble(&ctx, body, parts, in_params)?;
-    Ok((copy, flags.0, flags.1))
+    Ok(RegionAnalysis {
+        copy,
+        tail_commit: flags.0,
+        has_trap: flags.1,
+        route_site,
+    })
 }
 
 /// INSERT 形态、游标查询与写完备性检查；产出批写所需的 SQL 片段引用。
@@ -103,6 +159,7 @@ fn assemble<'a>(
         aggs: body.aggs,
         field_writes: body.field_writes,
         route: body.route,
+        dual_arm: false,
         folded: body.folded,
         inlined: body.inlined,
         inline_checks: body.inline_checks,

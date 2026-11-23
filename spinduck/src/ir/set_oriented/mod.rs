@@ -24,13 +24,13 @@ mod shape;
 mod vguard;
 mod viewdep;
 
-pub(crate) use entry::{entry_ok, ConversionPlan, FnPrelude};
+pub(crate) use entry::{entry_ok, ConversionPlan, Discriminator, FnPrelude};
 
 use super::{AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, VarName};
 use crate::catalog::{CompiledRoutine, ParamMode};
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
-use analyze::analyze_region;
+use analyze::{analyze_region, analyze_then_arm};
 
 /// 集合化语义契约；所有模式均只执行已证明的转换。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -101,6 +101,23 @@ impl OnSkip {
     }
 }
 
+/// 双臂路由选中的臂（设计 v3.1 §12.3(d)）：`Then` = 判别式命中臂值，
+/// `Else` = 主计划（值域补集）。单臂计划恒 `None`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arm {
+    Then,
+    Else,
+}
+
+impl Arm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Then => "then",
+            Self::Else => "else",
+        }
+    }
+}
+
 /// 未获得集合化证明的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SkipReason {
@@ -137,6 +154,9 @@ pub enum SkipReason {
     /// MAX_TUPLES），Converted 计划绝不原样穿透（设计 §4.2）。
     UnresolvedFnSite,
     DynamicSql,
+    /// 双臂计划（§12 D7）的判别式在运行期取不到唯一非 NULL 值
+    /// （0 行 / 多行 / NULL）：无法证选臂，整段退回原 IR 解释。
+    RouteDiscriminatorNotTotal,
 }
 
 impl SkipReason {
@@ -163,6 +183,7 @@ impl SkipReason {
             Self::MultiOutCallImpure => "multi-out-call-impure",
             Self::UnresolvedFnSite => "unresolved-fn-site",
             Self::DynamicSql => "dynamic-sql",
+            Self::RouteDiscriminatorNotTotal => "route-discriminator-not-total",
         }
     }
 
@@ -189,6 +210,7 @@ impl SkipReason {
             "multi-out-call-impure" => Self::MultiOutCallImpure,
             "unresolved-fn-site" => Self::UnresolvedFnSite,
             "dynamic-sql" => Self::DynamicSql,
+            "route-discriminator-not-total" => Self::RouteDiscriminatorNotTotal,
             _ => return None,
         })
     }
@@ -197,8 +219,14 @@ impl SkipReason {
 /// 一次调用实际选择的优化状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
-    Converted { sql: String },
-    Skipped { reason: SkipReason },
+    /// `arm`：双臂计划（§12 D7）运行期判别式选中的臂；单臂计划恒 `None`。
+    Converted {
+        sql: String,
+        arm: Option<Arm>,
+    },
+    Skipped {
+        reason: SkipReason,
+    },
 }
 
 /// 原始例程和独立优化产物的对应报告。
@@ -273,6 +301,9 @@ struct CopyLoop<'a> {
     pub(super) field_writes: Vec<agg::FieldWrite>,
     /// IF 路由（§4.3）：(查找变量, 常量 SQL)，入口守卫证明 THEN 不可达。
     pub(super) route: Option<(VarName, String)>,
+    /// 本 CopyLoop 是双臂计划的 ELSE 臂（§12.3）：generate 据此把
+    /// route_guards 换成判别式 SQL，route 不可达证明改由选臂承担。
+    pub(super) dual_arm: bool,
     /// 条件算术覆写（§3.3）：IF 门内变量重赋值，投影外层 CASE。
     pub(super) arith_writes: Vec<ArithWrite>,
     /// PureExpr 常量折叠（§4.3 A7）：赋值变量 → 常量；仅用于静态剪枝
@@ -341,21 +372,27 @@ fn plan_from(
                     let in_params = in_param_names(routine);
                     match analyze_region(&routine.prog, &region, mode, ctx.catalog, &in_params) {
                         Err(reason) => Err(PlanRejection::firm(reason)),
-                        Ok((mut copy, tail, has_trap)) => {
-                            // 下沉/查找变量若是 OUT/INOUT 形参，出口写回不可消除
-                            if live_param_hit(&copy, routine) {
-                                Err(PlanRejection::firm(SkipReason::LiveOutState))
-                            } else {
-                                match generate(&mut copy, source, ctx, &region, tail)? {
-                                    Err(reason) => Err(PlanRejection {
-                                        reason: rollback_scope_reason(mode, has_trap, reason),
-                                        // generate 消费 Source 探测：Static 下拒因
-                                        // 可能由探测缺口导出（admit F2 → conservative）。
-                                        probe_suspect: matches!(source, schema::Source::Static(_)),
-                                    }),
-                                    Ok(p) => Ok(p),
+                        Ok(ra) => {
+                            // D7 双臂（§12.3/§12.7）：route_site 存在时 THEN
+                            // 臂独立走查+生成；单臂失败 = 整体拒绝（不静默
+                            // 退回单臂计划）。ELSE 臂 = 今日走查产物。
+                            let then_ra = match ra.route_site {
+                                None => None,
+                                Some(site) => {
+                                    match analyze_then_arm(
+                                        &routine.prog,
+                                        &region,
+                                        mode,
+                                        ctx.catalog,
+                                        &in_params,
+                                        site,
+                                    ) {
+                                        Err(reason) => return Ok(Err(PlanRejection::firm(reason))),
+                                        Ok(t) => Some(t),
+                                    }
                                 }
-                            }
+                            };
+                            gen_arm_plan(ra, routine, source, ctx, &region, mode, then_ra)?
                         }
                     }
                 }
@@ -363,6 +400,168 @@ fn plan_from(
         }
     };
     Ok(selected)
+}
+
+/// 单臂/双臂计划生成（D7 §12.3）：`then_ra = Some` 时 ELSE 臂标
+/// `dual_arm`（generate 换判别式）、THEN 臂独立 generate 后填入
+/// `Discriminator.arms`。单臂失败 = 整体 `PlanRejection`。
+fn gen_arm_plan<'a>(
+    ra: analyze::RegionAnalysis<'a>,
+    routine: &CompiledRoutine,
+    source: &schema::Source<'_>,
+    ctx: &OptimizeCtx<'_>,
+    region: &region::CursorRegion,
+    mode: SetOrientedMode,
+    then_ra: Option<analyze::RegionAnalysis<'a>>,
+) -> Result<Result<entry::ConversionPlan, PlanRejection>, EngineError> {
+    let dual = then_ra.is_some();
+    let mut ra = ra;
+    if dual {
+        ra.copy.dual_arm = true;
+    }
+    // 下沉/查找变量若是 OUT/INOUT 形参，出口写回不可消除
+    if live_param_hit(&ra.copy, routine) {
+        return Ok(Err(PlanRejection::firm(SkipReason::LiveOutState)));
+    }
+    // D7 §12.3(b)：两臂写集之差中「本臂恒 NULL」的变量候选——判别式
+    // 选臂后兄弟臂不可达，其独占写入不发生；声明初始化/显式置空
+    // 之外的写入点出现即放弃候选（保守）。
+    let arm_nulls = then_ra
+        .as_ref()
+        .map(|t| arm_null_candidates(routine, region, ra.route_site, &ra.copy, &t.copy));
+    let mut copy = ra.copy;
+    let mut plan = match generate(&mut copy, source, ctx, region, ra.tail_commit)? {
+        Err(reason) => {
+            return Ok(Err(PlanRejection {
+                reason: rollback_scope_reason(mode, ra.has_trap, reason),
+                // generate 消费 Source 探测：Static 下拒因
+                // 可能由探测缺口导出（admit F2 → conservative）。
+                probe_suspect: matches!(source, schema::Source::Static(_)),
+            }));
+        }
+        Ok(p) => p,
+    };
+    let Some(then) = then_ra else {
+        return Ok(Ok(plan));
+    };
+    if live_param_hit(&then.copy, routine) {
+        return Ok(Err(PlanRejection::firm(SkipReason::LiveOutState)));
+    }
+    let mut tcopy = then.copy;
+    if let Some(nulls) = arm_nulls {
+        for v in nulls {
+            tcopy.folded.push((v, crate::value::SpinValue::Null));
+        }
+    }
+    let tplan = match generate(&mut tcopy, source, ctx, region, then.tail_commit)? {
+        Err(reason) => {
+            return Ok(Err(PlanRejection {
+                reason: rollback_scope_reason(mode, then.has_trap, reason),
+                probe_suspect: matches!(source, schema::Source::Static(_)),
+            }))
+        }
+        Ok(p) => p,
+    };
+    if let Some(d) = &mut plan.discriminator {
+        d.arms.push(entry::RouteArm {
+            plan: Box::new(tplan),
+        });
+    }
+    Ok(Ok(plan))
+}
+
+/// 臂写集：CopyLoop 各事实结构登记的全部目标变量。
+fn arm_write_vars(c: &CopyLoop<'_>) -> std::collections::BTreeSet<VarName> {
+    let mut s = std::collections::BTreeSet::new();
+    s.extend(c.lookups.iter().map(|l| l.var.clone()));
+    s.extend(
+        c.tuples
+            .iter()
+            .flat_map(|t| t.slots.iter().map(|sl| sl.var.clone())),
+    );
+    s.extend(c.sinks.iter().map(|(v, _, _, _)| v.clone()));
+    s.extend(c.arith_writes.iter().map(|w| w.var.clone()));
+    s.extend(c.inlined.iter().map(|(v, _)| v.clone()));
+    s.extend(c.folded.iter().map(|(v, _)| v.clone()));
+    s.extend(c.aggs.iter().map(|a| a.var.clone()));
+    s.extend(c.field_writes.iter().map(|f| f.var.clone()));
+    s.extend(c.dead.iter().cloned());
+    s
+}
+
+/// 语句是否写入变量 `v`（覆盖 Assign/查找 INTO/动态 INTO/FETCH/
+/// CALL 写回/OPEN 游标名；Field 目标写的是记录字段而非变量本身）。
+fn stmt_writes_var(stmt: &IrStmt, v: &VarName) -> bool {
+    let is_var = |t: &AssignTarget| matches!(t, AssignTarget::Var(tv) if tv == v);
+    match stmt {
+        IrStmt::Assign { target, .. } | IrStmt::FoldedQuery { target, .. } => is_var(target),
+        IrStmt::SqlQuery { into, .. } => into.iter().any(is_var),
+        IrStmt::SqlExecDynamic { into_targets, .. } => into_targets.iter().any(is_var),
+        IrStmt::Fetch { targets, .. } => targets.iter().any(is_var),
+        IrStmt::CallRoutine { out_targets, .. } => out_targets.iter().flatten().any(is_var),
+        IrStmt::OpenCursor { cursor, .. } => cursor == v,
+        _ => false,
+    }
+}
+
+/// D7 §12.3(b) 臂内 NULL 事实候选：`else − then` 写集差中，全部
+/// 写入点要么位于兄弟臂 pc 区间（本臂选中时不可达），要么是
+/// `Assign Const(Null)`（声明初始化/显式置空）→ 本臂读到的值恒 NULL。
+/// 形参（IN/OUT/INOUT）有调用方值、记录变量与游标名排除；任一其它
+/// 写入点（非空默认、前缀赋值、处理器写回等）即放弃该候选。
+fn arm_null_candidates(
+    routine: &CompiledRoutine,
+    region: &region::CursorRegion,
+    site: Option<analyze::RouteSite>,
+    else_copy: &CopyLoop<'_>,
+    then_copy: &CopyLoop<'_>,
+) -> Vec<VarName> {
+    let Some(site) = site else {
+        return Vec::new();
+    };
+    let else_vars = arm_write_vars(else_copy);
+    let then_vars = arm_write_vars(then_copy);
+    let params: std::collections::BTreeSet<String> = routine
+        .params
+        .iter()
+        .map(|p| p.name.to_ascii_lowercase())
+        .collect();
+    let mut out = Vec::new();
+    'cand: for v in else_vars.difference(&then_vars) {
+        if params.contains(&v.0.to_ascii_lowercase()) || *v == region.record {
+            continue;
+        }
+        for (pc, stmt) in routine.prog.code.iter().enumerate() {
+            if !stmt_writes_var(stmt, v) || in_else_arm(site, region, pc) {
+                continue;
+            }
+            let null_init = matches!(
+                stmt,
+                IrStmt::Assign {
+                    target: AssignTarget::Var(tv),
+                    expr: IrExpr::Const(crate::value::SpinValue::Null),
+                } if tv == v
+            );
+            if !null_init {
+                continue 'cand;
+            }
+        }
+        out.push(v.clone());
+    }
+    out
+}
+
+/// pc 是否落在兄弟臂（ELSE）区间内：Branch 形态 ELSE=[to, 汇合点)，
+/// TrapGroup 形态 ELSE=查找组 [else_start, resume_pc)。
+fn in_else_arm(site: analyze::RouteSite, region: &region::CursorRegion, pc: usize) -> bool {
+    match site {
+        analyze::RouteSite::Branch { to, .. } => (to..region.close_pc - 1).contains(&pc),
+        analyze::RouteSite::TrapGroup {
+            else_start,
+            resume_pc,
+            ..
+        } => (else_start..resume_pc).contains(&pc),
+    }
 }
 
 /// 入口守卫类别（admit 报告元数据，设计 v3.1 §4.1/§6）。

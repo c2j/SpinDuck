@@ -84,6 +84,30 @@ pub(crate) struct ConversionPlan {
     /// miss 仿真标量出口（NO_DATA_FOUND 处理器赋值回填）：批写成功后
     /// 按程序序执行，返回行时写回帧变量。
     pub(crate) miss_outs: Vec<MissOut>,
+    /// 双臂路由（设计 v3.1 §12.3(a)）：`Some` 时本计划是 ELSE 臂（值域
+    /// 补集），`route_guards` 必须为空——THEN 不可达改由运行期判别式
+    /// 取值选臂证明。`None` = 今日单臂形态，行为逐字不变。
+    pub(crate) discriminator: Option<Discriminator>,
+}
+
+/// 双臂判别式（§12.3(a/d)）：`sql` 返回整型标签——`-1` = 判别值
+/// NULL（`RouteDiscriminatorNotTotal` 整段回退）、`0..arms.len()-1`
+/// = 对应臂计划、`arms.len()` = ELSE 臂（主计划本体，值域补集）。
+/// 臂等值比较在 SQL 侧完成（`=` 语义与原 IF 条件同源），不经
+/// SpinValue 跨类型比对。
+#[derive(Clone)]
+pub(crate) struct Discriminator {
+    pub sql: String,
+    /// 非 ELSE 臂计划（值域划分；ELSE 臂即外层 ConversionPlan 本体）。
+    pub arms: Vec<RouteArm>,
+}
+
+/// 判别式标签命中时选用的备选臂计划（独立走查+生成，§12.3(b/c)）。
+#[derive(Clone)]
+pub(crate) struct RouteArm {
+    /// 该臂自己的 sql/binds/guards/preludes/tail_commit；`discriminator`
+    /// 恒 `None`（臂内不再嵌套路由分叉）。
+    pub plan: Box<ConversionPlan>,
 }
 
 pub(super) type BoundGuard = (String, Vec<(String, BindSrc)>);
@@ -372,6 +396,7 @@ mod tests {
             route_guards: route,
             expr_guards: expr,
             miss_outs: Vec::new(),
+            discriminator: None,
         }
     }
 
@@ -422,6 +447,15 @@ mod tests {
         assert_eq!(sqls.len(), 5, "sys_dummy×2 + drift×2 + top1×1: {sqls:?}");
         assert_eq!(sqls[4], "SELECT 1");
         assert!(!sqls.iter().any(|s| s == "SELECT FALSE"));
+    }
+
+    #[test]
+    fn should_default_plan_to_single_arm_with_route_guards() {
+        // 测试 13（§12.6）：discriminator=None 的单臂计划——route_guards
+        // 保留、臂字段缺席，ELSE-only 形态逐字不变。
+        let p = plan(vec![], vec!["SELECT TRUE".to_string()], vec![]);
+        assert!(p.discriminator.is_none());
+        assert_eq!(p.route_guards, ["SELECT TRUE"]);
     }
 
     #[test]

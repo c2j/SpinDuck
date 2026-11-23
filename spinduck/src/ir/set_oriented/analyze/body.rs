@@ -33,6 +33,11 @@ pub(super) struct Body<'a> {
     /// LookupTuple 槽位变量：调用被集合化跳过后不得再被赋值（防陈旧绑定）。
     tuple_vars: std::collections::BTreeSet<VarName>,
     pub route: Option<(VarName, String)>,
+    /// route 决策点（D7 双臂走查 divert 输入；两种 route 形态见
+    /// [`super::RouteSite`]）。
+    pub route_site: Option<super::RouteSite>,
+    /// 本次走查是否为 D7 THEN 臂（裸 SqlQuery 的 case_sink 受理面）。
+    then_arm: bool,
     pub folded: Vec<(VarName, crate::value::SpinValue)>,
     pub inlined: Vec<(VarName, IrExpr)>,
     pub inline_checks: Vec<(VarName, IrExpr)>,
@@ -57,15 +62,85 @@ pub(super) struct Body<'a> {
 
 impl<'a> Body<'a> {
     pub(super) fn walk(ctx: &Context<'a, '_>) -> Result<Self, SkipReason> {
+        Self::walk_diverted(ctx, None)
+    }
+
+    /// D7 双臂（§12.3(b) 每臂独立走查）：在 route 决策点分流进
+    /// THEN 臂、臂尾跳到汇合后续走——公共后缀在本臂入口状态下独立
+    /// 走查，不做两臂事实合并。trap 形态臂含 trap 语义，预置
+    /// `has_trap`（PushTrap/PopTrap/handler 被 divert 跳过）。
+    pub(super) fn walk_then(
+        ctx: &Context<'a, '_>,
+        site: super::RouteSite,
+    ) -> Result<Self, SkipReason> {
+        Self::walk_diverted(ctx, Some(site))
+    }
+
+    fn walk_diverted(
+        ctx: &Context<'a, '_>,
+        site: Option<super::RouteSite>,
+    ) -> Result<Self, SkipReason> {
+        let redirects: Vec<(usize, usize)> = match site {
+            Some(super::RouteSite::Branch { pc, to }) => {
+                vec![(pc, pc + 1), (to - 1, ctx.region.close_pc - 1)]
+            }
+            Some(super::RouteSite::TrapGroup {
+                push_pc,
+                else_start,
+                resume_pc,
+            }) => vec![(push_pc, push_pc + 2), (else_start - 1, resume_pc)],
+            None => Vec::new(),
+        };
+        let trap_route = matches!(site, Some(super::RouteSite::TrapGroup { .. }));
         let mut body = Self {
             agg_candidates: agg_candidates(ctx),
+            then_arm: site.is_some(),
             ..Default::default()
         };
+        if trap_route {
+            body.has_trap = true;
+        }
         let mut pc = ctx.region.open_pc + 3;
         while pc < ctx.region.close_pc - 1 {
+            if let Some((_, next)) = redirects.iter().find(|(at, _)| *at == pc) {
+                pc = *next;
+                continue;
+            }
             pc = body.statement(ctx, pc)?;
         }
+        // D7 THEN 臂事后冲突检查：折叠常量之后又被任一写汇/查找/内联
+        // 事实接管同名变量 → 折叠值对覆写前的读取不再成立，整体拒绝。
+        if site.is_some() {
+            for (v, _) in &body.folded {
+                if body.arm_fact_conflict(v, false) {
+                    return Err(SkipReason::UnsupportedControlFlow);
+                }
+            }
+        }
         Ok(body)
+    }
+
+    /// THEN 臂折叠常量的同名事实冲突检查：变量已被查找/写汇/内联/
+    /// 算术覆写/聚合/死存储等任一事实持有时拒绝（§12.3 臂内独立事实）。
+    /// `include_folded`：赋值时点检查含 folded 自身（重复赋值拒绝）；
+    /// 事后检查排除（folded 条目自身即被检对象）。
+    fn reject_arm_fact(&self, v: &VarName) -> Result<(), SkipReason> {
+        if self.arm_fact_conflict(v, true) {
+            return Err(SkipReason::UnsupportedControlFlow);
+        }
+        Ok(())
+    }
+
+    fn arm_fact_conflict(&self, v: &VarName, include_folded: bool) -> bool {
+        (include_folded && self.folded.iter().any(|(fv, _)| fv == v))
+            || self.inlined.iter().any(|(iv, _)| iv == v)
+            || self.sinks.iter().any(|(sv, _, _, _)| sv == v)
+            || self.arith_writes.iter().any(|w| w.var == *v)
+            || self.lookups.iter().any(|l| l.var == *v)
+            || self.aggs.iter().any(|a| a.var == *v)
+            || self.agg_vars.contains(v)
+            || self.tuple_vars.contains(v)
+            || self.dead.contains(v)
     }
 
     fn statement(&mut self, ctx: &Context<'a, '_>, pc: usize) -> Result<usize, SkipReason> {
@@ -112,6 +187,21 @@ impl<'a> Body<'a> {
             } => {
                 if !fn_sites.is_empty() {
                     return Err(SkipReason::UnresolvedFnSite);
+                }
+                // D7 THEN 臂：裸 SELECT INTO 仅受理 sys_dummy CASE 写汇
+                // （入口守卫已证 total，无 miss 语义）。
+                if self.then_arm {
+                    let [AssignTarget::Var(var)] = into.as_slice() else {
+                        return Err(SkipReason::UnsupportedControlFlow);
+                    };
+                    match lookup::parse_then_case_sink(sql, var.clone(), binds, &ctx.region.record)?
+                    {
+                        Some(lq) => {
+                            self.add_group(vec![lq])?;
+                            return Ok(pc + 1);
+                        }
+                        None => return Err(SkipReason::UnsupportedControlFlow),
+                    }
                 }
                 if !matches!(into.as_slice(), [AssignTarget::Var(_)]) || !binds.is_empty() {
                     return Err(SkipReason::UnsupportedControlFlow);
@@ -160,7 +250,7 @@ impl<'a> Body<'a> {
                 return Ok(pc + 2);
             }
         }
-        if let Some((cond, group, resume)) =
+        if let Some((cond, group, resume, else_start)) =
             lookup::fallback_if_group_at(ctx.prog, pc, ctx.region, ctx.catalog)?
         {
             if self.route.is_some() {
@@ -169,6 +259,11 @@ impl<'a> Body<'a> {
             let r = route::cond(&cond, &self.lookups).ok_or(SkipReason::UnsupportedControlFlow)?;
             self.add_group(group)?;
             self.route = Some(r);
+            self.route_site = Some(super::RouteSite::TrapGroup {
+                push_pc: pc,
+                else_start,
+                resume_pc: resume,
+            });
             self.has_trap = true;
             return Ok(resume);
         }
@@ -250,6 +345,7 @@ impl<'a> Body<'a> {
         }
         self.route =
             Some(route::cond(cond, &self.lookups).ok_or(SkipReason::UnsupportedControlFlow)?);
+        self.route_site = Some(super::RouteSite::Branch { pc, to });
         Ok(to)
     }
 
@@ -281,11 +377,21 @@ impl<'a> Body<'a> {
             IrExpr::FuncCall { name, args, .. } => self.assign_call(ctx, v, name, args)?,
             IrExpr::Bin { op, l, r } => self.sink(ctx.region, v, (*op, l, r))?,
             IrExpr::Const(c) => {
+                // D7 THEN 臂：活常量赋值折叠为字面量事实（臂内独立，
+                // 不影响 ELSE 臂逐字路径）；真死存储仍走 dead。
+                if self.then_arm {
+                    if dead::eliminable(ctx.prog, v, c) {
+                        self.dead.push(v.clone());
+                    } else {
+                        self.reject_arm_fact(v)?;
+                        self.folded.push((v.clone(), c.clone()));
+                    }
                 // 聚合槽位的前置清零：INTO/处理器在所有路径上覆写，属死存储。
-                if !dead::eliminable(ctx.prog, v, c) && !self.agg_candidates.contains(v) {
+                } else if !dead::eliminable(ctx.prog, v, c) && !self.agg_candidates.contains(v) {
                     return Err(SkipReason::UnsupportedControlFlow);
+                } else {
+                    self.dead.push(v.clone());
                 }
-                self.dead.push(v.clone());
             }
             IrExpr::SqlFn { .. } => {
                 self.reject_reassignment(v)?;
@@ -340,11 +446,15 @@ impl<'a> Body<'a> {
         binds: &[(String, BindSrc)],
     ) -> Result<(), SkipReason> {
         self.validate_sinks(ctx, binds)?;
-        if self.folded.iter().any(|(v, _)| {
-            binds
-                .iter()
-                .any(|(_, src)| matches!(src, BindSrc::Var(bv) if bv == v))
-        }) {
+        // D7 THEN 臂活常量折叠：folded 变量可作 INSERT 绑定源——
+        // 投影层（copy/inline.rs）按字面量渲染，逐行同值。
+        if !self.then_arm
+            && self.folded.iter().any(|(v, _)| {
+                binds
+                    .iter()
+                    .any(|(_, src)| matches!(src, BindSrc::Var(bv) if bv == v))
+            })
+        {
             return Err(SkipReason::UnsupportedControlFlow);
         }
         for lq in &self.lookups {
