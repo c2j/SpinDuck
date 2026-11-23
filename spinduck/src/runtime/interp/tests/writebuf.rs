@@ -451,6 +451,8 @@ fn should_flush_partial_batch_when_write_buf_cap_reached() {
     let mut f = Frame::new();
     let mut sink = crate::exec::TraceNoopSink;
     let cat = crate::catalog::RoutineCatalog::new();
+    let mut current_error = None;
+    let mut last_write_rows = 0usize;
     let mut env = Env {
         frame: &mut f,
         ex: &ex,
@@ -460,8 +462,8 @@ fn should_flush_partial_batch_when_write_buf_cap_reached() {
         budget: DEFAULT_STEP_BUDGET,
         batch: true,
         wbuf: crate::runtime::interp::writebuf::shared_buffer_with_cap(2),
-        current_error: None,
-        last_write_rows: 0,
+        current_error: &mut current_error,
+        last_write_rows: &mut last_write_rows,
         var_types: &prog.var_types,
     };
     let mut traps = Vec::new();

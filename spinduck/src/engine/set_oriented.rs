@@ -33,6 +33,10 @@ impl Engine {
             batch_commit: self.batch_commit,
         };
         if self.set_oriented == SetOrientedMode::Off {
+            // loop-parallel 二级降级通道（默认 Off 时 try_loop_parallel 立即返回）
+            if let Some(out) = self.try_loop_parallel(routine, frame, sink, limits)? {
+                return Ok(out);
+            }
             return self.run_prog(&routine.prog, frame, sink, limits, RunSpan::default());
         }
         // 设计 §2.1：原 `routine.prog` 只读不变，按已选区域列表分段
@@ -42,6 +46,10 @@ impl Engine {
         let plans = match self.select_plan(routine)? {
             Err(reason) => {
                 self.push_report(&routine.name, Status::Skipped { reason });
+                // 集合化未接管：loop-parallel 作为二级降级通道再试一次
+                if let Some(out) = self.try_loop_parallel(routine, frame, sink, limits)? {
+                    return Ok(out);
+                }
                 return self.run_prog(&routine.prog, frame, sink, limits, RunSpan::default());
             }
             Ok(p) => vec![p],
@@ -74,7 +82,7 @@ impl Engine {
             }
         }
         let mut cursor_pc = 0usize;
-        for p in &plans {
+        for (i, p) in plans.iter().enumerate() {
             // 步 1：前缀按原 IR 执行至区域入口（stop_pc 处指令不执行、不计步）；
             // 非 Stopped 按 §2.1 直接返回——区域未执行，不记 Converted
             let out = self.run_prog(
@@ -85,13 +93,17 @@ impl Engine {
                 RunSpan {
                     start_pc: cursor_pc,
                     stop_pc: Some(p.open_pc),
+                    exit_pc: None,
+                    entry_exec: false,
                 },
             )?;
             if !matches!(out, RunOutcome::Stopped) {
                 return Ok(out);
             }
             // 步 2-5：入口守卫裁决 → 集合 SQL 直发或原区域续跑
-            if let Some(out) = self.adjudicate_region(routine, p, frame, sink, limits)? {
+            if let Some(out) =
+                self.adjudicate_region(routine, p, frame, sink, limits, i + 1 == plans.len())?
+            {
                 return Ok(out);
             }
             cursor_pc = p.close_pc + 1;
@@ -105,6 +117,8 @@ impl Engine {
             RunSpan {
                 start_pc: cursor_pc,
                 stop_pc: None,
+                exit_pc: None,
+                entry_exec: false,
             },
         )
     }
@@ -114,6 +128,9 @@ impl Engine {
     /// 事务仍干净才退回原区域 `[open_pc .. close_pc + 1)`，绝不重放前缀；
     /// 守卫通过则集合 SQL 当场直发（不经 WriteBuffer），开始执行即失败
     /// 直接上抛严禁回放原循环。返回 `Some(out)` 表示例程已提前终结。
+    /// `is_last` = 本区域是计划列表末项：守卫运行态拒绝时允许
+    /// loop-parallel 接管（其串行尾会跑完例程剩余全部 PC，故仅末区
+    /// 域安全——前面区域拒绝时后续计划仍须按原序裁决）。
     fn adjudicate_region(
         &mut self,
         routine: &CompiledRoutine,
@@ -121,12 +138,17 @@ impl Engine {
         frame: &mut Frame,
         sink: &mut dyn TraceSink,
         limits: RunLimits,
+        is_last: bool,
     ) -> Result<Option<RunOutcome>, EngineError> {
         // 守卫 SQL 引用缓存表的计划（verbatim cur_scan / 写守卫子查询）：
         // 物化前导先于入口守卫，否则守卫查询打到不存在的 sd_fn*/sd_bf*。
         // 回退时解释器会重新物化——例程纯度已证，仅多一次去重调用。
+        // 备选臂计划的 fn_preludes 与主计划同源（游标/INSERT 位），
+        // 任一计划需要前置物化即提前执行。
+        let preludes_first =
+            plan.preludes_first || plan.route_alt.as_ref().is_some_and(|a| a.preludes_first);
         let mut preluded = false;
-        if plan.preludes_first && !plan.fn_preludes.is_empty() {
+        if preludes_first && !plan.fn_preludes.is_empty() {
             // INSERT 位前导的 distinct-over-sd_cur 查询可内嵌 sd_vwN
             // 查找 CTE——fn 前导先于视图物化，须先物化一次；例程调用
             // 可回滚会话临时表，视图在 fn 后由下方步骤再物化（幂等）。
@@ -159,57 +181,89 @@ impl Engine {
         if !plan.view_preludes.is_empty() {
             self.materialize_views(plan)?;
         }
-        match entry_ok(self.ex.as_ref(), plan, &self.optimize_ctx(), frame)? {
+        // 分臂备选：主计划（ELSE 臂）入口守卫失败时尝试 THEN 臂备选
+        // 计划——其守卫集独立（route_guards 为"条件 IS TRUE"判定），
+        // 全过才放行；两臂计划共享同一区域边界，选中者执行其批写 SQL。
+        let optimize = self.optimize_ctx();
+        let mut chosen: Option<&ConversionPlan> = None;
+        let mut skip_reason = None;
+        match entry_ok(self.ex.as_ref(), plan, &optimize, frame)? {
+            Ok(()) => chosen = Some(plan),
             Err(reason) => {
-                self.push_report(&routine.name, Status::Skipped { reason });
-                let out = self.run_prog(
-                    &routine.prog,
-                    frame,
-                    sink,
-                    limits,
-                    RunSpan {
-                        start_pc: plan.open_pc,
-                        stop_pc: Some(plan.close_pc + 1),
-                    },
-                )?;
-                Ok((!matches!(out, RunOutcome::Stopped)).then_some(out))
-            }
-            Ok(()) => {
-                self.push_report(
-                    &routine.name,
-                    Status::Converted {
-                        sql: plan.sql.clone(),
-                    },
-                );
-                // fn_site 物化前导：与解释器 OpenCursor 时点同口径，
-                // 失败直接上抛（同点失败语义），绝不部分物化后续跑批写。
-                if !preluded && !plan.fn_preludes.is_empty() {
-                    crate::runtime::interp::materialize_fn_preludes(
-                        &plan.fn_preludes,
-                        frame,
-                        self.ex.as_ref(),
-                        sink,
-                        &self.catalog,
-                        &routine.prog.var_types,
-                    )?;
-                }
-                let rows = self.exec_region_sql(plan, frame, sink)?;
-                // miss 仿真标量出口：NO_DATA_FOUND 处理器赋值回填——
-                // 存在 miss 行时取回逐行（均匀性已由入口守卫证明）
-                // 处理器赋值结果写回帧；无 miss 行保持批写前值。
-                for mo in &plan.miss_outs {
-                    let bm = crate::runtime::interp::resolve_binds(&mo.binds, frame)?;
-                    let mut stream = self.ex.query(&mo.sql, &bm)?;
-                    if let Some(row) = stream.fetch_many(1).into_iter().next() {
-                        for (var, val) in mo.targets.iter().zip(row) {
-                            frame.set(var, val);
-                        }
+                if let Some(alt) = plan.route_alt.as_deref() {
+                    if matches!(entry_ok(self.ex.as_ref(), alt, &optimize, frame)?, Ok(())) {
+                        chosen = Some(alt);
                     }
                 }
-                self.commit_region_tail(plan, rows, sink)?;
-                Ok(None)
+                if chosen.is_none() {
+                    skip_reason = Some(reason);
+                }
             }
         }
+        let Some(p) = chosen else {
+            let reason = skip_reason.unwrap_or(SkipReason::UnsupportedControlFlow);
+            self.push_report(&routine.name, Status::Skipped { reason });
+            // SO+LP 派发缺口：守卫运行态拒绝（数据相关）时，末区域
+            // 交 loop-parallel 接管——前缀已执行，LP 只补 OPEN 段；
+            // LP 自身门禁/预热失败会退回同状态串行续跑，语义零变化。
+            if is_last {
+                if let Some(out) =
+                    self.try_loop_parallel_region(routine, plan, frame, sink, limits)?
+                {
+                    return Ok(Some(out));
+                }
+            }
+            let out = self.run_prog(
+                &routine.prog,
+                frame,
+                sink,
+                limits,
+                RunSpan {
+                    start_pc: plan.open_pc,
+                    stop_pc: Some(plan.close_pc + 1),
+                    exit_pc: None,
+                    entry_exec: false,
+                },
+            )?;
+            return Ok((!matches!(out, RunOutcome::Stopped)).then_some(out));
+        };
+        self.push_report(&routine.name, Status::Converted { sql: p.sql.clone() });
+        // fn_site 物化前导：与解释器 OpenCursor 时点同口径，
+        // 失败直接上抛（同点失败语义），绝不部分物化后续跑批写。
+        if !preluded && !p.fn_preludes.is_empty() {
+            crate::runtime::interp::materialize_fn_preludes(
+                &p.fn_preludes,
+                frame,
+                self.ex.as_ref(),
+                sink,
+                &self.catalog,
+                &routine.prog.var_types,
+            )?;
+        }
+        // 混合调度（so-exception-row-hybrid §3）：异常行号集在入口期
+        // 求值；空集落入下方既有 SO 路径（plan.sql 已是全行版本，
+        // 与无混合计划行为等价）。非空走分段批写+单行重放。
+        if p.hybrid.is_some() {
+            let exc = crate::ir::set_oriented::exc_rows(self.ex.as_ref(), p, frame)?;
+            if !exc.is_empty() {
+                return self.run_hybrid_region(routine, p, frame, sink, limits, exc);
+            }
+        }
+        let rows = self.exec_region_sql(p, frame, sink)?;
+        // miss 仿真标量出口：NO_DATA_FOUND 处理器赋值回填——
+        // 存在 miss 行时取回逐行（均匀性已由入口守卫证明）
+        // 处理器赋值结果写回帧；无 miss 行保持批写前值。
+        for mo in &p.miss_outs {
+            let bm = crate::runtime::interp::resolve_binds(&mo.binds, frame)?;
+            let mut stream = self.ex.query(&mo.sql, &bm)?;
+            if let Some(row) = stream.fetch_many(1).into_iter().next() {
+                for (var, val) in mo.targets.iter().zip(row) {
+                    frame.set(var, val);
+                }
+            }
+        }
+        self.commit_region_tail(p, rows, sink)?;
+        Ok(None)
     }
 
     /// 视图物化前导执行：`CREATE OR REPLACE TEMP TABLE sd_vwN AS
@@ -249,6 +303,79 @@ impl Engine {
         Ok(())
     }
 
+    /// 混合调度的物化表存在性探测：一次交叉空集查询覆盖全部
+    /// `sd_fn*`/`sd_bf*`/`sd_vw*` 物化表——任一缺失整查询报错，
+    /// 由调用方触发刷新。目录错误不毒化事务，可安全续跑。
+    fn so_materializations_intact(&self, plan: &ConversionPlan) -> bool {
+        let names: Vec<&str> = plan
+            .fn_preludes
+            .iter()
+            .map(|p| p.table.as_str())
+            .chain(plan.view_preludes.iter().filter_map(|v| {
+                // `CREATE OR REPLACE TEMP TABLE <name> AS ...` → 取 TABLE 后词。
+                let mut it = v.sql.split_whitespace();
+                it.by_ref()
+                    .find(|w| w.eq_ignore_ascii_case("TABLE"))
+                    .and_then(|_| it.next())
+            }))
+            .collect();
+        if names.is_empty() {
+            return true;
+        }
+        let probe = format!(
+            "SELECT COUNT(*) FROM {}",
+            names
+                .iter()
+                .map(|n| format!("(SELECT 1 FROM \"{n}\" LIMIT 0) _t"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        self.ex.query(&probe, &crate::exec::BindMap::new()).is_ok()
+    }
+
+    /// 段前守卫：物化表被重放例程调用撤销时才重建（探测代价 =
+    /// 一次空集查询，远低于全量重物化）。
+    fn ensure_so_materializations(
+        &self,
+        plan: &ConversionPlan,
+        routine: &CompiledRoutine,
+        frame: &mut Frame,
+        sink: &mut dyn TraceSink,
+    ) -> Result<(), EngineError> {
+        if !self.so_materializations_intact(plan) {
+            self.refresh_so_materializations(plan, routine, frame, sink)?;
+        }
+        Ok(())
+    }
+
+    /// 混合调度的物化刷新：单行重放会原生执行体内例程调用，会话
+    /// 回滚可撤销 `sd_fn*`/`sd_bf*`/`sd_vw*` 临时表（解释器路径由
+    /// dynamic.rs 逐站点重写兜底，混合路径的批写段没有该机制）。
+    /// 次序镜像入口期 views→fn→views；重写幂等（distinct 实参不
+    /// 依赖帧内行级变量），失败上抛——事务已中止无法安全续跑。
+    fn refresh_so_materializations(
+        &self,
+        plan: &ConversionPlan,
+        routine: &CompiledRoutine,
+        frame: &mut Frame,
+        sink: &mut dyn TraceSink,
+    ) -> Result<(), EngineError> {
+        if plan.view_preludes.is_empty() && plan.fn_preludes.is_empty() {
+            return Ok(());
+        }
+        self.materialize_views(plan)?;
+        crate::runtime::interp::materialize_fn_preludes(
+            &plan.fn_preludes,
+            frame,
+            self.ex.as_ref(),
+            sink,
+            &self.catalog,
+            &routine.prog.var_types,
+        )?;
+        self.materialize_views(plan)?;
+        Ok(())
+    }
+
     /// 集合区域 SQL 的直发执行：按实际顺序发 `IrStmt` variant `SqlExec`
     /// trace 与 `TraceEvent::SqlExec { sql, binds, elapsed_us: 0 }`，返回
     /// 影响行数供 `tail_commit` 判定（设计 §2.1 契约 2）。
@@ -258,20 +385,207 @@ impl Engine {
         frame: &Frame,
         sink: &mut dyn TraceSink,
     ) -> Result<usize, EngineError> {
-        // 与解释路径同序：先 IrStmt variant 埋点（主循环派发前），
-        // 再解析绑定发 TraceEvent::SqlExec，最后下发执行
+        self.exec_sql(&plan.sql, &plan.binds, frame, sink)
+    }
+
+    /// 集合区域 SQL 的直发执行（混合分段复用同一 trace/绑定口径）：
+    /// 先 `IrStmt` variant `SqlExec` 埋点，再 `TraceEvent::SqlExec`，
+    /// 最后下发执行并返回影响行数。
+    fn exec_sql(
+        &self,
+        sql: &str,
+        binds: &[(String, crate::ir::BindSrc)],
+        frame: &Frame,
+        sink: &mut dyn TraceSink,
+    ) -> Result<usize, EngineError> {
         if sink.is_enabled() {
             sink.on_event(crate::exec::TraceEvent::IrStmt { variant: "SqlExec" });
         }
-        let bound = crate::runtime::interp::resolve_binds(&plan.binds, frame)?;
+        let bound = crate::runtime::interp::resolve_binds(binds, frame)?;
         if sink.is_enabled() {
             sink.on_event(crate::exec::TraceEvent::SqlExec {
-                sql: plan.sql.clone(),
+                sql: sql.to_string(),
                 binds: bound.clone(),
                 elapsed_us: 0,
             });
         }
-        Ok(self.ex.execute(&plan.sql, &bound)?.rows_affected)
+        Ok(self.ex.execute(sql, &bound)?.rows_affected)
+    }
+
+    /// 混合段批写：`plan.sql` 段谓词占位符替换为 [lo,hi) 字面量
+    /// （__SD_HI__ 排他）后按普通 SO 同一 trace/绑定口径直发。
+    fn exec_hybrid_segment(
+        &self,
+        plan: &ConversionPlan,
+        frame: &Frame,
+        sink: &mut dyn TraceSink,
+        lo: u64,
+        hi: u64,
+    ) -> Result<usize, EngineError> {
+        let tmpl = plan
+            .seg_sql
+            .as_deref()
+            .ok_or_else(|| EngineError::invariant(32, "hybrid plan missing seg_sql"))?;
+        let sql = tmpl
+            .replace("__SD_LO__", &lo.to_string())
+            .replace("__SD_HI__", &hi.to_string());
+        debug_assert!(!sql.contains("__SD_"));
+        self.exec_sql(&sql, &plan.binds, frame, sink)
+    }
+
+    /// SO 行级混合执行（so-exception-row-hybrid §3）：正常行按行段
+    /// 批写（与异常行重放保序交错），异常行 `seek_before`+真实 Fetch
+    /// 单行重放；早退/返回原样上交；末尾补终止空 FETCH 对齐游标属性，
+    /// `exit_pc==close_pc` 时补执行 CloseCursor 后交还外层续跑。
+    fn run_hybrid_region(
+        &mut self,
+        routine: &CompiledRoutine,
+        plan: &ConversionPlan,
+        frame: &mut Frame,
+        sink: &mut dyn TraceSink,
+        limits: RunLimits,
+        exc: std::collections::BTreeSet<u64>,
+    ) -> Result<Option<RunOutcome>, EngineError> {
+        let spec = plan
+            .hybrid
+            .as_ref()
+            .ok_or_else(|| EngineError::invariant(32, "hybrid plan missing spec"))?;
+        // OPEN：真实游标就位（解释器 OpenCursor 指令，open_pc..fetch_pc）。
+        let out = self.run_prog(
+            &routine.prog,
+            frame,
+            sink,
+            limits,
+            RunSpan {
+                start_pc: plan.open_pc,
+                stop_pc: Some(spec.fetch_pc),
+                exit_pc: None,
+                entry_exec: false,
+            },
+        )?;
+        if !matches!(out, RunOutcome::Stopped) {
+            return Ok(Some(out));
+        }
+        let total = match frame.cursor_state(&spec.cursor) {
+            Some(crate::runtime::CursorState::Open { total, .. }) => *total,
+            _ => {
+                return Err(EngineError::invariant(
+                    32,
+                    "hybrid cursor not open after OpenCursor span",
+                ))
+            }
+        };
+        let mut written = 0usize;
+        let mut seg_lo = 0u64;
+        let mut exited = false;
+        for &e in &exc {
+            if e >= total as u64 {
+                return Err(EngineError::invariant(
+                    32,
+                    format!("hybrid exc row {e} out of range (total={total})"),
+                ));
+            }
+            if e > seg_lo {
+                self.ensure_so_materializations(plan, routine, frame, sink)?;
+                written += self.exec_hybrid_segment(plan, frame, sink, seg_lo, e)?;
+            }
+            let rspec = crate::runtime::interp::ReplaySpec {
+                cursor: &spec.cursor,
+                row_index: e as usize,
+                fetch_pc: spec.fetch_pc,
+                exit_pc: spec.exit_pc,
+                limits,
+            };
+            match crate::runtime::interp::replay_cursor_row(
+                &routine.prog,
+                frame,
+                &rspec,
+                self.ex.as_ref(),
+                sink,
+                &self.catalog,
+                0,
+            )? {
+                crate::runtime::interp::RowReplay::IterDone => {}
+                crate::runtime::interp::RowReplay::LoopExited => {
+                    exited = true;
+                    break;
+                }
+                crate::runtime::interp::RowReplay::Returned(v) => {
+                    return Ok(Some(RunOutcome::Returned(v)))
+                }
+                crate::runtime::interp::RowReplay::Completed => {
+                    return Ok(Some(RunOutcome::Completed))
+                }
+            }
+            seg_lo = e + 1;
+        }
+        if !exited {
+            if seg_lo < total as u64 {
+                self.ensure_so_materializations(plan, routine, frame, sink)?;
+                written += self.exec_hybrid_segment(plan, frame, sink, seg_lo, total as u64)?;
+            }
+            // 终止空 FETCH：游标属性（%NOTFOUND/%ROWCOUNT）对齐串行——
+            // seek_before(total)+真实 Fetch 必然走 NOTFOUND 出口边。
+            let rspec = crate::runtime::interp::ReplaySpec {
+                cursor: &spec.cursor,
+                row_index: total,
+                fetch_pc: spec.fetch_pc,
+                exit_pc: spec.exit_pc,
+                limits,
+            };
+            match crate::runtime::interp::replay_cursor_row(
+                &routine.prog,
+                frame,
+                &rspec,
+                self.ex.as_ref(),
+                sink,
+                &self.catalog,
+                0,
+            )? {
+                crate::runtime::interp::RowReplay::LoopExited
+                | crate::runtime::interp::RowReplay::IterDone => {}
+                crate::runtime::interp::RowReplay::Returned(v) => {
+                    return Ok(Some(RunOutcome::Returned(v)))
+                }
+                crate::runtime::interp::RowReplay::Completed => {
+                    return Ok(Some(RunOutcome::Completed))
+                }
+            }
+        }
+        // miss 仿真标量出口 + 尾提交：与普通 SO 同序同口径。
+        // 末段重放可能再次撤销物化表——出口查询前探测补齐。
+        self.ensure_so_materializations(plan, routine, frame, sink)?;
+        for mo in &plan.miss_outs {
+            let bm = crate::runtime::interp::resolve_binds(&mo.binds, frame)?;
+            let mut stream = self.ex.query(&mo.sql, &bm)?;
+            if let Some(row) = stream.fetch_many(1).into_iter().next() {
+                for (var, val) in mo.targets.iter().zip(row) {
+                    frame.set(var, val);
+                }
+            }
+        }
+        self.commit_region_tail(plan, written, sink)?;
+        // CloseCursor：exit_pc==close_pc 时补执行 CLOSE 指令；
+        // exit_pc==close_pc+1 时串行 EXIT 本就跳过 CLOSE，游标保持打开
+        // （与串行状态一致），直接交还外层续跑。
+        if spec.exit_pc == plan.close_pc {
+            let out = self.run_prog(
+                &routine.prog,
+                frame,
+                sink,
+                limits,
+                RunSpan {
+                    start_pc: spec.exit_pc,
+                    stop_pc: Some(spec.exit_pc + 1),
+                    exit_pc: None,
+                    entry_exec: false,
+                },
+            )?;
+            if !matches!(out, RunOutcome::Stopped) {
+                return Ok(Some(out));
+            }
+        }
+        Ok(None)
     }
 
     fn optimize_ctx(&self) -> OptimizeCtx<'_> {

@@ -20,9 +20,28 @@ enum Gate {
     },
 }
 
+/// 区域体走查臂：Primary = ELSE 臂计划（现状，IF 组 THEN 由入口守卫
+/// 证明不可达）；ThenArm = THEN 臂备选计划（分臂备选），遇 IF 路由
+/// 闭包时走 THEN 臂语句、ELSE 臂整体跳过。
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum WalkArm {
+    #[default]
+    Primary,
+    ThenArm,
+}
+
+/// THEN 臂走查上下文：IF 组的 ELSE 臂区间与处理器重置（死存储证明输入）。
+struct ArmIf {
+    else_range: std::ops::Range<usize>,
+    resets: Vec<(VarName, crate::value::SpinValue)>,
+    cond: IrExpr,
+}
+
 #[derive(Default)]
 pub(super) struct Body<'a> {
     pub insert_stmt: Option<&'a IrStmt>,
+    /// 主走查是否命中 IF 路由闭包（决定是否尝试 THEN 臂备选计划）。
+    pub if_group_seen: bool,
     pub tail_commit: bool,
     pub has_trap: bool,
     /// §3.5-4 INSERT 跳起型处理器：坏行数由入口守卫裁决。
@@ -53,12 +72,22 @@ pub(super) struct Body<'a> {
     pending_lookups: std::collections::BTreeMap<usize, lookup::LookupQuery>,
     /// §3.3 条件算术覆写：IF 门内 `var := <DECIMAL 乘/减>`。
     pub arith_writes: Vec<ArithWrite>,
+    /// 当前走查臂（walk 注入；statement/trap/branch 据此分流）。
+    walk_arm: WalkArm,
+    /// THEN 臂走查进行中：IF 组上下文（arm_query/finish_arm 消费）。
+    arm_if: Option<ArmIf>,
+    /// THEN 臂已收集的查找（pc, 查找），finish_arm 时成组并做死存储证明。
+    arm_lookups: Vec<(usize, lookup::LookupQuery)>,
+    /// 函数调用 OUT 写回目标变量：备选计划后缀读取检查的输入
+    /// （批写路径不回写帧，后缀读取会取到陈旧值）。
+    pub call_outs: std::collections::BTreeSet<VarName>,
 }
 
 impl<'a> Body<'a> {
-    pub(super) fn walk(ctx: &Context<'a, '_>) -> Result<Self, SkipReason> {
+    pub(super) fn walk(ctx: &Context<'a, '_>, arm: WalkArm) -> Result<Self, SkipReason> {
         let mut body = Self {
             agg_candidates: agg_candidates(ctx),
+            walk_arm: arm,
             ..Default::default()
         };
         let mut pc = ctx.region.open_pc + 3;
@@ -110,6 +139,11 @@ impl<'a> Body<'a> {
                 into,
                 fn_sites,
             } => {
+                // THEN 臂备选走查：臂内 SELECT INTO 按查找组成员准入
+                // （parse_total 全定义证明 + 写集不相交 + 处理器重置兜底）。
+                if self.arm_if.is_some() {
+                    return self.arm_query(ctx, pc, sql, binds, into, fn_sites);
+                }
                 if !fn_sites.is_empty() {
                     return Err(SkipReason::UnresolvedFnSite);
                 }
@@ -160,17 +194,32 @@ impl<'a> Body<'a> {
                 return Ok(pc + 2);
             }
         }
-        if let Some((cond, group, resume)) =
-            lookup::fallback_if_group_at(ctx.prog, pc, ctx.region, ctx.catalog)?
-        {
-            if self.route.is_some() {
+        if let Some(ig) = lookup::fallback_if_group_at(ctx.prog, pc, ctx.region, ctx.catalog)? {
+            if self.route.is_some() || self.arm_if.is_some() {
                 return Err(SkipReason::UnsupportedControlFlow);
             }
-            let r = route::cond(&cond, &self.lookups).ok_or(SkipReason::UnsupportedControlFlow)?;
-            self.add_group(group)?;
+            let r =
+                route::cond(&ig.cond, &self.lookups).ok_or(SkipReason::UnsupportedControlFlow)?;
+            if self.walk_arm == WalkArm::ThenArm {
+                // THEN 臂备选计划：走 THEN 臂语句（SqlQuery 经 arm_query
+                // 准入），ELSE 臂与处理器跳过，汇合后共享后缀照常走查。
+                self.arm_if = Some(ArmIf {
+                    else_range: ig.else_range.clone(),
+                    resets: ig.resets.clone(),
+                    cond: ig.cond.clone(),
+                });
+                let mut apc = ig.then_range.start;
+                while apc < ig.then_range.end {
+                    apc = self.statement(ctx, apc)?;
+                }
+                self.finish_arm(ctx)?;
+                return Ok(ig.resume);
+            }
+            self.add_group(ig.group)?;
             self.route = Some(r);
             self.has_trap = true;
-            return Ok(resume);
+            self.if_group_seen = true;
+            return Ok(ig.resume);
         }
         if let Some(resume) = self.mixed_trap(ctx, pc)? {
             return Ok(resume);
@@ -194,6 +243,86 @@ impl<'a> Body<'a> {
             lq.group = gid;
         }
         self.lookups.extend(group);
+        Ok(())
+    }
+
+    /// THEN 臂备选走查的 SELECT INTO 准入：与 ELSE 组成员同口径
+    /// （parse_total 全定义证明、写集不相交、处理器重置或组内局部死
+    /// 兜底）；fn_sites 与非单变量 INTO 保守拒绝。
+    fn arm_query(
+        &mut self,
+        ctx: &Context<'a, '_>,
+        pc: usize,
+        sql: &str,
+        binds: &[(String, BindSrc)],
+        into: &[AssignTarget],
+        fn_sites: &[crate::sql::FnSite],
+    ) -> Result<usize, SkipReason> {
+        if !fn_sites.is_empty() {
+            return Err(SkipReason::UnresolvedFnSite);
+        }
+        let [AssignTarget::Var(var)] = into else {
+            return Err(SkipReason::UnsupportedControlFlow);
+        };
+        let default = self
+            .arm_if
+            .as_ref()
+            .and_then(|arm| {
+                arm.resets
+                    .iter()
+                    .find(|(rv, _)| rv == var)
+                    .map(|(_, d)| d.clone())
+            })
+            .unwrap_or(crate::value::SpinValue::Null);
+        let query = lookup::parse_total(
+            sql,
+            var.clone(),
+            lookup::fallback_sql(&default)?,
+            binds,
+            &ctx.region.record,
+        )?;
+        let writes = region::write_set(ctx.prog, ctx.region, ctx.catalog)?;
+        if writes.contains(&query.table.0)
+            || query.in_filters.iter().any(|f| writes.contains(&f.table.0))
+        {
+            return Err(SkipReason::TargetReadDependency);
+        }
+        self.arm_lookups.push((pc, query));
+        Ok(pc + 1)
+    }
+
+    /// THEN 臂走查收尾：未重置成员组内局部死证明（镜像 ELSE 组口径，
+    /// 豁免区换成 ELSE 臂 pc——备选计划不执行 ELSE 臂），查找成组，
+    /// 路由变量与主计划同源。
+    fn finish_arm(&mut self, ctx: &Context<'a, '_>) -> Result<(), SkipReason> {
+        let arm = self
+            .arm_if
+            .take()
+            .ok_or(SkipReason::UnsupportedControlFlow)?;
+        for (_, lq) in &self.arm_lookups {
+            if arm.resets.iter().any(|(rv, _)| rv == &lq.var) {
+                continue;
+            }
+            let mut allowed: Vec<usize> = self
+                .arm_lookups
+                .iter()
+                .filter(|(_, m)| m.case_sink.as_ref().is_some_and(|cs| cs.operand == lq.var))
+                .map(|(p, _)| *p)
+                .collect();
+            allowed.extend(arm.else_range.clone());
+            if !dead::read_only_within(ctx.prog, &lq.var, &allowed) {
+                return Err(SkipReason::UnsupportedControlFlow);
+            }
+        }
+        let group = self
+            .arm_lookups
+            .drain(..)
+            .map(|(_, q)| q)
+            .collect::<Vec<_>>();
+        self.add_group(group)?;
+        self.route =
+            Some(route::cond(&arm.cond, &self.lookups).ok_or(SkipReason::UnsupportedControlFlow)?);
+        self.has_trap = true;
         Ok(())
     }
 
@@ -227,7 +356,9 @@ impl<'a> Body<'a> {
             }
         }
         // §3.4 IF 门：THEN 线性走查，字段覆写投影为外层 CASE。
+        // THEN 臂备选走查内不允许再开门（臂内嵌套门投影无臂感知证明）。
         if self.gate.is_none()
+            && self.arm_if.is_none()
             && ctx.mode == SetOrientedMode::BatchAtomic
             && agg::gate_renderable(cond)
             && to > pc + 1
@@ -238,10 +369,13 @@ impl<'a> Body<'a> {
             return Ok(pc + 1);
         }
         // §3.3 算术覆写门：THEN 恰一条 `v := <DECIMAL 乘/减>`。
-        if let Some(next) = self.arith_gate(ctx, pc, cond, to, back_pc) {
-            return Ok(next);
+        if self.arm_if.is_none() {
+            if let Some(next) = self.arith_gate(ctx, pc, cond, to, back_pc) {
+                return Ok(next);
+            }
         }
         if self.route.is_some()
+            || self.arm_if.is_some()
             || to <= pc + 1
             || to > back_pc
             || !matches!(ctx.prog.code.get(to - 1), Some(IrStmt::Jump(t)) if *t == back_pc)

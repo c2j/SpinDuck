@@ -28,6 +28,7 @@ pub(crate) fn cmd_call(cmd: Command) -> CallParts {
             args,
             batch_commit,
             set_oriented,
+            loop_parallel,
             step_budget,
             trace,
             trace_format,
@@ -40,6 +41,7 @@ pub(crate) fn cmd_call(cmd: Command) -> CallParts {
             args,
             batch_commit,
             set_oriented,
+            loop_parallel,
             step_budget,
             trace,
             trace_format,
@@ -57,6 +59,7 @@ pub(crate) struct CallParts {
     args: Vec<String>,
     batch_commit: bool,
     set_oriented: Option<crate::ir::set_oriented::SetOrientedMode>,
+    loop_parallel: Option<crate::ir::loop_parallel::LoopParallelMode>,
     step_budget: Option<u64>,
     trace: Option<PathBuf>,
     trace_format: crate::trace::TraceFormat,
@@ -171,6 +174,7 @@ pub(crate) struct CallPrepared {
     pub sources: Vec<PathBuf>,
     pub rules: RuleRegistry,
     pub set_oriented: SetOrientedMode,
+    pub loop_parallel: crate::ir::loop_parallel::LoopParallelConfig,
     pub codeweb_refs: Option<Vec<crate::plan::PlanRef>>,
     /// 编译期快照的 codeweb 项目根；仅 codeweb 计划且集合化开启时导出。
     pub snapshot_root: Option<PathBuf>,
@@ -198,6 +202,11 @@ pub(crate) fn prepare_call(
         sources: t.sources,
         rules,
         set_oriented: parts.set_oriented.unwrap_or(t.set_oriented),
+        // CLI 只覆盖模式；threads/chunk_size/min_rows 旋钮来自项目配置。
+        loop_parallel: crate::ir::loop_parallel::LoopParallelConfig {
+            mode: parts.loop_parallel.unwrap_or(t.loop_parallel.mode),
+            ..t.loop_parallel
+        },
         codeweb_refs: t.codeweb_refs,
         snapshot_root: t.snapshot_root,
     }))
@@ -241,6 +250,7 @@ pub(crate) fn call_engine(
     use crate::cli::args::parse_literal;
     eng.batch_commit = run.batch_commit;
     eng.set_oriented = prep.set_oriented;
+    eng.loop_parallel = prep.loop_parallel;
     // 复核应修 C：大业务（100k 级游标循环）默认预算不够，CLI 放大入口。
     // 缺省必须写回 DEFAULT——batch 引擎缓存复用同一 Engine，不复位会把
     // 上一步的 --step-budget 泄漏给本步（放大/收紧都偏离单步 CLI 语义）。
@@ -376,6 +386,7 @@ fn refuse_on_kernel_gaps(
 #[cfg(feature = "native")]
 struct CallTargeting {
     set_oriented: SetOrientedMode,
+    loop_parallel: crate::ir::loop_parallel::LoopParallelConfig,
     target: String,
     sources: Vec<PathBuf>,
     rules_files: std::collections::BTreeSet<PathBuf>,
@@ -394,6 +405,7 @@ fn call_target_and_sources(
     match &parts.target {
         CallTarget::Routine(r) => Ok(Some(CallTargeting {
             set_oriented: project_set_oriented(&parts.files)?,
+            loop_parallel: project_loop_parallel(&parts.files)?,
             target: r.clone(),
             sources: parts.files.clone(),
             rules_files: discover_rules_files(&parts.files),
@@ -433,6 +445,7 @@ fn call_target_and_sources(
             };
             Ok(Some(CallTargeting {
                 set_oriented: project.set_oriented,
+                loop_parallel: project.loop_parallel,
                 target: plan.target.clone(),
                 sources: files,
                 rules_files: project.rules_files.iter().cloned().collect(),
@@ -455,6 +468,26 @@ fn project_set_oriented(files: &[PathBuf]) -> Result<SetOrientedMode, EngineErro
                 ));
             }
             policy = Some(project.set_oriented);
+        }
+    }
+    Ok(policy.unwrap_or_default())
+}
+
+#[cfg(feature = "native")]
+fn project_loop_parallel(
+    files: &[PathBuf],
+) -> Result<crate::ir::loop_parallel::LoopParallelConfig, EngineError> {
+    use crate::ir::loop_parallel::LoopParallelConfig;
+    let mut policy: Option<LoopParallelConfig> = None;
+    for file in files {
+        if let Some(project) = crate::project::ProjectConfig::discover_strict(file)? {
+            if policy.is_some_and(|p| p != project.loop_parallel) {
+                return Err(EngineError::env(
+                    30,
+                    "多个项目的 [engine].loop_parallel 配置冲突",
+                ));
+            }
+            policy = Some(project.loop_parallel);
         }
     }
     Ok(policy.unwrap_or_default())
@@ -723,6 +756,7 @@ mod tests {
             sources: Vec::new(),
             rules: RuleRegistry::default(),
             set_oriented: SetOrientedMode::Off,
+            loop_parallel: crate::ir::loop_parallel::LoopParallelConfig::default(),
             codeweb_refs: None,
             snapshot_root: None,
         };

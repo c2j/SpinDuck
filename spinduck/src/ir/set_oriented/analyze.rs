@@ -31,7 +31,7 @@ pub(super) fn analyze_region<'a>(
     mode: SetOrientedMode,
     catalog: &crate::catalog::RoutineCatalog,
     in_params: &std::collections::BTreeSet<String>,
-) -> Result<(CopyLoop<'a>, bool, bool), SkipReason> {
+) -> Result<(CopyLoop<'a>, Option<CopyLoop<'a>>, bool, bool), SkipReason> {
     let ctx = Context {
         prog,
         region,
@@ -39,11 +39,40 @@ pub(super) fn analyze_region<'a>(
         catalog,
         in_params: in_params.clone(),
     };
-    let body = body::Body::walk(&ctx)?;
+    let body = body::Body::walk(&ctx, body::WalkArm::Primary)?;
+    let try_alt = body.if_group_seen;
     let parts = prepare(&ctx, &body, in_params)?;
     let flags = (body.tail_commit, body.has_trap);
     let copy = assemble(&ctx, body, parts, in_params)?;
-    Ok((copy, flags.0, flags.1))
+    let alt = if try_alt {
+        alt_copy_loop(&ctx, in_params)
+    } else {
+        None
+    };
+    Ok((copy, alt, flags.0, flags.1))
+}
+
+/// THEN 臂备选计划的区域体分析：独立走查 THEN 臂语句后与主走查共享
+/// 同一后缀。任一证明失败 = None（主计划不受影响，退化为单臂计划）。
+/// 函数调用 OUT 写回目标若在区域后缀被读取，批写路径不回写帧会取到
+/// 陈旧值——备选计划直接放弃（该暴露面与主计划既有口径一致，不在
+/// 本机制内扩面）。
+fn alt_copy_loop<'a>(
+    ctx: &Context<'a, '_>,
+    in_params: &std::collections::BTreeSet<String>,
+) -> Option<CopyLoop<'a>> {
+    let body = body::Body::walk(ctx, body::WalkArm::ThenArm).ok()?;
+    if !body.call_outs.is_empty() {
+        let mut reads = std::collections::BTreeSet::new();
+        for stmt in &ctx.prog.code[ctx.region.close_pc + 1..] {
+            region::collect_stmt_reads(stmt, &mut reads);
+        }
+        if body.call_outs.iter().any(|v| reads.contains(v)) {
+            return None;
+        }
+    }
+    let parts = prepare(ctx, &body, in_params).ok()?;
+    assemble(ctx, body, parts, in_params).ok()
 }
 
 /// INSERT 形态、游标查询与写完备性检查；产出批写所需的 SQL 片段引用。

@@ -76,6 +76,18 @@ pub(crate) struct ConversionPlan {
     /// 有序 Top-1 入口并列一致性守卫 SQL（期望 COUNT(*) = 0）及其须随行的
     /// 形参绑定（LATERAL 静态过滤含 BETWEEN 等；入口从运行帧解析后求值）。
     pub(super) top1_guards: Vec<(String, Vec<(String, BindSrc)>)>,
+    /// 混合调度异常行守卫（so-exception-row-hybrid）：每条返回违规行
+    /// `__sd_rn`（0 基）集合；非空时引擎走"正常行批段+异常行单行重放"。
+    /// 仅 `PlanFlags.hybrid` 计划填充，此时对应 dup 守卫已从
+    /// `top1_guards` 移除（不再整段退回）。
+    pub(crate) exc_guards: Vec<BoundGuard>,
+    /// 混合调度规格（游标/FETCH pc/唯一出口 pc）；`exc_guards` 非空
+    /// 的充要条件——引擎据此走分段批写+单行重放。
+    pub(crate) hybrid: Option<super::hybrid::HybridSpec>,
+    /// 混合段批写 SQL 模板（含 `__SD_LO__`/`__SD_HI__` 占位符）；
+    /// `sql` 字段为占位符替换 NULL 后的全行版本（exc 空集路径直发，
+    /// 与无混合计划行为等价）。
+    pub(crate) seg_sql: Option<String>,
     /// IF 路由入口守卫 SQL（期望 TRUE = THEN 分支不可达，§4.3）。
     pub(super) route_guards: Vec<String>,
     /// 内联表达式入口无抛错守卫 SQL（期望 COUNT = 0，§4.5-2）：以 TRY_
@@ -84,9 +96,29 @@ pub(crate) struct ConversionPlan {
     /// miss 仿真标量出口（NO_DATA_FOUND 处理器赋值回填）：批写成功后
     /// 按程序序执行，返回行时写回帧变量。
     pub(crate) miss_outs: Vec<MissOut>,
+    /// THEN 臂备选计划（分臂备选）：本计划为 ELSE 臂（route_guards 证
+    /// THEN 不可达）；主计划入口守卫失败时尝试备选，其 route_guards
+    /// 为"条件 IS TRUE"判定（THEN 可达才放行）。视图物化前导不兼容
+    /// 双计划（sd_vwN 序号冲突），含前导的备选在计划期已丢弃。
+    pub(crate) route_alt: Option<Box<ConversionPlan>>,
 }
 
 pub(super) type BoundGuard = (String, Vec<(String, BindSrc)>);
+
+/// 两份 fn 物化前导逐项全等（表名/例程/去重 SQL/绑定/元数/依赖标记）。
+/// 分臂备选计划共用同一份入口期物化结果的前提——INSERT 位 sd_bfN 的
+/// distinct-over-sd_cur 按臂投影渲染，同名表内容可不同，不等即不可挂载。
+pub(crate) fn same_fn_preludes(a: &[FnPrelude], b: &[FnPrelude]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(x, y)| {
+            x.table == y.table
+                && x.name == y.name
+                && x.distinct_sql == y.distinct_sql
+                && x.binds == y.binds
+                && x.arity == y.arity
+                && x.needs_sd_cur == y.needs_sd_cur
+        })
+}
 
 pub(super) fn bind_guards(
     guards: Vec<String>,
@@ -165,6 +197,28 @@ pub(crate) fn entry_ok(
         }
     }
     Ok(Ok(()))
+}
+
+/// 混合调度异常行集（so-exception-row-hybrid §3）：逐条 `exc_guards`
+/// 求值并集，返回 0 基行号集合（对齐 `CursorState::seek_before` 与批写
+/// `__sd_rn` 区间）。守卫 SQL/绑定与 `top1_guards` 同口径（计划期已
+/// 补齐 $v_ 形参）。空集 = 无异常行，调用方走既有 SO 路径。
+pub(crate) fn exc_rows(
+    ex: &dyn SqlExecutor,
+    plan: &ConversionPlan,
+    frame: &crate::runtime::Frame,
+) -> Result<std::collections::BTreeSet<u64>, EngineError> {
+    let mut rows = std::collections::BTreeSet::new();
+    for (sql, binds) in &plan.exc_guards {
+        let bm = crate::runtime::interp::resolve_binds(binds, frame)?;
+        let mut stream = ex.query(sql, &bm)?;
+        for row in stream.fetch_many(usize::MAX) {
+            if let Some(crate::value::SpinValue::Int(rn)) = row.first() {
+                rows.insert((*rn).max(0) as u64);
+            }
+        }
+    }
+    Ok(rows)
 }
 
 fn snapshot_matches(

@@ -64,6 +64,7 @@ pub(super) fn render_correlated_lateral(
         guard_binds: lq.filter_binds.clone(),
         miss_guards: Vec::new(),
         miss_out: None,
+        exc_guard: None,
     })
 }
 

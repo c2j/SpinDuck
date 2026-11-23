@@ -12,10 +12,11 @@ mod entry;
 mod expr;
 mod filter;
 mod generate;
+mod hybrid;
 use generate::generate;
 mod lookup;
 pub mod metadata;
-mod region;
+pub(crate) mod region;
 mod resolve;
 mod route;
 mod schema;
@@ -23,7 +24,7 @@ mod shape;
 mod vguard;
 mod viewdep;
 
-pub(crate) use entry::{entry_ok, ConversionPlan, FnPrelude};
+pub(crate) use entry::{entry_ok, exc_rows, same_fn_preludes, ConversionPlan, FnPrelude};
 
 use super::{AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, VarName};
 use crate::catalog::{CompiledRoutine, ParamMode};
@@ -258,16 +259,53 @@ fn plan_from(
                     let in_params = in_param_names(routine);
                     match analyze_region(&routine.prog, &region, mode, ctx.catalog, &in_params) {
                         Err(reason) => Err(reason),
-                        Ok((mut copy, tail, has_trap)) => {
-                            // 下沉/查找变量若是 OUT/INOUT 形参，出口写回不可消除
+                        Ok((mut copy, alt_copy, tail, has_trap)) => {
+                            // 下沉/查找变量若是 OUT/INOUT 形参，出口写回不可消除；
+                            // 备选计划同项证明失败只丢弃备选，不连坐主计划。
                             if live_param_hit(&copy, routine) {
                                 Err(SkipReason::LiveOutState)
                             } else {
-                                match generate(&mut copy, source, ctx, &region, tail)? {
+                                let alt_copy = alt_copy.filter(|c| !live_param_hit(c, routine));
+                                let flags = generate::PlanFlags {
+                                    tail_commit: tail,
+                                    then_arm: false,
+                                    hybrid: hybrid::analyze(&routine.prog, &region).is_some(),
+                                };
+                                match generate(&mut copy, source, ctx, &region, flags)? {
                                     Err(reason) => {
                                         Err(rollback_scope_reason(mode, has_trap, reason))
                                     }
-                                    Ok(p) => Ok(p),
+                                    Ok(mut p) => {
+                                        // THEN 臂备选计划：生成失败/含视图物化
+                                        // 前导（sd_vwN 序号按计划独立编号，与主
+                                        // 计划冲突不可证）→ 静默放弃，仅留主计划。
+                                        // fn 前导同理：INSERT 位 sd_bfN 的
+                                        // distinct-over-sd_cur 按臂投影渲染，
+                                        // 两计划同名表内容可不同——入口期只物化
+                                        // 一份，备选守卫会读到主计划缓存内容。
+                                        // 前导不全等即丢弃备选（保守口径）。
+                                        if let Some(mut alt) = alt_copy {
+                                            let alt_flags = generate::PlanFlags {
+                                                tail_commit: tail,
+                                                then_arm: true,
+                                                hybrid: hybrid::analyze(&routine.prog, &region)
+                                                    .is_some(),
+                                            };
+                                            if let Ok(Ok(alt_plan)) =
+                                                generate(&mut alt, source, ctx, &region, alt_flags)
+                                            {
+                                                if alt_plan.view_preludes.is_empty()
+                                                    && same_fn_preludes(
+                                                        &p.fn_preludes,
+                                                        &alt_plan.fn_preludes,
+                                                    )
+                                                {
+                                                    p.route_alt = Some(Box::new(alt_plan));
+                                                }
+                                            }
+                                        }
+                                        Ok(p)
+                                    }
                                 }
                             }
                         }

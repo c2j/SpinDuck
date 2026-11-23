@@ -11,6 +11,7 @@ mod parse;
 mod top1;
 mod tuple;
 pub(super) use mixed::mixed_fallback_group_at;
+pub(crate) use parse::fallback_sql;
 pub(crate) use parse::parse_total;
 pub(crate) use parse::parse_tuple_total;
 pub(super) use tuple::render_tuple;
@@ -267,6 +268,10 @@ pub(super) struct LookupRender {
     /// miss 仿真入口守卫（期望求值 = 0）：命中/落空混合拒绝 +
     /// 处理器赋值逐行结果非均匀拒绝。绑定与 tie_guard 同口径。
     pub miss_guards: Vec<(String, Vec<(String, BindSrc)>)>,
+    /// dup 守卫的行号版变体（so-exception-row-hybrid）：返回违规行
+    /// `__sd_rn`（0 基）集合而非计数；仅 miss_emu 路径产出，混合
+    /// 调度启用时顶替 tie_guard(dup) 的整段退回语义。
+    pub exc_guard: Option<(String, Vec<(String, BindSrc)>)>,
     /// 批写后标量出口（miss 仿真处理器赋值回填）。
     pub miss_out: Option<MissOut>,
 }
@@ -339,19 +344,37 @@ pub(super) fn fallback_group_at(
     Ok(Some(out))
 }
 
+/// IF 路由型常量兜底闭包的解析产物（§4.3 + §4.4 B1）：ELSE 臂连续
+/// SELECT INTO 组与 THEN 臂 pc 区间，供主走查（ELSE 计划）与备选
+/// 走查（THEN 臂计划，分臂备选）分别消费。
+pub(super) struct IfGroup {
+    /// IF 条件表达式（循环不变路由变量 = 常量）。
+    pub cond: IrExpr,
+    /// ELSE 臂查找组（程序序）。
+    pub group: Vec<LookupQuery>,
+    /// 续跑 pc（处理器尾 Jump 之后）。
+    pub resume: usize,
+    /// THEN 臂 pc 区间（PushTrap+2 .. ELSE 起始）。
+    pub then_range: std::ops::Range<usize>,
+    /// ELSE 臂 pc 区间（else_start .. else_start + 组大小）。
+    pub else_range: std::ops::Range<usize>,
+    /// 处理器常量重置（变量, 兜底常量），未重置成员须组内局部死。
+    pub resets: Vec<(VarName, SpinValue)>,
+}
+
 /// 识别 pc 处的 IF 路由型常量兜底闭包（§4.3 + §4.4 B1）：主线首条 IF 由
 /// 循环不变量路由（THEN 入口守卫证明不可达），ELSE 为连续 SELECT INTO 组，
 /// 处理器重置成员子集（全量 m=n 或部分 m<n）。部分兜底的未重置成员须组内
 /// 局部死（仅被同组 CASE 写汇作操作数读取，INSERT/出口/他处均无读取），
 /// 其批写值经 group_hits 合取门控，落空时输出取重置兜底，残值不可观察。
-/// 返回 (IF 条件, ELSE 查找组, 续跑 pc)；形态不符 = Ok(None)；全定义证明
+/// 返回完整 IF 组描述；形态不符 = Ok(None)；全定义证明
 /// 失败 = Err(UnprovenQueryTotalness)；局部死证明失败 = Err(UnsupportedControlFlow)。
 pub(super) fn fallback_if_group_at(
     prog: &IrProg,
     pc: usize,
     region: &CursorRegion,
     catalog: &crate::catalog::RoutineCatalog,
-) -> Result<Option<(IrExpr, Vec<LookupQuery>, usize)>, SkipReason> {
+) -> Result<Option<IfGroup>, SkipReason> {
     let IrStmt::PushTrap { entries } = &prog.code[pc] else {
         return Ok(None);
     };
@@ -405,7 +428,14 @@ pub(super) fn fallback_if_group_at(
             return Err(SkipReason::UnsupportedControlFlow);
         }
     }
-    Ok(Some((iff.cond, out, iff.resume_pc)))
+    Ok(Some(IfGroup {
+        cond: iff.cond,
+        group: out,
+        resume: iff.resume_pc,
+        then_range: pc + 2..iff.else_start,
+        else_range: iff.else_start..iff.else_start + iff.query_vars.len(),
+        resets: iff.resets,
+    }))
 }
 
 /// 识别 pc 处的跳行 trap 查找（§5 步骤 4）：PushTrap(WHEN OTHERS → 跳行)

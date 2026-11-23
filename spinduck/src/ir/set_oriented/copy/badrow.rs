@@ -4,18 +4,23 @@ use super::{shape, Table};
 
 /// `sd_cur` CTE 定义（批写主查询与坏行守卫共用，保证行集口径一致）。
 /// verbatim 游标原文已含 WHERE/GROUP BY，直接内嵌不再追加过滤。
-pub(super) fn sd_cur_cte(select: &shape::Select, source: &Table) -> String {
-    if let Some(v) = &select.verbatim {
-        return format!("sd_cur AS ({v})");
-    }
-    let where_clause = match &select.filter {
-        Some(f) => format!(" WHERE {f}"),
-        None => String::new(),
+/// `rn` = 混合调度：外包 `ROW_NUMBER()` 投影 0 基 `__sd_rn`（与游标流
+/// 序同口径，依赖 R1 行序稳定假设），供段谓词过滤。
+pub(super) fn sd_cur_cte(select: &shape::Select, source: &Table, rn: bool) -> String {
+    let inner = if let Some(v) = &select.verbatim {
+        v.clone()
+    } else {
+        let where_clause = match &select.filter {
+            Some(f) => format!(" WHERE {f}"),
+            None => String::new(),
+        };
+        format!("{}{where_clause}", super::sd_cur_scan(select, source))
     };
-    format!(
-        "sd_cur AS ({}{where_clause})",
-        super::sd_cur_scan(select, source)
-    )
+    if rn {
+        format!("sd_cur AS (SELECT *, ROW_NUMBER() OVER () - 1 AS __sd_rn FROM ({inner}) _rn)")
+    } else {
+        format!("sd_cur AS ({inner})")
+    }
 }
 
 /// 内核域坏行守卫：`COUNT(*)` 统计 DECIMAL 算术值域守卫不成立的行。
@@ -38,7 +43,7 @@ pub(super) fn kernel_row_guard(
         .collect::<Vec<_>>()
         .join(" OR ");
     let (ctes, joins) = parts;
-    let with = std::iter::once(sd_cur_cte(select, source))
+    let with = std::iter::once(sd_cur_cte(select, source, false))
         .chain(ctes.iter().cloned())
         .collect::<Vec<_>>()
         .join(", ");
@@ -71,7 +76,7 @@ pub(super) fn bad_row_guard(
         .collect::<Vec<_>>()
         .join(" OR ");
     let (ctes, joins) = parts;
-    let with = std::iter::once(sd_cur_cte(select, source))
+    let with = std::iter::once(sd_cur_cte(select, source, false))
         .chain(ctes.iter().cloned())
         .collect::<Vec<_>>()
         .join(", ");

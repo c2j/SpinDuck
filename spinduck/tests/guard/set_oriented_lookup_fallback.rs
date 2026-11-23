@@ -440,3 +440,77 @@ fn should_reject_partial_fallback_when_intermediate_is_live_out() {
         }
     );
 }
+
+fn setup_copy_both_arms(route: &str) -> Engine {
+    // 双臂均可集合化的路由 IF（purchase kind IF 同构）：
+    // THEN/ELSE 各含「维表查找 + sys_dummy CASE 写汇」，写集一致
+    // {v_ct, v_yj}，处理器仅重置 v_yj，v_ct 为组内局部死。
+    let sql = "CREATE PROCEDURE copy_both_arms IS v_yj VARCHAR2(10); v_ct VARCHAR2(10); v_route VARCHAR2(10); BEGIN \
+        FOR r IN SELECT a, k, yj_a, yj_b FROM source_rows LOOP \
+        BEGIN SELECT kind INTO v_route FROM route_tab WHERE op = 'X'; \
+        EXCEPTION WHEN OTHERS THEN v_route := '0'; END; \
+        BEGIN \
+        IF v_route = '1' THEN \
+        SELECT ct_t INTO v_ct FROM dim_tab WHERE dim_tab.k = 'T1'; \
+        SELECT CASE v_ct WHEN 'A' THEN r.yj_a ELSE r.yj_b END INTO v_yj FROM sys_dummy; \
+        ELSE \
+        SELECT ct INTO v_ct FROM dim_tab WHERE dim_tab.k = r.k; \
+        SELECT CASE v_ct WHEN 'A' THEN r.yj_a WHEN 'B' THEN r.yj_b ELSE r.yj_a END INTO v_yj FROM sys_dummy; \
+        END IF; \
+        EXCEPTION WHEN OTHERS THEN v_yj := '0'; END; \
+        INSERT INTO target_rows(val, yj) VALUES (r.a, v_yj); \
+        END LOOP; END;";
+    let mut eng = Engine::new(
+        Box::new(DuckExecutor::open_in_memory().unwrap()),
+        RuleRegistry::default(),
+    );
+    for ddl in [
+        "CREATE TABLE source_rows(a BIGINT, k VARCHAR, yj_a VARCHAR, yj_b VARCHAR)",
+        "CREATE TABLE target_rows(val BIGINT, yj VARCHAR)",
+        "INSERT INTO source_rows VALUES (10, 'K1', 'AA1', 'BB1'), (20, 'K2', 'AA2', 'BB2'), (30, 'K3', 'AA3', 'BB3')",
+        "CREATE TABLE route_tab(kind VARCHAR, op VARCHAR)",
+        &format!("INSERT INTO route_tab VALUES ('{route}', 'X')"),
+        "CREATE TABLE dim_tab(k VARCHAR, ct VARCHAR, ct_t VARCHAR)",
+        "INSERT INTO dim_tab VALUES ('K1', 'A', 'A'), ('K2', 'B', 'B'), ('T1', 'X', 'A')",
+        "CREATE TABLE sys_dummy(dummy VARCHAR)",
+        "INSERT INTO sys_dummy VALUES ('X')",
+    ] {
+        eng.ex.execute(ddl, &BindMap::new()).unwrap();
+    }
+    eng.register(sql).unwrap();
+    eng
+}
+
+fn rows_copy_both_arms(eng: &Engine) -> Vec<Vec<SpinValue>> {
+    eng.ex
+        .query(
+            "SELECT val, yj FROM target_rows ORDER BY val",
+            &BindMap::new(),
+        )
+        .unwrap()
+        .fetch_many(20)
+}
+
+#[test]
+fn should_convert_route_if_when_both_arms_are_convertible() {
+    // 分臂备选计划：THEN/ELSE 均可集合化时，入口按路由条件选择对应计划
+    // ——THEN 臂激活时不再 Skipped，而是按 THEN 语义 Converted。
+    for route in ["1", "0"] {
+        let mut baseline = setup_copy_both_arms(route);
+        baseline.call("copy_both_arms", &[]).unwrap();
+        let expected = rows_copy_both_arms(&baseline);
+
+        let mut eng = setup_copy_both_arms(route);
+        eng.set_oriented = SetOrientedMode::BatchAtomic;
+        eng.call("copy_both_arms", &[]).unwrap();
+        assert_eq!(rows_copy_both_arms(&eng), expected, "route: {route}");
+        assert!(
+            matches!(
+                eng.set_oriented_reports()[0].status,
+                Status::Converted { .. }
+            ),
+            "route: {route}, report: {:?}",
+            eng.set_oriented_reports()[0]
+        );
+    }
+}

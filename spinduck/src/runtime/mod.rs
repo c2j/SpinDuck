@@ -3,6 +3,7 @@ pub mod cursor;
 pub mod eval;
 pub mod frame;
 pub mod interp;
+pub(crate) mod parallel;
 
 pub use cursor::{CursorAttrKind, CursorState};
 pub use eval::{eval, eval_cond, EvalEnv};

@@ -185,6 +185,10 @@ name = "cli"
 path = "tests/cli.rs"
 required-features = ["cli"]
 
+[[test]]
+name = "loop_parallel"
+path = "tests/loop_parallel.rs"
+
 
 [patch."https://github.com/c2j/ogsql-parser"]
 # 把 codeweb 的 git ogsql-parser 重定向到本仓库子模块：进程内只能有一份

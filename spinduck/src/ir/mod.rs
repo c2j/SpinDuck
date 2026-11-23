@@ -12,6 +12,7 @@ mod control;
 mod dummy;
 mod entry;
 mod expr;
+pub mod loop_parallel;
 pub mod set_oriented;
 mod sql;
 mod stmt;

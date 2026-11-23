@@ -162,6 +162,8 @@ pub(crate) fn materialize_fn_preludes(
     cat: &crate::catalog::RoutineCatalog,
     var_types: &std::collections::BTreeMap<String, crate::types::SpinType>,
 ) -> Result<(), EngineError> {
+    let mut current_error = None;
+    let mut last_write_rows = 0usize;
     let mut env = Env {
         frame,
         ex,
@@ -171,8 +173,8 @@ pub(crate) fn materialize_fn_preludes(
         budget: super::DEFAULT_STEP_BUDGET,
         batch: false,
         wbuf: None,
-        current_error: None,
-        last_write_rows: 0,
+        current_error: &mut current_error,
+        last_write_rows: &mut last_write_rows,
         var_types,
     };
     let (base, dep): (Vec<_>, Vec<_>) = preludes.iter().partition(|p| !p.needs_sd_cur);

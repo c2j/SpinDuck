@@ -31,6 +31,7 @@ pub(super) fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
     let mut db: Option<PathBuf> = None;
     let mut batch_commit = false;
     let mut set_oriented = None;
+    let mut loop_parallel = None;
     let mut step_budget: Option<u64> = None;
     let mut rules = None;
     let mut trace = None;
@@ -74,6 +75,16 @@ pub(super) fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
                 set_oriented = Some(
                     crate::ir::set_oriented::SetOrientedMode::from_name(name)
                         .ok_or_else(|| usage_err("--set-oriented[=off|strict|batch-atomic]"))?,
+                );
+            }
+            flag if flag == "--loop-parallel" || flag.starts_with("--loop-parallel=") => {
+                if loop_parallel.is_some() {
+                    return Err(dup_flag_err("--loop-parallel"));
+                }
+                let name = flag.strip_prefix("--loop-parallel=").unwrap_or("safe");
+                loop_parallel = Some(
+                    crate::ir::loop_parallel::LoopParallelMode::from_name(name)
+                        .ok_or_else(|| usage_err("--loop-parallel[=off|safe]"))?,
                 );
             }
             "--step-budget" => {
@@ -170,6 +181,7 @@ pub(super) fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
         args,
         batch_commit,
         set_oriented,
+        loop_parallel,
         step_budget,
         trace,
         trace_format: trace_format.unwrap_or_default(),
@@ -210,6 +222,7 @@ mod tests {
                     args: v(&["'batch-atomic'"]),
                     batch_commit: false,
                     set_oriented: Some(mode),
+                    loop_parallel: None,
                     step_budget: None,
                     trace: None,
                     trace_format: TraceFormat::Text,
@@ -316,6 +329,7 @@ mod tests {
                 args: v(&["1", "2"]),
                 batch_commit: false,
                 set_oriented: None,
+                loop_parallel: None,
                 step_budget: None,
                 trace: None,
                 trace_format: TraceFormat::Text,
@@ -348,6 +362,7 @@ mod tests {
                 args: v(&["'20250715'", "'0130000001'"]),
                 batch_commit: false,
                 set_oriented: None,
+                loop_parallel: None,
                 step_budget: None,
                 trace: None,
                 trace_format: TraceFormat::Text,
@@ -370,6 +385,7 @@ mod tests {
                 args: vec![],
                 batch_commit: false,
                 set_oriented: None,
+                loop_parallel: None,
                 step_budget: Some(20_000_000),
                 trace: None,
                 trace_format: TraceFormat::Text,

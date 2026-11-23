@@ -43,6 +43,9 @@ impl<'a> Body<'a> {
                 return Err(SkipReason::UnsupportedCall);
             };
             self.reject_slot(target)?;
+            // 批写路径不回写帧：OUT 目标值仅存于投影表达式，
+            // 备选计划的后缀读取检查以此为准。
+            self.call_outs.insert(target.clone());
             match oexpr {
                 IrExpr::Const(c) => self.folded.push((target.clone(), c)),
                 expr => self.inlined.push((target.clone(), expr)),

@@ -59,3 +59,16 @@ pub(super) fn guard(l: &ResolvedLookup, lit: &str) -> Result<String, SkipReason>
         l.render.hit, l.render.value, l.render.default_sql
     ))
 }
+
+/// THEN 臂备选计划的路由判定 SQL：与 [`guard`] 同一值表达式，判定
+/// "条件 IS TRUE"（THEN 可达）——分臂备选的入口按数据选臂，
+/// NULL/不等值落 ELSE 计划（PL IF 语义：条件非 TRUE 即走 ELSE）。
+pub(super) fn pick(l: &ResolvedLookup, lit: &str) -> Result<String, SkipReason> {
+    if !l.render.key_checks.is_empty() {
+        return Err(SkipReason::UnsupportedControlFlow);
+    }
+    Ok(format!(
+        "SELECT (((CASE WHEN {} THEN {} ELSE {} END) = {lit}) IS TRUE)",
+        l.render.hit, l.render.value, l.render.default_sql
+    ))
+}

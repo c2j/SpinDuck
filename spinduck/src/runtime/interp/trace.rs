@@ -4,7 +4,7 @@ use crate::exec::TraceEvent;
 use crate::exec::TraceSink;
 use crate::ir::IrStmt;
 
-pub(super) fn spinduck_trace_event(st: &IrStmt) -> TraceEvent {
+pub(crate) fn spinduck_trace_event(st: &IrStmt) -> TraceEvent {
     TraceEvent::IrStmt {
         variant: variant_name(st),
     }

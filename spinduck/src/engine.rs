@@ -12,6 +12,7 @@ use ogsql_parser::ast::Statement;
 use ogsql_parser::token::tokenizer::Tokenizer;
 
 mod batch_hooks;
+mod loop_parallel;
 mod set_oriented;
 mod support;
 
@@ -39,11 +40,18 @@ pub struct Engine {
     /// 默认关闭的受限静态集合化，不与 batch_commit 叠加。
     pub set_oriented: crate::ir::set_oriented::SetOrientedMode,
     set_oriented_reports: Vec<crate::ir::set_oriented::Report>,
+    /// 集合化退回后的二级降级并行通道（默认全关；设计 loop-parallel §2）。
+    pub loop_parallel: crate::ir::loop_parallel::LoopParallelConfig,
+    loop_parallel_reports: Vec<crate::ir::loop_parallel::LoopParallelReport>,
     /// 纯标量语句记忆化缓存（`ex` 内的 MemoizingExecutor 与本句柄共享），
     /// 每次顶层调用入口清空，给缓存一个确定的内存上界。
     memo: std::rc::Rc<crate::exec::MemoCache>,
     /// 参数表点查缓存。与 memo 一样在顶层调用入口清空。
     lookup: std::rc::Rc<crate::lookup_cache::LookupState>,
+    /// 与 `ex` 链中 LookupExecutor 共享 inner/state 的句柄：
+    /// loop-parallel 预热（`try_prewarm_only`）与快照导出
+    /// （`export_frozen`）必须走同一条底层连接。
+    lookup_exec: crate::lookup_cache::LookupExecutor,
     /// IR 编译缓存（设计 V4 §5.4 二期）：`None` = 不缓存（默认）。
     /// 命中跳过 tokenize/parse/编译全链路；键含注册上下文指纹，
     /// 保证例程互调下沉与宏消歧不串条目。
@@ -66,8 +74,12 @@ impl Engine {
         catalog.set_sql_rules(rules.clone());
         let memo = std::rc::Rc::new(crate::exec::MemoCache::default());
         let lookup = std::rc::Rc::new(crate::lookup_cache::LookupState::default());
-        let ex = Box::new(crate::exec::MemoizingExecutor::with_cache(ex, memo.clone()));
-        let ex = Box::new(crate::lookup_cache::LookupExecutor::new(ex, lookup.clone()));
+        let inner: std::rc::Rc<dyn SqlExecutor> =
+            std::rc::Rc::new(crate::exec::MemoizingExecutor::with_cache(ex, memo.clone()));
+        // 与 ex 链中 LookupExecutor 共享同一 inner/state 的克隆句柄：
+        // loop-parallel 预热/冻结必须落在同一条底层连接与缓存状态上。
+        let lookup_exec = crate::lookup_cache::LookupExecutor::new(inner, lookup.clone());
+        let ex = Box::new(lookup_exec.clone());
         Self {
             ex,
             rules,
@@ -77,8 +89,11 @@ impl Engine {
             batch_commit: false,
             set_oriented: crate::ir::set_oriented::SetOrientedMode::Off,
             set_oriented_reports: Vec::new(),
+            loop_parallel: crate::ir::loop_parallel::LoopParallelConfig::default(),
+            loop_parallel_reports: Vec::new(),
             memo,
             lookup,
+            lookup_exec,
             ir_cache: None,
             compiled_cache: None,
             schema_snapshot: None,
@@ -364,6 +379,7 @@ impl Engine {
         self.memo.clear();
         self.lookup.clear();
         self.set_oriented_reports.clear();
+        self.loop_parallel_reports.clear();
         let routine = self
             .catalog
             .lookup(name)

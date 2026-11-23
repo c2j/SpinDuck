@@ -112,6 +112,8 @@ pub enum Command {
         batch_commit: bool,
         /// 集合化契约覆盖；None 使用项目配置。
         set_oriented: Option<crate::ir::set_oriented::SetOrientedMode>,
+        /// 循环并行模式覆盖；None 使用项目配置（旋钮仅项目表可给）。
+        loop_parallel: Option<crate::ir::loop_parallel::LoopParallelMode>,
         /// 步数预算覆盖（复核应修 C：默认预算跑不动 100k 级游标循环，
         /// 大业务经此入口放大；None = 用引擎默认值）。
         step_budget: Option<u64>,

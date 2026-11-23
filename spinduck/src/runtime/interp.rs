@@ -24,7 +24,7 @@ pub(in crate::runtime) mod writebuf;
 
 pub(crate) use binds::resolve_binds;
 pub(crate) use dynamic::materialize_fn_preludes;
-use trace::spinduck_trace_event;
+pub(crate) use trace::spinduck_trace_event;
 
 /// 单次运行结果。
 #[derive(Debug, Clone, PartialEq)]
@@ -49,8 +49,37 @@ pub fn run(
 }
 
 /// 异常处理帧（§3.5）：处理器表 + resume PC（PopTrap 后的 Jump(resume)）。
-struct TrapFrame {
-    entries: Vec<crate::ir::TrapEntry>,
+#[derive(Clone, Debug)]
+pub(crate) struct TrapFrame {
+    pub(crate) entries: Vec<crate::ir::TrapEntry>,
+}
+
+/// 跨指令/跨行持久的解释器状态（loop-parallel 设计 §3.2）：
+/// `run_spanned` 的一次调用内等价于原局部变量集合；loop-parallel
+/// 主线程在同一 `InterpState` 上按 `row_idx` 续跑多轮。
+/// `ex`/`sink`/`cat`/预算等"环境"不属于状态——每次派发时外部注入。
+pub(crate) struct InterpState {
+    pub frame: Frame,
+    pub(crate) traps: Vec<TrapFrame>,
+    pub pc: usize,
+    pub steps: u64,
+    /// 进入异常处理器体时写入的当前错误——裸 `RAISE;` 的重抛源。
+    pub current_error: Option<EngineError>,
+    /// 最近一次直发 SqlExec 的影响行数（`TxCommitIfWritten` 的条件面）。
+    pub last_write_rows: usize,
+}
+
+impl InterpState {
+    pub(crate) fn new(frame: Frame) -> Self {
+        Self {
+            frame,
+            traps: Vec::new(),
+            pc: 0,
+            steps: 0,
+            current_error: None,
+            last_write_rows: 0,
+        }
+    }
 }
 
 /// 带 trace 的运行（§2.1/§10.5：core 一次埋点，CLI/监控共用）。
@@ -84,6 +113,16 @@ pub struct RunSpan {
     pub start_pc: usize,
     /// 边界 pc：到达即返回 `Stopped`（不执行该处指令、不计步）。
     pub stop_pc: Option<usize>,
+    /// 第二边界 pc（SO 混合单行重放，so-exception-row-hybrid §3.1）：
+    /// 循环早退边目标（EXIT WHEN/GOTO 出循环的落点）。到达同样返回
+    /// `Stopped`，调用方按 `state.pc` 区分——`stop_pc` = 本行迭代结束，
+    /// `exit_pc` = 循环提前退出（串行下后续行不再执行，混合须中止余段）。
+    pub exit_pc: Option<usize>,
+    /// 入口即边界时仍执行一条指令（SO 混合单行重放专用：入口 pc
+    /// == stop_pc == fetch_pc，语义是"执行 Fetch 起至回到 fetch_pc"）。
+    /// 其余调用方必须保持 false——`start_pc == stop_pc` 的既有语义是
+    /// "已在边界，立即 Stopped"（如相邻区域间零指令间隔）。
+    pub entry_exec: bool,
 }
 
 impl Default for RunLimits {
@@ -140,13 +179,34 @@ pub fn run_spanned(
     depth: usize,
     control: RunControl,
 ) -> Result<RunOutcome, EngineError> {
+    // 常规入口：帧借用转为 owned 状态跑完后写回（loop-parallel 直接持有
+    // `InterpState` 调 `run_state_spanned`，不经过此包装）。
+    let mut state = InterpState::new(std::mem::replace(frame, Frame::new()));
+    state.pc = control.span.start_pc;
+    let out = run_state_spanned(&mut state, prog, ex, sink, cat, depth, control);
+    *frame = state.frame;
+    out
+}
+
+/// 在持久 `InterpState` 上续跑（loop-parallel 主线程多轮驱动入口）。
+/// 与 `run_spanned` 同一 trap 展开/步数预算/区间边界语义；续跑调用方
+/// 直接维护 `state.pc`/`state.steps`（`span.start_pc` 仅作首次入口）。
+pub(crate) fn run_state_spanned(
+    state: &mut InterpState,
+    prog: &IrProg,
+    ex: &dyn SqlExecutor,
+    sink: &mut dyn TraceSink,
+    cat: &crate::catalog::RoutineCatalog,
+    depth: usize,
+    control: RunControl,
+) -> Result<RunOutcome, EngineError> {
     let limits = control.limits;
     let span = control.span;
-    let mut traps: Vec<TrapFrame> = Vec::new();
-    let mut pc = span.start_pc;
-    let mut steps = 0u64;
+    if state.pc == 0 {
+        state.pc = span.start_pc;
+    }
     let mut env = Env {
-        frame,
+        frame: &mut state.frame,
         ex,
         sink,
         cat,
@@ -158,16 +218,17 @@ pub fn run_spanned(
         } else {
             None
         },
-        current_error: None,
-        last_write_rows: 0,
+        current_error: &mut state.current_error,
+        last_write_rows: &mut state.last_write_rows,
         var_types: &prog.var_types,
     };
+    let traps = &mut state.traps;
+    let pc = &mut state.pc;
+    let steps = &mut state.steps;
     loop {
         let driven = match span.stop_pc {
-            None => run_inner(prog, &mut env, &mut traps, &mut pc, &mut steps),
-            Some(stop) => {
-                run_inner_spanned(prog, &mut env, &mut traps, &mut pc, &mut steps, Some(stop))
-            }
+            None if span.exit_pc.is_none() => run_inner(prog, &mut env, traps, pc, steps),
+            _ => run_inner_spanned(prog, &mut env, traps, pc, steps, span),
         };
         match driven {
             Ok(out) => {
@@ -177,51 +238,144 @@ pub fn run_spanned(
                 return Ok(out);
             }
             Err(e) => {
-                // 自顶向下找匹配处理器；进入处理器前写 SQLERRM/SQLCODE 帧变量
-                let mut handled = false;
-                while !traps.is_empty() {
-                    // 循环条件保证非空；仍以模式匹配防御（§5：内核状态一律 ? / 显式错误）
-                    let hit = traps.last().and_then(|top| {
-                        top.entries
-                            .iter()
-                            .find(|en| en.conds.iter().any(|c| crate::error::cond_matches(c, &e)))
-                    });
-                    match hit {
-                        Some(h) => {
-                            // 消费该 trap（丢弃其上全部未弹出的内层 trap）并重入处理器体；
-                            // 处理器可见 SQLERRM（错误消息）
-                            let body_start = h.body_start;
-                            traps.pop();
-                            // 内核域错误已作废最外层显式事务：进入处理器体前先复位会话，
-                            // 否则处理器内第一条 SQL 即连锁失败
-                            if e.domain == crate::error::FaultDomain::Kernel {
-                                flow::reset_session(&mut env)?;
-                            }
-                            env.frame.set(
-                                &VarName("__sqlerrm".to_string()),
-                                SpinValue::Str(e.message.clone()),
-                            );
-                            // 裸 RAISE; 的重抛源（已知口径：处理器结束后不清除，
-                            // 见 validation.md V21）
-                            env.current_error = Some(e.clone());
-                            pc = body_start;
-                            handled = true;
-                            break;
+                // 自顶向下找匹配处理器；进入处理器体前写 SQLERRM/SQLCODE 帧变量
+                match find_trap_handler(traps, &e) {
+                    Some(body_start) => {
+                        // 内核域错误已作废最外层显式事务：进入处理器体前先复位会话，
+                        // 否则处理器内第一条 SQL 即连锁失败
+                        if e.domain == crate::error::FaultDomain::Kernel {
+                            flow::reset_session(&mut env)?;
                         }
-                        None => {
-                            traps.pop(); // 无匹配 → 展开到外层
-                        }
+                        env.frame.set(
+                            &VarName("__sqlerrm".to_string()),
+                            SpinValue::Str(e.message.clone()),
+                        );
+                        // 裸 RAISE; 的重抛源（已知口径：处理器结束后不清除，
+                        // 见 validation.md V21）
+                        *env.current_error = Some(e.clone());
+                        *pc = body_start;
+                        // handler 末尾的 Jump(resume) 负责跳回 resume
+                    }
+                    None => {
+                        // 最终未处理：缓冲语句与已执行语句一起回滚，丢弃缓冲后外抛
+                        writebuf::discard(&mut env);
+                        return Err(e);
                     }
                 }
-                if !handled {
-                    // 最终未处理：缓冲语句与已执行语句一起回滚，丢弃缓冲后外抛
-                    writebuf::discard(&mut env);
-                    return Err(e);
-                }
-                // pc 已指向处理器体；handler 末尾的 Jump(resume) 负责跳回 resume
             }
         }
     }
+}
+
+/// SO 混合单行重放规格（so-exception-row-hybrid §3.1）。
+#[derive(Debug)]
+pub struct ReplaySpec<'a> {
+    /// 被重放游标名（`Frame::cursor_mut` 定位）。
+    pub cursor: &'a VarName,
+    /// 目标行号（游标流 0 基下标，对齐 `sd_cur.__rn`）。
+    pub row_index: usize,
+    /// FETCH 指令 pc：重放从该处开始（先执行真实 Fetch，再进循环体）。
+    pub fetch_pc: usize,
+    /// 循环早退边目标 pc（EXIT WHEN/GOTO 出循环的落点）。
+    pub exit_pc: usize,
+    /// 本次重放的步数预算/批量提交开关（与区域执行同一 limits）。
+    pub limits: RunLimits,
+}
+
+/// 单行重放结果：区分"本行迭代正常结束"与"循环提前退出"。
+#[derive(Debug, PartialEq)]
+pub enum RowReplay {
+    /// Fetch+体执行完，控制流回到下一迭代边界（stop_pc 命中）。
+    IterDone,
+    /// 体内早退边命中（exit_pc）——串行下循环终止，混合须中止余段。
+    LoopExited,
+    /// 体内 RETURN（例程级返回值）。
+    Returned(Option<SpinValue>),
+    /// 走到程序末尾（防御分支：正常 span 应先命中边界）。
+    Completed,
+}
+
+/// SO 混合单行重放：游标 `seek_before(row_index)` 定位后，以
+/// `span{stop=fetch_pc, exit=exit_pc}` 驱动真实 Fetch+循环体至下一边界。
+/// trap 栈自空开始——与 SO fallback 分段续跑同一口径（体内 PushTrap
+/// 在本次重放内自平衡）；例程级 trap 的跨段可见性是既有边界。
+pub fn replay_cursor_row(
+    prog: &IrProg,
+    frame: &mut Frame,
+    spec: &ReplaySpec<'_>,
+    ex: &dyn SqlExecutor,
+    sink: &mut dyn TraceSink,
+    cat: &crate::catalog::RoutineCatalog,
+    depth: usize,
+) -> Result<RowReplay, EngineError> {
+    frame.cursor_mut(spec.cursor)?.seek_before(spec.row_index)?;
+    let mut state = InterpState::new(std::mem::replace(frame, Frame::new()));
+    state.pc = spec.fetch_pc;
+    let out = run_state_spanned(
+        &mut state,
+        prog,
+        ex,
+        sink,
+        cat,
+        depth,
+        RunControl {
+            limits: spec.limits,
+            span: RunSpan {
+                start_pc: spec.fetch_pc,
+                stop_pc: Some(spec.fetch_pc),
+                exit_pc: Some(spec.exit_pc),
+                entry_exec: true,
+            },
+        },
+    );
+    *frame = state.frame;
+    let pc = state.pc;
+    match out? {
+        RunOutcome::Stopped => match pc {
+            pc if pc == spec.fetch_pc => Ok(RowReplay::IterDone),
+            pc if pc == spec.exit_pc => Ok(RowReplay::LoopExited),
+            _ => Err(EngineError::invariant(
+                32,
+                format!(
+                    "hybrid replay escape: pc={pc} not in fetch/exit stops ({}, {})",
+                    spec.fetch_pc, spec.exit_pc
+                ),
+            )),
+        },
+        RunOutcome::Returned(v) => Ok(RowReplay::Returned(v)),
+        RunOutcome::Completed => Ok(RowReplay::Completed),
+    }
+}
+
+/// trap 分派查找（`drive` 的 Err 分支与 loop-parallel `QueryError`
+/// 错误注入共用同一口径）：自顶向下弹栈直至首个含匹配条件的
+/// `TrapFrame`，命中返回其 `body_start`（该帧已弹出，其上未弹出
+/// 的内层 trap 一并丢弃）；无任何匹配返回 `None`（此时全部 trap
+/// 已弹出——与串行错误路径的栈消费完全一致）。
+///
+/// 调用方负责分派后的副作用：`__sqlerrm`/`current_error` 写入、
+/// Kernel 域会话复位（需 `env.ex`，故不在本函数内）、`pc` 跳转。
+pub(crate) fn find_trap_handler(
+    traps: &mut Vec<TrapFrame>,
+    e: &crate::error::EngineError,
+) -> Option<usize> {
+    while let Some(top) = traps.last() {
+        let hit = top
+            .entries
+            .iter()
+            .find(|en| en.conds.iter().any(|c| crate::error::cond_matches(c, e)));
+        match hit {
+            Some(h) => {
+                let body_start = h.body_start;
+                traps.pop();
+                return Some(body_start);
+            }
+            None => {
+                traps.pop(); // 无匹配 → 展开到外层
+            }
+        }
+    }
+    None
 }
 
 /// 执行上下文（§3：≥5 参数一律结构体；接缝引用保持 `SqlExecutor`/`TraceSink`）。
@@ -237,10 +391,12 @@ pub(super) struct Env<'a> {
     pub batch: bool,
     /// 本层调用的延迟写缓冲（batch = true 时 Some；嵌套例程各自独立）。
     pub(super) wbuf: writebuf::WBufOpt,
-    /// 进入异常处理器体时写入的当前错误——裸 `RAISE;` 的重抛源。
-    pub current_error: Option<EngineError>,
-    /// 最近一次直发 SqlExec 的影响行数（`TxCommitIfWritten` 的条件面）。
-    pub last_write_rows: usize,
+    /// 进入异常处理器体时写入的当前错误——裸 `RAISE;` 的重抛源
+    /// （借用 `InterpState` 字段，跨续跑轮次保持）。
+    pub current_error: &'a mut Option<EngineError>,
+    /// 最近一次直发 SqlExec 的影响行数（`TxCommitIfWritten` 的条件面；
+    /// 同样借用 `InterpState` 字段）。
+    pub last_write_rows: &'a mut usize,
     /// 当前例程已映射的标量声明（写入 `VARCHAR` 槽时转换）。
     pub var_types: &'a BTreeMap<String, SpinType>,
 }
@@ -253,22 +409,28 @@ fn run_inner(
     pc: &mut usize,
     steps: &mut u64,
 ) -> Result<RunOutcome, EngineError> {
-    run_inner_spanned(prog, env, traps, pc, steps, None)
+    run_inner_spanned(prog, env, traps, pc, steps, RunSpan::default())
 }
 
-/// 带边界 pc 的内层驱动：到达 `stop_pc` 返回 `Stopped`（不执行、不计步）。
+/// 带边界 pc 的内层驱动：到达 `span.stop_pc`/`span.exit_pc` 返回
+/// `Stopped`（不执行、不计步；两者同语义，调用方按 `state.pc` 区分）。
 fn run_inner_spanned(
     prog: &IrProg,
     env: &mut Env<'_>,
     traps: &mut Vec<TrapFrame>,
     pc: &mut usize,
     steps: &mut u64,
-    stop_pc: Option<usize>,
+    span: RunSpan,
 ) -> Result<RunOutcome, EngineError> {
+    // entry_exec（SO 混合重放）：入口即边界时仍执行该指令一次，
+    // 之后到达边界才 Stopped；默认 false 保持"入口在边界即停"语义。
+    let mut first = true;
     loop {
-        if stop_pc == Some(*pc) {
+        let at_stop = span.stop_pc == Some(*pc) || span.exit_pc == Some(*pc);
+        if at_stop && !(first && span.entry_exec) {
             return Ok(RunOutcome::Stopped);
         }
+        first = false;
         *steps += 1;
         if *steps > env.budget {
             return Err(EngineError::invariant(
@@ -300,7 +462,7 @@ fn run_inner_spanned(
             }
             // 零行写入不提交（不切换事务快照、不产生 trace 事件，设计 §4.5）
             IrStmt::TxCommitIfWritten => {
-                if env.last_write_rows > 0 {
+                if *env.last_write_rows > 0 {
                     if env.sink.is_enabled() {
                         env.sink.on_event(spinduck_trace_event(&IrStmt::TxCommit));
                     }
@@ -353,7 +515,7 @@ fn run_inner_spanned(
             } => {
                 let buffered = writebuf::take_insert(env, sql, binds, fn_sites, *buffer_policy)?;
                 if !buffered {
-                    env.last_write_rows = sqlstmts::exec(env, sql, binds, fn_sites)?;
+                    *env.last_write_rows = sqlstmts::exec(env, sql, binds, fn_sites)?;
                 }
                 *pc += 1;
             }

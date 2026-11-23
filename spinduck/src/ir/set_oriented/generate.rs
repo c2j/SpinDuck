@@ -1,6 +1,8 @@
 //! 集合化计划生成：结构证据、内联提升、快照复核与批写绑定。
 
-use super::{catalog_summary, copy, entry, filter, lookup, region, resolve, route, schema, shape};
+use super::{
+    catalog_summary, copy, entry, filter, hybrid, lookup, region, resolve, route, schema, shape,
+};
 use super::{BindSrc, CopyLoop, EngineError, OptimizeCtx, SkipReason, VarName};
 
 struct Inputs {
@@ -14,12 +16,22 @@ struct Inputs {
     target: schema::Table,
 }
 
+/// 计划生成标志：尾提交授权 + THEN 臂备选（分臂路由守卫口径）。
+#[derive(Clone, Copy)]
+pub(super) struct PlanFlags {
+    pub tail_commit: bool,
+    pub then_arm: bool,
+    /// SO 行级混合（so-exception-row-hybrid）：dup 基数守卫改产行号
+    /// 集 `exc_guards` 顶替整段退回；需计划期逃逸/行序证明齐备。
+    pub hybrid: bool,
+}
+
 pub(super) fn generate(
     copy: &mut CopyLoop<'_>,
     ex: &schema::Source<'_>,
     ctx: &OptimizeCtx<'_>,
     region: &region::CursorRegion,
-    tail_commit: bool,
+    flags: PlanFlags,
 ) -> Result<Result<entry::ConversionPlan, SkipReason>, EngineError> {
     let inputs = match load_inputs(copy, ex)? {
         Ok(inputs) => inputs,
@@ -107,7 +119,7 @@ pub(super) fn generate(
         resolved_tuples,
         resolved_aggs,
         region,
-        tail_commit,
+        flags,
     ) {
         Ok(p) => Ok(Ok(p)),
         Err(reason) => Ok(Err(reason)),
@@ -273,28 +285,67 @@ fn finish(
     resolved_tuples: Vec<(lookup::ResolvedTuple, resolve::LookupTables)>,
     resolved_aggs: Vec<(super::agg::ResolvedAgg, resolve::LookupTables)>,
     region: &region::CursorRegion,
-    tail_commit: bool,
+    flags: PlanFlags,
 ) -> Result<entry::ConversionPlan, SkipReason> {
     let projections: Vec<lookup::ResolvedLookup> =
         resolved.iter().map(|(l, _)| l.clone()).collect();
+    // 混合资格重证（mod.rs 已用同一 analyze 置 flags.hybrid）：
+    // spec 随计划下发，驱动入口 exc 求值与引擎分段/重放调度。
+    let hspec = if flags.hybrid {
+        hybrid::analyze(copy.prog, region)
+    } else {
+        None
+    };
+    // 混合仅在存在 exc_guard（miss_emu dup 行号守卫）时启用：
+    // 无异常行来源的计划保持原 SQL 形态（无 __sd_rn/段谓词），
+    // `|E|` 恒空也无调度收益。
+    let has_exc = resolved.iter().any(|(l, _)| l.render.exc_guard.is_some());
+    let hybrid_on = hspec.is_some() && has_exc;
+    // 混合启用时，miss_emu 的 dup 守卫（tie_guard 槽位）改由
+    // exc_guards 行号集承载——顶替"任一 dup 行即整段退回"。
     let top1_guards: Vec<entry::BoundGuard> = resolved
         .iter()
         .flat_map(|(l, _)| {
-            l.render
-                .tie_guard
-                .clone()
-                .map(|g| (g, l.render.guard_binds.clone()))
+            let tie = if hybrid_on && l.render.exc_guard.is_some() {
+                None
+            } else {
+                l.render.tie_guard.clone()
+            };
+            tie.map(|g| (g, l.render.guard_binds.clone()))
                 .into_iter()
                 .chain(l.render.miss_guards.iter().cloned())
         })
         .collect();
+    let exc_guards: Vec<entry::BoundGuard> = if hybrid_on {
+        resolved
+            .iter()
+            .filter_map(|(l, _)| l.render.exc_guard.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     // miss 仿真标量出口：按查找程序序应用（后写覆盖先写）。
     let mut miss_outs: Vec<lookup::MissOut> = projections
         .iter()
         .filter_map(|l| l.render.miss_out.clone())
         .collect();
     miss_outs.sort_by_key(|m| m.pc);
-    let route_guards = route_guards(copy, &resolved)?;
+    // 分臂备选（then_arm）：路由守卫改为"条件 IS TRUE = THEN 可达"
+    // 判定——入口守卫期望 TRUE 才放行本计划；主计划保持"THEN 不可达"
+    // 口径，两臂守卫互斥，入口按数据选臂。
+    let route_guards = if flags.then_arm {
+        match &copy.route {
+            Some((v, lit)) => {
+                let Some((l, _)) = resolved.iter().find(|(l, _)| &l.var == v) else {
+                    return Err(SkipReason::UnsupportedControlFlow);
+                };
+                vec![route::pick(l, lit)?]
+            }
+            None => return Err(SkipReason::UnsupportedControlFlow),
+        }
+    } else {
+        route_guards(copy, &resolved)?
+    };
     let tuple_views: Vec<lookup::ResolvedTuple> =
         resolved_tuples.iter().map(|(t, _)| t.clone()).collect();
     let agg_views: Vec<super::agg::ResolvedAgg> =
@@ -306,23 +357,42 @@ fn finish(
         &projections,
         &tuple_views,
         &agg_views,
+        hybrid_on,
     )?;
+    // 混合计划：`sql` 存占位符全范围替换版（exc 空集直发路径），
+    // `seg_sql` 存含 __SD_LO__/__SD_HI__ 占位符的分段模板。
+    let (sql, seg_sql) = if hybrid_on {
+        (
+            generated
+                .sql
+                .replace("__SD_LO__", "NULL")
+                .replace("__SD_HI__", "NULL"),
+            Some(generated.sql.clone()),
+        )
+    } else {
+        (generated.sql.clone(), None)
+    };
     let binds = with_param_binds(copy, &generated, query_binds(copy, &resolved));
     // verbatim 游标的 cur_scan 原文含 $v_ 绑定：守卫 SQL 按 token 出现
     // 情况从全量绑定集补齐（guard_binds 只覆盖查找自身过滤绑定）。
-    let top1_guards: Vec<entry::BoundGuard> = top1_guards
-        .into_iter()
-        .map(|(sql, mut gbinds)| {
-            if let Some(t) = shape::Tokens::new(&sql) {
-                for (ph, src) in &binds {
-                    if t.words().iter().any(|w| w == ph) && !gbinds.iter().any(|(p, _)| p == ph) {
-                        gbinds.push((ph.clone(), src.clone()));
+    let fill_binds = |guards: Vec<entry::BoundGuard>| -> Vec<entry::BoundGuard> {
+        guards
+            .into_iter()
+            .map(|(sql, mut gbinds)| {
+                if let Some(t) = shape::Tokens::new(&sql) {
+                    for (ph, src) in &binds {
+                        if t.words().iter().any(|w| w == ph) && !gbinds.iter().any(|(p, _)| p == ph)
+                        {
+                            gbinds.push((ph.clone(), src.clone()));
+                        }
                     }
                 }
-            }
-            (sql, gbinds)
-        })
-        .collect();
+                (sql, gbinds)
+            })
+            .collect()
+    };
+    let top1_guards = fill_binds(top1_guards);
+    let exc_guards = fill_binds(exc_guards);
     let expr_guards = entry::bind_guards(generated.expr_guards, &binds)?;
     // fn_site 物化前导：游标 WHERE site 的 distinct_sql 为编译期原文
     // （含源表与过滤），INSERT 位 site 为 copy_sql 生成的
@@ -363,12 +433,12 @@ fn finish(
             })
     } || !view_preludes.is_empty();
     Ok(entry::ConversionPlan {
-        sql: generated.sql,
+        sql,
         binds,
         fn_preludes,
         view_preludes,
         preludes_first,
-        tail_commit,
+        tail_commit: flags.tail_commit,
         open_pc: region.open_pc,
         close_pc: region.close_pc,
         source: inputs.select.table,
@@ -382,6 +452,9 @@ fn finish(
             .chain(resolved_aggs.into_iter().flat_map(|(_, ts)| ts))
             .collect(),
         top1_guards,
+        exc_guards,
+        hybrid: if hybrid_on { hspec } else { None },
+        seg_sql,
         route_guards,
         expr_guards,
         miss_outs: miss_outs
@@ -392,6 +465,7 @@ fn finish(
                 binds: m.binds,
             })
             .collect(),
+        route_alt: None,
     })
 }
 

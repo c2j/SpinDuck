@@ -13,7 +13,9 @@ pub enum CursorAttrKind {
     RowCount,
 }
 
-/// 运行期游标状态（RowStream 无 Debug，手动实现）。
+/// 运行期游标状态（RowStream 无 Debug，手动实现；Clone 供 Worker 帧快照，
+/// 行数据经 `Arc` 零拷贝共享，`pos` 为各消费者本地位置）。
+#[derive(Clone)]
 pub enum CursorState {
     Closed,
     Open {
@@ -91,6 +93,50 @@ impl CursorState {
     pub fn is_open(&self) -> bool {
         matches!(self, CursorState::Open { .. })
     }
+
+    /// loop-parallel：已 FETCH 行数（Worker `row_idx` 的绝对基址）。
+    pub(crate) fn fetched(&self) -> usize {
+        match self {
+            CursorState::Open { fetched, .. } => *fetched,
+            CursorState::Closed => 0,
+        }
+    }
+
+    /// SO 混合单行重放（so-exception-row-hybrid §3.1）：定位到"下一次
+    /// `fetch` 将返回第 `index` 行（0 基）"的前置状态——等价于顺序
+    /// FETCH 完前 `index` 行：`fetched=index`、`last_hit = index>0`、
+    /// `attempted = index>0`（与 OPEN 后/流尾取空语义对齐）。
+    /// 重放随后执行真实 `Fetch` 指令取行，trace/步数/%ROWCOUNT 全走
+    /// 原生路径。`index` 越界时等价于流尾取空前置态（`last_hit=false`）。
+    pub fn seek_before(&mut self, index: usize) -> Result<(), EngineError> {
+        match self {
+            CursorState::Closed => Err(EngineError::invariant(50, "seek on closed cursor")),
+            CursorState::Open {
+                stream,
+                total,
+                fetched,
+                last_hit,
+                attempted,
+            } => {
+                stream.reset();
+                let _ = stream.fetch_many(index.min(*total));
+                let in_range = index <= *total;
+                *fetched = index.min(*total);
+                *last_hit = index > 0 && in_range;
+                *attempted = index > 0 || !in_range;
+                Ok(())
+            }
+        }
+    }
+
+    /// loop-parallel：导出物化行的只读共享存储（仅 Open 态；
+    /// `pos`/`fetched` 等消费位置仍归本游标独占）。
+    pub(crate) fn shared_rows(&self) -> Option<std::sync::Arc<Vec<Row>>> {
+        match self {
+            CursorState::Open { stream, .. } => Some(stream.shared_rows()),
+            CursorState::Closed => None,
+        }
+    }
 }
 
 impl std::fmt::Debug for CursorState {
@@ -143,9 +189,49 @@ mod tests {
     }
 
     #[test]
+    fn should_seek_before_index_for_hybrid_row_replay() {
+        // SO 混合单行重放：seek_before(e) 等价于"顺序 FETCH 完前 e 行"——
+        // 随后真实 Fetch 返回第 e 行；属性面 %ROWCOUNT=e、
+        // %FOUND=e>0、%NOTFOUND=false。
+        let mut c = CursorState::open(stream3());
+        c.seek_before(1).unwrap();
+        assert_eq!(c.attr(CursorAttrKind::RowCount), SpinValue::Int(1));
+        assert_eq!(c.attr(CursorAttrKind::Found), SpinValue::Bool(true));
+        assert_eq!(c.attr(CursorAttrKind::NotFound), SpinValue::Bool(false));
+        assert_eq!(c.fetch().unwrap(), Some(vec![SpinValue::Int(2)]));
+        assert_eq!(c.attr(CursorAttrKind::RowCount), SpinValue::Int(2));
+        // 首行前置态 = OPEN 后未 FETCH：两属性皆 false。
+        c.seek_before(0).unwrap();
+        assert_eq!(c.attr(CursorAttrKind::NotFound), SpinValue::Bool(false));
+        assert_eq!(c.attr(CursorAttrKind::Found), SpinValue::Bool(false));
+        assert_eq!(c.fetch().unwrap(), Some(vec![SpinValue::Int(1)]));
+        // 流尾前置态（index=total）：等价取空前——NOTFOUND 仍 false，
+        // 下一次 fetch 返回 None 且置 NOTFOUND。
+        c.seek_before(3).unwrap();
+        assert_eq!(c.attr(CursorAttrKind::RowCount), SpinValue::Int(3));
+        assert_eq!(c.attr(CursorAttrKind::NotFound), SpinValue::Bool(false));
+        assert!(c.fetch().unwrap().is_none());
+        assert_eq!(c.attr(CursorAttrKind::NotFound), SpinValue::Bool(true));
+        // Closed 态与 fetch 同口径报错。
+        assert!(CursorState::Closed.seek_before(0).is_err());
+    }
+
+    #[test]
     fn should_report_closed_cursor_attrs() {
         let mut c = CursorState::Closed;
         assert_eq!(c.attr(CursorAttrKind::IsOpen), SpinValue::Bool(false));
         assert!(c.fetch().is_err());
+    }
+
+    #[test]
+    fn should_export_shared_rows_only_when_open() {
+        let mut c = CursorState::open(stream3());
+        let rows = c.shared_rows().expect("Open 态应可导出");
+        assert_eq!(rows.len(), 3);
+        // 导出不改变游标消费位置。
+        assert!(c.fetch().unwrap().is_some());
+        assert_eq!(c.attr(CursorAttrKind::RowCount), SpinValue::Int(1));
+        let closed = CursorState::Closed;
+        assert!(closed.shared_rows().is_none());
     }
 }
