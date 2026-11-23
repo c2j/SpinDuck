@@ -74,8 +74,35 @@ impl From<bool> for SetOrientedMode {
     }
 }
 
-/// 未获得集合化证明的原因。
+/// `call --on-skip[=mode]` / `[engine].set_oriented_on_skip`：
+/// 判定行前移时机与 Skipped 是否参与退出码（设计 v3.1 §5 B2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnSkip {
+    /// 判定行在区域裁决点即时输出，退出码不受 Skipped 影响。
+    Report,
+    /// 同 Report，且任一未列入 `--on-skip-error-if` 的 Skipped → 退出码非零。
+    Error,
+}
+
+impl OnSkip {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Report => "report",
+            Self::Error => "error",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "report" => Some(Self::Report),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+/// 未获得集合化证明的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SkipReason {
     UnsupportedControlFlow,
     ExceptionScopePresent,
@@ -137,6 +164,33 @@ impl SkipReason {
             Self::UnresolvedFnSite => "unresolved-fn-site",
             Self::DynamicSql => "dynamic-sql",
         }
+    }
+
+    /// `as_str` 的反查（`--on-skip-error-if` 名单口径 = 工件 reason 口径）。
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "unsupported-control-flow" => Self::UnsupportedControlFlow,
+            "exception-scope-present" => Self::ExceptionScopePresent,
+            "transaction-boundary-inside-loop" => Self::TransactionBoundaryInsideLoop,
+            "batch-commit-enabled" => Self::BatchCommitEnabled,
+            "live-out-state" => Self::LiveOutState,
+            "unsupported-write" => Self::UnsupportedWrite,
+            "target-read-dependency" => Self::TargetReadDependency,
+            "unknown-object-dependency" => Self::UnknownObjectDependency,
+            "unproven-expression" => Self::UnprovenExpression,
+            "unproven-target-constraints" => Self::UnprovenTargetConstraints,
+            "unproven-rollback-scope" => Self::UnprovenRollbackScope,
+            "unproven-write-completeness" => Self::UnprovenWriteCompleteness,
+            "non-deterministic-default" => Self::NonDeterministicDefault,
+            "unproven-sys-dummy-invariant" => Self::UnprovenSysDummyInvariant,
+            "unproven-query-totalness" => Self::UnprovenQueryTotalness,
+            "ambiguous-top1-tie" => Self::AmbiguousTop1Tie,
+            "unsupported-call" => Self::UnsupportedCall,
+            "multi-out-call-impure" => Self::MultiOutCallImpure,
+            "unresolved-fn-site" => Self::UnresolvedFnSite,
+            "dynamic-sql" => Self::DynamicSql,
+            _ => return None,
+        })
     }
 }
 

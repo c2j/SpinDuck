@@ -332,3 +332,83 @@ fn should_call_routine_on_default_off_path() {
     assert_eq!(out, "CALL prc_fill OK\n", "{out}");
     assert_eq!(err, "", "全部输出走 stdout");
 }
+
+/// `--on-skip` 契约（设计 v3.1 §5 B2，D8 路线 A）：库里有源/目标表但无
+/// sys_dummy → 计划期 Skipped(UnknownObjectDependency)，解释器回退跑通
+/// CALL OK；判定行在裁决点即时输出（子进程 stdout），error 退出码隔离。
+const ON_SKIP_ROUTINE: &str = "CREATE PROCEDURE copy_rows IS BEGIN \
+     FOR r IN SELECT id FROM source_rows LOOP \
+     INSERT INTO target_rows(id) VALUES (r.id); END LOOP; END;\n";
+
+fn on_skip_fixture(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use spinduck_core::exec::{BindMap, SqlExecutor};
+    use spinduck_core::sql::exec_native::DuckExecutor;
+    let sql = write(root, "copy_rows.sql", ON_SKIP_ROUTINE);
+    let db = root.join("t.duckdb");
+    let ex = DuckExecutor::open(&db.to_string_lossy()).unwrap();
+    for s in [
+        "CREATE TABLE source_rows (id BIGINT)",
+        "CREATE TABLE target_rows (id BIGINT)",
+        "INSERT INTO source_rows VALUES (1)",
+    ] {
+        ex.execute(s, &BindMap::new()).unwrap();
+    }
+    (sql, db)
+}
+
+fn on_skip_args<'a>(
+    sql: &'a std::path::Path,
+    db: &'a std::path::Path,
+    extra: &[&'a str],
+) -> Vec<String> {
+    let mut v: Vec<String> = vec![
+        "call".into(),
+        "--file".into(),
+        sql.to_string_lossy().into_owned(),
+        "--db".into(),
+        db.to_string_lossy().into_owned(),
+        "--set-oriented=strict".into(),
+    ];
+    v.extend(extra.iter().map(|s| s.to_string()));
+    v.push("copy_rows".into());
+    v
+}
+
+fn on_skip_cli(args: &[String]) -> (i32, String, String) {
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    cli(&argv)
+}
+
+#[test]
+fn should_print_skip_line_and_fail_only_under_on_skip_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (sql, db) = on_skip_fixture(tmp.path());
+    // report：判定行在、退出码不受 Skipped 影响。
+    let (code, out, err) = on_skip_cli(&on_skip_args(&sql, &db, &["--on-skip=report"]));
+    assert_eq!(code, EXIT_OK, "{out}");
+    assert!(
+        out.contains("SET_ORIENTED copy_rows skipped reason=UnknownObjectDependency"),
+        "{out}"
+    );
+    assert!(out.contains("CALL copy_rows OK"), "{out}");
+    assert_eq!(err, "");
+    // error：同一 Skipped 判红。
+    let (code, out, _) = on_skip_cli(&on_skip_args(&sql, &db, &["--on-skip=error"]));
+    assert_eq!(code, EXIT_FAIL, "{out}");
+    assert!(out.contains("SET_ORIENTED copy_rows skipped"), "{out}");
+    // error-if 名单豁免该 reason → 回到 EXIT_OK。
+    let (code, out, _) = on_skip_cli(&on_skip_args(
+        &sql,
+        &db,
+        &[
+            "--on-skip=error",
+            "--on-skip-error-if",
+            "unknown-object-dependency",
+        ],
+    ));
+    assert_eq!(code, EXIT_OK, "{out}");
+    // 无旗标：既有事后渲染逐字不变（判定行仍在、位置在 CALL 行前由渲染序保证）。
+    let (code, out, _) = on_skip_cli(&on_skip_args(&sql, &db, &[]));
+    assert_eq!(code, EXIT_OK, "{out}");
+    assert!(out.contains("SET_ORIENTED copy_rows skipped"), "{out}");
+}

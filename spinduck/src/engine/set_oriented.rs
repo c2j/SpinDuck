@@ -305,10 +305,16 @@ impl Engine {
     }
 
     fn push_report(&mut self, routine: &str, status: Status) {
-        self.set_oriented_reports.push(Report {
+        let report = Report {
             routine: routine.to_string(),
             status,
-        });
+        };
+        self.set_oriented_reports.push(report.clone());
+        // D8：即时回调先于入队返回——`call --on-skip` 的判定行在区域
+        // 裁决点输出，不等整次调用返回（OFF 路径不产生报告，不触发）。
+        if let Some(cb) = &mut self.on_set_oriented_report {
+            cb(&report);
+        }
     }
 
     fn run_prog(
