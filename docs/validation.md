@@ -5240,3 +5240,41 @@ allowed warnings）全部通过；`cargo test --features gauss`（A 模式容器
   是 4 列最小投影，与这份 38 列视图不是同一份定义，不能互替。
 - 不声称服务器语料与仓库一致：真机 `routines=6 missing=0` 的状态是服务器侧本地补件
   产生的；本轮把等价补件正式入库后，两侧应重新对齐（服务器重跑 compile 以仓库为准）。
+
+## V52. loop-parallel + SO 行级混合落地与 PR#62 评审修复实证（2026-11-24）
+
+### V52.1 评审必修项修复与守护测试
+
+- **回滚缓存失效（P0-1）**：`RollbackWatch` 恒启用 + `LookupState::invalidate_on_rollback()`
+  （只清 `Slot::Ready` 数据槽、保留 `Slot::Off` 降级标记）。实证反例：
+  `tests/loop_parallel.rs::should_invalidate_frozen_snapshot_after_mid_loop_rollback`
+  ——前缀未提交 `UPDATE lut` + 第 3 行 `ROLLBACK`，Safe/Off 两模式行 4/5 均读回
+  回滚后值 10（修复前 Off 模式串行路径即读到回滚前 1010，属既有串行漏洞）。
+  `set_oriented_dummy::should_reject_sys_dummy_block_when_not_total_and_verify_
+  decimal_mul_sub` 同步验证：全清方案会使回滚后重跑必然失败的 build SQL
+  （视图全量物化 CAST 错）把事务打入 aborted 态丢行，Ready-only 口径两全。
+- **例程物化读写相交（P0-2）**：`tests/loop_parallel.rs::
+  should_not_serve_stale_call_snapshot_when_loop_writes_callee_read_table`
+  锁定门禁 7 拒绝（callee `SqlQuery` 读表并入 `R_prefix`）。
+- **混合前置证明（P0-3）**：`sd_cur` 单次物化 `__sd_hcur_<seq>` + 游标流重绑定
+  消除无序 GROUP BY 行序漂移；`exc_rows` 畸形 → `HybridPreflightFailed`
+  安全串行回退。实证：byfund_branch SO `Skipped{AmbiguousTop1Tie}` →
+  `Converted`（混合路径），探针连跑 3/3 稳定 Converted（修复前 2/3 抖动）。
+- **trace 契约（P1）**：Worker `SqlQuery` 补发 `IrStmt{SqlQuery}`；
+  `SqlExec.elapsed_us` 全站点实测；`peak_snapshot_bytes` 真实化。
+
+### V52.2 门禁
+
+`cargo fmt --all -- --check`、`cargo clippy --all-features --tests -- -D warnings`、
+`cargo test --features cli`（65 个测试目标全绿，742 lib + 全部集成）通过。
+`cargo audit`：7 个存量传递依赖公告（zip 6.0.0 ×6、bincode/chrono/
+unsafe-libyaml unmaintained），非本 PR 引入，单独跟进。
+
+### V52.3 不声称
+
+- 不声称 `zz_top1_pick_probe` 类环境行为探针留在常驻 CI：已按评审移除
+  （其结论——GROUP BY 无 ORDER BY 行序不稳定——已由 P0-3b 物化方案
+  架构性消解，断言本身依赖内核实现细节会随升级漂移）。
+- 不声称混合 SO 在 byfund_branch 上快于串行：实测 so_ba≈51s vs off≈43s
+  （exc 占比高 → 段数≈|E|+1 固有成本），其价值是"此前整体拒绝的区域
+  现在可转换"；性能最优路径仍是 LP（lp_safe≈42s）。
