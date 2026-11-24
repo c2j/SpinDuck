@@ -47,24 +47,34 @@ enum ParallelEntry {
 
 /// trace 包装汇：旁路侦测 `TxRollback` / 回滚性 SQL——命中即作废
 /// 快照与在途 Worker 结果，剩余行原生串行（设计 §3.2/§5.2）。
+/// 同时持有共享 `LookupState`：侦测到回滚的当下清空 lookup/memo
+/// 缓存——事务回滚改变可见数据，冻结槽位与 live 槽位若继续服务
+/// 会把回滚前的值供给主线程串行续跑（P0-1 审核）。清空收敛在
+/// LP 驱动窗口内：常规串行路径不经过本汇，行为零变化。
 struct RollbackWatch<'a> {
     inner: &'a mut dyn TraceSink,
     hit: Cell<bool>,
+    lookup: std::rc::Rc<crate::lookup_cache::LookupState>,
 }
 
 impl TraceSink for RollbackWatch<'_> {
+    /// 恒 true：回滚侦测是正确性机制而非观测面——默认
+    /// `TraceNoopSink`（`is_enabled()==false`）下解释器不构造任何
+    /// 事件，若透传内层开关，`TxRollback`/`ROLLBACK` SQL 将完全
+    /// 逃过侦测，冻结快照在回滚后继续供 Worker 读取（错数据）。
+    /// 事件构造开销仅存在于 LP 驱动窗口内；内层 sink 照常收事件。
     fn is_enabled(&self) -> bool {
-        self.inner.is_enabled()
+        true
     }
     fn on_event(&mut self, ev: TraceEvent) {
-        match &ev {
-            TraceEvent::IrStmt { variant } if *variant == "TxRollback" => {
-                self.hit.set(true);
-            }
-            TraceEvent::SqlExec { sql, .. } if sql.to_ascii_lowercase().contains("rollback") => {
-                self.hit.set(true);
-            }
-            _ => {}
+        let rollback = match &ev {
+            TraceEvent::IrStmt { variant } => *variant == "TxRollback",
+            TraceEvent::SqlExec { sql, .. } => crate::exec::is_rollback_stmt(sql),
+            _ => false,
+        };
+        if rollback {
+            self.hit.set(true);
+            self.lookup.invalidate_on_rollback();
         }
         self.inner.on_event(ev);
     }
@@ -103,6 +113,7 @@ impl Engine {
         let mut watch = RollbackWatch {
             inner: sink,
             hit: Cell::new(false),
+            lookup: self.lookup.clone(),
         };
         let out = self.drive_parallel_loop(
             routine,
@@ -153,6 +164,7 @@ impl Engine {
         let mut watch = RollbackWatch {
             inner: sink,
             hit: Cell::new(false),
+            lookup: self.lookup.clone(),
         };
         let out = self.drive_parallel_loop(
             routine,
@@ -318,6 +330,7 @@ impl Engine {
             prewarmed,
             prewarm_ms,
             need_keys: 0,
+            snapshot_bytes: snapshot.approx_bytes(),
         };
         let mut serial_tail = false;
         'outer: for chunk_indices in indices.chunks(chunk) {
@@ -456,6 +469,12 @@ impl Engine {
         if routine.kind != RoutineKind::Function {
             return CallOutcome::Failed;
         }
+        // arity 与 `eval_funccall` 同口径：不符 → Failed → Worker 交权
+        // 原生重跑，由解释器产生真实 BIZ 错误（P0-2：不得静默按
+        // 缺省值物化成功）。
+        if crate::catalog::check_arity(name, &routine.params, args.len()).is_err() {
+            return CallOutcome::Failed;
+        }
         let mut callee_args = Vec::with_capacity(routine.params.len());
         for (i, p) in routine.params.iter().enumerate() {
             callee_args.push(match args.get(i) {
@@ -471,6 +490,10 @@ impl Engine {
         {
             return CallOutcome::Failed;
         }
+        // trace 静默是刻意的：物化是并行驱动的内部补执行，callee 事件
+        // 与 Worker 前缀 trace 的时序本就无法与串行逐语句对齐；物化
+        // 失败路径（CallOutcome::Failed）交权原生重跑，trace 由解释器
+        // 原生发出——观测面差异仅限"静默成功"的物化调用（P0-2 评审）。
         let mut sink = TraceNoopSink;
         let out = run_with_catalog(
             &routine.prog,
@@ -759,7 +782,7 @@ impl Engine {
                 prewarm_ms: stats.prewarm_ms,
                 snapshot_hits: calls.hits(),
                 snapshot_misses: calls.misses(),
-                peak_snapshot_bytes: 0,
+                peak_snapshot_bytes: stats.snapshot_bytes + calls.approx_bytes(),
             },
         );
         Ok(Some(out))
@@ -795,6 +818,8 @@ struct ParallelStats {
     prewarm_ms: u64,
     /// E2：`NeedKeys` 主线程补物化次数（审计/调优观测）。
     need_keys: u64,
+    /// 冻结 lookup 快照体积估算（`FrozenLookupSnapshot::approx_bytes`）。
+    snapshot_bytes: usize,
 }
 
 /// `NeedKeys` 待物化请求提取（克隆返回——`res` 随后会被重派结果

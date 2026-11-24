@@ -301,6 +301,16 @@ fn finish(
     // `|E|` 恒空也无调度收益。
     let has_exc = resolved.iter().any(|(l, _)| l.render.exc_guard.is_some());
     let hybrid_on = hspec.is_some() && has_exc;
+    // 混合计划的 `sd_cur` 改读引擎物化临时表：物化 SELECT 随 spec
+    // 下发，`__sd_rn` 只在物化时赋一次（P0-3b 行序证明的锚点）。
+    let hspec = if hybrid_on {
+        hspec.map(|mut h| {
+            h.hcur_sql = super::copy::sd_cur_rows(&inputs.select, &inputs.cur);
+            h
+        })
+    } else {
+        None
+    };
     // 混合启用时，miss_emu 的 dup 守卫（tie_guard 槽位）改由
     // exc_guards 行号集承载——顶替"任一 dup 行即整段退回"。
     let top1_guards: Vec<entry::BoundGuard> = resolved

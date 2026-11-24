@@ -19,7 +19,8 @@ use crate::ir::set_oriented::region::CursorRegion;
 use crate::ir::{IrProg, IrStmt, VarName};
 use std::collections::BTreeSet;
 
-/// 混合调度规格：游标名 + FETCH pc + 唯一早退出口 pc。
+/// 混合调度规格：游标名 + FETCH pc + 唯一早退出口 pc + `sd_cur`
+/// 物化 SELECT（`__sd_rn` 0 基行号，只在物化时赋一次）。
 #[derive(Debug, Clone)]
 pub(crate) struct HybridSpec {
     pub cursor: VarName,
@@ -27,6 +28,9 @@ pub(crate) struct HybridSpec {
     /// 循环唯一出口 pc（`close_pc` 或 `close_pc+1`）；无早退边时
     /// 取 `close_pc`（终止空 FETCH 的 NOTFOUND 边同样落此）。
     pub exit_pc: usize,
+    /// `sd_cur` 物化查询（含 `ROW_NUMBER() OVER () - 1 AS __sd_rn`）；
+    /// 计划期由 `generate::finish` 填充，`analyze` 先置空串。
+    pub hcur_sql: String,
 }
 
 /// 区域混合资格证明。返回 `None` = 不满足前提，走普通路径。
@@ -57,6 +61,9 @@ pub(crate) fn analyze(prog: &IrProg, region: &CursorRegion) -> Option<HybridSpec
                 }
             }
             IrStmt::TxRollback => return None,
+            // 逃逸证明只关心控制转移/事务/陷阱边界；其余指令变体
+            // （赋值/SQL/例程调用等）不改变"跳转目标 ∈ 区域"论证，
+            // 显式忽略——新增跳转类变体时须回到本 match 评审。
             _ => {}
         }
     }
@@ -69,5 +76,6 @@ pub(crate) fn analyze(prog: &IrProg, region: &CursorRegion) -> Option<HybridSpec
         cursor: region.cursor.clone(),
         fetch_pc,
         exit_pc,
+        hcur_sql: String::new(),
     })
 }

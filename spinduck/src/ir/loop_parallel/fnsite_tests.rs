@@ -112,9 +112,7 @@ fn analyze_ok(prog: &IrProg) -> PurePrefixPlan {
 }
 
 fn analyze_err(prog: &IrProg) -> ParallelSkipReason {
-    analyze(prog, &RoutineCatalog::new(), false)
-        .err()
-        .expect("fixture 应被门禁拒绝")
+    analyze(prog, &RoutineCatalog::new(), false).expect_err("fixture 应被门禁拒绝")
 }
 
 /// 四条纯赋值 + 一条可预热查询（满足最小工作量）。

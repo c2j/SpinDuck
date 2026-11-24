@@ -244,3 +244,178 @@ fn should_stay_serial_when_both_optimizations_off() {
     assert!(eng.loop_parallel_reports().is_empty());
     assert!(eng.set_oriented_reports().is_empty());
 }
+
+/// P0-1 回滚侦测守护：循环内 `ROLLBACK` 必须作废冻结查找快照，
+/// 使后续行回到串行读真实库状态。侦测点在语义执行层
+/// （`IrStmt`/`SqlExec` 事件），不得依赖 `TraceSink::is_enabled()`
+/// ——默认 `Engine::call` 用 `TraceNoopSink`，旧实现下 `RollbackWatch`
+/// 永不命中，行 4/5 会继续读到回滚前的冻结值（错数据）。
+///
+/// 场景：前缀 `UPDATE lut`（未提交）把查找值改为 1010；循环不变
+/// 查找 `WHERE lut.k = 1` 被整体预热冻结；第 3 行 `ROLLBACK` 回滚
+/// 该 UPDATE 与此前全部 dst 写入；行 4/5 串行语义应读回 10。
+const RB_PROC: &str = "CREATE PROCEDURE p_rb(p_k NUMBER) IS \
+    v1 NUMBER; \
+    BEGIN \
+    UPDATE lut SET v = v + 1000; \
+    FOR r IN SELECT id FROM src LOOP \
+        SELECT v INTO v1 FROM lut WHERE k = p_k; \
+        INSERT INTO dst(id, v) VALUES (r.id, v1); \
+        IF r.id = 3 THEN ROLLBACK; END IF; \
+    END LOOP; \
+    END;";
+
+fn rb_engine(mode: LoopParallelMode) -> Engine {
+    let mut eng = Engine::new(
+        Box::new(DuckExecutor::open_in_memory().unwrap()),
+        RuleRegistry::default(),
+    );
+    for sql in [
+        "CREATE TABLE lut(k BIGINT, v BIGINT)",
+        "CREATE TABLE src(id BIGINT)",
+        "CREATE TABLE dst(id BIGINT, v BIGINT)",
+        "INSERT INTO lut VALUES (1,10),(2,20)",
+        "INSERT INTO src VALUES (1),(2),(3),(4),(5)",
+    ] {
+        eng.ex.execute(sql, &BindMap::new()).unwrap();
+    }
+    eng.register(RB_PROC).unwrap();
+    eng.loop_parallel = LoopParallelConfig {
+        mode,
+        threads: 2,
+        chunk_size: 2,
+        min_rows: 2,
+    };
+    eng
+}
+
+fn rb_state(eng: &Engine) -> (Vec<Vec<SpinValue>>, Vec<Vec<SpinValue>>) {
+    let dst = eng
+        .ex
+        .query("SELECT id, v FROM dst ORDER BY id", &BindMap::new())
+        .unwrap()
+        .fetch_many(20);
+    let lut = eng
+        .ex
+        .query("SELECT k, v FROM lut ORDER BY k", &BindMap::new())
+        .unwrap()
+        .fetch_many(20);
+    (dst, lut)
+}
+
+#[test]
+fn should_invalidate_frozen_snapshot_after_mid_loop_rollback() {
+    let mut safe = rb_engine(LoopParallelMode::Safe);
+    safe.call("p_rb", &[SpinValue::Int(1)]).unwrap();
+    let mut off = rb_engine(LoopParallelMode::Off);
+    off.call("p_rb", &[SpinValue::Int(1)]).unwrap();
+    // 串行语义：行 1-3 写入被 ROLLBACK 吞掉，行 4/5 读到回滚后的 10。
+    let want_dst = vec![
+        vec![SpinValue::Int(4), SpinValue::Int(10)],
+        vec![SpinValue::Int(5), SpinValue::Int(10)],
+    ];
+    let want_lut = vec![
+        vec![SpinValue::Int(1), SpinValue::Int(10)],
+        vec![SpinValue::Int(2), SpinValue::Int(20)],
+    ];
+    assert_eq!(
+        rb_state(&off),
+        (want_dst.clone(), want_lut.clone()),
+        "off diverged"
+    );
+    assert_eq!(rb_state(&safe), (want_dst, want_lut), "safe diverged");
+    // 侦测必须真实命中并记入报告（rollback_invalidated）。
+    assert!(
+        matches!(
+            safe.loop_parallel_reports()[0].status,
+            ParallelStatus::Parallelized {
+                rollback_invalidated: true,
+                ..
+            }
+        ),
+        "lp reports: {:?}",
+        safe.loop_parallel_reports()
+    );
+}
+
+/// P0-2 读写不相交补全守护：`CallSnapshot` 按 (name,实参) 缓存整轮
+/// ——callee 体内 `SqlQuery` 读到的表若被循环写，同键后续行必须读到
+/// 新值。修复前 `R_prefix` 不含 callee 读集，LP 接管后 row2+ 命中
+/// 陈旧物化值；修复后门禁 7 判相交 → 整区域串行，语义正确。
+const CALLMAT_LUT_FN: &str = "CREATE OR REPLACE FUNCTION f_get(p_k IN NUMBER) \
+    RETURN NUMBER IS v1 NUMBER; BEGIN \
+    SELECT v INTO v1 FROM lut3 WHERE k = p_k; \
+    RETURN v1; END;";
+
+const CALLMAT_PROC: &str = "CREATE PROCEDURE p_callmat IS \
+    x NUMBER; a NUMBER; b NUMBER; c NUMBER; d NUMBER; \
+    BEGIN \
+    FOR r IN SELECT id FROM src2 LOOP \
+        x := f_get(1); \
+        a := x + 0; b := a + 0; c := b + 0; d := c + 0; \
+        INSERT INTO dst2(id, v) VALUES (r.id, d); \
+        UPDATE lut3 SET v = v + 100 WHERE k = 1; \
+    END LOOP; \
+    END;";
+
+#[test]
+fn should_not_serve_stale_call_snapshot_when_loop_writes_callee_read_table() {
+    let build = |mode: LoopParallelMode| {
+        let mut eng = Engine::new(
+            Box::new(DuckExecutor::open_in_memory().unwrap()),
+            RuleRegistry::default(),
+        );
+        for sql in [
+            "CREATE TABLE lut3(k BIGINT, v BIGINT)",
+            "CREATE TABLE src2(id BIGINT)",
+            "CREATE TABLE dst2(id BIGINT, v BIGINT)",
+            "INSERT INTO lut3 VALUES (1,10)",
+            "INSERT INTO src2 VALUES (1),(2),(3),(4),(5)",
+        ] {
+            eng.ex.execute(sql, &BindMap::new()).unwrap();
+        }
+        eng.register(CALLMAT_LUT_FN).unwrap();
+        eng.register(CALLMAT_PROC).unwrap();
+        eng.loop_parallel = LoopParallelConfig {
+            mode,
+            threads: 2,
+            chunk_size: 2,
+            min_rows: 2,
+        };
+        eng
+    };
+    let mut safe = build(LoopParallelMode::Safe);
+    safe.call("p_callmat", &[]).unwrap();
+    let mut off = build(LoopParallelMode::Off);
+    off.call("p_callmat", &[]).unwrap();
+    let snap = |eng: &Engine| {
+        let dst = eng
+            .ex
+            .query("SELECT id, v FROM dst2 ORDER BY id", &BindMap::new())
+            .unwrap()
+            .fetch_many(20);
+        let lut = eng
+            .ex
+            .query("SELECT v FROM lut3", &BindMap::new())
+            .unwrap()
+            .fetch_many(20);
+        (dst, lut)
+    };
+    // 串行语义：每行先读再写——row i 读到 10+100*(i-1)。
+    let want_dst: Vec<Vec<SpinValue>> = (1..=5)
+        .map(|i| vec![SpinValue::Int(i), SpinValue::Int(10 + 100 * (i - 1))])
+        .collect();
+    let want_lut = vec![vec![SpinValue::Int(510)]];
+    assert_eq!(snap(&off), (want_dst.clone(), want_lut.clone()), "off");
+    assert_eq!(snap(&safe), (want_dst, want_lut), "safe");
+    // 门禁 7 必须因 callee 读集 ∩ 循环写集判相交而拒绝接管——
+    // 若仍 Parallelized 且碰巧正确，说明读集收集漏了（回归洞）。
+    assert!(
+        !matches!(
+            safe.loop_parallel_reports()[0].status,
+            ParallelStatus::Parallelized { .. }
+        ),
+        "lp reports: {:?}",
+        safe.loop_parallel_reports()
+    );
+}

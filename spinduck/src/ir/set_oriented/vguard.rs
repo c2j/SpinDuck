@@ -254,17 +254,17 @@ fn miss_guards(
     let scan = guard_scan(lq, table, cur_scan, dims, filter);
     let dup = format!("SELECT COUNT(*) {scan} WHERE COALESCE(_b.__cnt, 0) > 1");
     // 混合调度行号版守卫（so-exception-row-hybrid §3）：与 dup 同谓词，
-    // 但 cur_scan 外包 ROW_NUMBER() 投影违规行 __sd_rn（0 基、对齐游标流
-    // 序——依赖 R1 行序稳定假设）。仅 miss_emu 路径产出：dup 行 =
-    // TOO_MANY_ROWS 异常行，交解释器单行重放复现 handler 副作用。
-    // `ROW_NUMBER()` 1 基减 1 → 0 基行号，直接对齐 `seek_before`/批写
-    // `__rn BETWEEN` 区间（两处共用同一编号口径）。
+    // 投影违规行 `__sd_rn`（0 基）。行号读自引擎物化的 `sd_cur` 临时表
+    // （`__SD_HCUR__` 占位符运行期替换）——编号只在物化时赋一次，
+    // 守卫/段批写/重放共用，引擎另做游标流序位置校验（P0-3b）。
+    // 仅 miss_emu 路径产出：dup 行 = TOO_MANY_ROWS 异常行，交解释器
+    // 单行重放复现 handler 副作用。
     let exc = format!(
         "SELECT _cur.__sd_rn {} WHERE COALESCE(_b.__cnt, 0) > 1",
         guard_scan(
             lq,
             table,
-            &format!("SELECT *, ROW_NUMBER() OVER () - 1 AS __sd_rn FROM ({cur_scan}) _rn"),
+            &format!("SELECT * FROM {}", crate::ir::set_oriented::SD_HCUR_TABLE),
             dims,
             filter
         )

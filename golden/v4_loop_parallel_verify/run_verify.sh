@@ -3,7 +3,8 @@
 #
 # 在当前 worktree（须含 loop-parallel 实现）上运行差分探针：
 #   1. 探针源码注入 spinduck/tests/（autodiscovery 自动注册）；
-#   2. cargo test --features native 跑 6 个用例（等价 ×4 + 性能 ×2）；
+#   2. cargo test --features native 跑 16 个用例（等价断言 +
+#      性能矩阵；perf_matrix 内含 OUT/状态逐值等价断言，并非纯打印）；
 #   3. 全部 V4| 行与测试结果落 reports/probe_run.log。
 #
 # 用法（仓库根目录）：

@@ -227,7 +227,12 @@ impl Engine {
             )?;
             return Ok((!matches!(out, RunOutcome::Stopped)).then_some(out));
         };
-        self.push_report(&routine.name, Status::Converted { sql: p.sql.clone() });
+        // 混合计划延迟上报：异常行集/基数前置证明在 `run_hybrid_region`
+        // 内完成，失败回退串行时报 Skipped 而非 Converted（P0-3）。
+        let hybrid_plan = p.hybrid.is_some();
+        if !hybrid_plan {
+            self.push_report(&routine.name, Status::Converted { sql: p.sql.clone() });
+        }
         // fn_site 物化前导：与解释器 OpenCursor 时点同口径，
         // 失败直接上抛（同点失败语义），绝不部分物化后续跑批写。
         if !preluded && !p.fn_preludes.is_empty() {
@@ -240,15 +245,54 @@ impl Engine {
                 &routine.prog.var_types,
             )?;
         }
-        // 混合调度（so-exception-row-hybrid §3）：异常行号集在入口期
-        // 求值；空集落入下方既有 SO 路径（plan.sql 已是全行版本，
-        // 与无混合计划行为等价）。非空走分段批写+单行重放。
-        if p.hybrid.is_some() {
-            let exc = crate::ir::set_oriented::exc_rows(self.ex.as_ref(), p, frame)?;
-            if !exc.is_empty() {
-                return self.run_hybrid_region(routine, p, frame, sink, limits, exc);
+        // 混合调度（so-exception-row-hybrid §3 + P0-3b）：先把 `sd_cur`
+        // 物化为会话临时表并替换计划 SQL 占位符——`__sd_rn` 只在物化
+        // 时赋一次，异常守卫/段批写共用同一编号（消除各 SQL 各自
+        // ROW_NUMBER 扫描的行序漂移）。游标流序一致性在 OPEN 后由
+        // `hcur_order_ok` 对 shared_rows 做位置校验，失配串行兜底。
+        // 空异常集落入下方既有 SO 路径（物化表版 plan.sql）。
+        let mut hcur: Option<(String, ConversionPlan)> = None;
+        if hybrid_plan {
+            match self.materialize_hcur(p, frame)? {
+                Some((name, hp)) => {
+                    match crate::ir::set_oriented::exc_rows(self.ex.as_ref(), &hp, frame)? {
+                        Some(exc) if !exc.is_empty() => {
+                            return self.run_hybrid_region(
+                                routine,
+                                &hp,
+                                frame,
+                                sink,
+                                limits,
+                                HybridRun {
+                                    exc,
+                                    hcur_name: &name,
+                                },
+                            );
+                        }
+                        Some(_) => {
+                            // 空异常集：全行批写（物化表版 plan.sql）。
+                            self.push_report(
+                                &routine.name,
+                                Status::Converted {
+                                    sql: hp.sql.clone(),
+                                },
+                            );
+                            hcur = Some((name, hp));
+                        }
+                        None => {
+                            // 畸形守卫行号：证据不可信 → 整区域串行
+                            // 兜底（此点尚未产生任何写入，语义零变化）。
+                            self.drop_hcur_table(&name);
+                            return self.hybrid_serial_from_open(routine, p, frame, sink, limits);
+                        }
+                    }
+                }
+                None => {
+                    return self.hybrid_serial_from_open(routine, p, frame, sink, limits);
+                }
             }
         }
+        let p = hcur.as_ref().map_or(p, |(_, hp)| hp);
         let rows = self.exec_region_sql(p, frame, sink)?;
         // miss 仿真标量出口：NO_DATA_FOUND 处理器赋值回填——
         // 存在 miss 行时取回逐行（均匀性已由入口守卫证明）
@@ -263,6 +307,9 @@ impl Engine {
             }
         }
         self.commit_region_tail(p, rows, sink)?;
+        if let Some((name, _)) = &hcur {
+            self.drop_hcur_table(name);
+        }
         Ok(None)
     }
 
@@ -433,10 +480,8 @@ impl Engine {
         self.exec_sql(&sql, &plan.binds, frame, sink)
     }
 
-    /// SO 行级混合执行（so-exception-row-hybrid §3）：正常行按行段
-    /// 批写（与异常行重放保序交错），异常行 `seek_before`+真实 Fetch
-    /// 单行重放；早退/返回原样上交；末尾补终止空 FETCH 对齐游标属性，
-    /// `exit_pc==close_pc` 时补执行 CloseCursor 后交还外层续跑。
+    /// 混合调度包装：无论成败都回收 `sd_cur` 物化临时表（唯一表名，
+    /// 不回收会在长会话内累积）。
     fn run_hybrid_region(
         &mut self,
         routine: &CompiledRoutine,
@@ -444,8 +489,28 @@ impl Engine {
         frame: &mut Frame,
         sink: &mut dyn TraceSink,
         limits: RunLimits,
-        exc: std::collections::BTreeSet<u64>,
+        run: HybridRun<'_>,
     ) -> Result<Option<RunOutcome>, EngineError> {
+        let hcur_name = run.hcur_name;
+        let r = self.run_hybrid_body(routine, plan, frame, sink, limits, run);
+        self.drop_hcur_table(hcur_name);
+        r
+    }
+
+    /// SO 行级混合执行（so-exception-row-hybrid §3）：正常行按行段
+    /// 批写（与异常行重放保序交错），异常行 `seek_before`+真实 Fetch
+    /// 单行重放；早退/返回原样上交；末尾补终止空 FETCH 对齐游标属性，
+    /// `exit_pc==close_pc` 时补执行 CloseCursor 后交还外层续跑。
+    fn run_hybrid_body(
+        &mut self,
+        routine: &CompiledRoutine,
+        plan: &ConversionPlan,
+        frame: &mut Frame,
+        sink: &mut dyn TraceSink,
+        limits: RunLimits,
+        run: HybridRun<'_>,
+    ) -> Result<Option<RunOutcome>, EngineError> {
+        let (exc, hcur_name) = (run.exc, run.hcur_name);
         let spec = plan
             .hybrid
             .as_ref()
@@ -466,27 +531,51 @@ impl Engine {
         if !matches!(out, RunOutcome::Stopped) {
             return Ok(Some(out));
         }
-        let total = match frame.cursor_state(&spec.cursor) {
-            Some(crate::runtime::CursorState::Open { total, .. }) => *total,
+        // P0-3b：游标快照重绑定到 `sd_cur` 物化表序（`ORDER BY
+        // __sd_rn` 取回、剥离 rn 列）——FETCH/seek_before/异常守卫/
+        // 段批写共用同一行序，`__sd_rn` 与 FETCH 位置的绑定由构造
+        // 保证，消除"游标查询与守卫各自 ROW_NUMBER 扫描"的双执行
+        // 行序漂移（无 ORDER BY 游标源两次执行本就可能给出不同序）。
+        // 重绑失败（查询失败/行宽失配）整区域串行兜底（零写入）。
+        if !self.rebind_hcur_cursor(hcur_name, frame, spec)? {
+            return self.hybrid_serial_fallback(routine, frame, sink, limits, spec);
+        }
+        let (total, shared) = match frame.cursor_state(&spec.cursor) {
+            Some(crate::runtime::CursorState::Open { total, .. }) => (
+                *total,
+                frame
+                    .cursor_state(&spec.cursor)
+                    .and_then(|c| c.shared_rows()),
+            ),
             _ => {
                 return Err(EngineError::invariant(
                     32,
-                    "hybrid cursor not open after OpenCursor span",
+                    "hybrid cursor not open after stream rebind",
                 ))
             }
         };
+        // P0-3a 前置证明（任何段写之前完成，失败零写入回退串行）：
+        // 异常行号必须全部落在游标总数内——越界说明守卫行号与
+        // FETCH 序已失配，继续执行只会错写。
+        if exc.iter().any(|e| *e >= total as u64) {
+            return self.hybrid_serial_fallback(routine, frame, sink, limits, spec);
+        }
+        self.push_report(
+            &routine.name,
+            Status::Converted {
+                sql: plan.sql.clone(),
+            },
+        );
         let mut written = 0usize;
         let mut seg_lo = 0u64;
         let mut exited = false;
         for &e in &exc {
-            if e >= total as u64 {
-                return Err(EngineError::invariant(
-                    32,
-                    format!("hybrid exc row {e} out of range (total={total})"),
-                ));
-            }
+            // 前置证明已证 e < total；此处仅作计划/驱动口径漂移的
+            // debug 断言（release 下不可达，不产生写后 invariant）。
+            debug_assert!(e < total as u64);
             if e > seg_lo {
                 self.ensure_so_materializations(plan, routine, frame, sink)?;
+                self.ensure_hcur(hcur_name, plan, frame, spec, shared_rows_slice(&shared))?;
                 written += self.exec_hybrid_segment(plan, frame, sink, seg_lo, e)?;
             }
             let rspec = crate::runtime::interp::ReplaySpec {
@@ -522,6 +611,7 @@ impl Engine {
         if !exited {
             if seg_lo < total as u64 {
                 self.ensure_so_materializations(plan, routine, frame, sink)?;
+                self.ensure_hcur(hcur_name, plan, frame, spec, shared_rows_slice(&shared))?;
                 written += self.exec_hybrid_segment(plan, frame, sink, seg_lo, total as u64)?;
             }
             // 终止空 FETCH：游标属性（%NOTFOUND/%ROWCOUNT）对齐串行——
@@ -588,6 +678,199 @@ impl Engine {
         Ok(None)
     }
 
+    /// 混合 `sd_cur` 物化（P0-3b）：`CREATE OR REPLACE TEMP TABLE
+    /// __sd_hcur_<seq> AS <hcur_sql>`——`__sd_rn` 只在此赋一次，
+    /// 异常守卫/段批写共用同一编号。返回 `(表名, 占位符已替换的
+    /// 计划副本)`；物化失败返回 `None`（调用方整区域串行兜底，
+    /// 真实错误由串行路径原样上抛）。
+    fn materialize_hcur(
+        &self,
+        plan: &ConversionPlan,
+        frame: &Frame,
+    ) -> Result<Option<(String, ConversionPlan)>, EngineError> {
+        let Some(spec) = plan.hybrid.as_ref() else {
+            return Ok(None);
+        };
+        if spec.hcur_sql.is_empty() {
+            return Ok(None);
+        }
+        let name = format!("__sd_hcur_{}", next_hcur_seq());
+        let bm = crate::runtime::interp::resolve_binds(&plan.binds, frame)?;
+        let ddl = format!("CREATE OR REPLACE TEMP TABLE {name} AS {}", spec.hcur_sql);
+        if self.ex.execute(&ddl, &bm).is_err() {
+            return Ok(None);
+        }
+        Ok(Some((name.clone(), substitute_hcur(plan, &name))))
+    }
+
+    /// 游标快照重绑定到 `sd_cur` 物化表序（P0-3b）：`ORDER BY
+    /// __sd_rn` 取回全行、剥离末列 `__sd_rn`，以原 schema 重建
+    /// `RowStream` 换入游标——此后 FETCH/`seek_before`/`shared_rows`
+    /// 与异常守卫、段批写共用同一行序。行宽与游标 schema 不符
+    /// （物化 SELECT 与游标投影漂移）返回 `false` 由调用方串行兜底。
+    fn rebind_hcur_cursor(
+        &self,
+        name: &str,
+        frame: &mut Frame,
+        spec: &crate::ir::set_oriented::HybridSpec,
+    ) -> Result<bool, EngineError> {
+        let mut stream = match self.ex.query(
+            &format!("SELECT * FROM {name} ORDER BY __sd_rn"),
+            &crate::exec::BindMap::new(),
+        ) {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
+        let mut rows = stream.fetch_many(usize::MAX);
+        let schema = match frame.cursor_state(&spec.cursor) {
+            Some(crate::runtime::CursorState::Open { stream: s, .. }) => s.schema.clone(),
+            _ => return Ok(false),
+        };
+        if rows.iter().any(|r| r.len() != schema.len() + 1) {
+            return Ok(false);
+        }
+        for r in &mut rows {
+            r.pop();
+        }
+        let rebound = crate::exec::RowStream::new(schema, rows);
+        match frame.cursor_mut(&spec.cursor) {
+            Ok(c) => {
+                c.swap_stream(rebound);
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// `sd_cur` 物化表与游标权威行集的位置校验（P0-3b/P0-3a 合一）：
+    /// `ORDER BY __sd_rn` 取回的行必须与 `shared_rows()`（FETCH 序）
+    /// 逐位相等，且末列 `__sd_rn` 恰为行下标——一次证明覆盖基数、
+    /// 行序与 rn↔位置绑定。查询失败/行数或内容失配 → `false`。
+    fn hcur_order_ok(
+        &self,
+        name: &str,
+        shared: Option<&[crate::exec::Row]>,
+    ) -> Result<bool, EngineError> {
+        let Some(shared) = shared else {
+            return Ok(false);
+        };
+        let sql = format!("SELECT * FROM {name} ORDER BY __sd_rn");
+        let mut stream = match self.ex.query(&sql, &crate::exec::BindMap::new()) {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
+        let rows = stream.fetch_many(usize::MAX);
+        if rows.len() != shared.len() {
+            return Ok(false);
+        }
+        Ok(rows.iter().enumerate().all(|(i, a)| {
+            a.len() == shared[i].len() + 1
+                && a[..shared[i].len()] == shared[i][..]
+                && a.last() == Some(&crate::value::SpinValue::Int(i as i64))
+        }))
+    }
+
+    /// 段批写前的物化表探活：重放行的原生例程调用可回滚会话临时表
+    /// （与 `sd_fn*/sd_bf*` 同因）。缺失则重建并重做位置校验——
+    /// 重建行序漂移无法在已提交段写后回退，只能 invariant 上抛
+    /// （理论上同查询同数据重建序应稳定，漂移属内核行为异常）。
+    fn ensure_hcur(
+        &mut self,
+        name: &str,
+        plan: &ConversionPlan,
+        frame: &Frame,
+        spec: &crate::ir::set_oriented::HybridSpec,
+        shared: Option<&[crate::exec::Row]>,
+    ) -> Result<(), EngineError> {
+        let probe = format!("SELECT 1 FROM {name} LIMIT 0");
+        if self.ex.query(&probe, &crate::exec::BindMap::new()).is_ok() {
+            return Ok(());
+        }
+        let bm = crate::runtime::interp::resolve_binds(&plan.binds, frame)?;
+        let ddl = format!("CREATE OR REPLACE TEMP TABLE {name} AS {}", spec.hcur_sql);
+        self.ex.execute(&ddl, &bm)?;
+        if !self.hcur_order_ok(name, shared)? {
+            return Err(EngineError::invariant(
+                32,
+                "sd_cur rematerialize order drift",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 回收混合物化临时表；失败静默（会话结束自然回收，唯一表名
+    /// 不影响后续区域）。
+    fn drop_hcur_table(&self, name: &str) {
+        let _ = self.ex.execute(
+            &format!("DROP TABLE IF EXISTS {name}"),
+            &crate::exec::BindMap::new(),
+        );
+    }
+
+    /// 混合前置证明失败的整区域串行兜底（游标尚未 OPEN）：从
+    /// `open_pc` 起原生续跑，FETCH 驱动整段循环，trace/步数/trap/
+    /// 事务语义与串行逐语句一致；已上报 Skipped，不产生批写。
+    fn hybrid_serial_from_open(
+        &mut self,
+        routine: &CompiledRoutine,
+        plan: &ConversionPlan,
+        frame: &mut Frame,
+        sink: &mut dyn TraceSink,
+        limits: RunLimits,
+    ) -> Result<Option<RunOutcome>, EngineError> {
+        self.push_report(
+            &routine.name,
+            Status::Skipped {
+                reason: SkipReason::HybridPreflightFailed,
+            },
+        );
+        let out = self.run_prog(
+            &routine.prog,
+            frame,
+            sink,
+            limits,
+            RunSpan {
+                start_pc: plan.open_pc,
+                stop_pc: Some(plan.close_pc + 1),
+                exit_pc: None,
+                entry_exec: false,
+            },
+        )?;
+        Ok((!matches!(out, RunOutcome::Stopped)).then_some(out))
+    }
+
+    /// 混合前置证明失败的串行兜底：游标已 OPEN 且 `fetched == 0`，
+    /// 从 `fetch_pc` 起原生续跑——FETCH 驱动整段循环，trace/步数/
+    /// trap/事务语义与串行逐语句一致；已上报 Skipped，不产生批写。
+    fn hybrid_serial_fallback(
+        &mut self,
+        routine: &CompiledRoutine,
+        frame: &mut Frame,
+        sink: &mut dyn TraceSink,
+        limits: RunLimits,
+        spec: &crate::ir::set_oriented::HybridSpec,
+    ) -> Result<Option<RunOutcome>, EngineError> {
+        self.push_report(
+            &routine.name,
+            Status::Skipped {
+                reason: SkipReason::HybridPreflightFailed,
+            },
+        );
+        let out = self.run_prog(
+            &routine.prog,
+            frame,
+            sink,
+            limits,
+            RunSpan {
+                start_pc: spec.fetch_pc,
+                stop_pc: None,
+                exit_pc: None,
+                entry_exec: false,
+            },
+        )?;
+        Ok((!matches!(out, RunOutcome::Stopped)).then_some(out))
+    }
+
     fn optimize_ctx(&self) -> OptimizeCtx<'_> {
         OptimizeCtx {
             mode: self.set_oriented,
@@ -643,4 +926,37 @@ impl Engine {
             RunControl { limits, span },
         )
     }
+}
+
+/// 混合调度运行上下文：异常行集 + `sd_cur` 物化临时表名。
+struct HybridRun<'a> {
+    exc: std::collections::BTreeSet<u64>,
+    hcur_name: &'a str,
+}
+
+/// 混合物化临时表序号：进程内唯一，递归/嵌套区域互不覆盖。
+static HCUR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_hcur_seq() -> u64 {
+    HCUR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `__SD_HCUR__` 占位符 → 实际临时表名：批写/段模板/异常守卫 SQL
+/// 全部替换（`route_alt` 仅入口期消费，此后不再执行，不替换）。
+fn substitute_hcur(plan: &ConversionPlan, name: &str) -> ConversionPlan {
+    let mut p = plan.clone();
+    p.sql = p.sql.replace(crate::ir::set_oriented::SD_HCUR_TABLE, name);
+    if let Some(seg) = &mut p.seg_sql {
+        *seg = seg.replace(crate::ir::set_oriented::SD_HCUR_TABLE, name);
+    }
+    for (sql, _) in &mut p.exc_guards {
+        *sql = sql.replace(crate::ir::set_oriented::SD_HCUR_TABLE, name);
+    }
+    p
+}
+
+fn shared_rows_slice(
+    shared: &Option<std::sync::Arc<Vec<crate::exec::Row>>>,
+) -> Option<&[crate::exec::Row]> {
+    shared.as_ref().map(|r| r.as_slice())
 }

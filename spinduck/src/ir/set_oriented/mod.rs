@@ -25,12 +25,17 @@ mod vguard;
 mod viewdep;
 
 pub(crate) use entry::{entry_ok, exc_rows, same_fn_preludes, ConversionPlan, FnPrelude};
+pub(crate) use hybrid::HybridSpec;
 
 use super::{AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, VarName};
 use crate::catalog::{CompiledRoutine, ParamMode};
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
 use analyze::analyze_region;
+
+/// 混合调度 `sd_cur` 物化表占位符：计划期 SQL 内嵌此字面量，
+/// 引擎在入口期替换为唯一临时表名（`__sd_hcur_<seq>`）后执行。
+pub(crate) const SD_HCUR_TABLE: &str = "__SD_HCUR__";
 
 /// 集合化语义契约；所有模式均只执行已证明的转换。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -110,6 +115,9 @@ pub enum SkipReason {
     /// MAX_TUPLES），Converted 计划绝不原样穿透（设计 §4.2）。
     UnresolvedFnSite,
     DynamicSql,
+    /// SO 行级混合前置证明失败（异常行号越界/游标基数漂移/守卫行号
+    /// 畸形）：整区域回退串行解释执行，零写入已产生（P0-3 审核修复）。
+    HybridPreflightFailed,
 }
 
 /// 一次调用实际选择的优化状态。

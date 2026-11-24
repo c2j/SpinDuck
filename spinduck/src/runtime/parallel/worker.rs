@@ -159,13 +159,19 @@ pub(crate) fn run_row(job: &WorkerJob<'_>, row_idx: usize) -> WorkerRowResult {
                 Ok(b) => b,
                 Err(_) => return fail(row_idx),
             };
-            match job.snapshot.probe(sql, &bound) {
+            let t = std::time::Instant::now();
+            let probed = job.snapshot.probe(sql, &bound);
+            let elapsed_us = t.elapsed().as_micros() as u64;
+            match probed {
                 Some(mut stream) => {
                     steps += 1;
+                    // 与串行同序：interp 主循环先发 `IrStmt{SqlQuery}`，
+                    // sqlstmts 再发 `SqlExec`（trace 契约，P1 审核）。
+                    traces.push(spinduck_trace_event(stmt));
                     traces.push(TraceEvent::SqlExec {
                         sql: sql.clone(),
                         binds: bound,
-                        elapsed_us: 0,
+                        elapsed_us,
                     });
                     let rows = stream.fetch_many(2);
                     // 探测结果权威（probe 回退已交权）：0/>1 行即

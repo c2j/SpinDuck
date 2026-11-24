@@ -191,6 +191,8 @@ fn recordish_vars(prog: &IrProg, region: &CursorRegion) -> BTreeSet<VarName> {
 fn fetch_target_locs(prog: &IrProg, region: &CursorRegion) -> Vec<Loc> {
     match prog.code.get(region.fetch_pc) {
         Some(IrStmt::Fetch { targets, .. }) => targets.iter().map(exprs::target_loc).collect(),
+        // fetch_pc 非 Fetch 指令属计划/区域错位：无目标可防，
+        // 由下游守卫按空集处理（不吞错——G_pure 另有结构校验）。
         _ => Vec::new(),
     }
 }
@@ -343,6 +345,7 @@ fn scan_stmt_tx(
             }
             scan_callee_tx(name, catalog, visiting)
         }
+        // 无表达式/无 callee 的指令变体无事务读可传递。
         _ => Ok(()),
     }
 }

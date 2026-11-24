@@ -202,23 +202,31 @@ pub(crate) fn entry_ok(
 /// 混合调度异常行集（so-exception-row-hybrid §3）：逐条 `exc_guards`
 /// 求值并集，返回 0 基行号集合（对齐 `CursorState::seek_before` 与批写
 /// `__sd_rn` 区间）。守卫 SQL/绑定与 `top1_guards` 同口径（计划期已
-/// 补齐 $v_ 形参）。空集 = 无异常行，调用方走既有 SO 路径。
+/// 补齐 $v_ 形参）。
+///
+/// 返回值三态：`Some(空集)` = 无异常行走普通 SO；`Some(集)` = 混合
+/// 调度；`None` = 守卫产出畸形行号（非 Int/负值/空行）——证据不可信，
+/// 调用方必须整区域串行兜底，**绝不**把畸形值静默当普通行跳过
+/// （P0-3 审核修复：此前非 Int 被 `if let` 静默丢弃）。
 pub(crate) fn exc_rows(
     ex: &dyn SqlExecutor,
     plan: &ConversionPlan,
     frame: &crate::runtime::Frame,
-) -> Result<std::collections::BTreeSet<u64>, EngineError> {
+) -> Result<Option<std::collections::BTreeSet<u64>>, EngineError> {
     let mut rows = std::collections::BTreeSet::new();
     for (sql, binds) in &plan.exc_guards {
         let bm = crate::runtime::interp::resolve_binds(binds, frame)?;
         let mut stream = ex.query(sql, &bm)?;
         for row in stream.fetch_many(usize::MAX) {
-            if let Some(crate::value::SpinValue::Int(rn)) = row.first() {
-                rows.insert((*rn).max(0) as u64);
+            match row.first() {
+                Some(crate::value::SpinValue::Int(rn)) if *rn >= 0 => {
+                    rows.insert(*rn as u64);
+                }
+                _ => return Ok(None),
             }
         }
     }
-    Ok(rows)
+    Ok(Some(rows))
 }
 
 fn snapshot_matches(

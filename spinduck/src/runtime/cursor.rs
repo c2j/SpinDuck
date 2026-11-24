@@ -129,6 +129,27 @@ impl CursorState {
         }
     }
 
+    /// SO 混合物化重绑定（P0-3b）：OPEN 后、首个 FETCH 前，把快照行
+    /// 换成 `sd_cur` 物化表序——此后 FETCH/seek_before/shared_rows
+    /// 共用同一行序，`__sd_rn` 与 FETCH 位置的绑定由构造保证。
+    /// 仅 Open 态生效；消费位置复位为刚 OPEN 的初态。
+    pub(crate) fn swap_stream(&mut self, stream: RowStream) {
+        if let CursorState::Open {
+            stream: s,
+            total,
+            fetched,
+            last_hit,
+            attempted,
+        } = self
+        {
+            *total = stream.len();
+            *s = stream;
+            *fetched = 0;
+            *last_hit = false;
+            *attempted = false;
+        }
+    }
+
     /// loop-parallel：导出物化行的只读共享存储（仅 Open 态；
     /// `pos`/`fetched` 等消费位置仍归本游标独占）。
     pub(crate) fn shared_rows(&self) -> Option<std::sync::Arc<Vec<Row>>> {

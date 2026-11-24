@@ -2,11 +2,10 @@
 
 use super::{shape, Table};
 
-/// `sd_cur` CTE 定义（批写主查询与坏行守卫共用，保证行集口径一致）。
-/// verbatim 游标原文已含 WHERE/GROUP BY，直接内嵌不再追加过滤。
-/// `rn` = 混合调度：外包 `ROW_NUMBER()` 投影 0 基 `__sd_rn`（与游标流
-/// 序同口径，依赖 R1 行序稳定假设），供段谓词过滤。
-pub(super) fn sd_cur_cte(select: &shape::Select, source: &Table, rn: bool) -> String {
+/// `sd_cur` 行集带 0 基 `__sd_rn` 的物化 SELECT（混合调度单次物化
+/// 与 CTE 形态共用同一编号口径）。`ROW_NUMBER()` 行序 == 游标流序
+/// 由引擎在物化后对 `cursor.shared_rows()` 做一次性位置校验证明。
+pub(in crate::ir::set_oriented) fn sd_cur_rows(select: &shape::Select, source: &Table) -> String {
     let inner = if let Some(v) = &select.verbatim {
         v.clone()
     } else {
@@ -16,11 +15,32 @@ pub(super) fn sd_cur_cte(select: &shape::Select, source: &Table, rn: bool) -> St
         };
         format!("{}{where_clause}", super::sd_cur_scan(select, source))
     };
+    format!("SELECT *, ROW_NUMBER() OVER () - 1 AS __sd_rn FROM ({inner}) _rn")
+}
+
+/// `sd_cur` CTE 定义（批写主查询与坏行守卫共用，保证行集口径一致）。
+/// verbatim 游标原文已含 WHERE/GROUP BY，直接内嵌不再追加过滤。
+/// `rn` = 混合调度：`sd_cur` 改读引擎物化的会话临时表
+/// （`__SD_HCUR__` 占位符由运行期替换为唯一表名）——`__sd_rn`
+/// 只在物化时赋一次，守卫/段批写共用同一编号，消除多次扫描间
+/// 的行序漂移（P0-3b）。
+pub(super) fn sd_cur_cte(select: &shape::Select, source: &Table, rn: bool) -> String {
     if rn {
-        format!("sd_cur AS (SELECT *, ROW_NUMBER() OVER () - 1 AS __sd_rn FROM ({inner}) _rn)")
-    } else {
-        format!("sd_cur AS ({inner})")
+        return format!(
+            "sd_cur AS (SELECT * FROM {})",
+            crate::ir::set_oriented::SD_HCUR_TABLE
+        );
     }
+    let inner = if let Some(v) = &select.verbatim {
+        v.clone()
+    } else {
+        let where_clause = match &select.filter {
+            Some(f) => format!(" WHERE {f}"),
+            None => String::new(),
+        };
+        format!("{}{where_clause}", super::sd_cur_scan(select, source))
+    };
+    format!("sd_cur AS ({inner})")
 }
 
 /// 内核域坏行守卫：`COUNT(*)` 统计 DECIMAL 算术值域守卫不成立的行。

@@ -280,9 +280,16 @@ fn should_serve_sqlquery_from_frozen_snapshot() {
             ("w", SpinValue::Str("hit".into())),
         ],
     );
-    // trace：SqlExec（快照命中同口径）+ IrStmt(Assign)。
-    assert!(matches!(res.traces[0], TraceEvent::SqlExec { .. }));
-    assert!(matches!(res.traces[1], TraceEvent::IrStmt { .. }));
+    // trace：与串行同序——IrStmt(SqlQuery) 在先，SqlExec 快照命中口径
+    // 随后，IrStmt(Assign) 收尾（P1 审核：补齐缺失的 IrStmt 事件）。
+    assert!(matches!(
+        res.traces[0],
+        TraceEvent::IrStmt {
+            variant: "SqlQuery"
+        }
+    ));
+    assert!(matches!(res.traces[1], TraceEvent::SqlExec { .. }));
+    assert!(matches!(res.traces[2], TraceEvent::IrStmt { .. }));
     assert!(matches!(res.outcome, WorkerOutcome::Yield { pc: 2 }));
 }
 
@@ -366,35 +373,6 @@ fn should_return_unbalanced_trap_stack_to_main() {
 
 use super::pool::{dispatch_chunk, ChunkJob};
 
-fn chunk_job<'a>(
-    ctx: &'a Ctx,
-    prog: &'a IrProg,
-    plan: &'a PurePrefixPlan,
-    frame: &'a Frame,
-    rows: &'a Arc<Vec<Row>>,
-    snap: &'a FrozenLookupSnapshot,
-    traps: &'a [TrapFrame],
-    indices: &'a [usize],
-    threads: usize,
-) -> ChunkJob<'a> {
-    ChunkJob {
-        prog,
-        plan,
-        base_frame: frame,
-        rows,
-        cursor_schema: ctx.schema.as_slice(),
-        record_target: &ctx.record_target,
-        snapshot: snap,
-        catalog: &ctx.catalog,
-        calls: &ctx.calls,
-        var_types: &ctx.var_types,
-        loose: false,
-        traps_seed: traps,
-        indices,
-        threads,
-    }
-}
-
 #[test]
 fn should_dispatch_chunk_with_ordered_results_across_threads() {
     // 4 行：x = rec.a + row_idx 无关（每行独立求值同值）。
@@ -424,16 +402,29 @@ fn should_dispatch_chunk_with_ordered_results_across_threads() {
     let snap = empty_snapshot();
     let traps = Vec::new();
     let indices = [0usize, 1, 2, 3];
-    let expected = vec![
+    let expected = [
         SpinValue::Int(11),
         SpinValue::Int(21),
         SpinValue::Int(31),
         SpinValue::Int(41),
     ];
     for threads in [1usize, 4] {
-        let out = dispatch_chunk(&chunk_job(
-            &ctx, &p, &plan, &ctx_frame, &rows, &snap, &traps, &indices, threads,
-        ));
+        let out = dispatch_chunk(&ChunkJob {
+            prog: &p,
+            plan: &plan,
+            base_frame: &ctx_frame,
+            rows: &rows,
+            cursor_schema: ctx.schema.as_slice(),
+            record_target: &ctx.record_target,
+            snapshot: &snap,
+            catalog: &ctx.catalog,
+            calls: &ctx.calls,
+            var_types: &ctx.var_types,
+            loose: false,
+            traps_seed: &traps,
+            indices: &indices,
+            threads,
+        });
         assert_eq!(out.len(), 4);
         for (i, res) in out.iter().enumerate() {
             assert_eq!(res.row_idx, i, "threads={threads} 结果须按 row_idx 排序");
@@ -488,7 +479,15 @@ fn should_return_queryerror_ndf_when_probe_bucket_empty() {
     ));
     assert_eq!(res.steps, 1);
     assert!(res.writes.is_empty());
-    assert!(matches!(res.traces[0], TraceEvent::SqlExec { .. }));
+    // 与串行同序：IrStmt(SqlQuery) 先于 SqlExec（步数/trace 已计已发，
+    // 错误行数结局由主线程注入 trap 分派）。
+    assert!(matches!(
+        res.traces[0],
+        TraceEvent::IrStmt {
+            variant: "SqlQuery"
+        }
+    ));
+    assert!(matches!(res.traces[1], TraceEvent::SqlExec { .. }));
 }
 
 #[test]

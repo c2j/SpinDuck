@@ -180,7 +180,7 @@ impl SqlExecutor for MemoizingExecutor {
         // 清缓存后透传。只收窄到 MACRO 形态——sqlfn 物化路径每行一次
         // CREATE OR REPLACE TEMP TABLE，若对任意 DDL 失效，带下沉的
         // 游标循环每行清空缓存，记忆化在这类过程上不成立（复核应修 A）。
-        if is_macro_ddl(sql) {
+        if is_macro_ddl(sql) || is_rollback_stmt(sql) {
             self.cache.clear();
         }
         self.inner.execute(sql, binds)
@@ -220,6 +220,18 @@ pub(crate) fn is_macro_ddl(sql: &str) -> bool {
     } else {
         is(0, "DROP") && kind(1)
     }
+}
+
+/// ROLLBACK 语句判定（结果缓存失效口径）：前导注释剥离后首关键字为
+/// `ROLLBACK`（含 `ROLLBACK TO <name>`）。事务回滚改变可见数据，
+/// memo/lookup 两级结果缓存必须整体清空——`invalidate` 的表名提取
+/// 对事务控制语句天然失效（不产生任何表名），这是串行路径上
+/// "回滚后读到回滚前缓存值"的已知漏洞（P0-1 审核修复）。
+pub(crate) fn is_rollback_stmt(sql: &str) -> bool {
+    strip_leading_comments(sql)
+        .split_whitespace()
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("rollback"))
 }
 
 /// 剥离可叠加的前导注释（行 `--` 与块 `/* */`）。

@@ -123,9 +123,7 @@ fn analyze_ok(prog: &IrProg) -> PurePrefixPlan {
 }
 
 fn analyze_err(prog: &IrProg, batch_commit: bool) -> ParallelSkipReason {
-    analyze(prog, &RoutineCatalog::new(), batch_commit)
-        .err()
-        .expect("fixture 应被门禁拒绝")
+    analyze(prog, &RoutineCatalog::new(), batch_commit).expect_err("fixture 应被门禁拒绝")
 }
 
 /// 四条纯赋值 + 一条可预热查询的标准前缀（满足最小工作量）。
@@ -467,22 +465,24 @@ fn should_reject_cursor_fn_sites_materialization() {
     // 逐行记录，OPEN 时未绑定）→ MaterializedFnSitePresent。
     // 准入侧用例见 `fnsite_tests.rs`。
     let mut code = cursor_prog(ample_body(), vec![]).code;
-    if let IrStmt::OpenCursor { source, .. } = &mut code[0] {
-        if let CursorSource::Static { fn_sites, .. } = source {
-            *fn_sites = vec![crate::sql::FnSite {
-                table: "tmp".into(),
-                name: "fn_x".into(),
-                args: Vec::new(),
-                distinct_sql: String::new(),
-                binds: vec![(
-                    "p_x".into(),
-                    crate::ir::BindSrc::Field {
-                        rec: vn("rec"),
-                        field: "a".into(),
-                    },
-                )],
-            }];
-        }
+    if let IrStmt::OpenCursor {
+        source: CursorSource::Static { fn_sites, .. },
+        ..
+    } = &mut code[0]
+    {
+        *fn_sites = vec![crate::sql::FnSite {
+            table: "tmp".into(),
+            name: "fn_x".into(),
+            args: Vec::new(),
+            distinct_sql: String::new(),
+            binds: vec![(
+                "p_x".into(),
+                crate::ir::BindSrc::Field {
+                    rec: vn("rec"),
+                    field: "a".into(),
+                },
+            )],
+        }];
     }
     let prog = IrProg {
         code,

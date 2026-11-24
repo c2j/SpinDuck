@@ -11,6 +11,7 @@ use super::schema::{Column, Default, Table};
 use super::shape::{self, Name};
 use super::{agg, entry, expr, lookup, substitute_binds, BindSrc, CopyLoop, SinkOp, SkipReason};
 use badrow::sd_cur_cte;
+pub(in crate::ir::set_oriented) use badrow::sd_cur_rows;
 use inline::{inline_projection, ProjEnv};
 
 pub(super) struct CopySql {

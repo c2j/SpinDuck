@@ -78,6 +78,43 @@ impl CallSnapshot {
     pub fn misses(&self) -> u64 {
         self.misses.load(Ordering::Relaxed)
     }
+
+    /// 快照体积估算（LP 报告 `peak_snapshot_bytes`）：键长 + 每条
+    /// 结果的 `SpinValue` 粒度。堆布局估算而非精确字节，仅供
+    /// 容量观测，不做正确性判据。
+    pub fn approx_bytes(&self) -> usize {
+        const V: usize = std::mem::size_of::<SpinValue>();
+        self.map.lock().map_or(0, |m| {
+            m.iter()
+                .map(|(key, outcome)| {
+                    let (count, extra) = match outcome {
+                        CallOutcome::Scalar(v) => (1, v_heap_extra(v)),
+                        CallOutcome::Routine { ret, outs } => (
+                            1 + outs.len(),
+                            v_heap_extra(ret)
+                                + outs.iter().flatten().map(v_heap_extra).sum::<usize>(),
+                        ),
+                        CallOutcome::Failed => (0, 0),
+                    };
+                    key.len() + 32 + count * V + extra
+                })
+                .sum()
+        })
+    }
+}
+
+/// `SpinValue` 堆内变长部分的粗估（字符串/字节内容长度；
+/// 数值型按 0 计——`approx_bytes` 本就是下界估算）。
+fn v_heap_extra(v: &SpinValue) -> usize {
+    match v {
+        SpinValue::Str(s) => s.len(),
+        SpinValue::Blob(b) => b.len(),
+        SpinValue::Record(fields) => fields
+            .iter()
+            .map(|(name, inner)| name.len() + v_heap_extra(inner))
+            .sum(),
+        _ => 0,
+    }
 }
 
 /// Worker → 主线程的待物化请求（`NeedKeys` 载荷）。

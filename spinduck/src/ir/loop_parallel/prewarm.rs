@@ -79,6 +79,13 @@ fn check_read_write_disjoint(
             r_prefix.extend(p.tables.iter().cloned());
         }
     }
+    // 物化调用闭包读集（P0-2）：`CallSnapshot` 按 (name,实参) 缓存
+    // 整轮——callee/`SqlFn`/内建 prepared SQL 读到的表若被循环写，
+    // 同键后续行命中陈旧值。无法枚举读集 → 保守拒绝。
+    match super::callmat::materialized_read_tables(prog, &plan.g_pure, catalog) {
+        Ok(tables) => r_prefix.extend(tables),
+        Err(()) => return Err(ParallelSkipReason::UncachedQueryInPrefix),
+    }
     if r_prefix.intersection(&w_loop).next().is_some() {
         return Err(ParallelSkipReason::UncachedQueryInPrefix);
     }

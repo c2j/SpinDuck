@@ -20,6 +20,7 @@
 
 use crate::catalog::{RoutineCatalog, RoutineKind};
 use crate::ir::{IrExpr, IrProg, IrStmt};
+use std::collections::BTreeSet;
 
 /// 例程物化递归深度上限（防 catalog 环）。
 const MAX_MAT_DEPTH: usize = 8;
@@ -111,6 +112,7 @@ pub(crate) fn stmt_exprs_materializable(
         | IrStmt::Return { value: Some(expr) } => vec![expr],
         IrStmt::SqlExecDynamic { text_expr, .. } => vec![text_expr],
         IrStmt::CallRoutine { args, .. } => args.iter().collect(),
+        // 其余指令变体不含可物化表达式（赋值/SQL/控制流等）。
         _ => Vec::new(),
     };
     exprs.iter().all(|e| expr_materializable(e, catalog, depth))
@@ -166,4 +168,239 @@ fn stmt_materializable(stmt: &IrStmt, catalog: &RoutineCatalog, depth: usize) ->
         | IrStmt::CloseCursor { .. }
         | IrStmt::Raise { .. } => false,
     }
+}
+
+/// 门禁 7（$R_{prefix} \cap W_{loop} = \emptyset$）的读集补全：
+/// `G_pure` 内经 `CallSnapshot` 物化的调用闭包所读表名。
+///
+/// 物化调用的结果按 `(name, 实参)` 缓存整轮循环——若 callee 体内
+/// `SqlQuery`/`FoldedQuery`/`SqlFn`/内建 `prepared` SQL 读到的表被
+/// 循环写（`W_loop`），后续同键行会命中陈旧物化值。此处把闭包读集
+/// 并入 `R_prefix` 由不相交证明兜底；任何无法枚举读集的形态返回
+/// `Err(())`，调用方必须保守拒绝（串行兜底），不得静默放行。
+pub(crate) fn materialized_read_tables(
+    prog: &IrProg,
+    g_pure: &BTreeSet<usize>,
+    catalog: &RoutineCatalog,
+) -> Result<BTreeSet<String>, ()> {
+    let mut out = BTreeSet::new();
+    for &pc in g_pure {
+        let Some(stmt) = prog.code.get(pc) else {
+            return Err(());
+        };
+        for expr in stmt_exprs(stmt) {
+            expr_read_tables(expr, catalog, &mut out, 0)?;
+        }
+    }
+    Ok(out)
+}
+
+/// 例程体全量读集（物化闭包成员：白名单已保证只读，仍逐语句收集）。
+fn prog_read_tables(
+    prog: &IrProg,
+    catalog: &RoutineCatalog,
+    out: &mut BTreeSet<String>,
+    depth: usize,
+) -> Result<(), ()> {
+    if depth > MAX_MAT_DEPTH {
+        return Err(());
+    }
+    for stmt in &prog.code {
+        match stmt {
+            IrStmt::SqlQuery { sql, fn_sites, .. } => {
+                if !fn_sites.is_empty() {
+                    return Err(());
+                }
+                sql_read_tables(sql, out)?;
+            }
+            IrStmt::FoldedQuery { sql, .. } => sql_read_tables(sql, out)?,
+            IrStmt::CallRoutine { name, args, .. } => {
+                for a in args {
+                    expr_read_tables(a, catalog, out, depth + 1)?;
+                }
+                let Some(r) = catalog.lookup(name) else {
+                    return Err(());
+                };
+                prog_read_tables(&r.prog, catalog, out, depth + 1)?;
+            }
+            // 其余指令变体无 callee 读表，仅需扫描其表达式位。
+            _ => {
+                for expr in stmt_exprs(stmt) {
+                    expr_read_tables(expr, catalog, out, depth + 1)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 语句内全部表达式位（与 `stmt_exprs_materializable` 同位覆盖）。
+fn stmt_exprs(stmt: &IrStmt) -> Vec<&IrExpr> {
+    match stmt {
+        IrStmt::Assign { expr, .. }
+        | IrStmt::Perform { expr }
+        | IrStmt::FoldedQuery { expr, .. } => vec![expr],
+        IrStmt::JumpIf { cond, .. } | IrStmt::JumpIfNot { cond, .. } => vec![cond],
+        IrStmt::Raise {
+            message: Some(expr),
+        }
+        | IrStmt::Return { value: Some(expr) } => vec![expr],
+        IrStmt::SqlExecDynamic { text_expr, .. } => vec![text_expr],
+        IrStmt::CallRoutine { args, .. } => args.iter().collect(),
+        // 其余指令变体不含表达式位。
+        _ => Vec::new(),
+    }
+}
+
+fn expr_read_tables(
+    expr: &IrExpr,
+    catalog: &RoutineCatalog,
+    out: &mut BTreeSet<String>,
+    depth: usize,
+) -> Result<(), ()> {
+    if depth > MAX_MAT_DEPTH {
+        return Err(());
+    }
+    match expr {
+        IrExpr::Const(_) | IrExpr::Var(_) | IrExpr::Field { .. } | IrExpr::CursorAttr { .. } => {
+            Ok(())
+        }
+        IrExpr::Bin { l, r, .. } => {
+            expr_read_tables(l, catalog, out, depth)?;
+            expr_read_tables(r, catalog, out, depth)
+        }
+        IrExpr::Not(e) | IrExpr::IsNull(e) => expr_read_tables(e, catalog, out, depth),
+        IrExpr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => {
+            if let Some(e) = operand {
+                expr_read_tables(e, catalog, out, depth)?;
+            }
+            for (c, v) in whens {
+                expr_read_tables(c, catalog, out, depth)?;
+                expr_read_tables(v, catalog, out, depth)?;
+            }
+            match else_expr {
+                Some(e) => expr_read_tables(e, catalog, out, depth),
+                None => Ok(()),
+            }
+        }
+        IrExpr::SqlFn { prepared, args, .. } => {
+            for a in args {
+                expr_read_tables(a, catalog, out, depth + 1)?;
+            }
+            match prepared {
+                Ok(s) => sql_read_tables(&s.sql, out),
+                Err(_) => Err(()),
+            }
+        }
+        IrExpr::FuncCall {
+            name,
+            args,
+            prepared,
+        } => {
+            for a in args {
+                expr_read_tables(a, catalog, out, depth + 1)?;
+            }
+            match catalog.lookup(name) {
+                Some(r) if r.kind == RoutineKind::Function => {
+                    prog_read_tables(&r.prog, catalog, out, depth + 1)
+                }
+                Some(_) => Err(()),
+                None => match prepared {
+                    Ok(sql) => sql_read_tables(sql, out),
+                    Err(_) => Err(()),
+                },
+            }
+        }
+        // Lookup 未纳入物化模型——出现在纯子图属口径漂移，保守拒绝。
+        IrExpr::Lookup { .. } => Err(()),
+    }
+}
+
+/// 单条 SQL 文本的读表集合。优先 `shape::recognize`（权威点查形态）；
+/// 其余 SELECT 退化为 token 扫描——收集 `FROM`/`JOIN`/`,` 之后的
+/// 标识符（含子查询内层、逗号连接表），列名/别名误收只会造成
+/// 过度拒绝（安全方向），绝不漏收真表。无法分词 → `Err(())`。
+fn sql_read_tables(sql: &str, out: &mut BTreeSet<String>) -> Result<(), ()> {
+    if let Some(plan) = crate::lookup_cache::shape::recognize(sql) {
+        out.extend(plan.tables.iter().cloned());
+        return Ok(());
+    }
+    use ogsql_parser::token::tokenizer::Tokenizer;
+    let tokens = Tokenizer::new(sql).tokenize().map_err(|_| ())?;
+    let words: Vec<String> = tokens
+        .iter()
+        .filter_map(|t| sql.get(t.span.start..t.span.end))
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    const STOP: &[&str] = &[
+        "select",
+        "from",
+        "where",
+        "group",
+        "order",
+        "having",
+        "limit",
+        "offset",
+        "on",
+        "using",
+        "as",
+        "join",
+        "inner",
+        "left",
+        "right",
+        "full",
+        "cross",
+        "natural",
+        "union",
+        "except",
+        "intersect",
+        "fetch",
+        "for",
+        "and",
+        "or",
+        "not",
+        "in",
+        "is",
+        "between",
+        "like",
+    ];
+    let mut i = 0usize;
+    while i < words.len() {
+        let triggered = matches!(words[i].as_str(), "from" | "join" | ",");
+        if !triggered {
+            i += 1;
+            continue;
+        }
+        // 逗号只在 FROM 子句内才是表分隔——`SELECT a, b` 的逗号会
+        // 误触发；此时下一个词是标识符/`(`，收进来只造成过度拒绝，
+        // 安全方向可接受。
+        i += 1;
+        while i < words.len() {
+            let w = words[i].as_str();
+            if w == "(" {
+                i += 1;
+                continue;
+            }
+            if w == ")" || w == "." {
+                i += 1;
+                continue;
+            }
+            if STOP.contains(&w) {
+                break;
+            }
+            // 数字/运算符等非标识符词跳过（不 break，防 WHERE 前列名截断）。
+            if w.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            {
+                out.insert(w.to_string());
+            }
+            i += 1;
+        }
+    }
+    Ok(())
 }

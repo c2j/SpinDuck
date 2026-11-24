@@ -40,6 +40,18 @@ impl LookupState {
     pub fn clear(&self) {
         self.slots.borrow_mut().clear();
     }
+
+    /// 事务回滚失效（P0-1 审核）：只丢数据承载的 `Slot::Ready`，
+    /// 保留 `Slot::Off` 降级标记。`Off` 槽位本就不服务数据（恒
+    /// fallback 到 `inner.query`），跨回滚保留它既正确又避免回滚后
+    /// 重复执行必然失败的 build SQL——那条失败语句会把事务打入
+    /// aborted 态，改变后续语句成败序列（`set_oriented_dummy`
+    /// 视图 CAST 场景实测）。
+    pub(crate) fn invalidate_on_rollback(&self) {
+        self.slots
+            .borrow_mut()
+            .retain(|_, slot| matches!(slot, Slot::Off { .. }));
+    }
 }
 
 /// 包在执行器外层。不改 [`SqlExecutor`] 签名。
@@ -100,7 +112,14 @@ impl SqlExecutor for LookupExecutor {
     }
 
     fn execute(&self, sql: &str, binds: &BindMap) -> Result<ExecOutcome, EngineError> {
-        self.invalidate(sql);
+        // 事务控制语句不产生表名，`invalidate` 的表名提取对其天然
+        // 失效——回滚改变可见数据，必须按回滚口径失效 Ready 数据槽
+        // （P0-1 审核：否则回滚后读到回滚前的缓存值）。
+        if crate::exec::is_rollback_stmt(sql) {
+            self.state.invalidate_on_rollback();
+        } else {
+            self.invalidate(sql);
+        }
         self.inner.execute(sql, binds)
     }
 }
@@ -243,6 +262,24 @@ pub(crate) struct FrozenLookupSnapshot {
 }
 
 impl FrozenLookupSnapshot {
+    /// Worker 侧快照体积估算（LP 报告 `peak_snapshot_bytes`；
+    /// 估算口径见 [`Index::approx_bytes`]）。
+    pub(crate) fn approx_bytes(&self) -> usize {
+        self.slots
+            .values()
+            .map(|frozen| {
+                frozen.index.approx_bytes()
+                    + frozen.names.iter().map(|n| n.len() + 16).sum::<usize>()
+                    + frozen
+                        .plan
+                        .tables
+                        .iter()
+                        .map(|t| t.len() + 16)
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
     /// 与 [`LookupExecutor::query`] 同口径的命中判定，但只查冻结槽位：
     /// `None` = 形状不支持 / 未预热 / 探测回退（Worker 必须交权）。
     pub(crate) fn probe(&self, sql: &str, binds: &BindMap) -> Option<RowStream> {
@@ -295,6 +332,38 @@ impl Index {
             }
         };
         index.ok_or_else(|| EngineError::invariant(67, "lookup build stream count mismatch"))
+    }
+
+    /// 快照体积估算（LP 报告 `peak_snapshot_bytes`）：单元格数 ×
+    /// `SpinValue` 粒度 + 行/键固定开销。堆布局估算而非精确字节，
+    /// 仅供容量观测，不做正确性判据。
+    fn approx_bytes(&self) -> usize {
+        const CELL: usize = std::mem::size_of::<SpinValue>();
+        const ROW_OVERHEAD: usize = 48;
+        const KEY_OVERHEAD: usize = 32;
+        let bucket = |k: &[KeyPart], rows: &[Row]| {
+            KEY_OVERHEAD
+                + std::mem::size_of_val(k)
+                + rows.len() * ROW_OVERHEAD
+                + rows.iter().map(|r| r.len()).sum::<usize>() * CELL
+        };
+        match self {
+            Index::Rows(map) => map.iter().map(|(k, rows)| bucket(k, rows)).sum(),
+            Index::Semi { outer, inner } => {
+                outer.iter().map(|(k, rows)| bucket(k, rows)).sum::<usize>()
+                    + inner
+                        .iter()
+                        .map(|(k, set)| {
+                            KEY_OVERHEAD
+                                + std::mem::size_of_val(k)
+                                + set
+                                    .iter()
+                                    .map(|_| std::mem::size_of::<KeyPart>())
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>()
+            }
+        }
     }
 }
 

@@ -522,3 +522,11 @@ spinduck/src/
     - `should_yield_or_reject_sqlfn_expressions_in_pure_prefix`：
       - 构造规则 `@` 标记函数（如 `@to_char`）经编译产生 `IrExpr::SqlFn` 出现在前缀 `Assign` 右值、`JumpIf` 条件、嵌套表达式（CASE 分支内）三类夹具，断言处置**按类固定（R6-P2-1）**：含 `SqlFn` 的语句**一律**成为 $E_{\text{yield}}$ 交权出口，**绝不进入 Worker 求值**（`eval_sqlfn` 经 `env.ex.query` 执行真实 SQL，Worker 零数据库接触铁律不可绕过）；交权后剩余前缀为空则由门禁 1 最小工作量门禁**确定性**判定 `InsufficientParallelWork`——不存在"交权或拒绝"的自由选择；同时断言 `CursorAttr` 形态仍走整域拒绝路径；
       - 对照：同一函数完成本地降阶后（`eval` 路径不触碰 `env.ex`）允许进入 $V_{\text{pure}}$，结果与 `Off` 一致——验证判据是求值路径而非函数名单。
+
+---
+
+## 审核修订记录（PR #62 评审后）
+
+- **回滚缓存失效（P0-1）**：`RollbackWatch` 恒启用（`is_enabled()=true`，侦测是正确性机制而非观测面），`TxRollback`/`ROLLBACK` 事件命中即调 `LookupState::invalidate_on_rollback()`——**只清数据承载的 `Slot::Ready`，保留 `Slot::Off` 降级标记**。全清会迫使回滚后重跑必然失败的 build SQL（如视图全量物化 CAST 错），失败语句把事务打入 aborted 态、改变后续语句成败序列（`set_oriented_dummy` 视图 CAST 场景实证）；`Off` 槽位本就不服务数据，保留它跨回滚既正确又避免该连锁。`MemoizingExecutor` 对回滚语句整体清缓存（仅缓存白名单纯标量，无表读）。该修复同时闭合**串行路径**上"回滚后读到回滚前缓存值"的既有漏洞（`invalidate` 表名提取对事务控制语句天然失效）。
+- **trace 契约补齐（P1）**：Worker `SqlQuery` 快照命中路径补发 `IrStmt{SqlQuery}` 事件（与串行 `interp` 主循环→`sqlstmts` 的事件序一致）；`SqlExec.elapsed_us` 三个站点（静态/动态/execute）与 Worker 探测路径均改为实测耗时。
+- **报告字段真实化（P1）**：`peak_snapshot_bytes` 由硬编码 0 改为 `FrozenLookupSnapshot::approx_bytes() + CallSnapshot::approx_bytes()` 估算和（堆布局估算口径，非精确字节）；`need_keys` 沿用真实计数。
