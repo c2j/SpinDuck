@@ -5324,7 +5324,8 @@ PR-5 第一步取证（先于任何 D7 实现）。夹具：
 | purchase `kind_id='0'`（OFF）`SET_ORIENTED` 行文本 | `… converted` | `… converted arm=else` | 双臂化后判别式选臂，判定行透出 `arm=` 片段（§3.2 同源渲染）；门 1 逐字口径的批准例外，生成 SQL 与退出码不变 |
 
 收缩仅 `copy_route` 一类（THEN 臂含不可证表达式写）；purchase/byfund
-语料无此形态，不受影响。
+语料无此形态。purchase 的唯一影响是判定行 `arm=` 后缀（上表末行），
+属输出契约增量而非收缩——生成 SQL、退出码、行集均不变。
 
 ### V54.2 正确性证据
 
@@ -5375,6 +5376,10 @@ byfund Off ~0.15s vs Batch ~2.8s。Batch 耗时随规模亚线性（purchase
   （两臂独立事实不互串断言）；测试 17 落地为
   `d7_admit_and_call_report_same_selected_arm`（admit_verify 与
   call 在 OFF/ON 象限 arm 标签一致，`try_clone` 共享同一 DuckDB）；
+  stdout 文本面由 `call::should_print_selected_arm_on_set_oriented_line_for_dual_arm_plan`
+  与 `compile_admit::compile_admit_should_render_selected_arm_for_dual_arm_plan`
+  双象限整行锚定（V54.6-N4 再收紧为 `arm=else|then` 全行相等 +
+  `err == ""`）；
   测试 15 由 fallback 四 seed（含 NULL/多行判别值→ELSE 臂）与
   purchase absent 象限覆盖；测试 13 由 entry 单测（discriminator
   缺席 + route_guards 保留）与 corpus 逐字守护覆盖；purchase_switch
@@ -5417,7 +5422,11 @@ byfund Off ~0.15s vs Batch ~2.8s。Batch 耗时随规模亚线性（purchase
   不再 KERNEL-0010。守护测试
   `fallback::should_reject_route_lookup_with_frame_bound_filter`
   （修复前实测 KERNEL-0010 `Invalid parameter name: v_v_f`，
-  修复后 Skipped + 行集全等）。`entry.rs` bind-free 注释同步更正。
+  修复后 Skipped + 行集全等）。`entry.rs` bind-free 注释同步更正；
+  `route::tests` 两条单测锁定占位符命中与字面量/引号内 `$v_` 不误拒。
+- **复核补漏（同轮自查）**：V54.1 表后「不受影响」句改为「purchase
+  仅判定行 `arm=` 后缀、非收缩」；V54.4 测试 17 映射补两条 CLI 契约
+  测试名；设计 §3.2 `arm=none`/守卫行字段处加实现口径指针。
 - **N-2 门 1 例外缺口** → 已修：设计 §12.5 门 1 增第二处批准例外
   （仍 Converted 的双臂判定行透出 `arm=` 片段）。
 - **N-3 可观测口径** → 已修：设计 §12.3(e) 示例标注为目标形态并

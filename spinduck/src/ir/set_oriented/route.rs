@@ -98,3 +98,23 @@ fn reject_frame_binds(sql: &str) -> Result<(), SkipReason> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_reject_frame_bind_placeholder_in_route_sql() {
+        // N-1：`$v_*` 占位符 = 帧依赖，bind-free 前提不成立 → 计划期拒绝。
+        assert!(reject_frame_binds("SELECT * FROM t WHERE op = $v_v_f").is_err());
+        assert!(reject_frame_binds("SELECT CASE WHEN x THEN $v_a ELSE $v_b END").is_err());
+    }
+
+    #[test]
+    fn should_allow_route_sql_without_frame_binds() {
+        // 字面量内的 `$v_` 文本不是占位符（词法层带引号，不得误拒）。
+        assert!(reject_frame_binds("SELECT * FROM t WHERE op = 'X'").is_ok());
+        assert!(reject_frame_binds("SELECT * FROM t WHERE note = '$v_v_f'").is_ok());
+        assert!(reject_frame_binds("SELECT * FROM t WHERE op = \"$v_v_f\"").is_ok());
+    }
+}
