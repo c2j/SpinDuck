@@ -118,6 +118,10 @@ pub enum SkipReason {
     /// SO 行级混合前置证明失败（异常行号越界/游标基数漂移/守卫行号
     /// 畸形）：整区域回退串行解释执行，零写入已产生（P0-3 审核修复）。
     HybridPreflightFailed,
+    /// `__sd_hcur` 入口物化/游标流重绑失败的串行兜底——与守卫证据类
+    /// `HybridPreflightFailed` 区分（物化失败可由内核行为/DDL 触发，
+    /// 非守卫行号证据问题）。
+    HybridHcurMaterializeFailed,
 }
 
 /// 一次调用实际选择的优化状态。
@@ -285,6 +289,7 @@ fn plan_from(
                                     then_arm: false,
                                     hybrid: hybrid::analyze(&routine.prog, &region).is_some(),
                                     hybrid_prefix_clean: hybrid_clean,
+                                    batch_commit: ctx.batch_commit,
                                 };
                                 match generate(&mut copy, source, ctx, &region, flags)? {
                                     Err(reason) => {
@@ -306,6 +311,7 @@ fn plan_from(
                                                 hybrid: hybrid::analyze(&routine.prog, &region)
                                                     .is_some(),
                                                 hybrid_prefix_clean: hybrid_clean,
+                                                batch_commit: ctx.batch_commit,
                                             };
                                             if let Ok(Ok(alt_plan)) =
                                                 generate(&mut alt, source, ctx, &region, alt_flags)

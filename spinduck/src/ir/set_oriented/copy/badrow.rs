@@ -3,8 +3,10 @@
 use super::{shape, Table};
 
 /// `sd_cur` 行集带 0 基 `__sd_rn` 的物化 SELECT（混合调度单次物化
-/// 与 CTE 形态共用同一编号口径）。`ROW_NUMBER()` 行序 == 游标流序
-/// 由引擎在物化后对 `cursor.shared_rows()` 做一次性位置校验证明。
+/// 与 CTE 形态共用同一编号口径）。`ROW_NUMBER()` 行序由**全列规范化
+/// `ORDER BY`** 决定：序由内容唯一决定——GROUP BY 游标的分组键是输出
+/// 行唯一键即全序；普通游标整行重复互换不可观测（合并模拟 byfund_branch
+/// 确定性复现 ENG-0032 后修复，移植自 sim/pr62-63-merged b990cc7）。
 pub(in crate::ir::set_oriented) fn sd_cur_rows(select: &shape::Select, source: &Table) -> String {
     let inner = if let Some(v) = &select.verbatim {
         v.clone()
@@ -15,7 +17,16 @@ pub(in crate::ir::set_oriented) fn sd_cur_rows(select: &shape::Select, source: &
         };
         format!("{}{where_clause}", super::sd_cur_scan(select, source))
     };
-    format!("SELECT *, ROW_NUMBER() OVER () - 1 AS __sd_rn FROM ({inner}) _rn")
+    let order = select
+        .columns
+        .iter()
+        .map(|c| c.sql())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if order.is_empty() {
+        return format!("SELECT *, ROW_NUMBER() OVER () - 1 AS __sd_rn FROM ({inner}) _rn");
+    }
+    format!("SELECT *, ROW_NUMBER() OVER () - 1 AS __sd_rn FROM ({inner}) _rn ORDER BY {order}")
 }
 
 /// `sd_cur` CTE 定义（批写主查询与坏行守卫共用，保证行集口径一致）。

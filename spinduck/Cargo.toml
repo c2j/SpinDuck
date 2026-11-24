@@ -189,6 +189,11 @@ required-features = ["cli"]
 name = "loop_parallel"
 path = "tests/loop_parallel.rs"
 
+[[test]]
+name = "guard_set_oriented_hybrid_fncache"
+path = "tests/guard/guard_set_oriented_hybrid_fncache.rs"
+required-features = ["native"]
+
 
 [patch."https://github.com/c2j/ogsql-parser"]
 # 把 codeweb 的 git ogsql-parser 重定向到本仓库子模块：进程内只能有一份

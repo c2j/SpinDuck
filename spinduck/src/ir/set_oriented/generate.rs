@@ -29,6 +29,9 @@ pub(super) struct PlanFlags {
     /// 写的事务被打入 aborted 态）。不满足时混合资格整体关闭，
     /// 退回普通 SO/串行路径。
     pub hybrid_prefix_clean: bool,
+    /// `--batch-commit`（WriteBuffer 延迟提交）：段批写直发内核、
+    /// 与重放行的交错回滚无法共用同一提交边界——混合计划整体关闭。
+    pub batch_commit: bool,
 }
 
 pub(super) fn generate(
@@ -305,10 +308,10 @@ fn finish(
     // 无异常行来源的计划保持原 SQL 形态（无 __sd_rn/段谓词），
     // `|E|` 恒空也无调度收益。
     let has_exc = resolved.iter().any(|(l, _)| l.render.exc_guard.is_some());
-    let hybrid_on = hspec.is_some() && has_exc && flags.hybrid_prefix_clean;
+    let hybrid_on = hspec.is_some() && has_exc && flags.hybrid_prefix_clean && !flags.batch_commit;
     // 混合计划的 `sd_cur` 改读引擎物化临时表：物化 SELECT 随 spec
     // 下发，`__sd_rn` 只在物化时赋一次（P0-3b 行序证明的锚点）。
-    let hspec = if hybrid_on {
+    let mut hspec = if hybrid_on {
         hspec.map(|mut h| {
             h.hcur_sql = super::copy::sd_cur_rows(&inputs.select, &inputs.cur);
             h
@@ -348,7 +351,7 @@ fn finish(
     // 分臂备选（then_arm）：路由守卫改为"条件 IS TRUE = THEN 可达"
     // 判定——入口守卫期望 TRUE 才放行本计划；主计划保持"THEN 不可达"
     // 口径，两臂守卫互斥，入口按数据选臂。
-    let route_guards = if flags.then_arm {
+    let mut route_guards = if flags.then_arm {
         match &copy.route {
             Some((v, lit)) => {
                 let Some((l, _)) = resolved.iter().find(|(l, _)| &l.var == v) else {
@@ -376,7 +379,7 @@ fn finish(
     )?;
     // 混合计划：`sql` 存占位符全范围替换版（exc 空集直发路径），
     // `seg_sql` 存含 __SD_LO__/__SD_HI__ 占位符的分段模板。
-    let (sql, seg_sql) = if hybrid_on {
+    let (mut sql, mut seg_sql) = if hybrid_on {
         (
             generated
                 .sql
@@ -406,9 +409,9 @@ fn finish(
             })
             .collect()
     };
-    let top1_guards = fill_binds(top1_guards);
-    let exc_guards = fill_binds(exc_guards);
-    let expr_guards = entry::bind_guards(generated.expr_guards, &binds)?;
+    let mut top1_guards = fill_binds(top1_guards);
+    let mut exc_guards = fill_binds(exc_guards);
+    let mut expr_guards = entry::bind_guards(generated.expr_guards, &binds)?;
     // fn_site 物化前导：游标 WHERE site 的 distinct_sql 为编译期原文
     // （含源表与过滤），INSERT 位 site 为 copy_sql 生成的
     // distinct-over-sd_cur 查询（needs_sd_cur，依赖游标表先行物化）。
@@ -427,10 +430,43 @@ fn finish(
     fn_preludes.extend(generated.fn_preludes);
     // 视图物化前导：普通查找落在视图上时由 viewdep 产出（每查找一张
     // sd_vwN 临时表）；先于入口守卫执行（守卫可内嵌 sd_vwN 派生表）。
-    let view_preludes: Vec<entry::ViewPrelude> = projections
+    let mut view_preludes: Vec<entry::ViewPrelude> = projections
         .iter()
         .filter_map(|l| l.view_prelude.clone())
         .collect();
+    // V55.4：计划侧游标位例程缓存统一改名 `sd_fnN`→`sd_pfnN`。
+    // 解释器重放路径按 statement 级生成 `sd_fn{i}`——与计划缓存同名
+    // 时 `CREATE OR REPLACE` 互相覆写（重放行 INSERT 位例程会冲掉
+    // 游标 WHERE 例程缓存，miss_outs/守卫读到异函数键形态 → 静默
+    // 错值）。解释器只产 `sd_fn{数字}`，`sd_pfn` 命名空间永不冲突；
+    // `sd_bfN`（INSERT 位缓存，重放不产）不在改名范围。
+    sql = rename_cursor_fn_cache(&sql);
+    seg_sql = seg_sql.map(|s| rename_cursor_fn_cache(&s));
+    for (s, _) in top1_guards
+        .iter_mut()
+        .chain(exc_guards.iter_mut())
+        .chain(expr_guards.iter_mut())
+    {
+        *s = rename_cursor_fn_cache(s);
+    }
+    for s in &mut route_guards {
+        *s = rename_cursor_fn_cache(s);
+    }
+    for m in &mut miss_outs {
+        m.sql = rename_cursor_fn_cache(&m.sql);
+    }
+    if let Some(h) = &mut hspec {
+        h.hcur_sql = rename_cursor_fn_cache(&h.hcur_sql);
+    }
+    for p in &mut fn_preludes {
+        p.table = rename_cursor_fn_cache(&p.table);
+        // INSERT 位前导的 distinct-over-sd_cur 查询内嵌游标扫描，
+        // 其中的游标缓存子查询同样引用 sd_fnN——必须与 table 同步改名。
+        p.distinct_sql = rename_cursor_fn_cache(&p.distinct_sql);
+    }
+    for v in &mut view_preludes {
+        v.sql = rename_cursor_fn_cache(&v.sql);
+    }
     // 守卫 SQL（verbatim cur_scan / 写守卫缓存子查询）引用 sd_fn*/sd_bf*
     // 临时表时，物化前导必须先于入口守卫执行，否则守卫查询打到不存在的表。
     // 视图前导存在时 fn 前导同样提前：fn 例程调用可回滚会话本地建表，
@@ -447,7 +483,7 @@ fn finish(
                     .is_some_and(|t| t.words().iter().any(|w| tables.contains(&w.as_str())))
             })
     } || !view_preludes.is_empty();
-    Ok(entry::ConversionPlan {
+    let plan = entry::ConversionPlan {
         sql,
         binds,
         fn_preludes,
@@ -481,7 +517,8 @@ fn finish(
             })
             .collect(),
         route_alt: None,
-    })
+    };
+    Ok(plan)
 }
 
 fn route_guards(
@@ -566,4 +603,29 @@ fn query_binds_inner(
         }
     }
     binds
+}
+
+/// `sd_fn<数字>` token 改名为 `sd_pfn<数字>`（V55.4 游标缓存隔离）。
+/// 前边界：串首或非标识符字符；后边界：必须紧跟 ASCII 数字——
+/// `sd_fn` 前缀的其它形态（如 `sd_fna`）不动。逐字节扫描但按
+/// UTF-8 字符边界复制，中文等多字节内容原样保留。
+fn rename_cursor_fn_cache(sql: &str) -> String {
+    let b = sql.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut i = 0;
+    while i < b.len() {
+        let hit = b[i..].starts_with(b"sd_fn")
+            && b.get(i + 5).is_some_and(|c| c.is_ascii_digit())
+            && (i == 0 || !ident(b[i - 1]));
+        if hit {
+            out.push_str("sd_pfn");
+            i += 5;
+        } else {
+            let len = sql[i..].chars().next().map_or(1, |c| c.len_utf8());
+            out.push_str(&sql[i..i + len]);
+            i += len;
+        }
+    }
+    out
 }

@@ -298,12 +298,26 @@ impl Engine {
                             // 畸形守卫行号：证据不可信 → 整区域串行
                             // 兜底（此点尚未产生任何写入，语义零变化）。
                             self.drop_hcur_table(&name);
-                            return self.hybrid_serial_from_open(routine, p, frame, sink, limits);
+                            return self.hybrid_serial_from_open(
+                                routine,
+                                p,
+                                frame,
+                                sink,
+                                limits,
+                                SkipReason::HybridPreflightFailed,
+                            );
                         }
                     }
                 }
                 None => {
-                    return self.hybrid_serial_from_open(routine, p, frame, sink, limits);
+                    return self.hybrid_serial_from_open(
+                        routine,
+                        p,
+                        frame,
+                        sink,
+                        limits,
+                        SkipReason::HybridHcurMaterializeFailed,
+                    );
                 }
             }
         }
@@ -344,6 +358,36 @@ impl Engine {
     /// `batch_commit=false` 当场 `COMMIT + BEGIN TRANSACTION`，`true` 时
     /// 延迟到 `call_with_sink` 出口统一提交。0 行不发 trace、不切快照。
     fn commit_region_tail(
+        &self,
+        plan: &ConversionPlan,
+        rows: usize,
+        sink: &mut dyn TraceSink,
+    ) -> Result<(), EngineError> {
+        if !(plan.tail_commit && rows > 0) {
+            return Ok(());
+        }
+        if sink.is_enabled() {
+            sink.on_event(crate::exec::TraceEvent::IrStmt {
+                variant: "TxCommit",
+            });
+        }
+        if !self.batch_commit {
+            self.ex.execute("COMMIT", &crate::exec::BindMap::new())?;
+            self.ex
+                .execute("BEGIN TRANSACTION", &crate::exec::BindMap::new())?;
+        }
+        Ok(())
+    }
+
+    /// 段批写提交边界（V55.4）：串行中每行写由体内 `TxCommit(IfWritten)`
+    /// 逐行提交，后续行异常回滚只撤当行；段写若滞留未提交，重放行的
+    /// 异常 `ROLLBACK` 会连带撤销整段批写。`tail_commit=true`（体内含
+    /// 提交）时段写在下一个重放前提交到等价边界；`false` 时不提交——
+    /// 串行同样保留挂起写由回滚撤销，语义一致。`batch_commit` 下混合
+    /// 计划已在计划期整体关闭（写缓冲口径不可与交错回滚混用），此处
+    /// 的 `!self.batch_commit` 仅为与 `commit_region_tail` 同口径的
+    /// 防御。
+    fn commit_hybrid_segment(
         &self,
         plan: &ConversionPlan,
         rows: usize,
@@ -555,7 +599,14 @@ impl Engine {
         // 行序漂移（无 ORDER BY 游标源两次执行本就可能给出不同序）。
         // 重绑失败（查询失败/行宽失配）整区域串行兜底（零写入）。
         if !self.rebind_hcur_cursor(hcur_name, frame, spec)? {
-            return self.hybrid_serial_fallback(routine, frame, sink, limits, spec);
+            return self.hybrid_serial_fallback(
+                routine,
+                frame,
+                sink,
+                limits,
+                spec,
+                SkipReason::HybridHcurMaterializeFailed,
+            );
         }
         let (total, shared) = match frame.cursor_state(&spec.cursor) {
             Some(crate::runtime::CursorState::Open { total, .. }) => (
@@ -575,7 +626,14 @@ impl Engine {
         // 异常行号必须全部落在游标总数内——越界说明守卫行号与
         // FETCH 序已失配，继续执行只会错写。
         if exc.iter().any(|e| *e >= total as u64) {
-            return self.hybrid_serial_fallback(routine, frame, sink, limits, spec);
+            return self.hybrid_serial_fallback(
+                routine,
+                frame,
+                sink,
+                limits,
+                spec,
+                SkipReason::HybridPreflightFailed,
+            );
         }
         self.push_report(
             &routine.name,
@@ -593,7 +651,9 @@ impl Engine {
             if e > seg_lo {
                 self.ensure_so_materializations(plan, routine, frame, sink)?;
                 self.ensure_hcur(hcur_name, plan, frame, spec, shared_rows_slice(&shared))?;
-                written += self.exec_hybrid_segment(plan, frame, sink, seg_lo, e)?;
+                let n = self.exec_hybrid_segment(plan, frame, sink, seg_lo, e)?;
+                written += n;
+                self.commit_hybrid_segment(plan, n, sink)?;
             }
             let rspec = crate::runtime::interp::ReplaySpec {
                 cursor: &spec.cursor,
@@ -629,7 +689,9 @@ impl Engine {
             if seg_lo < total as u64 {
                 self.ensure_so_materializations(plan, routine, frame, sink)?;
                 self.ensure_hcur(hcur_name, plan, frame, spec, shared_rows_slice(&shared))?;
-                written += self.exec_hybrid_segment(plan, frame, sink, seg_lo, total as u64)?;
+                let n = self.exec_hybrid_segment(plan, frame, sink, seg_lo, total as u64)?;
+                written += n;
+                self.commit_hybrid_segment(plan, n, sink)?;
             }
             // 终止空 FETCH：游标属性（%NOTFOUND/%ROWCOUNT）对齐串行——
             // seek_before(total)+真实 Fetch 必然走 NOTFOUND 出口边。
@@ -776,14 +838,15 @@ impl Engine {
     /// `sd_cur` 物化表与游标权威行集的位置校验（P0-3b/P0-3a 合一）：
     /// `ORDER BY __sd_rn` 取回的行必须与 `shared_rows()`（FETCH 序）
     /// 逐位相等，且末列 `__sd_rn` 恰为行下标——一次证明覆盖基数、
-    /// 行序与 rn↔位置绑定。查询失败/行数或内容失配 → `false`。
+    /// 行序与 rn↔位置绑定。按成因返回 [`HcurOrder`]，由调用方区分
+    /// 错误消息（ENG-0032 不再统一误报 "order drift"）。
     fn hcur_order_ok(
         &self,
         name: &str,
         shared: Option<&[crate::exec::Row]>,
-    ) -> Result<bool, EngineError> {
+    ) -> Result<HcurOrder, EngineError> {
         let Some(shared) = shared else {
-            return Ok(false);
+            return Ok(HcurOrder::CountMismatch);
         };
         let sql = format!("SELECT * FROM {name} ORDER BY __sd_rn");
         let mut stream = match self.ex.query(&sql, &crate::exec::BindMap::new()) {
@@ -795,18 +858,25 @@ impl Engine {
                 self.ex.execute("ROLLBACK", &crate::exec::BindMap::new())?;
                 self.ex
                     .execute("BEGIN TRANSACTION", &crate::exec::BindMap::new())?;
-                return Ok(false);
+                return Ok(HcurOrder::ProbeFailed);
             }
         };
         let rows = stream.fetch_many(usize::MAX);
         if rows.len() != shared.len() {
-            return Ok(false);
+            return Ok(HcurOrder::CountMismatch);
         }
-        Ok(rows.iter().enumerate().all(|(i, a)| {
-            a.len() == shared[i].len() + 1
-                && a[..shared[i].len()] == shared[i][..]
-                && a.last() == Some(&crate::value::SpinValue::Int(i as i64))
-        }))
+        for (i, a) in rows.iter().enumerate() {
+            if a.len() != shared[i].len() + 1 {
+                return Ok(HcurOrder::WidthMismatch);
+            }
+            if a[..shared[i].len()] != shared[i][..] {
+                return Ok(HcurOrder::RowMismatch);
+            }
+            if a.last() != Some(&crate::value::SpinValue::Int(i as i64)) {
+                return Ok(HcurOrder::RnMismatch);
+            }
+        }
+        Ok(HcurOrder::Ok)
     }
 
     /// 段批写前的物化表探活：重放行的原生例程调用可回滚会话临时表
@@ -842,13 +912,25 @@ impl Engine {
         );
         self.ex.execute(&ddl, &bm)?;
         self.load_hcur_rows(name, shared)?;
-        if !self.hcur_order_ok(name, Some(shared))? {
-            return Err(EngineError::invariant(
+        match self.hcur_order_ok(name, Some(shared))? {
+            HcurOrder::Ok => Ok(()),
+            HcurOrder::ProbeFailed => Err(EngineError::invariant(
+                32,
+                "sd_cur rematerialize probe failed",
+            )),
+            HcurOrder::CountMismatch => Err(EngineError::invariant(
+                32,
+                "sd_cur rematerialize row count drift",
+            )),
+            HcurOrder::WidthMismatch | HcurOrder::RowMismatch => Err(EngineError::invariant(
                 32,
                 "sd_cur rematerialize order drift",
-            ));
+            )),
+            HcurOrder::RnMismatch => Err(EngineError::invariant(
+                32,
+                "sd_cur rematerialize row-number drift",
+            )),
         }
-        Ok(())
     }
 
     /// `__sd_hcur` 重建的数据装载：冻结游标行 + 0 基 `__sd_rn` 逐块
@@ -900,13 +982,9 @@ impl Engine {
         frame: &mut Frame,
         sink: &mut dyn TraceSink,
         limits: RunLimits,
+        reason: SkipReason,
     ) -> Result<Option<RunOutcome>, EngineError> {
-        self.push_report(
-            &routine.name,
-            Status::Skipped {
-                reason: SkipReason::HybridPreflightFailed,
-            },
-        );
+        self.push_report(&routine.name, Status::Skipped { reason });
         let out = self.run_prog(
             &routine.prog,
             frame,
@@ -932,13 +1010,9 @@ impl Engine {
         sink: &mut dyn TraceSink,
         limits: RunLimits,
         spec: &crate::ir::set_oriented::HybridSpec,
+        reason: SkipReason,
     ) -> Result<Option<RunOutcome>, EngineError> {
-        self.push_report(
-            &routine.name,
-            Status::Skipped {
-                reason: SkipReason::HybridPreflightFailed,
-            },
-        );
+        self.push_report(&routine.name, Status::Skipped { reason });
         let out = self.run_prog(
             &routine.prog,
             frame,
@@ -1044,4 +1118,18 @@ fn shared_rows_slice(
     shared: &Option<std::sync::Arc<Vec<crate::exec::Row>>>,
 ) -> Option<&[crate::exec::Row]> {
     shared.as_ref().map(|r| r.as_slice())
+}
+
+/// `hcur_order_ok` 的分型结果（ENG-0032 按成因区分消息）：
+/// `Ok` 通过；`ProbeFailed` 校验查询本身失败（已事务复位）；
+/// `CountMismatch` 行数不符；`WidthMismatch`/`RowMismatch` 行宽或
+/// 内容/行序失配；`RnMismatch` 末列 `__sd_rn` 与行下标不符。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HcurOrder {
+    Ok,
+    ProbeFailed,
+    CountMismatch,
+    WidthMismatch,
+    RowMismatch,
+    RnMismatch,
 }
