@@ -17,6 +17,7 @@ mod snapshot;
 use batch::parse_batch;
 use call::parse_call;
 use compile::parse_compile;
+pub use compile::AdmitMode;
 use exec::{parse_explain, parse_materialize, parse_sync};
 use project::parse_deploy;
 use snapshot::{parse_compare, parse_query};
@@ -44,6 +45,14 @@ pub enum Command {
         codeweb_project: Option<PathBuf>,
         /// 同步运行态快照（`conf/spinduck.runtime.toml`），默认关。
         sync_manifest: bool,
+        /// `--admit[=report|error]`：集合化判定开关（强制配 `--db`，D9）。
+        admit: Option<AdmitMode>,
+        /// admit 的数据面库文件（`--db`）。
+        db: Option<PathBuf>,
+        /// `--set-oriented[=mode]`：覆盖 `[engine].set_oriented`（CLI > 项目）。
+        set_oriented: Option<crate::ir::set_oriented::SetOrientedMode>,
+        /// `--admit-record <f>`：判定工件输出路径（显式给才写）。
+        admit_record: Option<PathBuf>,
     },
     /// 规则文件探针（版本锚定检查）。
     RulesProbe { path: PathBuf },
@@ -112,6 +121,11 @@ pub enum Command {
         batch_commit: bool,
         /// 集合化契约覆盖；None 使用项目配置。
         set_oriented: Option<crate::ir::set_oriented::SetOrientedMode>,
+        /// `--on-skip[=report|error]`：判定行前移 + Skipped 退出码策略；
+        /// None = 既有事后渲染（stdout 契约不变）。
+        on_skip: Option<crate::ir::set_oriented::OnSkip>,
+        /// `--on-skip-error-if` 名单（kebab reason）：列入者不参与 error 判红。
+        on_skip_error_if: std::collections::BTreeSet<crate::ir::set_oriented::SkipReason>,
         /// 循环并行模式覆盖；None 使用项目配置（旋钮仅项目表可给）。
         loop_parallel: Option<crate::ir::loop_parallel::LoopParallelMode>,
         /// 步数预算覆盖（复核应修 C：默认预算跑不动 100k 级游标循环，
@@ -231,7 +245,10 @@ pub fn usage() -> &'static str {
      \x20 compile <path>...               语料编译体检（递归 *.sql）\n\
      \x20 compile [--dir <项目目录>] [--schema <名>] [--entry <routine>]...\n\
      \x20      [--analyze] [--codeweb-project <dir>] [--sync-manifest]\n\
+     \x20      [--admit[=report|error] --db <f> [--set-oriented[=off|strict|batch-atomic]]\n\
+     \x20       [--admit-record <f>]]\n\
      \x20                                项目态：进程内嵌 codeweb 取图，按入口落盘计划并 IR 体检；\n\
+     \x20                                --admit 做集合化判定（强制 --db；=error 时 firm skipped 判红）；\n\
      \x20                                --analyze 取图前允许增量分析（store 缺失/过期时自动补）；\n\
      \x20                                --sync-manifest 同步运行态快照 conf/spinduck.runtime.toml\n\
      \x20 rules probe <rules.toml>        规则文件版本锚定检查\n\
@@ -256,6 +273,9 @@ pub fn usage() -> &'static str {
      \x20 call --plan <计划.toml> [--db <f>] [--rules <f>] [--file <sql>]... [--batch-commit] [--step-budget <n>]\n\
      \x20      [--trace <f> [--trace-format <text|jsonl>] [--trace-level <stmt|sql|bind|all>]] [args...]\n\
      \x20      [--set-oriented[=off|strict|batch-atomic]]（两种 call 形态均可用）\n\
+     \x20      [--on-skip[=report|error] [--on-skip-error-if <reason,...>]]\n\
+     \x20                                判定行前移到区域裁决点；error 时未列名 Skipped 判红，\n\
+     \x20                                名单口径 = 工件 kebab reason（如 unsupported-control-flow）\n\
      \x20                                注册例程并调用；计划面自带目标与源清单，缺件即红\n\
      \x20                                集合化默认 off；裸 --set-oriented 为 strict，覆盖项目配置；\n\
      \x20                                batch-atomic 授权合并循环尾提交、放宽崩溃部分持久化，\n\

@@ -78,7 +78,7 @@ fn should_inline_multi_out_lookup_tuple_and_reject_unregistered_or_partial_out()
     let b = tuple_fn("fnc_tuple_b", "9", "9", "99");
     let mut eng = engine_with(&[a.as_str(), caller("fnc_tuple_a").as_str()]);
     eng.call("caller_fnc_tuple_a", &[]).unwrap();
-    let Status::Converted { sql } = status(&eng) else {
+    let Status::Converted { sql, .. } = status(&eng) else {
         panic!("{:?}", eng.set_oriented_reports());
     };
     for piece in [
@@ -97,7 +97,7 @@ fn should_inline_multi_out_lookup_tuple_and_reject_unregistered_or_partial_out()
     let call_b = caller("fnc_tuple_b");
     let mut eng_b = engine_with(&[b.as_str(), call_b.as_str()]);
     eng_b.call("caller_fnc_tuple_b", &[]).unwrap();
-    let Status::Converted { sql: sql_b } = status(&eng_b) else {
+    let Status::Converted { sql: sql_b, .. } = status(&eng_b) else {
         panic!("{:?}", eng_b.set_oriented_reports());
     };
     assert_ne!(sql, sql_b, "兜底常量必须进入生成 SQL");

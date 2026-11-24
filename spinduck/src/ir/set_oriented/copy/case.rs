@@ -78,6 +78,11 @@ fn operand_sql(
             ))
         }
         None => {
+            // 折叠常量操作数（D7 THEN 臂活常量/臂内 NULL 事实）：
+            // 字面量逐行同值，CASE 操作数语义不变。
+            if let Some((_, c)) = region.folded.iter().find(|(v, _)| *v == cs.operand) {
+                return crate::sql::render::const_to_sql(c).ok_or(SkipReason::UnprovenExpression);
+            }
             let Some((_, expr)) = region.inlined.iter().find(|(v, _)| *v == cs.operand) else {
                 return Err(SkipReason::UnprovenExpression);
             };

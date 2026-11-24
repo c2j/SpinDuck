@@ -5241,9 +5241,178 @@ allowed warnings）全部通过；`cargo test --features gauss`（A 模式容器
 - 不声称服务器语料与仓库一致：真机 `routines=6 missing=0` 的状态是服务器侧本地补件
   产生的；本轮把等价补件正式入库后，两侧应重新对齐（服务器重跑 compile 以仓库为准）。
 
-## V52. loop-parallel + SO 行级混合落地与 PR#62 评审修复实证（2026-11-24）
+## V52 call --on-skip 判定行前移（设计 v3.1 §5 B2，D8 路线 A）
 
-### V52.1 评审必修项修复与守护测试
+### V52.1 契约证据（tests/cli/call.rs::should_print_skip_line_and_fail_only_under_on_skip_error）
+
+fixture：临时 duckdb 仅建 `source_rows`/`target_rows`、无 `sys_dummy` →
+`copy_rows`（游标 FOR + INSERT）计划期 `Skipped(UnknownObjectDependency)`，
+解释器回退跑通 `CALL copy_rows OK`。四态实测：
+
+```text
+$ spinduck call --file copy_rows.sql --db t.duckdb --set-oriented=strict \
+      --on-skip=report copy_rows
+SET_ORIENTED copy_rows skipped reason=UnknownObjectDependency   ← 裁决点即时行
+CALL copy_rows OK                                                rc=0
+
+$ … --on-skip=error copy_rows                                    → 同上行 + rc=1
+$ … --on-skip=error --on-skip-error-if unknown-object-dependency \
+      copy_rows                                                  → rc=0
+$ …（无旗标）                                                     → 判定行事后渲染不变
+```
+
+即时行由 `Engine::on_set_oriented_report` 回调在 `push_report` 内同步写出；
+回调为 `'static` 闭包直写 `std::io::stdout()`（绕过非 `'static` 的 `out`
+借用），仅 `--on-skip` 激活时安装。`--on-skip-error-if` 名单口径 =
+`SkipReason::as_str` kebab 形式，与 `spinduck-admit/1` 工件 reason 一致。
+项目键 `[engine].set_oriented_on_skip = "report"|"error"`，CLI `--on-skip`
+优先于项目（与 set_oriented mode 同优先级）。
+
+### V52.2 不声称
+
+- 不声称即时行可被 `run_str`/库内嵌 `out` 缓冲捕获：回调直写进程 stdout，
+  `--on-skip` 是 CLI 专属旗标；库内嵌消费者仍读 `set_oriented_reports()`。
+- 不声称覆盖 Converted 路径的前移观感：本轮契约只锁 Skipped 判定行；
+  Converted 行同走同一回调，文本形态 `SET_ORIENTED <r> converted`。
+
+## V53 G5 重测：purchase switch 两象限当前行为（设计 v3.1 §12.4/§12.7）
+
+PR-5 第一步取证（先于任何 D7 实现）。夹具：
+`tests/set_oriented_purchase_switch.rs`，进程内内核部署
+`golden/case_corpus_purchase`（仓内 seed `swh_all_kind.kind_id='0'`），
+`UPDATE swh_all_kind` 翻转 ON 象限（语料资产零改动），
+`prc_trd_deal_purchase('20250715', null)` 两次调用各取一份
+`set_oriented_reports`（= `SET_ORIENTED` 行同一数据源）。
+
+实测（commit 基线 = PR-4 `fcceda5`）：
+
+| mode | switch='0'（OFF） | switch='1'（ON） |
+| :--- | :--- | :--- |
+| Strict | `Skipped(TransactionBoundaryInsideLoop)` | 同左（更早门槛先拒，到不了 route 守卫） |
+| BatchAtomic | `Converted`（批写 SQL 产出） | `Skipped(UnsupportedControlFlow)` → 解释回退 |
+
+- OFF→ON→OFF 三连调 verdict 序列可复现（off2 == off）。
+- **门 1 基线**：BatchAtomic OFF 的 `Converted.sql` 与 ON 的
+  `Skipped(UnsupportedControlFlow)` 即「逐字一致」对照面；D7 合入后
+  OFF 象限必须逐字不变，ON 象限预期改为选 then 臂 Converted。
+- Strict 象限对 D7 无增量（route 守卫不可达），D7 收益面 =
+  BatchAtomic。
+
+### V53.1 不声称
+
+- 不声称 ON 象限业务等价（门 3 四象限等价需 §12.7 数据前置，
+  ON 臂批写 vs 逐行解释的 `dat_trd_repurchase` 比对尚未跑）。
+- 不声称 `--admit` 面输出：本轮只取运行期 reports；compile --admit
+  的 purchase 判定行待 CLI 层补测。
+
+## V54 D7 双臂路由转换落地证据与兼容面收缩登记（设计 v3.1 §12，PR-5）
+
+实现 commit `6e57f85` + 评审修订（臂前导前移探测、NULL→ELSE 口径）。
+机制：`RouteSite` 记录 Branch/TrapGroup 决策点 → THEN 臂 divert 走查 +
+独立 `generate()` → `ConversionPlan.discriminator` 运行期选臂；
+`Status::Converted.arm` 报告选中臂。**降级口径（V54.7 修订）**：
+THEN 臂分析/生成任一证明失败 → 静默降级单臂（`discriminator=None` +
+主计划 `route_guards` 守 THEN 不可达），不再整体 `PlanRejection`。
+
+### V54.1 兼容面收缩逐例登记（「单臂失败整体失败」语义后果；V54.7 已部分回退）
+
+| 例程/形态 | v3.0（main） | D7 后 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `copy_route`（THEN 臂 `r.a+1000` 表达式写） | `Converted`（批 ELSE，route 守卫证 THEN 不可达） | ~~`Skipped(UnsupportedWrite)`~~ → 降级后 ELSE 数据 `Converted{arm:None}`、THEN 数据 `Skipped(UnsupportedControlFlow)` | 臂内无残余 trap 可证「无需坏行过滤」；V54.7 降级口径下备选失败只丢 THEN 臂，主计划保留 |
+| `copy_if_trap` 判别值 NULL seed | `Converted` | `Converted(arm=else)` | NULL 经 SQL `=` 三值语义落 ELSE（PR#62 `route::pick` 同口径），**无收缩** |
+| `copy_partial_then` THEN 可达 seed | `Skipped(UnsupportedControlFlow)` | `Converted(arm=then)` | 兄弟臂独占写入变量按本臂恒 NULL 折叠（`CASE NULL WHEN`），**扩大可转面** |
+| purchase `kind_id='1'`（ON） | `Skipped(UnsupportedControlFlow)` | `Converted(arm=then)` | D7 目标场景，**扩大可转面** |
+| purchase `kind_id='0'`（OFF）`SET_ORIENTED` 行文本 | `… converted` | `… converted arm=else` | 双臂化后判别式选臂，判定行透出 `arm=` 片段（§3.2 同源渲染）；门 1 逐字口径的批准例外，生成 SQL 与退出码不变 |
+
+收缩仅 `copy_route` 一类（THEN 臂含不可证表达式写）；purchase/byfund
+语料无此形态。purchase 的唯一影响是判定行 `arm=` 后缀（上表末行），
+属输出契约增量而非收缩——生成 SQL、退出码、行集均不变。
+**V54.7 降级口径后本表 `copy_route` 行已再变**（见下节）。
+
+### V54.2 正确性证据
+
+- `d7_purchase_batch_matches_interpreter_all_quadrants`：OFF/ON/absent
+  三象限 `dat_trd_repurchase` 全列 + `p_o_succeed` 与 Off 逐值一致，
+  arm 标签断言（else/absent→`Arm::Else`，then→`Arm::Then`）。
+- byfund corpus：`Converted` + Off/Batch 行集全等（既有守护保持绿）。
+- `copy_if_trap` 四 seed（含 NULL/多行判别值）→ 全部 `Converted(arm=else)`，
+  行集与 Off 全等；`('1','X')` → `Converted(arm=then)` 写 'U' 一致。
+- 臂前导前移探测（评审 P1-3 修复）：`lateral::
+  should_probe_then_arm_view_preludes_before_user_code`——THEN 臂
+  视图物化必失败（`CAST('abc' AS INTEGER)`）时前移探测覆盖臂计划，
+  ROLLBACK 后整段解释执行，调用成功 + `Skipped(UnprovenQueryTotalness)`；
+  对照 `should_convert_arm_view_preludes_when_materialization_succeeds`
+  证明健康臂视图照常 Converted 选臂（排除计划期拒绝假象）。
+
+### V54.3 性能取证（100k 规模，进程内 DuckDB debug 构建）
+
+载体 `tests/d7_perf_bench.rs`（`SD_BENCH=1` 显式启用，默认跳过——
+非门禁取证工具）。`mid_yjqs_detail` 自连接放大：purchase 98,304 行、
+byfund 65,536 行；计时 = `eng.call()` 全程（含 BatchAtomic 首次计划
+编译与判别式求值），单轮。
+
+| 用例 | Off（解释器） | BatchAtomic | 结论 |
+| :--- | :--- | :--- | :--- |
+| purchase switch OFF→ELSE 臂 | 127.4s 后 `ENG-0032` 步数预算超限，**调用失败** | **4.40s** `Converted(arm=else)` | 该规模下解释器不可行，批写唯一可行路径 |
+| purchase switch ON→THEN 臂 | 119.0s 同上失败 | **5.99s** `Converted(arm=then)` | 同上，双臂均验证 |
+| byfund | 0.55s | 5.39–6.13s `Converted`（两轮） | **~10× 回退** |
+
+小规模对照（~3k 行）：purchase Off ~6.5–8.5s vs Batch ~1.3–1.7s（~5×）；
+byfund Off ~0.15s vs Batch ~2.8s。Batch 耗时随规模亚线性（purchase
+3k→98k 数据 ×32、耗时仅 ×3.4）。
+
+**byfund 回退机理**：生成 SQL 对 `par_fund_seat_para`（10 次）、
+`jyfy_temp` 等工作表做逐组相关子查询重扫；解释器每行 ~8µs 轻量逻辑
+反而更便宜。处置决定待业务评审（豁免机制 / SQL join 化 / 接受现状），
+本版如实登记为已知限制。
+
+### V54.4 评审修订记录（PR#63 评审 → 处置）
+
+- **P1-3 臂前导探测绕过** → 已修：臂计划 `view_preludes` 纳入前移
+  探测（`engine/set_oriented.rs`），守护测试双向锁定。
+- **P1-1 兼容面收缩口径** → 已修：D10/§12.5 门 1 措辞改为如实登记
+  （见 V54.1）；NULL 判别值向 PR#62 `route::pick` 口径靠拢
+  （NULL→ELSE 臂 Converted，撤销 `-1`→NotTotal 设计）。
+- **P1-2 门 1/2 代码锁** → 已修：测试 14 落地为
+  `set_oriented::tests::should_analyze_both_route_arms_with_independent_facts`
+  （两臂独立事实不互串断言）；测试 17 落地为
+  `d7_admit_and_call_report_same_selected_arm`（admit_verify 与
+  call 在 OFF/ON 象限 arm 标签一致，`try_clone` 共享同一 DuckDB）；
+  stdout 文本面由 `call::should_print_selected_arm_on_set_oriented_line_for_dual_arm_plan`
+  与 `compile_admit::compile_admit_should_render_selected_arm_for_dual_arm_plan`
+  双象限整行锚定（V54.6-N4 再收紧为 `arm=else|then` 全行相等 +
+  `err == ""`）；
+  测试 15 由 fallback 四 seed（含 NULL/多行判别值→ELSE 臂）与
+  purchase absent 象限覆盖；测试 13 由 entry 单测（discriminator
+  缺席 + route_guards 保留）与 corpus 逐字守护覆盖；purchase_switch
+  恒真断言已修。
+- **P2 区域级缓存表计数器（§12.3(c)）** → 采用评审备选的前提锁定：
+  `lateral::should_convert_arm_view_preludes_when_materialization_succeeds`
+  fixture 改为两臂均落视图（THEN=`v_bad`、ELSE=`v_ok`），两臂
+  `view_preludes` 同名 `sd_vw0` 而内容不同；两象限行集与 Off 全等
+  证明「选中臂前导最后物化生效」前提成立。计数器本身仍为后续项，
+  G4 取证时复核。
+- **P3 文件规模** → `admit.rs`/`mod.rs`/`generate.rs` 超 500 行线，
+  拆分为后续项。
+
+### V54.5 不声称
+
+- 不声称 byfund BatchAtomic 性能可接受（~10× 回退已实测，处置未决）。
+- 不声称 `RouteDiscriminatorNotTotal` 有 SQL 数据面可达路径（防御位）。
+- 不声称 §12.3(c) 区域级缓存表计数器已实现（V54.4-P2 缺口）。
+- 不声称门 1 sha256 基线独立登记（逐字面由 corpus 守护承担）。
+- `arm=` 反映**求值时点**数据：admit 在 compile 时刻、call 在前缀
+  执行后各自求值判别式，两次之间开关表被改写时两侧 `arm=` 可合法
+  不一致——同源铁律只承诺同一 SQL 与同一标签口径，不承诺跨时点
+  稳定，下游不得把 `arm=` 当稳定契约消费。
+- 不声称 release 构建性能（全部数字为 debug 构建实测）。
+<<<<<<< HEAD
+## V55. loop-parallel + SO 行级混合落地与 PR#62 评审修复实证（2026-11-24）
+
+> 编号说明：PR#62 与 PR#63 各自将实证登记为 V52（编号撞车）；合并模拟
+> 中 PR#62 段顺延为 V55，PR#63 的 V52（on-skip 判定行）/V53/V54 保留原号。
+
+### V55.1 评审必修项修复与守护测试
 
 - **回滚缓存失效（P0-1）**：`RollbackWatch` 恒启用 + `LookupState::invalidate_on_rollback()`
   （只清 `Slot::Ready` 数据槽、保留 `Slot::Off` 降级标记）。实证反例：
@@ -5263,14 +5432,14 @@ allowed warnings）全部通过；`cargo test --features gauss`（A 模式容器
 - **trace 契约（P1）**：Worker `SqlQuery` 补发 `IrStmt{SqlQuery}`；
   `SqlExec.elapsed_us` 全站点实测；`peak_snapshot_bytes` 真实化。
 
-### V52.2 门禁
+### V55.2 门禁
 
 `cargo fmt --all -- --check`、`cargo clippy --all-features --tests -- -D warnings`、
 `cargo test --features cli`（65 个测试目标全绿，742 lib + 全部集成）通过。
 `cargo audit`：7 个存量传递依赖公告（zip 6.0.0 ×6、bincode/chrono/
 unsafe-libyaml unmaintained），非本 PR 引入，单独跟进。
 
-### V52.3 不声称
+### V55.3 不声称
 
 - 不声称 `zz_top1_pick_probe` 类环境行为探针留在常驻 CI：已按评审移除
   （其结论——GROUP BY 无 ORDER BY 行序不稳定——已由 P0-3b 物化方案
@@ -5279,7 +5448,92 @@ unsafe-libyaml unmaintained），非本 PR 引入，单独跟进。
   （exc 占比高 → 段数≈|E|+1 固有成本），其价值是"此前整体拒绝的区域
   现在可转换"；性能最优路径仍是 LP（lp_safe≈42s）。
 
-## V53. PR#62 二轮评审修复实证（2026-11-25）
+### V55.4 合并模拟基准（PR#62 × PR#63 双 head 合并树，2026-11-24）
+
+模拟分支 `sim/pr62-63-merged`（main 867a731 + PR#62 head 00da4c6 + PR#63
+head 5f5358b 三方合并，门禁 fmt/clippy/test 1270 全绿）上以 V4 探针重跑
+purchase/byfund 100k 矩阵（debug 构建、8 线程、`golden/v4_loop_parallel_verify/
+reports/probe_run.log`）：
+
+| 场景 | off | so_ba | lp_safe | so_lp | 结论 |
+|---|---|---|---|---|---|
+| purchase_base (~9.6 万游标行) | 56136 | 14605 | 14597 | **11104** | SO 3.8×/LP 3.8×/SO+LP 5.1× |
+| purchase_branch_k0 (kind='0'，arm=Else) | 127196 | 10629 | 61983 | **6336** | SO 12.0×；D7 判别式选臂 `Some(Else)` |
+| purchase_branch_k1 (kind='1'，arm=Then) | 140125 | 11485 | 65770 | **9619** | SO 12.2×；D7 判别式选臂 `Some(Then)`——**PR#62 route_alt 首轮 Skipped 再选臂的形态在合并树上消失**，首轮即 `Converted{arm=Then}` |
+| byfund_base (5000 分组) | 469166 | 23878 | 228513 | **9529** | SO 19.6×；`__sd_hcur` 物化跨 3 次调用稳定，SO+LP 49.7× 全场最优 |
+| byfund_branch (5000 分组·异常行) | 521908 | **ENG-0032** | 276340 | **ENG-0032** | lp_safe 1.9×；混合 SO 见下 |
+
+D7 判别式运行期选臂证据：k1 两配置 `Converted{arm: Some(Then)}`、k0 两配置
+`Converted{arm: Some(Else)}`、非路由区域 `arm: None`——PR#63 的结构化臂
+报告与 PR#62 的 LP/混合通道在同一合并树上同时成立。
+
+#### byfund_branch 混合 SO 确定性失败：两层根因（归因诊断记录）
+
+`v4_perf_byfund_branch` so_ba/so_lp 在合并树（5a3d1a9 起）确定性失败：
+`ENG-0032 "sd_cur rematerialize order drift"`（两轮独立复现；pre-5a3d1a9
+合并树同场景 3 轮全过）。带桩诊断（`ensure_hcur`/`materialize_hcur`
+临时埋点）定位出**两层问题**，第一层已修，第二层为 PR#62 设计层缺口：
+
+**层 1（已修）：重建序无确定性保证。** `ensure_hcur` 以同文本
+`spec.hcur_sql` 重建 `__sd_hcur_N`，其注释假设「同查询同数据重建序
+应稳定」——段批写后优化器统计变化可改变 `ROW_NUMBER() OVER ()` 的
+赋序管线。修复：`copy/badrow.rs::sd_cur_rows` 物化 SELECT 追加**全列
+`ORDER BY`**（`select.columns` 输出名，verbatim 恒等映射口径两种游标
+形态皆正确）——序由内容唯一决定（GROUP BY 分组键唯一即全序；整行重复
+互换不可观测），物化与重建共用同一文本，重建必然复现原序。修复后
+call #1 的 7 次重建全部按规范序恒等复现。
+
+**层 2（已登记，未修——PR#62 设计层缺口）：重放路径例程缓存名冲突。**
+修复层 1 后失败依旧，且诊断显示失败轮重建结果为 **0 行**（tbl=0 vs
+shared=1005）而非顺序漂移——`ENG-0032` 的 "order drift" 消息属误导性
+表述。真实因果链：SO 计划期为游标 WHERE 例程（`fnc_get_fund_data_mode`）
+的缓存分配 `sd_fn0`、为 INSERT 位例程（`fnc_get_rate_info2`）改名
+`sd_bf0` 避让；但异常行重放的原生执行按 statement 级命名
+（`sqlfn/plan.rs::format!("sd_fn{i}")`，语句内站点序）把 rate_info2
+缓存也建为 `sd_fn0`——**重放写换 `sd_fn0` 内容后，hcur_sql 的 WHERE
+查找全不匹配 → 全行过滤 → 重建空集**。时序证据：call #1 期间
+`sd_fn0` 恒为 fund_data_mode 的 4 行（重放查找打错缓存靠缺省兜底，
+未暴露）；call #2 重放时点 `sd_fn0` 空缺 → rate_info2 数据写入 →
+下一次 `ensure_hcur` 重建即空集。即重放行例程缓存与 SO 计划缓存共享
+命名空间无协调，属 PR#62 混合重放设计层缺口（其分支 16/16 为时序
+侥幸）。守护测试
+`guard_set_oriented_hybrid_hcur::should_survive_hybrid_hcur_rebuild_
+across_calls`（scale(200) 约 68s 确定性复现）以 `#[ignore]` 登记原因，
+PR#62 修复（建议：重放缓存按函数语义命名与计划缓存共用一份，或重放
+前将计划缓存内容预种到解释器命名空间）后移除 ignore 转绿。
+
+> 注意：层 2 的隐蔽面比 ENG-0032 更深——call #1 不失败，但重放行的
+> rate_info2 查找打到了 fund_data_mode 的缓存上（键形态不同必不匹配），
+> 依赖缺省值兜底；若缺省值 ≠ 真实例程返回值，重放行写入即偏离 Off。
+> 本轮语料因异常行副作用被约束为序不变（BRANCH_COVERAGE.md 种子约束）
+> 而未暴露，等价性守护无法覆盖此缺口。
+
+#### 合并语义变更登记（评审口径）
+
+- 双臂机制统一为 PR#63 D7 判别式；PR#62 route_alt 退役。THEN 臂独立
+  证明失败 → 静默降级单臂（route_alt 口径），主计划 route_guards 守
+  「THEN 不可达」，运行态拒绝仍经 SO→LP 派发缺口交 LP（两 PR 语义同时
+  成立）。
+- THEN 臂 SELECT INTO 准入合成两侧超集：PR#62 `arm_query/finish_arm`
+  （parse_total 全定义 + 处理器重置兜底 + 组内局部死）+ PR#63 活常量
+  折叠 + `parse_then_case_sink`。
+- `guard_set_oriented_lookup::should_convert_route_if_when_both_arms_are_
+  convertible`（PR#62 新增）在统一设计下转绿：TrapGroup 形态 D7 臂走查
+  打通（原 PR#63 臂内仅受理 sys_dummy CASE 形态，普通 SELECT INTO 被拒）。
+- `tests/loop_parallel.rs`：原 `should_parallelize_region_when_route_guard_
+  rejects_at_runtime` 场景在统一设计下 SO 期即转换（THEN 臂可折叠加持），
+  改名 `should_convert_dual_arm_region_when_both_arms_convertible` 断言
+  `Converted{arm=Then}` + LP 报告为空；新增
+  `should_parallelize_region_when_then_arm_unconvertible` 以 THEN 臂双变量
+  INTO（不可证）场景原样保留 `Skipped{UnsupportedControlFlow}` +
+  LP `Parallelized` 断言——SO→LP 派发缺口继续有守护。
+- `SkipReason::HybridPreflightFailed` 补 kebab 名 `hybrid-preflight-failed`
+  （PR#62 未注册，`--on-skip-error-if` 需要可引用名）。
+- docs 编号：PR#62/PR#63 各自登记 V52 撞号，PR#62 段顺延为 V55。
+## V56. PR#62 二轮评审修复实证（2026-11-25）
+
+> 编号说明：本段由 PR#62 devin 以 V53 自编号，与 PR#63 的 V53 撞号，
+> 合并树顺延为 V56（PR#62 此前实证见 V55）。
 
 ### V53.1 修复项
 
@@ -5333,3 +5587,127 @@ unsafe-libyaml unmaintained），非本 PR 引入，单独跟进。
   `<record>` 占位字面量会产生解析错误——游标列出现该类型时
   ensure_hcur 上抛（响亮失败非静默错数据）；byfund/purchase
   实测游标列均为标量，未触发。
+
+### V55.4a 终局集成与 a3ab5b0 复审验证（2026-11-25）
+
+PR#62 devin 按评审任务（task_id=pr62-fix-001）完成三：
+
+- **层 2 静默错值面**：计划侧游标位例程缓存 `sd_fnN`→`sd_pfnN` 命名空间
+  隔离（`rename_cursor_fn_cache` 词法边界扫描，覆盖 sql/seg_sql/守卫/
+  miss_outs/fn_preludes/view_preludes；解释器重放只产 `sd_fn{数字}`，
+  结构性无冲突）；新增守护 `guard_set_oriented_hybrid_fncache`（含修复前
+  Red 证据：6 行 vs 4 行分歧实测；accrual/accrual_tax 与 Off 逐值断言），
+  并修正段批写被共享事务回滚抹除的问题（段写后 COMMIT+BEGIN 边界；
+  batch_commit 下混合计划整体关闭）。
+- **ENG-0032 分因**：`HcurOrder` 四成因枚举 +
+  `SkipReason::HybridHcurMaterializeFailed`（入口物化失败与守卫证据类
+  区分）。
+- **层 1**：`sd_cur_rows` 全列 ORDER BY（与合并树 b990cc7 同源互认）。
+
+复审独立验证（opencode，feat-loop-parallel worktree @a3ab5b0）：fmt/clippy
+`-D warnings` 全绿；`cargo test --features cli` 1238 passed / 0 failed
+（zz 探针截断前）；**byfund_branch 场景独立复验 1 passed / 0 failed**
+（1422s，四配置 OUT 断言全过，ENG-0032 未再现——d854214 回灌方案 + a3ab5b0
+命名隔离叠加生效）。终局集成预期：byfund_branch 集合化恢复可用。
+=======
+- 不声称 §12.3(e) 目标可观测形态已实现：逐臂明细行
+  （`arm=… verdict=… unchecked=…`）、`guards=N/M` 计数、
+  `arm=none` 字段、未选中臂 `Unchecked(control-flow-excluded)`、
+  守卫级 `arm=` 均**未实现**。当前面只有：判定行 `arm=then|else`
+  后缀（converted/conditional 同源）+ 守卫清单只列选中臂。
+- 不声称 route 判别式/守卫支持帧绑定：渲染产物含 `$v_*` 占位符
+  即计划期 `Skipped(UnsupportedControlFlow)`（bind-free 前提由
+  `route::reject_frame_binds` 词法扫描强制，V54.6-N1）。
+
+### V54.6 评审修订记录（PR#63 第三轮 → 处置）
+
+- **N-1 route/判别式帧绑定崩溃（P2，v0.2.4 存量缺陷）** → 已修：
+  `route::discriminator`/`route::guard` 渲染后经 `shape::Tokens`
+  词法扫描 `$v_*` 占位符，命中即 `Skipped(UnsupportedControlFlow)`
+  计划期拒绝——`call`/`compile --admit` 两路均安全回退解释器，
+  不再 KERNEL-0010。守护测试
+  `fallback::should_reject_route_lookup_with_frame_bound_filter`
+  （修复前实测 KERNEL-0010 `Invalid parameter name: v_v_f`，
+  修复后 Skipped + 行集全等）。`entry.rs` bind-free 注释同步更正；
+  `route::tests` 两条单测锁定占位符命中与字面量/引号内 `$v_` 不误拒。
+- **复核补漏（同轮自查）**：V54.1 表后「不受影响」句改为「purchase
+  仅判定行 `arm=` 后缀、非收缩」；V54.4 测试 17 映射补两条 CLI 契约
+  测试名；设计 §3.2 `arm=none`/守卫行字段处加实现口径指针。
+- **N-2 门 1 例外缺口** → 已修：设计 §12.5 门 1 增第二处批准例外
+  （仍 Converted 的双臂判定行透出 `arm=` 片段）。
+- **N-3 可观测口径** → 已修：设计 §12.3(e) 示例标注为目标形态并
+  列出未实现项；§12.7 Ask-first 第 1 条注明 `control-flow-excluded`
+  本版不实现；V54.5 不声称清单同步补齐。
+- **N-4 测试收紧** → 已修：admit 断言改整行锚定
+  `ADMIT copy_partial converted arm=else|then` 并覆盖 THEN 象限；
+  `call` 侧断言同步整行锚定 + `err == ""`；新增
+  `run::tests::should_render_arm_suffix_on_conditional_verdict_line`
+  覆盖 conditional 行 `arm_suffix`；新 CLI 测试登记 V54.4 映射。
+- **N-5 fixture 去重** → 已修：`DUAL_ARM_COPY_PARTIAL`/
+  `DUAL_ARM_SCHEMA` 上收到 `tests/cli.rs`，call/compile_admit 共用。
+
+### V54.7 复审降级口径 + THEN 臂准入超集（合并模拟评审会签，PR#63 第四轮）
+
+来源：PR#63 评审 comment-7126643938 + 合并树 `sim/pr62-63-merged`
+（main + PR#62 + PR#63 三方合并）V55.4 根因分析。三项处置：
+
+1. **THEN 臂证明失败 → 静默降级单臂**（语义会签，反转「单臂失败
+   整体拒绝」）：`analyze_then_arm` 失败 `.ok()` 丢弃备选；
+   `gen_arm_plan` 先证 THEN 臂 `generate()`，失败同样降级
+   （`generate(...)?.ok()`，`EngineError` 仍上抛）。降级产物 =
+   `discriminator=None` 单臂 ELSE 计划 + `route_guards` 守
+   「THEN 不可达」：ELSE 活跃数据 `Converted{arm:None}`，THEN
+   活跃数据运行态守卫拒绝 `Skipped{UnsupportedControlFlow}`——
+   该拒绝点即 PR#62 `try_loop_parallel_region` 接管触发点，
+   恢复 SO→LP 派发缺口（本分支无 LP，`Parallelized` 断言随
+   PR#62 合入补齐）。**与合并树的差异如实登记**：合并树仅降级
+   分析期失败、生成期失败仍整体拒绝；本分支按会签口径把降级
+   扩到生成期（`copy_route` 表达式写场景由此转为降级而非
+   `Skipped{UnsupportedWrite}`），覆盖面更大且同样保守。
+2. **THEN 臂准入超集**（合并树 `arm_query`/`finish_arm` 移植）：
+   TrapGroup 路由 IF 的 THEN 臂不再限 `parse_then_case_sink`
+   （case_sink×sys_dummy），改走 `lookup::parse_total` 全定义
+   证明 + 处理器重置兜底 + 组内局部死（豁免区 = ELSE 臂 pc
+   区间）；`finish_arm` 不记 route（臂计划无路由守卫，运行期
+   判别式选臂）。`fallback_if_group_at` 升级结构化 `IfGroup`
+   返回（cond/group/resume/else_start/then_range/else_range/
+   resets），`RouteSite::TrapGroup` 去 `push_pc`。守护
+   `fallback::should_convert_route_if_when_both_arms_are_
+   convertible`（合并树移植，THEN=普通 SELECT INTO+CASE 写汇
+   双臂 route='1'/'0' 均 `Converted`）转绿；byfund TrapGroup
+   路由 IF 形态由此可证。
+3. **`set_oriented_lookup_top1.rs` 生效性复核**：复审称「未注册
+   + 无父模块声明」——实测 `guard_set_oriented_lookup.rs:37`
+   `#[path] mod top1` 自 `6e57f85` 起已挂接，`guard_set_
+   oriented_lookup` 目标在 Cargo.toml:132 已注册，14 个用例
+   实际在跑（独立编译报错仅因误当独立目标）。断言按降级口径
+   重写：`top1::should_downgrade_to_single_arm_and_reject_then_
+   at_runtime_when_arm_unproven`（ELSE 数据 `Converted{arm:None}`
+   ×4 seed；THEN 数据 `'1'/'X'` → `Skipped{UnsupportedControlFlow}`
+   + 行集与 Off 全等）；新增
+   `fallback::should_reject_at_runtime_for_lp_takeover_when_then_
+   arm_unconvertible`（THEN 臂双变量 INTO 不可证 → 分析期降级 →
+   运行态拒绝，SO 侧接管点守护）。
+>>>>>>> 0657715
+
+### V55.4b 终局集成矩阵（两 PR 修复全部落地后，2026-11-25）
+
+终局树 = main + PR#62 head a3ab5b0 + PR#63 head 0657715 全量合并
+（1281 测试全绿）。byfund_branch **集合化恢复可用**（层 2 命名隔离 +
+回灌重建叠加生效，ENG-0032 未再现）：
+
+| 场景 | off | so_ba | lp_safe | so_lp | 最优 |
+|---|---|---|---|---|---|
+| purchase_base | 13.7s | 5.1s（2.7×） | 5.8s | **3.7s（3.7×）** | so_lp |
+| purchase_branch_k0（arm=Else） | 29.6s | 2.8s（10.6×） | 27.0s | **2.9s（10.2×）** | so_lp |
+| purchase_branch_k1（arm=Then） | 32.7s | 3.9s（8.3×） | 28.3s | **3.7s（8.8×）** | so_lp |
+| byfund_base | 134.3s | 4.3s（31.5×） | 82.7s | **4.2s（31.7×）** | so_lp≈so_ba |
+| byfund_branch | 140.6s | 110.3s（1.3×） | **78.8s（1.8×）** | 107.1s（1.3×） | lp_safe |
+
+- 等价：全部场景/配置 OUT 与用户表状态逐值 EQ（9 处 outs=EQ 断言行）。
+- D7 选臂：k1 `Converted{arm:Some(Then)}`、k0 `Converted{arm:Some(Else)}`
+  （本轮矩阵报表口径同 V55.4）。
+- byfund_branch 通道结论：lp_safe 1.8× 为该场景最优；集合化可用但仅
+  1.3×（混合路径的段批写+异常行重放固有成本），供数据特征选型。
+- 探针报告：`golden/v4_loop_parallel_verify/reports/probe_run.log`
+  （16/16，1451.50s）。

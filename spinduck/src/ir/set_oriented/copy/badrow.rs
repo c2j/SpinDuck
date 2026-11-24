@@ -5,8 +5,9 @@ use super::{shape, Table};
 /// `sd_cur` 行集带 0 基 `__sd_rn` 的物化 SELECT（混合调度单次物化
 /// 与 CTE 形态共用同一编号口径）。`ROW_NUMBER()` 行序由**全列规范化
 /// `ORDER BY`** 决定：序由内容唯一决定——GROUP BY 游标的分组键是输出
-/// 行唯一键即全序；普通游标整行重复互换不可观测（合并模拟 byfund_branch
-/// 确定性复现 ENG-0032 后修复，移植自 sim/pr62-63-merged b990cc7）。
+/// 行唯一键即全序；普通游标整行重复互换不可观测。物化与重建
+/// （`ensure_hcur` 回灌路径之外的入口物化）共用同一文本；投影列为空
+/// 时退回无序形态（调用方 `hcur_order_ok` 仍以冻结行集兜底）。
 pub(in crate::ir::set_oriented) fn sd_cur_rows(select: &shape::Select, source: &Table) -> String {
     let inner = if let Some(v) = &select.verbatim {
         v.clone()

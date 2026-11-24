@@ -279,6 +279,11 @@ fn projection(
         if let Some((_, ie)) = region.inlined.iter().find(|(iv, _)| iv == v) {
             return inline_projection(region, to, (v, ie), env);
         }
+        // D7 THEN 臂活常量折叠：字面量逐行同值，写汇 TRY_CAST 守卫同口径。
+        if let Some((_, c)) = region.folded.iter().find(|(fv, _)| fv == v) {
+            let lit = crate::sql::render::const_to_sql(c).ok_or(SkipReason::UnprovenExpression)?;
+            return Ok(expr::at_write_sink(lit, to));
+        }
         if let Some(g) = tuple_projection(to, v, env)? {
             return Ok(g);
         }

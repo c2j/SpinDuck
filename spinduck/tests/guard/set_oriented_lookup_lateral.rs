@@ -77,7 +77,9 @@ fn should_exempt_unreachable_then_reads_from_group_local_dead_proof() {
         eng.set_oriented_reports()[0]
     );
 
-    // THEN 可达种子：op='X' 命中 kind='1' → v_route='1'，守卫失败 → 退回解释。
+    // D7 双臂：THEN 臂对仅 ELSE 写入的 v_ct 按「本臂恒 NULL」折叠
+    // （CASE NULL WHEN → 恒取 ELSE 支），两臂均可证 → Converted。
+    // 判别值 '1' → 选 THEN 臂批写，与解释执行逐行一致。
     let seed = "INSERT INTO route_tab VALUES ('1', 'X')";
     let mut baseline = setup_copy_partial_then(seed);
     baseline.call("copy_partial_then", &[]).unwrap();
@@ -86,13 +88,127 @@ fn should_exempt_unreachable_then_reads_from_group_local_dead_proof() {
     eng.set_oriented = SetOrientedMode::BatchAtomic;
     eng.call("copy_partial_then", &[]).unwrap();
     assert_eq!(rows_copy_partial_then(&eng), expected);
-    assert_eq!(
-        eng.set_oriented_reports()[0].status,
-        Status::Skipped {
-            reason: SkipReason::UnsupportedControlFlow
-        }
+    assert!(
+        matches!(
+            eng.set_oriented_reports()[0].status,
+            Status::Converted {
+                arm: Some(Arm::Then),
+                ..
+            }
+        ),
+        "report: {:?}",
+        eng.set_oriented_reports()[0]
     );
 }
+/// D7 臂前导前移探测守护：THEN 臂 trap 包裹的视图查找产生
+/// `view_preludes`，其物化（`CREATE … AS SELECT * FROM v_bad`）在
+/// `CAST('abc' AS INTEGER)` 上必失败。前移探测必须覆盖臂计划——
+/// 否则选中 THEN 臂时 `pick_arm` 内物化失败会中止事务、把整调用
+/// 打成内核错；探测覆盖后 ROLLBACK 重开、整段按原 IR 解释执行，
+/// 调用成功且行集与 Off 全等（未选中臂的坏视图同样保守整段回退）。
+fn setup_copy_arm_view(seed: &str, raw: &str) -> Engine {
+    let sql = "CREATE PROCEDURE copy_arm_view IS v_yj VARCHAR2(10); v_ct VARCHAR2(10); \
+        v_route VARCHAR2(10); v_x INTEGER; BEGIN \
+        FOR r IN SELECT a, k, yj_a, yj_b FROM source_rows LOOP \
+        BEGIN SELECT kind INTO v_route FROM route_tab WHERE op = 'X'; \
+        EXCEPTION WHEN OTHERS THEN v_route := '0'; END; \
+        BEGIN \
+        IF v_route = '1' THEN \
+        BEGIN SELECT vv INTO v_x FROM v_bad WHERE k = r.k; \
+        EXCEPTION WHEN OTHERS THEN v_x := 0; END; \
+        SELECT CASE v_x WHEN 0 THEN r.yj_a ELSE r.yj_b END INTO v_yj FROM sys_dummy; \
+        ELSE \
+        SELECT ct INTO v_ct FROM v_ok WHERE v_ok.k = r.k; \
+        SELECT CASE v_ct WHEN 'A' THEN r.yj_a WHEN 'B' THEN r.yj_b ELSE r.yj_a END \
+        INTO v_yj FROM sys_dummy; \
+        END IF; \
+        EXCEPTION WHEN OTHERS THEN v_yj := '0'; END; \
+        INSERT INTO target_rows(val, yj) VALUES (r.a, v_yj); \
+        END LOOP; END;";
+    let mut eng = Engine::new(
+        Box::new(DuckExecutor::open_in_memory().unwrap()),
+        RuleRegistry::default(),
+    );
+    let dim_bad_insert = format!("INSERT INTO dim_bad VALUES ('K1', '{raw}')");
+    for ddl in [
+        "CREATE TABLE source_rows(a BIGINT, k VARCHAR, yj_a VARCHAR, yj_b VARCHAR)",
+        "CREATE TABLE target_rows(val BIGINT, yj VARCHAR)",
+        "INSERT INTO source_rows VALUES (10, 'K1', 'AA1', 'BB1'), (20, 'K2', 'AA2', 'BB2')",
+        "CREATE TABLE route_tab(kind VARCHAR, op VARCHAR)",
+        seed,
+        "CREATE TABLE dim_tab(k VARCHAR, ct VARCHAR)",
+        "INSERT INTO dim_tab VALUES ('K1', 'A'), ('K2', 'B')",
+        // ELSE 臂同样落视图：两臂 view_preludes 同名 sd_vw0 而内容不同
+        // ——锁定「选中臂前导最后物化生效」的隐式次序前提（§12.3(c)）。
+        "CREATE VIEW v_ok AS SELECT k, ct FROM dim_tab",
+        "CREATE TABLE dim_bad(k VARCHAR, raw VARCHAR)",
+        dim_bad_insert.as_str(),
+        "CREATE VIEW v_bad AS SELECT k, CAST(raw AS INTEGER) AS vv FROM dim_bad",
+        "CREATE TABLE sys_dummy(dummy VARCHAR)",
+        "INSERT INTO sys_dummy VALUES ('X')",
+    ] {
+        eng.ex.execute(ddl, &BindMap::new()).unwrap();
+    }
+    eng.register(sql).unwrap();
+    eng
+}
+
+#[test]
+fn should_probe_then_arm_view_preludes_before_user_code() {
+    for seed in [
+        "INSERT INTO route_tab VALUES ('1', 'X')",
+        "INSERT INTO route_tab VALUES ('0', 'X')",
+    ] {
+        let mut baseline = setup_copy_arm_view(seed, "abc");
+        baseline.call("copy_arm_view", &[]).unwrap();
+        let expected = rows_copy_partial_then(&baseline);
+
+        let mut eng = setup_copy_arm_view(seed, "abc");
+        eng.set_oriented = SetOrientedMode::BatchAtomic;
+        eng.call("copy_arm_view", &[]).unwrap();
+        assert_eq!(rows_copy_partial_then(&eng), expected, "seed: {seed}");
+        assert_eq!(
+            eng.set_oriented_reports()[0].status,
+            Status::Skipped {
+                reason: SkipReason::UnprovenQueryTotalness
+            },
+            "seed: {seed}, report: {:?}",
+            eng.set_oriented_reports()[0]
+        );
+    }
+}
+
+/// 同 fixture 的健康视图对照：臂 `view_preludes` 物化成功时双臂照常
+/// Converted 并按判别式选臂——证明上例的 Skipped 来自前移探测而非
+/// 计划期拒绝（`UnprovenQueryTotalness` 只在探测失败路径产出）。
+#[test]
+fn should_convert_arm_view_preludes_when_materialization_succeeds() {
+    for (seed, arm) in [
+        ("INSERT INTO route_tab VALUES ('1', 'X')", Arm::Then),
+        ("INSERT INTO route_tab VALUES ('0', 'X')", Arm::Else),
+    ] {
+        let mut baseline = setup_copy_arm_view(seed, "123");
+        baseline.call("copy_arm_view", &[]).unwrap();
+        let expected = rows_copy_partial_then(&baseline);
+
+        let mut eng = setup_copy_arm_view(seed, "123");
+        eng.set_oriented = SetOrientedMode::BatchAtomic;
+        eng.call("copy_arm_view", &[]).unwrap();
+        assert_eq!(rows_copy_partial_then(&eng), expected, "seed: {seed}");
+        assert!(
+            matches!(
+                eng.set_oriented_reports()[0].status,
+                Status::Converted {
+                    arm: Some(got),
+                    ..
+                } if got == arm
+            ),
+            "seed: {seed}, report: {:?}",
+            eng.set_oriented_reports()[0]
+        );
+    }
+}
+
 fn setup_copy_inlist(seeds: &[&str]) -> Engine {
     let sql = "CREATE PROCEDURE copy_inlist IS v_ct VARCHAR2(10); BEGIN \
         FOR r IN SELECT a, market_code, seat_code, stock_kind FROM source_rows LOOP \

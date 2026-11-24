@@ -6,6 +6,7 @@
 
 pub(crate) mod call;
 mod compile;
+mod compile_admit;
 mod compile_project;
 pub(crate) mod io;
 
@@ -14,7 +15,9 @@ use compile::{compile_cmd, explain_cmd};
 use compile_project::compile_project_cmd;
 #[cfg(test)]
 pub(crate) use compile_project::compile_with_source;
-pub use compile_project::{compile_project_with_source, ProjectCompile};
+pub use compile_project::{
+    compile_project_admit_with_source, compile_project_with_source, ProjectCompile,
+};
 use io::{cmd_materialize, cmd_sync, materialize_cmd, sync_cmd};
 
 use crate::cli::args::{parse, usage, Command};
@@ -86,6 +89,10 @@ pub(crate) fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError
             analyze,
             codeweb_project,
             sync_manifest,
+            admit,
+            db,
+            set_oriented,
+            admit_record,
         } => compile_project_cmd(
             ProjectCompile {
                 dir,
@@ -94,6 +101,10 @@ pub(crate) fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError
                 analyze,
                 codeweb_project,
                 sync_manifest,
+                admit,
+                db,
+                set_oriented,
+                admit_record,
             },
             out,
         ),
@@ -127,6 +138,33 @@ pub(crate) fn exec(cmd: Command, out: &mut dyn Write) -> Result<i32, EngineError
 
 pub(super) fn io_err(e: std::io::Error) -> EngineError {
     EngineError::env(13, format!("stdout: {e}"))
+}
+
+/// `SET_ORIENTED`/`ADMIT` 判定行共用片段（设计 v3.1 §3.2 同源铁律：
+/// 两个前缀必须出自同一格式化函数，判定口径不允许两套）。
+pub(crate) fn skipped_reason_body(
+    routine: &str,
+    reason: crate::ir::set_oriented::SkipReason,
+) -> String {
+    format!("{routine} skipped reason={reason:?}")
+}
+
+/// `converted` 判定行主体：双臂计划（§12 D7）附 `arm=then|else`，
+/// 单臂恒无后缀——`SET_ORIENTED`/`ADMIT` 两前缀共用同一函数（§3.2 铁律）。
+pub(crate) fn converted_body(routine: &str, arm: Option<crate::ir::set_oriented::Arm>) -> String {
+    match arm {
+        Some(a) => format!("{routine} converted arm={}", a.as_str()),
+        None => format!("{routine} converted"),
+    }
+}
+
+/// `arm=` 后缀片段：conditional 等非 converted 判定行同样透出选中臂
+/// （判别式已在 admit 数据面求值，臂标签与 converted 行同源）。
+pub(crate) fn arm_suffix(arm: Option<crate::ir::set_oriented::Arm>) -> String {
+    match arm {
+        Some(a) => format!(" arm={}", a.as_str()),
+        None => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +209,24 @@ mod tests {
         let (code, out) = run_str(&["rules", "probe", &p.to_string_lossy()]);
         assert_eq!(code, EXIT_FAIL);
         assert!(out.contains("match=false"), "{out}");
+    }
+
+    #[test]
+    fn should_render_arm_suffix_on_conditional_verdict_line() {
+        // §12.3(e)：conditional 判定行与 converted 同源透出选中臂——
+        // `ADMIT <r> conditional arm=then|else`（单臂无后缀）。
+        use crate::ir::set_oriented::Arm;
+        let line =
+            |arm: Option<Arm>| format!("ADMIT {} conditional{}", "copy_partial", arm_suffix(arm));
+        assert_eq!(
+            line(Some(Arm::Then)),
+            "ADMIT copy_partial conditional arm=then"
+        );
+        assert_eq!(
+            line(Some(Arm::Else)),
+            "ADMIT copy_partial conditional arm=else"
+        );
+        assert_eq!(line(None), "ADMIT copy_partial conditional");
     }
 
     #[test]

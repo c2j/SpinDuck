@@ -2,7 +2,7 @@
 #![cfg(feature = "native")]
 
 use spinduck_core::exec::{ExecOutcome, RowStream, SqlExecutor};
-use spinduck_core::ir::set_oriented::{SetOrientedMode, SkipReason, Status};
+use spinduck_core::ir::set_oriented::{Arm, SetOrientedMode, SkipReason, Status};
 use spinduck_core::project::ProjectConfig;
 use spinduck_core::verify::deploy_project;
 use spinduck_core::{BindMap, DuckExecutor, Engine, EngineError, RuleRegistry, SpinValue};
@@ -102,7 +102,14 @@ fn check_variant(label: &str, sql: &[&str], count: usize, skipped: Option<SkipRe
         let status = &batch.set_oriented_reports()[0].status;
         match (skipped, candidate) {
             (Some(reason), _) => assert_eq!(*status, Status::Skipped { reason }, "{label}"),
-            (None, Some(sql)) => assert_eq!(*status, Status::Converted { sql }, "{label}"),
+            (None, Some(sql)) => assert_eq!(
+                *status,
+                Status::Converted {
+                    sql,
+                    arm: Some(Arm::Else)
+                },
+                "{label}"
+            ),
             (None, None) => assert!(
                 matches!(status, Status::Converted { .. }),
                 "{label}: {status:?}"
@@ -209,7 +216,10 @@ fn should_compile_full_purchase_candidate_offline_and_reuse_it_with_typed_hash_e
     );
     assert_eq!(
         batch.set_oriented_reports()[0].status,
-        Status::Converted { sql }
+        Status::Converted {
+            sql,
+            arm: Some(Arm::Else)
+        }
     );
 }
 
@@ -343,7 +353,13 @@ fn should_gain_end_to_end_on_scaled_purchase_corpus_including_all_guards() {
             "runtime"
         };
         match candidate {
-            Some(sql) => assert_eq!(*status, Status::Converted { sql }),
+            Some(sql) => assert_eq!(
+                *status,
+                Status::Converted {
+                    sql,
+                    arm: Some(Arm::Else)
+                }
+            ),
             None => assert!(matches!(status, Status::Converted { .. }), "{status:?}"),
         }
         eprintln!("[corpus-perf] {path} 1000 rows: off={baseline:?} batch={optimized:?} speedup={:.2}x sha256={hash}",
@@ -500,7 +516,11 @@ fn should_keep_prc_trd_deal_purchase_single_region_conversion_unchanged() {
     assert_eq!(rows(&batch), expected_rows, "typed rows 与 Off 逐行一致");
 
     assert_eq!(batch.set_oriented_reports().len(), 1);
-    let Status::Converted { sql } = &batch.set_oriented_reports()[0].status else {
+    let Status::Converted {
+        sql,
+        arm: Some(Arm::Else),
+    } = &batch.set_oriented_reports()[0].status
+    else {
         panic!("{:?}", batch.set_oriented_reports());
     };
     // 三事件序：集合 SQL 的 TraceEvent::SqlExec 前一条必须是

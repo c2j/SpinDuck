@@ -58,7 +58,7 @@ fn should_not_commit_the_batch_when_every_source_row_is_filtered() {
     eng.set_oriented = SetOrientedMode::BatchAtomic;
     calls.borrow_mut().clear();
     eng.call("copy_filtered", &[]).unwrap();
-    let Status::Converted { sql } = &eng.set_oriented_reports()[0].status else {
+    let Status::Converted { sql, .. } = &eng.set_oriented_reports()[0].status else {
         panic!("{:?}", eng.set_oriented_reports());
     };
     assert_eq!(

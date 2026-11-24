@@ -195,12 +195,56 @@ fn fee_rows(fees: &[&str]) -> Vec<Vec<SpinValue>> {
 }
 
 #[test]
-fn should_parallelize_region_when_route_guard_rejects_at_runtime() {
-    use spinduck_core::ir::set_oriented::{SkipReason, Status};
+fn should_convert_dual_arm_region_when_both_arms_convertible() {
+    // 合并语义（PR#62 route_alt × PR#63 D7 判别式统一）：THEN 臂
+    // `v_fee := 'T'` 经 D7 臂内活常量折叠可证 → 双臂计划，运行期判别式
+    // 恰一行标签选臂——kind='1' 时 SO 直接 Converted{arm=Then} 批写，
+    // 不再 Skipped 后交 loop-parallel（PR#62 原口径）。输出逐值等价；
+    // LP 缺口由 THEN 臂不可证场景继续覆盖（见下方 parallelize 测试）。
+    use spinduck_core::ir::set_oriented::{Arm, Status};
     let mut eng = route_engine("1", LoopParallelMode::Safe);
     eng.call("p_route", &[]).unwrap();
     // THEN 臂生效：v_fee 恒为 'T'
     assert_eq!(route_fees(&eng), fee_rows(&["T", "T", "T", "T", "T"]));
+    assert!(matches!(
+        eng.set_oriented_reports()[0].status,
+        Status::Converted {
+            arm: Some(Arm::Then),
+            ..
+        }
+    ));
+    // 双臂均可证：SO 已批写，LP 无需接管。
+    assert!(eng.loop_parallel_reports().is_empty());
+}
+
+#[test]
+fn should_parallelize_region_when_then_arm_unconvertible() {
+    // SO→LP 派发缺口（PR#62 口径保留）：THEN 臂 `SELECT id, payload
+    // INTO v_fee, v_extra` 为双变量 INTO——臂内准入拒绝 → 降级单臂
+    // （discriminator=None），运行态 route guard 拒绝（kind='1' 数据走
+    // THEN）→ 末区域交 loop-parallel 接管，前缀已执行，LP 只补 OPEN 段。
+    const ROUTE_PROC_WIDE: &str = "CREATE PROCEDURE p_route IS \
+    v_kind VARCHAR; v_fee VARCHAR; v_extra VARCHAR; \
+    BEGIN \
+    FOR r IN SELECT id, payload FROM source_rows LOOP \
+        BEGIN \
+            SELECT kind_id INTO v_kind FROM switches WHERE operation_kind = 'SW'; \
+        EXCEPTION WHEN OTHERS THEN v_kind := '0'; END; \
+        BEGIN \
+            IF v_kind = '1' THEN \
+                SELECT id, payload INTO v_fee, v_extra FROM source_rows WHERE source_rows.id = r.id; \
+            ELSE \
+                SELECT fee INTO v_fee FROM fee_tbl WHERE fee_tbl.id = r.id; \
+            END IF; \
+        EXCEPTION WHEN OTHERS THEN v_fee := 'D'; END; \
+        INSERT INTO target_rows(id, fee) VALUES (r.id, v_fee); \
+    END LOOP; END;";
+    use spinduck_core::ir::set_oriented::{SkipReason, Status};
+    let mut eng = route_engine("1", LoopParallelMode::Safe);
+    eng.register(ROUTE_PROC_WIDE).unwrap();
+    eng.call("p_route", &[]).unwrap();
+    // THEN 臂生效：v_fee = r.id（第一列），处理器不触发
+    assert_eq!(route_fees(&eng), fee_rows(&["1", "2", "3", "4", "5"]));
     assert!(matches!(
         eng.set_oriented_reports()[0].status,
         Status::Skipped {

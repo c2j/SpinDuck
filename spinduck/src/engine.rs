@@ -25,6 +25,10 @@ pub use support::{param_names_to_vars, var_target, EvalCtx};
 pub use batch_hooks::CompiledRoutineCache;
 
 /// 引擎：执行器 + 规则 + 例程目录。
+/// 集合化报告即时回调（'static：Engine 持有期间不能借用调用方缓冲，
+/// 见 `call --on-skip` 的 stdout 直写约定）。
+type SetOrientedReportHook = Box<dyn FnMut(&crate::ir::set_oriented::Report)>;
+
 pub struct Engine {
     pub ex: Box<dyn SqlExecutor>,
     pub rules: RuleRegistry,
@@ -40,6 +44,9 @@ pub struct Engine {
     /// 默认关闭的受限静态集合化，不与 batch_commit 叠加。
     pub set_oriented: crate::ir::set_oriented::SetOrientedMode,
     set_oriented_reports: Vec<crate::ir::set_oriented::Report>,
+    /// 集合化报告即时回调（`call --on-skip` 判定行前移，设计 v3.1 §5 B2/D8）：
+    /// `push_report` 内同步调用；`None` = 仅事后 `set_oriented_reports()` 读取。
+    pub on_set_oriented_report: Option<SetOrientedReportHook>,
     /// 集合化退回后的二级降级并行通道（默认全关；设计 loop-parallel §2）。
     pub loop_parallel: crate::ir::loop_parallel::LoopParallelConfig,
     loop_parallel_reports: Vec<crate::ir::loop_parallel::LoopParallelReport>,
@@ -89,6 +96,7 @@ impl Engine {
             batch_commit: false,
             set_oriented: crate::ir::set_oriented::SetOrientedMode::Off,
             set_oriented_reports: Vec::new(),
+            on_set_oriented_report: None,
             loop_parallel: crate::ir::loop_parallel::LoopParallelConfig::default(),
             loop_parallel_reports: Vec::new(),
             memo,

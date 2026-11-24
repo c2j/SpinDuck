@@ -31,6 +31,9 @@ pub(super) fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
     let mut db: Option<PathBuf> = None;
     let mut batch_commit = false;
     let mut set_oriented = None;
+    let mut on_skip = None;
+    let mut on_skip_error_if: std::collections::BTreeSet<crate::ir::set_oriented::SkipReason> =
+        std::collections::BTreeSet::new();
     let mut loop_parallel = None;
     let mut step_budget: Option<u64> = None;
     let mut rules = None;
@@ -76,6 +79,33 @@ pub(super) fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
                     crate::ir::set_oriented::SetOrientedMode::from_name(name)
                         .ok_or_else(|| usage_err("--set-oriented[=off|strict|batch-atomic]"))?,
                 );
+            }
+            flag if flag == "--on-skip" || flag.starts_with("--on-skip=") => {
+                if on_skip.is_some() {
+                    return Err(dup_flag_err("--on-skip"));
+                }
+                let name = flag.strip_prefix("--on-skip=").unwrap_or("report");
+                on_skip = Some(
+                    crate::ir::set_oriented::OnSkip::from_name(name)
+                        .ok_or_else(|| usage_err("--on-skip[=report|error]"))?,
+                );
+            }
+            "--on-skip-error-if" => {
+                if !on_skip_error_if.is_empty() {
+                    return Err(dup_flag_err("--on-skip-error-if"));
+                }
+                let list = it
+                    .next()
+                    .ok_or_else(|| usage_err("--on-skip-error-if <reason,...>"))?;
+                for name in list.split(',') {
+                    let reason =
+                        crate::ir::set_oriented::SkipReason::from_name(name).ok_or_else(|| {
+                            usage_err(format!(
+                                "--on-skip-error-if 含未知 reason {name}（kebab 口径见工件）"
+                            ))
+                        })?;
+                    on_skip_error_if.insert(reason);
+                }
             }
             flag if flag == "--loop-parallel" || flag.starts_with("--loop-parallel=") => {
                 if loop_parallel.is_some() {
@@ -167,6 +197,10 @@ pub(super) fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
             }
         }
     }
+    // 逃生阀只对 error 语义有意义；无 --on-skip 时名单无处可去。
+    if !on_skip_error_if.is_empty() && on_skip.is_none() {
+        return Err(usage_err("--on-skip-error-if 需要 --on-skip[=error]"));
+    }
     // 形态与级别是给汇用的：没有落盘路径就没有承接者，静默收下等于给出"有日志"的假象。
     if trace.is_none() && (trace_format.is_some() || trace_level.is_some()) {
         return Err(usage_err(
@@ -181,6 +215,8 @@ pub(super) fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
         args,
         batch_commit,
         set_oriented,
+        on_skip,
+        on_skip_error_if,
         loop_parallel,
         step_budget,
         trace,
@@ -222,6 +258,8 @@ mod tests {
                     args: v(&["'batch-atomic'"]),
                     batch_commit: false,
                     set_oriented: Some(mode),
+                    on_skip: None,
+                    on_skip_error_if: std::collections::BTreeSet::new(),
                     loop_parallel: None,
                     step_budget: None,
                     trace: None,
@@ -329,6 +367,8 @@ mod tests {
                 args: v(&["1", "2"]),
                 batch_commit: false,
                 set_oriented: None,
+                on_skip: None,
+                on_skip_error_if: std::collections::BTreeSet::new(),
                 loop_parallel: None,
                 step_budget: None,
                 trace: None,
@@ -362,6 +402,8 @@ mod tests {
                 args: v(&["'20250715'", "'0130000001'"]),
                 batch_commit: false,
                 set_oriented: None,
+                on_skip: None,
+                on_skip_error_if: std::collections::BTreeSet::new(),
                 loop_parallel: None,
                 step_budget: None,
                 trace: None,
@@ -385,6 +427,8 @@ mod tests {
                 args: vec![],
                 batch_commit: false,
                 set_oriented: None,
+                on_skip: None,
+                on_skip_error_if: std::collections::BTreeSet::new(),
                 loop_parallel: None,
                 step_budget: Some(20_000_000),
                 trace: None,
@@ -468,6 +512,83 @@ mod tests {
             let e = parse(&argv).unwrap_err();
             assert_eq!(e.code.to_string(), "ENG-0010", "{argv:?}");
             assert!(e.message.contains("--trace"), "{}", e.message);
+        }
+    }
+
+    #[test]
+    fn should_parse_on_skip_flags() {
+        use crate::ir::set_oriented::{OnSkip, SkipReason};
+        // 裸 --on-skip = report；=error 显式；error-if 名单 kebab 反查。
+        match parse(&v(&["call", "--on-skip", "r"])).unwrap() {
+            Command::Call {
+                on_skip,
+                on_skip_error_if,
+                ..
+            } => {
+                assert_eq!(on_skip, Some(OnSkip::Report));
+                assert!(on_skip_error_if.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&v(&[
+            "call",
+            "--on-skip=error",
+            "--on-skip-error-if",
+            "unsupported-control-flow,unknown-object-dependency",
+            "r",
+        ]))
+        .unwrap()
+        {
+            Command::Call {
+                on_skip,
+                on_skip_error_if,
+                ..
+            } => {
+                assert_eq!(on_skip, Some(OnSkip::Error));
+                assert_eq!(
+                    on_skip_error_if,
+                    [
+                        SkipReason::UnsupportedControlFlow,
+                        SkipReason::UnknownObjectDependency
+                    ]
+                    .into_iter()
+                    .collect()
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn should_reject_bad_on_skip_usage() {
+        for argv in [
+            v(&["call", "--on-skip=bogus", "r"]),
+            v(&["call", "--on-skip", "--on-skip=error", "r"]),
+            v(&[
+                "call",
+                "--on-skip-error-if",
+                "unsupported-control-flow",
+                "r",
+            ]),
+            v(&[
+                "call",
+                "--on-skip-error-if",
+                "not-a-reason",
+                "--on-skip=error",
+                "r",
+            ]),
+            v(&[
+                "call",
+                "--on-skip-error-if",
+                "a",
+                "--on-skip-error-if",
+                "b",
+                "--on-skip",
+                "r",
+            ]),
+        ] {
+            let e = parse(&argv).unwrap_err();
+            assert_eq!(e.code.to_string(), "ENG-0010", "{argv:?}");
         }
     }
 

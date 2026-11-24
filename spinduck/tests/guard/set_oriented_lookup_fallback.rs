@@ -254,11 +254,11 @@ fn rows_copy_if_trap(eng: &Engine) -> Vec<Vec<SpinValue>> {
 
 #[test]
 fn should_route_invariant_if_inside_const_fallback_trap() {
-    // 设计 §4.3 + §4.4 B1：WHEN OTHERS 常量兜底闭包的主线含 IF 路由——
-    // 条件为循环不变兜底查找变量 v_route = '1'，入口以三值判据证明 THEN
-    // 不可达后仅集合化 ELSE 兜底查找组；处理器同序重置全部组成员（全量
-    // 兜底）。v_route = '1' 为真时无损退回解释执行（THEN 写 'U'）。
-    // THEN 不可达：ELSE 相关查找命中取 AA/BB，K3 落空兜底 '0'。
+    // 设计 §4.3 + §4.4 B1 + D7：条件为循环不变兜底查找变量
+    // v_route = '1' 的 IF 路由——THEN 写 'U'、ELSE 走兜底查找组。
+    // D7 双臂：THEN/ELSE 各自独立分析，运行期判别式选臂。判别值不等
+    // '1'（含 NULL——SQL `=` 三值语义落 ELSE，与 PL IF 及 PR#62
+    // route::pick 口径一致）→ ELSE 臂 Converted。
     for seed in [
         "INSERT INTO route_tab VALUES ('1', 'OTHER')",
         "INSERT INTO route_tab VALUES ('0', 'X')",
@@ -276,16 +276,19 @@ fn should_route_invariant_if_inside_const_fallback_trap() {
         eng.set_oriented = SetOrientedMode::BatchAtomic;
         eng.call("copy_if_trap", &[]).unwrap();
         assert_eq!(rows_copy_if_trap(&eng), expected, "seed: {seed}");
+        let report = &eng.set_oriented_reports()[0];
         assert!(
             matches!(
-                eng.set_oriented_reports()[0].status,
-                Status::Converted { .. }
+                report.status,
+                Status::Converted {
+                    arm: Some(Arm::Else),
+                    ..
+                }
             ),
-            "seed: {seed}, report: {:?}",
-            eng.set_oriented_reports()[0]
+            "seed: {seed}, report: {report:?}"
         );
     }
-    // THEN 可达：v_route = '1' → 入口守卫失败，退回解释执行写 'U'。
+    // THEN 可达：判别值 '1' → 选 THEN 臂批写 'U'，与解释执行逐行一致。
     let seed = "INSERT INTO route_tab VALUES ('1', 'X')";
     let mut baseline = setup_copy_if_trap(seed);
     baseline.call("copy_if_trap", &[]).unwrap();
@@ -296,11 +299,16 @@ fn should_route_invariant_if_inside_const_fallback_trap() {
     eng.set_oriented = SetOrientedMode::BatchAtomic;
     eng.call("copy_if_trap", &[]).unwrap();
     assert_eq!(rows_copy_if_trap(&eng), expected);
-    assert_eq!(
-        eng.set_oriented_reports()[0].status,
-        Status::Skipped {
-            reason: SkipReason::UnsupportedControlFlow
-        }
+    assert!(
+        matches!(
+            eng.set_oriented_reports()[0].status,
+            Status::Converted {
+                arm: Some(Arm::Then),
+                ..
+            }
+        ),
+        "report: {:?}",
+        eng.set_oriented_reports()[0]
     );
 }
 fn setup_copy_partial(seed: &str) -> Engine {
@@ -441,8 +449,68 @@ fn should_reject_partial_fallback_when_intermediate_is_live_out() {
     );
 }
 
+fn setup_copy_route_bound() -> Engine {
+    // N-1 回归 fixture：route 查找过滤引用帧变量 v_f（循环不变量但帧绑定），
+    // 判别式渲染产物含 `$v_*` 占位符；bind-free 前提不成立，计划期必须拒绝。
+    let sql = "CREATE PROCEDURE copy_route_bound IS v_yj VARCHAR2(10); v_ct VARCHAR2(10); v_route VARCHAR2(10); v_f VARCHAR2(10); BEGIN \
+        v_f := 'X'; \
+        FOR r IN SELECT a, k, yj_a, yj_b FROM source_rows LOOP \
+        BEGIN SELECT kind INTO v_route FROM route_tab WHERE op = v_f; \
+        EXCEPTION WHEN OTHERS THEN v_route := '0'; END; \
+        BEGIN \
+        IF v_route = '1' THEN v_yj := 'U'; \
+        ELSE \
+        SELECT ct INTO v_ct FROM dim_tab WHERE dim_tab.k = r.k; \
+        SELECT CASE v_ct WHEN 'A' THEN r.yj_a WHEN 'B' THEN r.yj_b ELSE r.yj_a END INTO v_yj FROM sys_dummy; \
+        END IF; \
+        EXCEPTION WHEN OTHERS THEN v_yj := '0'; END; \
+        INSERT INTO target_rows(val, yj) VALUES (r.a, v_yj); \
+        END LOOP; END;";
+    let mut eng = Engine::new(
+        Box::new(DuckExecutor::open_in_memory().unwrap()),
+        RuleRegistry::default(),
+    );
+    for ddl in [
+        "CREATE TABLE source_rows(a BIGINT, k VARCHAR, yj_a VARCHAR, yj_b VARCHAR)",
+        "CREATE TABLE target_rows(val BIGINT, yj VARCHAR)",
+        "INSERT INTO source_rows VALUES (10, 'K1', 'AA1', 'BB1'), (20, 'K2', 'AA2', 'BB2'), (30, 'K3', 'AA3', 'BB3')",
+        "CREATE TABLE route_tab(kind VARCHAR, op VARCHAR)",
+        "INSERT INTO route_tab VALUES ('1', 'X')",
+        "CREATE TABLE dim_tab(k VARCHAR, ct VARCHAR)",
+        "INSERT INTO dim_tab VALUES ('K1', 'A'), ('K2', 'B')",
+        "CREATE TABLE sys_dummy(dummy VARCHAR)",
+        "INSERT INTO sys_dummy VALUES ('X')",
+    ] {
+        eng.ex.execute(ddl, &BindMap::new()).unwrap();
+    }
+    eng.register(sql).unwrap();
+    eng
+}
+
+#[test]
+fn should_reject_route_lookup_with_frame_bound_filter() {
+    // N-1：route 判别式/守卫以空 BindMap 求值；过滤含帧变量时计划期
+    // 必须 Skipped(UnsupportedControlFlow) 回退解释器——不得 KERNEL-0010 崩溃。
+    let mut baseline = setup_copy_route_bound();
+    baseline.call("copy_route_bound", &[]).unwrap();
+    let expected = rows_copy_partial(&baseline);
+
+    let mut eng = setup_copy_route_bound();
+    eng.set_oriented = SetOrientedMode::BatchAtomic;
+    eng.call("copy_route_bound", &[]).unwrap();
+    assert_eq!(rows_copy_partial(&eng), expected);
+    assert_eq!(
+        eng.set_oriented_reports()[0].status,
+        Status::Skipped {
+            reason: SkipReason::UnsupportedControlFlow
+        },
+        "report: {:?}",
+        eng.set_oriented_reports()[0]
+    );
+}
+
 fn setup_copy_both_arms(route: &str) -> Engine {
-    // 双臂均可集合化的路由 IF（purchase kind IF 同构）：
+    // 双臂均可集合化的路由 IF（purchase kind IF 同构，合并树移植）：
     // THEN/ELSE 各含「维表查找 + sys_dummy CASE 写汇」，写集一致
     // {v_ct, v_yj}，处理器仅重置 v_yj，v_ct 为组内局部死。
     let sql = "CREATE PROCEDURE copy_both_arms IS v_yj VARCHAR2(10); v_ct VARCHAR2(10); v_route VARCHAR2(10); BEGIN \
@@ -495,6 +563,8 @@ fn rows_copy_both_arms(eng: &Engine) -> Vec<Vec<SpinValue>> {
 fn should_convert_route_if_when_both_arms_are_convertible() {
     // 分臂备选计划：THEN/ELSE 均可集合化时，入口按路由条件选择对应计划
     // ——THEN 臂激活时不再 Skipped，而是按 THEN 语义 Converted。
+    // 分臂判别式：THEN/ELSE 均可集合化时判别式选臂——THEN 臂激活
+    // 不再整体 Skipped，按 THEN 语义 Converted（合并树移植，D7 准入超集）。
     for route in ["1", "0"] {
         let mut baseline = setup_copy_both_arms(route);
         baseline.call("copy_both_arms", &[]).unwrap();
@@ -512,5 +582,98 @@ fn should_convert_route_if_when_both_arms_are_convertible() {
             "route: {route}, report: {:?}",
             eng.set_oriented_reports()[0]
         );
+    }
+}
+
+#[test]
+fn should_reject_at_runtime_for_lp_takeover_when_then_arm_unconvertible() {
+    // SO→LP 派发缺口守护（合并树 should_parallelize_region_when_then_arm_
+    // unconvertible 的 SO 侧；本分支无 loop-parallel，LP Parallelized 断言
+    // 随 PR#62 合入补齐）。THEN 臂 `SELECT id, payload INTO v_fee, v_extra`
+    // 为双变量 INTO——臂内准入拒绝 → analyze_then_arm 失败 → 静默降级
+    // 单臂（discriminator=None，route_guards 守 THEN 不可达）；kind='1'
+    // 数据走 THEN → 运行态守卫拒绝 → Skipped{UnsupportedControlFlow}，
+    // 该拒绝点即 PR#62 try_loop_parallel_region 的接管触发点。
+    // kind='0' 走 ELSE → 单臂 Converted；两种数据行集均与 Off 全等。
+    const ROUTE_PROC_WIDE: &str = "CREATE PROCEDURE p_route_wide IS \
+    v_kind VARCHAR; v_fee VARCHAR; v_extra VARCHAR; \
+    BEGIN \
+    FOR r IN SELECT id, payload FROM source_rows LOOP \
+        BEGIN \
+            SELECT kind_id INTO v_kind FROM switches WHERE operation_kind = 'SW'; \
+        EXCEPTION WHEN OTHERS THEN v_kind := '0'; END; \
+        BEGIN \
+            IF v_kind = '1' THEN \
+                SELECT id, payload INTO v_fee, v_extra FROM source_rows WHERE source_rows.id = r.id; \
+            ELSE \
+                SELECT fee INTO v_fee FROM fee_tbl WHERE fee_tbl.id = r.id; \
+            END IF; \
+        EXCEPTION WHEN OTHERS THEN v_fee := 'D'; END; \
+        INSERT INTO target_rows(id, fee) VALUES (r.id, v_fee); \
+    END LOOP; END;";
+    for kind in ["1", "0"] {
+        let setup = |eng: &mut Engine| {
+            for sql in [
+                "CREATE TABLE source_rows(id BIGINT, payload VARCHAR)",
+                "CREATE TABLE target_rows(id BIGINT, fee VARCHAR)",
+                "CREATE TABLE switches(operation_kind VARCHAR, kind_id VARCHAR)",
+                "CREATE TABLE fee_tbl(id BIGINT, fee VARCHAR)",
+                "CREATE TABLE sys_dummy AS SELECT 1",
+                "INSERT INTO source_rows VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')",
+                "INSERT INTO fee_tbl VALUES (1,'f1'),(2,'f2'),(3,'f3'),(4,'f4'),(5,'f5')",
+                &format!("INSERT INTO switches VALUES ('SW', '{kind}')"),
+            ] {
+                eng.ex.execute(sql, &BindMap::new()).unwrap();
+            }
+            eng.register(ROUTE_PROC_WIDE).unwrap();
+        };
+        let mut baseline = Engine::new(
+            Box::new(DuckExecutor::open_in_memory().unwrap()),
+            RuleRegistry::default(),
+        );
+        setup(&mut baseline);
+        baseline.call("p_route_wide", &[]).unwrap();
+        let expected = baseline
+            .ex
+            .query(
+                "SELECT id, fee FROM target_rows ORDER BY id",
+                &BindMap::new(),
+            )
+            .unwrap()
+            .fetch_many(20);
+
+        let mut eng = Engine::new(
+            Box::new(DuckExecutor::open_in_memory().unwrap()),
+            RuleRegistry::default(),
+        );
+        setup(&mut eng);
+        eng.set_oriented = SetOrientedMode::BatchAtomic;
+        eng.call("p_route_wide", &[]).unwrap();
+        let actual = eng
+            .ex
+            .query(
+                "SELECT id, fee FROM target_rows ORDER BY id",
+                &BindMap::new(),
+            )
+            .unwrap()
+            .fetch_many(20);
+        assert_eq!(actual, expected, "kind: {kind}");
+        let report = &eng.set_oriented_reports()[0];
+        if kind == "1" {
+            // THEN 活跃：降级单臂计划运行态守卫拒绝 → SO 缺口（LP 接管点）。
+            assert_eq!(
+                report.status,
+                Status::Skipped {
+                    reason: SkipReason::UnsupportedControlFlow
+                },
+                "kind: {kind}, report: {report:?}"
+            );
+        } else {
+            // ELSE 活跃：降级单臂 ELSE 计划 Converted{arm:None}。
+            assert!(
+                matches!(report.status, Status::Converted { arm: None, .. }),
+                "kind: {kind}, report: {report:?}"
+            );
+        }
     }
 }

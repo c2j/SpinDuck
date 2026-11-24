@@ -101,12 +101,15 @@ fn should_reuse_offline_candidate_and_recheck_live_data_guards() {
     eng.call("copy_rows", &[]).unwrap();
     assert_eq!(
         eng.set_oriented_reports()[0].status,
-        Status::Converted { sql: sql.clone() }
+        Status::Converted {
+            sql: sql.clone(),
+            arm: None
+        }
     );
     eng.call("copy_rows", &[]).unwrap();
     assert_eq!(
         eng.set_oriented_reports()[0].status,
-        Status::Converted { sql }
+        Status::Converted { sql, arm: None }
     );
     eng.ex
         .execute("INSERT INTO sys_dummy VALUES ('Y')", &BindMap::new())
@@ -173,7 +176,7 @@ fn should_reuse_offline_not_null_and_constant_default_evidence() {
     eng.call("copy_rows", &[]).unwrap();
     assert_eq!(
         eng.set_oriented_reports()[0].status,
-        Status::Converted { sql },
+        Status::Converted { sql, arm: None },
         "snapshot={snapshot:?}, runtime={:?}",
         eng.ex
             .query(
@@ -326,7 +329,7 @@ fn should_reuse_offline_postfix_cast_defaults_and_native_unparameterized_numeric
     eng.call("copy_rows", &[]).unwrap();
     assert_eq!(
         eng.set_oriented_reports()[0].status,
-        Status::Converted { sql }
+        Status::Converted { sql, arm: None }
     );
     assert_eq!(
         eng.ex

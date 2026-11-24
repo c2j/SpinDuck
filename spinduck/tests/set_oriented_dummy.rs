@@ -879,7 +879,7 @@ fn scenario_expr_params() {
 
     let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
     let actual = eng.call("caller_expr", &args()).unwrap();
-    let Status::Converted { sql } = eng.set_oriented_reports()[0].status.clone() else {
+    let Status::Converted { sql, .. } = eng.set_oriented_reports()[0].status.clone() else {
         panic!(
             "复杂参数表达式必须 Converted: {:?}",
             eng.set_oriented_reports()
@@ -903,7 +903,7 @@ fn scenario_inlined_out_arith() {
 
     let mut eng = engine_with_routines(&ddl, SetOrientedMode::BatchAtomic, &routines);
     let actual = eng.call("caller_dummy_fn", &args()).unwrap();
-    let Status::Converted { sql } = eng.set_oriented_reports()[0].status.clone() else {
+    let Status::Converted { sql, .. } = eng.set_oriented_reports()[0].status.clone() else {
         panic!(
             "内联 OUT 变量的 IF 算术门必须 Converted: {:?}",
             eng.set_oriented_reports()
@@ -931,7 +931,7 @@ fn scenario_positive() {
 
     let (mut eng, _seen) = engine_seen(&ddl);
     eng.call("caller_dummy", &args()).unwrap();
-    let Status::Converted { sql } = eng.set_oriented_reports()[0].status.clone() else {
+    let Status::Converted { sql, .. } = eng.set_oriented_reports()[0].status.clone() else {
         panic!("{:?}", eng.set_oriented_reports());
     };
     assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");

@@ -2,7 +2,7 @@
 
 use super::schema::{self, Table};
 use super::shape::Name;
-use super::{BindSrc, OptimizeCtx, SkipReason, VarName};
+use super::{BindSrc, GuardKind, GuardScope, OptimizeCtx, SkipReason, VarName};
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
 
@@ -96,29 +96,34 @@ pub(crate) struct ConversionPlan {
     /// miss 仿真标量出口（NO_DATA_FOUND 处理器赋值回填）：批写成功后
     /// 按程序序执行，返回行时写回帧变量。
     pub(crate) miss_outs: Vec<MissOut>,
-    /// THEN 臂备选计划（分臂备选）：本计划为 ELSE 臂（route_guards 证
-    /// THEN 不可达）；主计划入口守卫失败时尝试备选，其 route_guards
-    /// 为"条件 IS TRUE"判定（THEN 可达才放行）。视图物化前导不兼容
-    /// 双计划（sd_vwN 序号冲突），含前导的备选在计划期已丢弃。
-    pub(crate) route_alt: Option<Box<ConversionPlan>>,
+    /// 双臂路由（设计 v3.1 §12.3(a)）：`Some` 时本计划是 ELSE 臂（值域
+    /// 补集），`route_guards` 必须为空——THEN 不可达改由运行期判别式
+    /// 取值选臂证明。`None` = 今日单臂形态，行为逐字不变。
+    pub(crate) discriminator: Option<Discriminator>,
+}
+
+/// 双臂判别式（§12.3(a/d)）：`sql` 返回整型标签——`0..arms.len()-1`
+/// = 对应臂计划、`arms.len()` = ELSE 臂（主计划本体，值域补集；
+/// 判别值 NULL 经 SQL `=` 三值语义同落 ELSE，与 PL IF 及 PR#62
+/// `route::pick` 口径一致）。标签越界/非整数/查询不产恰一行 →
+/// `RouteDiscriminatorNotTotal` 整段回退（防御位）。臂等值比较在
+/// SQL 侧完成（`=` 语义与原 IF 条件同源），不经 SpinValue 跨类型比对。
+#[derive(Clone)]
+pub(crate) struct Discriminator {
+    pub sql: String,
+    /// 非 ELSE 臂计划（值域划分；ELSE 臂即外层 ConversionPlan 本体）。
+    pub arms: Vec<RouteArm>,
+}
+
+/// 判别式标签命中时选用的备选臂计划（独立走查+生成，§12.3(b/c)）。
+#[derive(Clone)]
+pub(crate) struct RouteArm {
+    /// 该臂自己的 sql/binds/guards/preludes/tail_commit；`discriminator`
+    /// 恒 `None`（臂内不再嵌套路由分叉）。
+    pub plan: Box<ConversionPlan>,
 }
 
 pub(crate) type BoundGuard = (String, Vec<(String, BindSrc)>);
-
-/// 两份 fn 物化前导逐项全等（表名/例程/去重 SQL/绑定/元数/依赖标记）。
-/// 分臂备选计划共用同一份入口期物化结果的前提——INSERT 位 sd_bfN 的
-/// distinct-over-sd_cur 按臂投影渲染，同名表内容可不同，不等即不可挂载。
-pub(crate) fn same_fn_preludes(a: &[FnPrelude], b: &[FnPrelude]) -> bool {
-    a.len() == b.len()
-        && a.iter().zip(b.iter()).all(|(x, y)| {
-            x.table == y.table
-                && x.name == y.name
-                && x.distinct_sql == y.distinct_sql
-                && x.binds == y.binds
-                && x.arity == y.arity
-                && x.needs_sd_cur == y.needs_sd_cur
-        })
-}
 
 pub(super) fn bind_guards(
     guards: Vec<String>,
@@ -139,6 +144,89 @@ pub(super) fn bind_guards(
         .collect()
 }
 
+/// plan 守卫的有序槽位视图：entry_ok 与 admit 共用同一求值序
+/// （sys_dummy → drift(源/目标/查找) → snapshot → top1 → route → expr）。
+pub(super) enum GuardSlot<'a> {
+    SysDummy,
+    Drift(&'a Name, &'a Table),
+    Snapshot(&'a ConversionPlan),
+    Top1(&'a BoundGuard),
+    Route(&'a str),
+    Expr(&'a BoundGuard),
+}
+
+impl<'a> GuardSlot<'a> {
+    /// 守卫类别（admit 报告元数据）。
+    pub(super) fn kind(&self) -> GuardKind {
+        match self {
+            Self::SysDummy => GuardKind::SysDummy,
+            Self::Drift(..) => GuardKind::Drift,
+            Self::Snapshot(_) => GuardKind::Snapshot,
+            Self::Top1(_) => GuardKind::Top1Tie,
+            Self::Route(_) => GuardKind::Route,
+            Self::Expr(_) => GuardKind::ExprTotalness,
+        }
+    }
+
+    /// 求值面：帧绑定守卫（top1/expr）= Frame，其余 = Static。
+    pub(super) fn scope(&self) -> GuardScope {
+        match self {
+            Self::Top1(_) | Self::Expr(_) => GuardScope::Frame,
+            _ => GuardScope::Static,
+        }
+    }
+
+    /// 守卫关联对象名（drift=表名；sys_dummy="sys_dummy"；其余 None）。
+    pub(super) fn object(&self) -> Option<String> {
+        match self {
+            Self::SysDummy => Some("sys_dummy".to_string()),
+            Self::Drift(name, _) => Some(name.0.clone()),
+            _ => None,
+        }
+    }
+
+    /// 守卫 SQL 原文（route/top1/expr；目录面守卫无独立 SQL）。
+    pub(super) fn sql(&self) -> Option<&'a str> {
+        match self {
+            Self::Top1(bound) | Self::Expr(bound) => Some(bound.0.as_str()),
+            Self::Route(sql) => Some(sql),
+            _ => None,
+        }
+    }
+
+    /// 须随行的按名绑定占位符（top1/expr；route 为空绑定求值）。
+    pub(super) fn bind_names(&self) -> Vec<String> {
+        match self {
+            Self::Top1(bound) | Self::Expr(bound) => {
+                bound.1.iter().map(|(name, _)| name.clone()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+pub(super) fn guard_slots(plan: &ConversionPlan) -> Vec<GuardSlot<'_>> {
+    let mut slots = Vec::with_capacity(
+        3 + plan.lookup_tables.len()
+            + plan.top1_guards.len()
+            + plan.route_guards.len()
+            + plan.expr_guards.len(),
+    );
+    slots.push(GuardSlot::SysDummy);
+    slots.push(GuardSlot::Drift(&plan.source, &plan.source_table));
+    slots.push(GuardSlot::Drift(&plan.target, &plan.target_table));
+    slots.extend(
+        plan.lookup_tables
+            .iter()
+            .map(|(name, table)| GuardSlot::Drift(name, table)),
+    );
+    slots.push(GuardSlot::Snapshot(plan));
+    slots.extend(plan.top1_guards.iter().map(GuardSlot::Top1));
+    slots.extend(plan.route_guards.iter().map(|sql| GuardSlot::Route(sql)));
+    slots.extend(plan.expr_guards.iter().map(GuardSlot::Expr));
+    slots
+}
+
 /// 入口守卫（前缀 IR 执行完毕、踏入 open_pc 之前）：全部查询经证明不抛错
 /// （存在性先行、只读目录面）。任一失败 → 调用方以 open_pc 续跑原始区域，
 /// 绝不重放前缀；事务此刻仍完全干净。
@@ -148,55 +236,90 @@ pub(crate) fn entry_ok(
     ctx: &OptimizeCtx<'_>,
     frame: &crate::runtime::Frame,
 ) -> Result<Result<(), SkipReason>, EngineError> {
-    if !schema::sys_dummy_ok(ex)? {
-        return Ok(Err(SkipReason::UnprovenSysDummyInvariant));
-    }
-    if drifted(ex, &plan.source, &plan.source_table)?
-        || drifted(ex, &plan.target, &plan.target_table)?
-    {
-        return Ok(Err(SkipReason::UnprovenTargetConstraints));
-    }
-    for (name, table) in &plan.lookup_tables {
-        if drifted(ex, name, table)? {
-            return Ok(Err(SkipReason::UnprovenTargetConstraints));
-        }
-    }
-    if !snapshot_matches(ex, plan, ctx)? {
-        return Ok(Err(SkipReason::UnprovenTargetConstraints));
-    }
-    for (guard, gbinds) in &plan.top1_guards {
-        let bm = crate::runtime::interp::resolve_binds(gbinds, frame)?;
-        let mut stream = ex.query(guard, &bm)?;
-        let clean = matches!(
-            stream.fetch_many(1).first().and_then(|r| r.first()),
-            Some(crate::value::SpinValue::Int(0))
-        );
-        if !clean {
-            return Ok(Err(SkipReason::AmbiguousTop1Tie));
-        }
-    }
-    for guard in &plan.route_guards {
-        let mut stream = ex.query(guard, &crate::exec::BindMap::new())?;
-        let unreachable = matches!(
-            stream.fetch_many(1).first().and_then(|r| r.first()),
-            Some(crate::value::SpinValue::Bool(true))
-        );
-        if !unreachable {
-            return Ok(Err(SkipReason::UnsupportedControlFlow));
-        }
-    }
-    for (guard, binds) in &plan.expr_guards {
-        let bm = crate::runtime::interp::resolve_binds(binds, frame)?;
-        let mut stream = ex.query(guard, &bm)?;
-        let clean = matches!(
-            stream.fetch_many(1).first().and_then(|r| r.first()),
-            Some(crate::value::SpinValue::Int(0))
-        );
-        if !clean {
-            return Ok(Err(SkipReason::UnprovenQueryTotalness));
+    for slot in guard_slots(plan) {
+        if let Err(reason) = eval_guard(&slot, ex, ctx, frame)? {
+            return Ok(Err(reason));
         }
     }
     Ok(Ok(()))
+}
+
+/// 单槽位求值：EngineError 原样上抛（`?`），逻辑不通过映射为 SkipReason。
+pub(super) fn eval_guard(
+    slot: &GuardSlot<'_>,
+    ex: &dyn SqlExecutor,
+    ctx: &OptimizeCtx<'_>,
+    frame: &crate::runtime::Frame,
+) -> Result<Result<(), SkipReason>, EngineError> {
+    Ok(match slot {
+        GuardSlot::SysDummy => {
+            if schema::sys_dummy_ok(ex)? {
+                Ok(())
+            } else {
+                Err(SkipReason::UnprovenSysDummyInvariant)
+            }
+        }
+        GuardSlot::Drift(name, expected) => {
+            if drifted(ex, name, expected)? {
+                Err(SkipReason::UnprovenTargetConstraints)
+            } else {
+                Ok(())
+            }
+        }
+        GuardSlot::Snapshot(plan) => {
+            if snapshot_matches(ex, plan, ctx)? {
+                Ok(())
+            } else {
+                Err(SkipReason::UnprovenTargetConstraints)
+            }
+        }
+        GuardSlot::Top1(bound) => {
+            if count_guard(ex, &bound.0, &bound.1, frame)? {
+                Ok(())
+            } else {
+                Err(SkipReason::AmbiguousTop1Tie)
+            }
+        }
+        GuardSlot::Route(sql) => {
+            if route_guard(ex, sql)? {
+                Ok(())
+            } else {
+                Err(SkipReason::UnsupportedControlFlow)
+            }
+        }
+        GuardSlot::Expr(bound) => {
+            if count_guard(ex, &bound.0, &bound.1, frame)? {
+                Ok(())
+            } else {
+                Err(SkipReason::UnprovenQueryTotalness)
+            }
+        }
+    })
+}
+
+/// 计数型守卫（top1/expr）：解析帧绑定 → 下发 SQL → 首行 Int(0) = 干净。
+fn count_guard(
+    ex: &dyn SqlExecutor,
+    sql: &str,
+    binds: &[(String, BindSrc)],
+    frame: &crate::runtime::Frame,
+) -> Result<bool, EngineError> {
+    let bm = crate::runtime::interp::resolve_binds(binds, frame)?;
+    let mut stream = ex.query(sql, &bm)?;
+    Ok(matches!(
+        stream.fetch_many(1).first().and_then(|r| r.first()),
+        Some(crate::value::SpinValue::Int(0))
+    ))
+}
+
+/// 路由守卫：无绑定求值（bind-free 由 `route::guard`/`route::discriminator`
+/// 计划期占位符扫描保证，含 `$v_*` 即拒绝），首行 TRUE = THEN 分支不可达。
+fn route_guard(ex: &dyn SqlExecutor, sql: &str) -> Result<bool, EngineError> {
+    let mut stream = ex.query(sql, &crate::exec::BindMap::new())?;
+    Ok(matches!(
+        stream.fetch_many(1).first().and_then(|r| r.first()),
+        Some(crate::value::SpinValue::Bool(true))
+    ))
 }
 
 /// 混合调度异常行集（so-exception-row-hybrid §3）：逐条 `exc_guards`
@@ -262,6 +385,192 @@ fn drifted(ex: &dyn SqlExecutor, name: &Name, expected: &Table) -> Result<bool, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::RoutineCatalog;
+    use crate::exec::{BindMap, ExecOutcome, RowStream};
+    use crate::rules::RuleRegistry;
+    use crate::DuckExecutor;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// 记录下发 SQL 的执行器包装：守卫序列是 entry_ok 可观察契约之一。
+    struct Seen {
+        inner: DuckExecutor,
+        seen: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl SqlExecutor for Seen {
+        fn query(&self, sql: &str, binds: &BindMap) -> Result<RowStream, EngineError> {
+            self.seen.borrow_mut().push(sql.to_string());
+            self.inner.query(sql, binds)
+        }
+        fn execute(&self, sql: &str, binds: &BindMap) -> Result<ExecOutcome, EngineError> {
+            self.seen.borrow_mut().push(sql.to_string());
+            self.inner.execute(sql, binds)
+        }
+    }
+
+    fn int_table(name: &str) -> Table {
+        Table {
+            qualified: Name(name.into()).sql(),
+            columns: vec![schema::Column {
+                name: Name("a".into()),
+                kind: "integer".into(),
+                nullable: true,
+                default: None,
+            }],
+        }
+    }
+
+    fn plan(top1: Vec<BoundGuard>, route: Vec<String>, expr: Vec<BoundGuard>) -> ConversionPlan {
+        ConversionPlan {
+            sql: String::new(),
+            binds: Vec::new(),
+            fn_preludes: Vec::new(),
+            view_preludes: Vec::new(),
+            preludes_first: false,
+            tail_commit: false,
+            open_pc: 0,
+            close_pc: 0,
+            source: Name("s".into()),
+            target: Name("t".into()),
+            source_table: int_table("s"),
+            target_table: int_table("t"),
+            lookup_tables: Vec::new(),
+            top1_guards: top1,
+            route_guards: route,
+            expr_guards: expr,
+            miss_outs: Vec::new(),
+            exc_guards: Vec::new(),
+            hybrid: None,
+            seg_sql: None,
+            discriminator: None,
+        }
+    }
+
+    /// 内存库：sys_dummy 恰 1 行 + s/t 各一整数列（漂移复核全过）。
+    fn engine() -> (Seen, RoutineCatalog, RuleRegistry) {
+        let inner = DuckExecutor::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE sys_dummy (x INTEGER)",
+            "INSERT INTO sys_dummy VALUES (1)",
+            "CREATE TABLE s (a INTEGER)",
+            "CREATE TABLE t (a INTEGER)",
+        ] {
+            inner.execute(sql, &BindMap::new()).unwrap();
+        }
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        (
+            Seen {
+                inner,
+                seen: seen.clone(),
+            },
+            RoutineCatalog::new(),
+            RuleRegistry::default(),
+        )
+    }
+
+    #[test]
+    fn should_report_top1_reason_before_route_when_both_guards_fail() {
+        // top1（帧槽位）排在 route（静态槽位）之前求值：两者同败时首个
+        // 失败原因必须是 AmbiguousTop1Tie，且 route 守卫 SQL 不得下发。
+        let (ex, catalog, rules) = engine();
+        let seen = ex.seen.clone();
+        let plan = plan(
+            vec![("SELECT 1".into(), Vec::new())],
+            vec!["SELECT FALSE".into()],
+            Vec::new(),
+        );
+        let ctx = OptimizeCtx {
+            mode: super::super::SetOrientedMode::Off,
+            batch_commit: false,
+            rules: &rules,
+            snapshot: None,
+            catalog: &catalog,
+        };
+        let frame = crate::runtime::Frame::new();
+        let verdict = entry_ok(&ex, &plan, &ctx, &frame).unwrap();
+        assert_eq!(verdict, Err(SkipReason::AmbiguousTop1Tie));
+        let sqls = seen.borrow();
+        assert_eq!(sqls.len(), 5, "sys_dummy×2 + drift×2 + top1×1: {sqls:?}");
+        assert_eq!(sqls[4], "SELECT 1");
+        assert!(!sqls.iter().any(|s| s == "SELECT FALSE"));
+    }
+
+    #[test]
+    fn should_default_plan_to_single_arm_with_route_guards() {
+        // 测试 13（§12.6）：discriminator=None 的单臂计划——route_guards
+        // 保留、臂字段缺席，ELSE-only 形态逐字不变。
+        let p = plan(vec![], vec!["SELECT TRUE".to_string()], vec![]);
+        assert!(p.discriminator.is_none());
+        assert_eq!(p.route_guards, ["SELECT TRUE"]);
+    }
+
+    #[test]
+    fn should_tag_route_guard_as_static_and_top1_as_frame() {
+        // 槽位次序 = entry_ok 原始次序；route 静态无绑定，top1/expr 帧绑定。
+        let plan = plan(
+            vec![(
+                "SELECT 0".into(),
+                vec![("$v_x".into(), BindSrc::Var(VarName("x".into())))],
+            )],
+            vec!["SELECT TRUE".into()],
+            vec![("SELECT 0".into(), Vec::new())],
+        );
+        let tags: Vec<(GuardKind, GuardScope)> = guard_slots(&plan)
+            .iter()
+            .map(|s| (s.kind(), s.scope()))
+            .collect();
+        assert_eq!(
+            tags,
+            vec![
+                (GuardKind::SysDummy, GuardScope::Static),
+                (GuardKind::Drift, GuardScope::Static),
+                (GuardKind::Drift, GuardScope::Static),
+                (GuardKind::Snapshot, GuardScope::Static),
+                (GuardKind::Top1Tie, GuardScope::Frame),
+                (GuardKind::Route, GuardScope::Static),
+                (GuardKind::ExprTotalness, GuardScope::Frame),
+            ]
+        );
+        let route = guard_slots(&plan)
+            .into_iter()
+            .find(|s| s.kind() == GuardKind::Route)
+            .unwrap();
+        assert_eq!(route.sql(), Some("SELECT TRUE"));
+        assert!(route.bind_names().is_empty());
+        let top1 = guard_slots(&plan)
+            .into_iter()
+            .find(|s| s.kind() == GuardKind::Top1Tie)
+            .unwrap();
+        assert_eq!(top1.bind_names(), vec!["$v_x".to_string()]);
+    }
+
+    #[test]
+    fn should_skip_with_route_reason_when_only_route_guard_fails() {
+        // top1/expr 全过、route 不可达证明失败 → UnsupportedControlFlow；
+        // route 守卫以空绑定表求值（无帧依赖）。
+        let (ex, catalog, rules) = engine();
+        let seen = ex.seen.clone();
+        let plan = plan(
+            vec![("SELECT 0".into(), Vec::new())],
+            vec!["SELECT FALSE".into()],
+            vec![("SELECT 0".into(), Vec::new())],
+        );
+        let ctx = OptimizeCtx {
+            mode: super::super::SetOrientedMode::Off,
+            batch_commit: false,
+            rules: &rules,
+            snapshot: None,
+            catalog: &catalog,
+        };
+        let frame = crate::runtime::Frame::new();
+        let verdict = entry_ok(&ex, &plan, &ctx, &frame).unwrap();
+        assert_eq!(verdict, Err(SkipReason::UnsupportedControlFlow));
+        let sqls = seen.borrow();
+        assert_eq!(sqls.last().map(String::as_str), Some("SELECT FALSE"));
+        assert_eq!(sqls.len(), 6, "expr 守卫不得执行: {sqls:?}");
+    }
+
     use crate::exec::FakeExecutor;
     use crate::value::SpinValue;
 

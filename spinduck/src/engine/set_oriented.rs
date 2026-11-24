@@ -6,7 +6,8 @@ use crate::catalog::CompiledRoutine;
 use crate::error::EngineError;
 use crate::exec::TraceSink;
 use crate::ir::set_oriented::{
-    entry_ok, ConversionPlan, OptimizeCtx, Report, SetOrientedMode, SkipReason, Status,
+    entry_ok, Arm, ConversionPlan, Discriminator, OptimizeCtx, Report, SetOrientedMode, SkipReason,
+    Status,
 };
 use crate::runtime::{Frame, RunControl, RunLimits, RunOutcome, RunSpan};
 
@@ -60,9 +61,20 @@ impl Engine {
         // 失败时事务内尚无副作用，ROLLBACK 重开后整段按原 IR 解释执行。
         // 计划期已证前缀与 fn 前导写集同视图底表不相交，探测通过 ⇒
         // 物化时点数据与探测时点一致。
-        if plans.iter().any(|p| !p.view_preludes.is_empty()) {
+        // D7 双臂：判别式选中臂的 view_preludes 同样在 pick_arm 内物化
+        // ——物化失败会中止事务且彼时用户代码已跑，无法安全回退，
+        // 故臂计划一并纳入前移探测（未选中臂的臂视图同样先建，
+        // 选中臂在裁决点按同名 CREATE OR REPLACE 重建覆盖，幂等）。
+        let view_plans = plans.iter().flat_map(|p| {
+            p.discriminator
+                .iter()
+                .flat_map(|d| d.arms.iter().map(|a| a.plan.as_ref()))
+                .chain(std::iter::once(p))
+        });
+        let view_plans: Vec<&ConversionPlan> = view_plans.collect();
+        if view_plans.iter().any(|p| !p.view_preludes.is_empty()) {
             let mut failed = false;
-            for p in &plans {
+            for p in &view_plans {
                 if self.materialize_views(p).is_err() {
                     failed = true;
                     break;
@@ -143,10 +155,10 @@ impl Engine {
         // 守卫 SQL 引用缓存表的计划（verbatim cur_scan / 写守卫子查询）：
         // 物化前导先于入口守卫，否则守卫查询打到不存在的 sd_fn*/sd_bf*。
         // 回退时解释器会重新物化——例程纯度已证，仅多一次去重调用。
-        // 备选臂计划的 fn_preludes 与主计划同源（游标/INSERT 位），
-        // 任一计划需要前置物化即提前执行。
-        let preludes_first =
-            plan.preludes_first || plan.route_alt.as_ref().is_some_and(|a| a.preludes_first);
+        // 备选臂计划的 fn_preludes 与主计划同源（游标/INSERT 位）：
+        // D7 判别式下 THEN 臂前导由 pick_arm 在选中时前置物化，
+        // 此处仅按主计划口径决定前移。
+        let preludes_first = plan.preludes_first;
         let mut preluded = false;
         if preludes_first && !plan.fn_preludes.is_empty() {
             // INSERT 位前导的 distinct-over-sd_cur 查询可内嵌 sd_vwN
@@ -181,165 +193,251 @@ impl Engine {
         if !plan.view_preludes.is_empty() {
             self.materialize_views(plan)?;
         }
-        // 分臂备选：主计划（ELSE 臂）入口守卫失败时尝试 THEN 臂备选
-        // 计划——其守卫集独立（route_guards 为"条件 IS TRUE"判定），
-        // 全过才放行；两臂计划共享同一区域边界，选中者执行其批写 SQL。
-        let optimize = self.optimize_ctx();
-        let mut chosen: Option<&ConversionPlan> = None;
-        let mut skip_reason = None;
-        match entry_ok(self.ex.as_ref(), plan, &optimize, frame)? {
-            Ok(()) => chosen = Some(plan),
-            Err(reason) => {
-                if let Some(alt) = plan.route_alt.as_deref() {
-                    if matches!(entry_ok(self.ex.as_ref(), alt, &optimize, frame)?, Ok(())) {
-                        chosen = Some(alt);
-                    }
-                }
-                if chosen.is_none() {
-                    skip_reason = Some(reason);
-                }
-            }
-        }
-        let Some(p) = chosen else {
-            let reason = skip_reason.unwrap_or(SkipReason::UnsupportedControlFlow);
-            self.push_report(&routine.name, Status::Skipped { reason });
-            // SO+LP 派发缺口：守卫运行态拒绝（数据相关）时，末区域
-            // 交 loop-parallel 接管——前缀已执行，LP 只补 OPEN 段；
-            // LP 自身门禁/预热失败会退回同状态串行续跑，语义零变化。
-            if is_last {
-                if let Some(out) =
-                    self.try_loop_parallel_region(routine, plan, frame, sink, limits)?
-                {
-                    return Ok(Some(out));
-                }
-            }
-            let out = self.run_prog(
-                &routine.prog,
-                frame,
-                sink,
-                limits,
-                RunSpan {
-                    start_pc: plan.open_pc,
-                    stop_pc: Some(plan.close_pc + 1),
-                    exit_pc: None,
-                    entry_exec: false,
-                },
-            )?;
-            return Ok((!matches!(out, RunOutcome::Stopped)).then_some(out));
-        };
-        // 混合计划延迟上报：异常行集/基数前置证明在 `run_hybrid_region`
-        // 内完成，失败回退串行时报 Skipped 而非 Converted（P0-3）。
-        let hybrid_plan = p.hybrid.is_some();
-        if !hybrid_plan {
-            self.push_report(&routine.name, Status::Converted { sql: p.sql.clone() });
-        }
-        // fn_site 物化前导：与解释器 OpenCursor 时点同口径，
-        // 失败直接上抛（同点失败语义），绝不部分物化后续跑批写。
-        if !preluded && !p.fn_preludes.is_empty() {
-            crate::runtime::interp::materialize_fn_preludes(
-                &p.fn_preludes,
-                frame,
-                self.ex.as_ref(),
-                sink,
-                &self.catalog,
-                &routine.prog.var_types,
-            )?;
-        }
-        // 混合调度（so-exception-row-hybrid §3 + P0-3b）：先把 `sd_cur`
-        // 物化为会话临时表并替换计划 SQL 占位符——`__sd_rn` 只在物化
-        // 时赋一次，异常守卫/段批写共用同一编号。行序正确性由游标流
-        // 重绑定保证（`run_hybrid_body` 内 `rebind_hcur_cursor`：
-        // `ORDER BY __sd_rn` 取回物化行重建 RowStream 换入游标），
-        // `hcur_order_ok` 仅在 `ensure_hcur` 重建路径做位置校验。
-        // 空异常集落入下方既有 SO 路径（物化表版 plan.sql）。
-        // 物化成功后的所有出口（exc 求值失败/畸形/空集/兜底）必须
-        // 回收临时表——`hcur` 置位前的 `?` 与提前 return 逐一显式
-        // `drop_hcur_table`。
-        let mut hcur: Option<(String, ConversionPlan)> = None;
-        if hybrid_plan {
-            match self.materialize_hcur(p, frame)? {
-                Some((name, hp)) => {
-                    let exc = match crate::ir::set_oriented::exc_rows(
-                        self.ex.as_ref(),
-                        &hp.exc_guards,
-                        frame,
-                    ) {
-                        Ok(e) => e,
-                        Err(e) => {
-                            self.drop_hcur_table(&name);
-                            return Err(e);
-                        }
-                    };
-                    match exc {
-                        Some(exc) if !exc.is_empty() => {
-                            // run_hybrid_region 自持清理（含内部 ? 出口）。
-                            return self.run_hybrid_region(
-                                routine,
-                                &hp,
-                                frame,
-                                sink,
-                                limits,
-                                HybridRun {
-                                    exc,
-                                    hcur_name: &name,
-                                    report_sql: &p.sql,
-                                },
-                            );
-                        }
-                        Some(_) => {
-                            // 空异常集：全行批写（物化表版 plan.sql）。
-                            self.push_report(
-                                &routine.name,
-                                Status::Converted { sql: p.sql.clone() },
-                            );
-                            hcur = Some((name, hp));
-                        }
-                        None => {
-                            // 畸形守卫行号：证据不可信 → 整区域串行
-                            // 兜底（此点尚未产生任何写入，语义零变化）。
-                            self.drop_hcur_table(&name);
-                            return self.hybrid_serial_from_open(
-                                routine,
-                                p,
-                                frame,
-                                sink,
-                                limits,
-                                SkipReason::HybridPreflightFailed,
-                            );
+        // D7 双臂（§12.3(d)）：判别式取值选臂——恰一行整数标签才可证，
+        // NULL/不等值经 SQL `=` 三值语义已落 ELSE 臂（PL IF 口径，
+        // 与 PR#62 route::pick 一致）；标签越界/非整数/查询异常 →
+        // RouteDiscriminatorNotTotal 整段退回（防御位）。未选中臂
+        // 的守卫不求值。判别式与主计划前导同序物化（可内嵌 sd_vwN）。
+        // PR#62 route_alt（备选计划 + 入口守卫选臂）由判别式取代：
+        // 同点消歧语义 + 结构化 Arm 上报（admit 集成）。
+        let (arm_plan, arm_label) = match &plan.discriminator {
+            None => (plan, None),
+            Some(d) => match self.pick_arm(d, plan, routine, frame, sink)? {
+                ArmPick::Plan(p, a) => (p, Some(a)),
+                ArmPick::NotTotal => {
+                    self.push_report(
+                        &routine.name,
+                        Status::Skipped {
+                            reason: SkipReason::RouteDiscriminatorNotTotal,
+                        },
+                    );
+                    // SO+LP 派发缺口：判别式运行态拒绝（数据相关）时，
+                    // 末区域交 loop-parallel 接管——前缀已执行，LP 只补
+                    // OPEN 段；LP 自身门禁/预热失败退回串行续跑，语义零变化。
+                    if is_last {
+                        if let Some(out) =
+                            self.try_loop_parallel_region(routine, plan, frame, sink, limits)?
+                        {
+                            return Ok(Some(out));
                         }
                     }
-                }
-                None => {
-                    return self.hybrid_serial_from_open(
-                        routine,
-                        p,
+                    let out = self.run_prog(
+                        &routine.prog,
                         frame,
                         sink,
                         limits,
-                        SkipReason::HybridHcurMaterializeFailed,
+                        RunSpan {
+                            start_pc: plan.open_pc,
+                            stop_pc: Some(plan.close_pc + 1),
+                            exit_pc: None,
+                            entry_exec: false,
+                        },
+                    )?;
+                    return Ok((!matches!(out, RunOutcome::Stopped)).then_some(out));
+                }
+            },
+        };
+        match entry_ok(self.ex.as_ref(), arm_plan, &self.optimize_ctx(), frame)? {
+            Err(reason) => {
+                self.push_report(&routine.name, Status::Skipped { reason });
+                // SO+LP 派发缺口：守卫运行态拒绝（数据相关）时，末区域
+                // 交 loop-parallel 接管——前缀已执行，LP 只补 OPEN 段；
+                // LP 自身门禁/预热失败会退回同状态串行续跑，语义零变化。
+                if is_last {
+                    if let Some(out) =
+                        self.try_loop_parallel_region(routine, plan, frame, sink, limits)?
+                    {
+                        return Ok(Some(out));
+                    }
+                }
+                let out = self.run_prog(
+                    &routine.prog,
+                    frame,
+                    sink,
+                    limits,
+                    RunSpan {
+                        start_pc: plan.open_pc,
+                        stop_pc: Some(plan.close_pc + 1),
+                        exit_pc: None,
+                        entry_exec: false,
+                    },
+                )?;
+                Ok((!matches!(out, RunOutcome::Stopped)).then_some(out))
+            }
+            Ok(()) => {
+                // 混合计划延迟上报（PR#62 P0-3）：异常行集/基数前置证明
+                // 在 `run_hybrid_region` 内完成，失败回退串行时报 Skipped
+                // 而非 Converted。混合×判别式臂为罕见组合：延迟路径的
+                // 上报不带臂标签（行为不受影响，报告面如实记录）。
+                let hybrid_plan = arm_plan.hybrid.is_some();
+                if !hybrid_plan {
+                    self.push_report(
+                        &routine.name,
+                        Status::Converted {
+                            sql: arm_plan.sql.clone(),
+                            arm: arm_label,
+                        },
                     );
                 }
-            }
-        }
-        let p = hcur.as_ref().map_or(p, |(_, hp)| hp);
-        let rows = self.exec_region_sql(p, frame, sink)?;
-        // miss 仿真标量出口：NO_DATA_FOUND 处理器赋值回填——
-        // 存在 miss 行时取回逐行（均匀性已由入口守卫证明）
-        // 处理器赋值结果写回帧；无 miss 行保持批写前值。
-        for mo in &p.miss_outs {
-            let bm = crate::runtime::interp::resolve_binds(&mo.binds, frame)?;
-            let mut stream = self.ex.query(&mo.sql, &bm)?;
-            if let Some(row) = stream.fetch_many(1).into_iter().next() {
-                for (var, val) in mo.targets.iter().zip(row) {
-                    frame.set(var, val);
+                // fn_site 物化前导：与解释器 OpenCursor 时点同口径，
+                // 失败直接上抛（同点失败语义），绝不部分物化后续跑批写。
+                // pick_arm 已物化 Then 臂前导；ELSE 臂=主计划走既有口径。
+                if !preluded && arm_label != Some(Arm::Then) && !arm_plan.fn_preludes.is_empty() {
+                    crate::runtime::interp::materialize_fn_preludes(
+                        &arm_plan.fn_preludes,
+                        frame,
+                        self.ex.as_ref(),
+                        sink,
+                        &self.catalog,
+                        &routine.prog.var_types,
+                    )?;
                 }
+                // 混合调度（so-exception-row-hybrid §3 + P0-3b）：先把
+                // `sd_cur` 物化为会话临时表并替换计划 SQL 占位符——
+                // `__sd_rn` 只在物化时赋一次，异常守卫/段批写共用同一
+                // 编号（消除各 SQL 各自 ROW_NUMBER 扫描的行序漂移）。
+                // 空异常集落入下方既有 SO 路径（物化表版 plan.sql）。
+                let mut hcur: Option<(String, ConversionPlan)> = None;
+                if hybrid_plan {
+                    match self.materialize_hcur(arm_plan, frame)? {
+                        Some((name, hp)) => {
+                            // exc_rows 三态：Err=查询错误（上抛，先回收物
+                            // 化表）；None=守卫行号畸形（串行兜底）；
+                            // Some(空集)=无异常行走普通 SO 批写。
+                            let exc = match crate::ir::set_oriented::exc_rows(
+                                self.ex.as_ref(),
+                                &hp.exc_guards,
+                                frame,
+                            ) {
+                                Ok(e) => e,
+                                Err(e) => {
+                                    self.drop_hcur_table(&name);
+                                    return Err(e);
+                                }
+                            };
+                            match exc {
+                                Some(exc) if !exc.is_empty() => {
+                                    return self.run_hybrid_region(
+                                        routine,
+                                        &hp,
+                                        frame,
+                                        sink,
+                                        limits,
+                                        HybridRun {
+                                            exc,
+                                            hcur_name: &name,
+                                            report_sql: &arm_plan.sql,
+                                        },
+                                    );
+                                }
+                                Some(_) => {
+                                    // 空异常集：全行批写（物化表版 plan.sql）。
+                                    self.push_report(
+                                        &routine.name,
+                                        Status::Converted {
+                                            sql: hp.sql.clone(),
+                                            arm: arm_label,
+                                        },
+                                    );
+                                    hcur = Some((name, hp));
+                                }
+                                None => {
+                                    // 畸形守卫行号：证据不可信 → 整区域串行
+                                    // 兜底（此点尚未产生任何写入，语义零变化）。
+                                    self.drop_hcur_table(&name);
+                                    return self.hybrid_serial_from_open(
+                                        routine,
+                                        arm_plan,
+                                        frame,
+                                        sink,
+                                        limits,
+                                        SkipReason::HybridPreflightFailed,
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            // 入口物化/重绑失败：串行兜底（分因上报，与
+                            // 守卫证据类 HybridPreflightFailed 区分）。
+                            return self.hybrid_serial_from_open(
+                                routine,
+                                arm_plan,
+                                frame,
+                                sink,
+                                limits,
+                                SkipReason::HybridHcurMaterializeFailed,
+                            );
+                        }
+                    }
+                }
+                let exec_plan = hcur.as_ref().map_or(arm_plan, |(_, hp)| hp);
+                let rows = self.exec_region_sql(exec_plan, frame, sink)?;
+                // miss 仿真标量出口：NO_DATA_FOUND 处理器赋值回填——
+                // 存在 miss 行时取回逐行（均匀性已由入口守卫证明）
+                // 处理器赋值结果写回帧；无 miss 行保持批写前值。
+                for mo in &exec_plan.miss_outs {
+                    let bm = crate::runtime::interp::resolve_binds(&mo.binds, frame)?;
+                    let mut stream = self.ex.query(&mo.sql, &bm)?;
+                    if let Some(row) = stream.fetch_many(1).into_iter().next() {
+                        for (var, val) in mo.targets.iter().zip(row) {
+                            frame.set(var, val);
+                        }
+                    }
+                }
+                self.commit_region_tail(exec_plan, rows, sink)?;
+                if let Some((name, _)) = &hcur {
+                    self.drop_hcur_table(name);
+                }
+                Ok(None)
             }
         }
-        self.commit_region_tail(p, rows, sink)?;
-        if let Some((name, _)) = &hcur {
-            self.drop_hcur_table(name);
+    }
+
+    /// D7 判别式选臂（§12.3(d).2）：`d.sql` 在 SQL 侧产整型标签——
+    /// `0..arms.len()-1` → 对应臂计划（先补物化其前导），
+    /// `arms.len()` → 主计划（ELSE 臂 =值域补集；判别值 NULL 已在
+    /// SQL 侧落 ELSE，与 PL IF 语义一致）。越界/非整数/查询不产
+    /// 恰一行 → `NotTotal` 整段回退（防御位）。臂等值比较已在
+    /// 判别式 SQL 内完成（`=` 语义与原 IF 条件同源），此处不再做
+    /// SpinValue 跨类型比对。
+    fn pick_arm<'p>(
+        &self,
+        d: &'p Discriminator,
+        plan: &'p ConversionPlan,
+        routine: &CompiledRoutine,
+        frame: &mut Frame,
+        sink: &mut dyn TraceSink,
+    ) -> Result<ArmPick<'p>, EngineError> {
+        let mut stream = self.ex.query(&d.sql, &crate::exec::BindMap::new())?;
+        let tag = match stream.fetch_many(1).first().and_then(|r| r.first()) {
+            Some(crate::value::SpinValue::Int(t)) => *t,
+            _ => return Ok(ArmPick::NotTotal),
+        };
+        if tag == d.arms.len() as i64 {
+            return Ok(ArmPick::Plan(plan, Arm::Else));
         }
-        Ok(None)
+        let Some(arm) = usize::try_from(tag).ok().and_then(|i| d.arms.get(i)) else {
+            return Ok(ArmPick::NotTotal);
+        };
+        let p = arm.plan.as_ref();
+        // 臂计划前导：视图物化恒先于守卫；fn 前导同主计划
+        // preludes_first 口径——臂计划一旦被选中其守卫/批写
+        // 可能引用 sd_fn*/sd_bf*，统一前置物化（纯度已证，
+        // 幂等去重）。
+        if !p.view_preludes.is_empty() || !p.fn_preludes.is_empty() {
+            self.materialize_views(p)?;
+            if !p.fn_preludes.is_empty() {
+                crate::runtime::interp::materialize_fn_preludes(
+                    &p.fn_preludes,
+                    frame,
+                    self.ex.as_ref(),
+                    sink,
+                    &self.catalog,
+                    &routine.prog.var_types,
+                )?;
+            }
+        }
+        Ok(ArmPick::Plan(p, Arm::Then))
     }
 
     /// 视图物化前导执行：`CREATE OR REPLACE TEMP TABLE sd_vwN AS
@@ -639,6 +737,7 @@ impl Engine {
             &routine.name,
             Status::Converted {
                 sql: report_sql.to_string(),
+                arm: None,
             },
         );
         let mut written = 0usize;
@@ -1059,10 +1158,16 @@ impl Engine {
     }
 
     fn push_report(&mut self, routine: &str, status: Status) {
-        self.set_oriented_reports.push(Report {
+        let report = Report {
             routine: routine.to_string(),
             status,
-        });
+        };
+        self.set_oriented_reports.push(report.clone());
+        // D8：即时回调先于入队返回——`call --on-skip` 的判定行在区域
+        // 裁决点输出，不等整次调用返回（OFF 路径不产生报告，不触发）。
+        if let Some(cb) = &mut self.on_set_oriented_report {
+            cb(&report);
+        }
     }
 
     fn run_prog(
@@ -1083,6 +1188,13 @@ impl Engine {
             RunControl { limits, span },
         )
     }
+}
+
+/// D7 选臂结果：`Plan` = 选中计划与臂标签；`NotTotal` = 判别式
+/// 0/>1 行或 NULL，无法证选臂（§12.3(d).4 保守回退）。
+enum ArmPick<'a> {
+    Plan(&'a ConversionPlan, Arm),
+    NotTotal,
 }
 
 /// 混合调度运行上下文：异常行集 + `sd_cur` 物化临时表名。
