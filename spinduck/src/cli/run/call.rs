@@ -28,6 +28,8 @@ pub(crate) fn cmd_call(cmd: Command) -> CallParts {
             args,
             batch_commit,
             set_oriented,
+            on_skip,
+            on_skip_error_if,
             step_budget,
             trace,
             trace_format,
@@ -40,6 +42,8 @@ pub(crate) fn cmd_call(cmd: Command) -> CallParts {
             args,
             batch_commit,
             set_oriented,
+            on_skip,
+            on_skip_error_if,
             step_budget,
             trace,
             trace_format,
@@ -57,6 +61,8 @@ pub(crate) struct CallParts {
     args: Vec<String>,
     batch_commit: bool,
     set_oriented: Option<crate::ir::set_oriented::SetOrientedMode>,
+    on_skip: Option<crate::ir::set_oriented::OnSkip>,
+    on_skip_error_if: std::collections::BTreeSet<crate::ir::set_oriented::SkipReason>,
     step_budget: Option<u64>,
     trace: Option<PathBuf>,
     trace_format: crate::trace::TraceFormat,
@@ -171,6 +177,10 @@ pub(crate) struct CallPrepared {
     pub sources: Vec<PathBuf>,
     pub rules: RuleRegistry,
     pub set_oriented: SetOrientedMode,
+    /// `call --on-skip` 生效策略（CLI > 项目 `[engine].set_oriented_on_skip`）。
+    pub on_skip: Option<crate::ir::set_oriented::OnSkip>,
+    /// `--on-skip-error-if` 名单（kebab reason → SkipReason）。
+    pub on_skip_error_if: std::collections::BTreeSet<crate::ir::set_oriented::SkipReason>,
     pub codeweb_refs: Option<Vec<crate::plan::PlanRef>>,
     /// 编译期快照的 codeweb 项目根；仅 codeweb 计划且集合化开启时导出。
     pub snapshot_root: Option<PathBuf>,
@@ -198,6 +208,8 @@ pub(crate) fn prepare_call(
         sources: t.sources,
         rules,
         set_oriented: parts.set_oriented.unwrap_or(t.set_oriented),
+        on_skip: parts.on_skip.or(t.set_oriented_on_skip),
+        on_skip_error_if: parts.on_skip_error_if.clone(),
         codeweb_refs: t.codeweb_refs,
         snapshot_root: t.snapshot_root,
     }))
@@ -280,11 +292,35 @@ pub(crate) fn call_engine(
         )?),
         None => None,
     };
+    // `--on-skip`（设计 v3.1 §5 B2/D8 路线 A）：判定行在 push_report 即时
+    // 写出（绕过 `out` 借用——回调为 'static 闭包，生产 out 即 stdout）；
+    // 事后渲染据此抑制避免重复行。OFF 路径不产生报告，stdout 零新增。
+    let on_skip = prep.on_skip;
+    if on_skip.is_some() {
+        eng.on_set_oriented_report = Some(Box::new(|report| {
+            use crate::ir::set_oriented::Status;
+            let line = match &report.status {
+                Status::Converted { arm, .. } => format!(
+                    "SET_ORIENTED {}",
+                    super::converted_body(&report.routine, *arm)
+                ),
+                Status::Skipped { reason } => format!(
+                    "SET_ORIENTED {}",
+                    super::skipped_reason_body(&report.routine, *reason)
+                ),
+            };
+            // 写失败（管道关闭等）静默丢弃：判定行是尽力而为的前移提示，
+            // 不构成调用失败面。
+            let _ = writeln!(std::io::stdout(), "{line}");
+        }));
+    }
     let res = match &mut traced {
         Some(t) => eng.call_with_sink(&prep.target, &args, t.sink()),
         None => eng.call(&prep.target, &args),
     };
-    render_set_oriented_reports(eng, out)?;
+    if on_skip.is_none() {
+        render_set_oriented_reports(eng, out)?;
+    }
     let res = res?;
     if res.outs.is_empty() && res.return_value.is_none() {
         writeln!(out, "CALL {target} OK", target = prep.target).map_err(io_err)?;
@@ -298,6 +334,19 @@ pub(crate) fn call_engine(
     }
     if let Some(t) = traced {
         t.finish()?;
+    }
+    // `--on-skip=error`：任一未列入 `--on-skip-error-if` 的 Skipped → 退出码非零
+    // （判定行已在裁决点输出；Converted 与名单内 Skipped 不判红）。
+    if on_skip == Some(crate::ir::set_oriented::OnSkip::Error)
+        && eng.set_oriented_reports().iter().any(|r| {
+            matches!(
+                r.status,
+                crate::ir::set_oriented::Status::Skipped { reason }
+                    if !prep.on_skip_error_if.contains(&reason)
+            )
+        })
+    {
+        return Ok(EXIT_FAIL);
     }
     Ok(EXIT_OK)
 }
@@ -376,6 +425,8 @@ fn refuse_on_kernel_gaps(
 #[cfg(feature = "native")]
 struct CallTargeting {
     set_oriented: SetOrientedMode,
+    /// 项目 `[engine].set_oriented_on_skip`（CLI 覆盖在 prepare_call 解析）。
+    set_oriented_on_skip: Option<crate::ir::set_oriented::OnSkip>,
     target: String,
     sources: Vec<PathBuf>,
     rules_files: std::collections::BTreeSet<PathBuf>,
@@ -392,14 +443,18 @@ fn call_target_and_sources(
 ) -> Result<Option<CallTargeting>, EngineError> {
     use crate::cli::args::CallTarget;
     match &parts.target {
-        CallTarget::Routine(r) => Ok(Some(CallTargeting {
-            set_oriented: project_set_oriented(&parts.files)?,
-            target: r.clone(),
-            sources: parts.files.clone(),
-            rules_files: discover_rules_files(&parts.files),
-            codeweb_refs: None,
-            snapshot_root: None,
-        })),
+        CallTarget::Routine(r) => {
+            let (mode, on_skip) = project_set_oriented(&parts.files)?;
+            Ok(Some(CallTargeting {
+                set_oriented: mode,
+                set_oriented_on_skip: on_skip,
+                target: r.clone(),
+                sources: parts.files.clone(),
+                rules_files: discover_rules_files(&parts.files),
+                codeweb_refs: None,
+                snapshot_root: None,
+            }))
+        }
         CallTarget::Plan(p) => {
             let text = crate::cli::read_source_strict(p)?;
             let plan = crate::plan::RunPlan::from_toml_str(&text)?;
@@ -433,6 +488,7 @@ fn call_target_and_sources(
             };
             Ok(Some(CallTargeting {
                 set_oriented: project.set_oriented,
+                set_oriented_on_skip: project.set_oriented_on_skip,
                 target: plan.target.clone(),
                 sources: files,
                 rules_files: project.rules_files.iter().cloned().collect(),
@@ -444,8 +500,11 @@ fn call_target_and_sources(
 }
 
 #[cfg(feature = "native")]
-fn project_set_oriented(files: &[PathBuf]) -> Result<SetOrientedMode, EngineError> {
+fn project_set_oriented(
+    files: &[PathBuf],
+) -> Result<(SetOrientedMode, Option<crate::ir::set_oriented::OnSkip>), EngineError> {
     let mut policy = None;
+    let mut on_skip = None;
     for file in files {
         if let Some(project) = crate::project::ProjectConfig::discover_strict(file)? {
             if policy.is_some_and(|p| p != project.set_oriented) {
@@ -454,10 +513,17 @@ fn project_set_oriented(files: &[PathBuf]) -> Result<SetOrientedMode, EngineErro
                     "多个项目的 [engine].set_oriented 配置冲突",
                 ));
             }
+            if on_skip.is_some() && on_skip != project.set_oriented_on_skip {
+                return Err(EngineError::env(
+                    30,
+                    "多个项目的 [engine].set_oriented_on_skip 配置冲突",
+                ));
+            }
             policy = Some(project.set_oriented);
+            on_skip = project.set_oriented_on_skip;
         }
     }
-    Ok(policy.unwrap_or_default())
+    Ok((policy.unwrap_or_default(), on_skip))
 }
 
 #[cfg(feature = "native")]
@@ -468,11 +534,15 @@ fn render_set_oriented_reports(
     use crate::ir::set_oriented::Status;
     for report in eng.set_oriented_reports() {
         match &report.status {
-            Status::Converted { .. } => writeln!(out, "SET_ORIENTED {} converted", report.routine),
+            Status::Converted { arm, .. } => writeln!(
+                out,
+                "SET_ORIENTED {}",
+                super::converted_body(&report.routine, *arm)
+            ),
             Status::Skipped { reason } => writeln!(
                 out,
-                "SET_ORIENTED {} skipped reason={reason:?}",
-                report.routine
+                "SET_ORIENTED {}",
+                super::skipped_reason_body(&report.routine, *reason)
             ),
         }
         .map_err(io_err)?;
@@ -614,6 +684,10 @@ mod tests {
             analyze: false,
             codeweb_project: None,
             sync_manifest: false,
+            admit: None,
+            db: None,
+            set_oriented: None,
+            admit_record: None,
         };
         let plan_code = crate::cli::compile_project_with_source(opts, &export, &mut plan_buf)
             .unwrap_or_else(|e| panic!("{}", e.message));
@@ -723,6 +797,8 @@ mod tests {
             sources: Vec::new(),
             rules: RuleRegistry::default(),
             set_oriented: SetOrientedMode::Off,
+            on_skip: None,
+            on_skip_error_if: std::collections::BTreeSet::new(),
             codeweb_refs: None,
             snapshot_root: None,
         };

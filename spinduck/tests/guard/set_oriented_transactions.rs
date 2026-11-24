@@ -56,14 +56,14 @@ fn should_convert_batch_atomic_when_batch_commit_enabled_and_avoid_empty_commit(
     let mut trace = Trace::default();
     eng.call_with_sink("copy_rows", &[], &mut trace).unwrap();
     assert_eq!(rows(&eng), expected());
-    let Status::Converted { sql } = &eng.set_oriented_reports()[0].status else {
+    let Status::Converted { sql, .. } = &eng.set_oriented_reports()[0].status else {
         panic!("expected conversion: {:?}", eng.set_oriented_reports());
     };
     let mut baseline = engine();
     baseline.register(COPY).unwrap();
     baseline.set_oriented = SetOrientedMode::BatchAtomic;
     baseline.call("copy_rows", &[]).unwrap();
-    let Status::Converted { sql: want } = &baseline.set_oriented_reports()[0].status else {
+    let Status::Converted { sql: want, .. } = &baseline.set_oriented_reports()[0].status else {
         panic!("expected conversion: {:?}", baseline.set_oriented_reports());
     };
     assert_eq!(sql, want, "batch_commit 不改变集合写语句");

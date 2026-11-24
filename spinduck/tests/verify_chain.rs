@@ -145,6 +145,10 @@ fn compile_export(root: &Path, json: serde_json::Value) -> (i32, String) {
         analyze: false,
         codeweb_project: None,
         sync_manifest: true,
+        admit: None,
+        db: None,
+        set_oriented: None,
+        admit_record: None,
     };
     let mut buf = Vec::new();
     let result = spinduck_core::cli::compile_project_with_source(opts, &export, &mut buf);

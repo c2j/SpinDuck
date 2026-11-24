@@ -32,6 +32,9 @@ pub struct ProjectConfig {
     pub kernel: String,
     /// `[engine].set_oriented`：默认关闭的受限静态集合化。
     pub set_oriented: SetOrientedMode,
+    /// `[engine].set_oriented_on_skip`（可选）：`call` 判定行前移策略
+    /// （report/error；CLI `--on-skip` 覆盖）。
+    pub set_oriented_on_skip: Option<crate::ir::set_oriented::OnSkip>,
     pub ddl_dir: PathBuf,
     pub routines_dir: PathBuf,
     pub stubs_dirs: Vec<PathBuf>,
@@ -98,9 +101,11 @@ impl ProjectConfig {
     }
 }
 
-fn set_oriented_option(v: &toml::Value) -> Result<SetOrientedMode, EngineError> {
+fn engine_options(
+    v: &toml::Value,
+) -> Result<(SetOrientedMode, Option<crate::ir::set_oriented::OnSkip>), EngineError> {
     let Some(engine) = v.get("engine") else {
-        return Ok(SetOrientedMode::Off);
+        return Ok((SetOrientedMode::Off, None));
     };
     let table = engine
         .as_table()
@@ -111,12 +116,30 @@ fn set_oriented_option(v: &toml::Value) -> Result<SetOrientedMode, EngineError> 
         Some(toml::Value::String(name)) => SetOrientedMode::from_name(name),
         Some(_) => None,
     };
-    mode.ok_or_else(|| {
+    let mode = mode.ok_or_else(|| {
         EngineError::env(
             30,
             "spinduck.toml: [engine].set_oriented 必须为布尔值或 off/strict/batch-atomic",
         )
-    })
+    })?;
+    let on_skip = match table.get("set_oriented_on_skip") {
+        None => None,
+        Some(toml::Value::String(name)) => Some(
+            crate::ir::set_oriented::OnSkip::from_name(name).ok_or_else(|| {
+                EngineError::env(
+                    30,
+                    "spinduck.toml: [engine].set_oriented_on_skip 必须为 report/error",
+                )
+            })?,
+        ),
+        Some(_) => {
+            return Err(EngineError::env(
+                30,
+                "spinduck.toml: [engine].set_oriented_on_skip 必须为 report/error",
+            ));
+        }
+    };
+    Ok((mode, on_skip))
 }
 
 fn is_runtime_snapshot(file: &Path) -> bool {
@@ -239,10 +262,12 @@ impl ProjectConfig {
             entries.push(EntryConfig::from_toml_value(&e)?);
         }
 
+        let (set_oriented, set_oriented_on_skip) = engine_options(&v)?;
         Ok(Self {
             name: name.to_string(),
             kernel: kernel.to_string(),
-            set_oriented: set_oriented_option(&v)?,
+            set_oriented,
+            set_oriented_on_skip,
             ddl_dir: get_path("ddl", "sql/ddl"),
             routines_dir: get_path("routines", "sql/routines"),
             stubs_dirs,

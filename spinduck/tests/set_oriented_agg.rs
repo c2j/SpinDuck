@@ -103,7 +103,7 @@ fn should_lower_jyfy_aggregate_with_exact_four_case_semantics() {
     // BatchAtomic：Converted 且结果逐行一致
     let mut eng = engine_with(&[caller().as_str()], SetOrientedMode::BatchAtomic);
     eng.call("caller_agg", &[]).unwrap();
-    let Status::Converted { sql } = eng.set_oriented_reports()[0].status.clone() else {
+    let Status::Converted { sql, .. } = eng.set_oriented_reports()[0].status.clone() else {
         panic!("{:?}", eng.set_oriented_reports());
     };
     assert_eq!(dst_rows(&eng), expected, "BatchAtomic 与 Off 必须逐行一致");

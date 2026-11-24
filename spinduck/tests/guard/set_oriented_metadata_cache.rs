@@ -68,7 +68,7 @@ fn should_recheck_indexes_and_columns_after_reusing_a_complete_offline_candidate
         }
         assert_eq!(
             eng.set_oriented_reports()[0].status,
-            Status::Converted { sql }
+            Status::Converted { sql, arm: None }
         );
         assert_eq!(
             rows(&eng),
@@ -186,7 +186,7 @@ fn should_invalidate_replaced_column_evidence_even_with_the_same_fingerprint() {
     eng.call("copy_rows", &[]).unwrap();
     assert_eq!(
         eng.set_oriented_reports()[0].status,
-        Status::Converted { sql }
+        Status::Converted { sql, arm: None }
     );
     let fingerprint = snapshot.fingerprint.clone();
     let target = snapshot

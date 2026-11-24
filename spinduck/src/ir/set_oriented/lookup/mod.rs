@@ -11,6 +11,7 @@ mod parse;
 mod top1;
 mod tuple;
 pub(super) use mixed::mixed_fallback_group_at;
+pub(crate) use parse::fallback_sql;
 pub(crate) use parse::parse_total;
 pub(crate) use parse::parse_tuple_total;
 pub(super) use tuple::render_tuple;
@@ -339,19 +340,39 @@ pub(super) fn fallback_group_at(
     Ok(Some(out))
 }
 
+/// IF 路由型常量兜底闭包的解析产物（§4.3 + §4.4 B1 + D7 §12.3(b)）：
+/// ELSE 臂连续 SELECT INTO 组与 THEN 臂 pc 区间，供主走查（ELSE 计划）
+/// 与 THEN 臂走查（判别式臂计划，PR#62 臂内准入口径）分别消费。
+pub(super) struct IfGroup {
+    /// IF 条件表达式（循环不变路由变量 = 常量）。
+    pub cond: IrExpr,
+    /// ELSE 臂查找组（程序序，含重置兜底与全定义证明）。
+    pub group: Vec<LookupQuery>,
+    /// 续跑 pc（处理器尾 Jump 之后）。
+    pub resume: usize,
+    /// ELSE 臂起始 pc（= THEN 臂终止 Jump 的下一 pc）。
+    pub else_start: usize,
+    /// THEN 臂 pc 区间（pc+2 .. else_start）。
+    pub then_range: std::ops::Range<usize>,
+    /// ELSE 臂 pc 区间（else_start .. else_start + 组大小）。
+    pub else_range: std::ops::Range<usize>,
+    /// 处理器常量重置（变量, 兜底常量），未重置成员须组内局部死。
+    pub resets: Vec<(VarName, SpinValue)>,
+}
+
 /// 识别 pc 处的 IF 路由型常量兜底闭包（§4.3 + §4.4 B1）：主线首条 IF 由
 /// 循环不变量路由（THEN 入口守卫证明不可达），ELSE 为连续 SELECT INTO 组，
 /// 处理器重置成员子集（全量 m=n 或部分 m<n）。部分兜底的未重置成员须组内
 /// 局部死（仅被同组 CASE 写汇作操作数读取，INSERT/出口/他处均无读取），
 /// 其批写值经 group_hits 合取门控，落空时输出取重置兜底，残值不可观察。
-/// 返回 (IF 条件, ELSE 查找组, 续跑 pc)；形态不符 = Ok(None)；全定义证明
-/// 失败 = Err(UnprovenQueryTotalness)；局部死证明失败 = Err(UnsupportedControlFlow)。
+/// 形态不符 = Ok(None)；全定义证明失败 = Err(UnprovenQueryTotalness)；
+/// 局部死证明失败 = Err(UnsupportedControlFlow)。
 pub(super) fn fallback_if_group_at(
     prog: &IrProg,
     pc: usize,
     region: &CursorRegion,
     catalog: &crate::catalog::RoutineCatalog,
-) -> Result<Option<(IrExpr, Vec<LookupQuery>, usize)>, SkipReason> {
+) -> Result<Option<IfGroup>, SkipReason> {
     let IrStmt::PushTrap { entries } = &prog.code[pc] else {
         return Ok(None);
     };
@@ -405,7 +426,29 @@ pub(super) fn fallback_if_group_at(
             return Err(SkipReason::UnsupportedControlFlow);
         }
     }
-    Ok(Some((iff.cond, out, iff.resume_pc)))
+    Ok(Some(IfGroup {
+        cond: iff.cond,
+        group: out,
+        resume: iff.resume_pc,
+        else_start: iff.else_start,
+        then_range: pc + 2..iff.else_start,
+        else_range: iff.else_start..iff.else_start + iff.query_vars.len(),
+        resets: iff.resets,
+    }))
+}
+
+/// D7 THEN 臂独立走查的裸 SqlQuery（§12.3(b)）：臂内 SELECT INTO 无
+/// 兜底组/处理器重置上下文，仅接受 `case_sink × sys_dummy` 形态——
+/// sys_dummy 入口守卫已证恰 1 行，INTO 恒 total、miss 语义不存在，
+/// `default_sql` 不参与渲染。其余形态 = Ok(None)。
+pub(super) fn parse_then_case_sink(
+    sql: &str,
+    var: VarName,
+    binds: &[(String, BindSrc)],
+    record: &VarName,
+) -> Result<Option<LookupQuery>, SkipReason> {
+    let lq = parse::parse_total(sql, var, "NULL".to_string(), binds, record)?;
+    Ok((lq.case_sink.is_some() && lq.table.0 == "sys_dummy").then_some(lq))
 }
 
 /// 识别 pc 处的跳行 trap 查找（§5 步骤 4）：PushTrap(WHEN OTHERS → 跳行)

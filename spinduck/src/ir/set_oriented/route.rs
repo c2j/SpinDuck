@@ -48,14 +48,73 @@ pub(super) fn static_cond(folded: &SpinValue, lit: &SpinValue) -> Option<bool> {
     }
 }
 
+/// D7 判别式 SQL（§12.3(d)）：臂标签在 SQL 侧产出——`= lit` → `0`
+/// （THEN 臂）；其余一律 `1`（ELSE 臂值域补集）。判别值 NULL 时
+/// `NULL = lit` → NULL → CASE 落 ELSE，与 PL `IF` 语义（条件非
+/// TRUE 即走 ELSE）及 PR#62 `route::pick` 口径一致。比较走 SQL
+/// `=` 语义，与原 IF 条件同源；与 [`guard`] 共用同一份渲染证据与
+/// `key_checks.is_empty()` 前提。当前单 route ⇒ 单 THEN 臂。
+/// `RouteDiscriminatorNotTotal` 仅剩防御位：判别式查询本身不产
+/// 恰一行整数标签时运行期兜底（当前形态恒产 0/1）。
+pub(super) fn discriminator(l: &ResolvedLookup, lit: &str) -> Result<String, SkipReason> {
+    if !l.render.key_checks.is_empty() {
+        return Err(SkipReason::UnsupportedControlFlow);
+    }
+    let inner = format!(
+        "CASE WHEN {} THEN {} ELSE {} END",
+        l.render.hit, l.render.value, l.render.default_sql
+    );
+    let sql = format!("SELECT CASE WHEN ({inner}) = {lit} THEN 0 ELSE 1 END");
+    reject_frame_binds(&sql)?;
+    Ok(sql)
+}
+
 /// 入口守卫 SQL：查找值（命中 NULL 保留、0/多行落兜底）与常量等值
 /// 的三值否定，期望 TRUE；守卫自身全定义不抛错。
 pub(super) fn guard(l: &ResolvedLookup, lit: &str) -> Result<String, SkipReason> {
     if !l.render.key_checks.is_empty() {
         return Err(SkipReason::UnsupportedControlFlow);
     }
-    Ok(format!(
+    let sql = format!(
         "SELECT ((CASE WHEN {} THEN {} ELSE {} END) = {lit}) IS NOT TRUE",
         l.render.hit, l.render.value, l.render.default_sql
-    ))
+    );
+    reject_frame_binds(&sql)?;
+    Ok(sql)
+}
+
+/// 判别式/守卫在入口与选臂两处均以**空绑定**求值（bind-free 前提，
+/// §12.3(d)）：渲染产物含 `$v_*` 占位符即帧依赖，计划期拒绝——
+/// 否则运行期空 BindMap 求值会 KERNEL-0010 崩溃而非 Skipped 回退
+/// （v0.2.4 存量缺陷，PR#62/#63 同态复现）。词法扫描避开字面量
+/// 内的 `$v_` 文本；Tokens 不可解析同样保守拒绝。
+fn reject_frame_binds(sql: &str) -> Result<(), SkipReason> {
+    let bound = match super::shape::Tokens::new(sql) {
+        Some(t) => t.words().iter().any(|w| w.starts_with("$v_")),
+        None => true,
+    };
+    if bound {
+        return Err(SkipReason::UnsupportedControlFlow);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_reject_frame_bind_placeholder_in_route_sql() {
+        // N-1：`$v_*` 占位符 = 帧依赖，bind-free 前提不成立 → 计划期拒绝。
+        assert!(reject_frame_binds("SELECT * FROM t WHERE op = $v_v_f").is_err());
+        assert!(reject_frame_binds("SELECT CASE WHEN x THEN $v_a ELSE $v_b END").is_err());
+    }
+
+    #[test]
+    fn should_allow_route_sql_without_frame_binds() {
+        // 字面量内的 `$v_` 文本不是占位符（词法层带引号，不得误拒）。
+        assert!(reject_frame_binds("SELECT * FROM t WHERE op = 'X'").is_ok());
+        assert!(reject_frame_binds("SELECT * FROM t WHERE note = '$v_v_f'").is_ok());
+        assert!(reject_frame_binds("SELECT * FROM t WHERE op = \"$v_v_f\"").is_ok());
+    }
 }

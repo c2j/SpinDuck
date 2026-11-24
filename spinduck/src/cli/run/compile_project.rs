@@ -4,10 +4,14 @@
 //! `--analyze` 允许在取图前于进程内完成增量分析。
 
 use super::compile::rules_for_paths;
+use super::compile_admit::render_admit;
 use super::{io_err, EXIT_FAIL, EXIT_OK};
+use crate::cli::args::AdmitMode;
 use crate::cli::{read_source_strict, NoopExecutor};
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::ir::set_oriented::admit::AdmitInput;
+use crate::ir::set_oriented::SetOrientedMode;
 use crate::plan::codeweb::{plans_from_source, CodewebSource, EmbeddedCodewebSource};
 use crate::plan::{write_plan, PlanWrite, RunPlan};
 use crate::project::ProjectConfig;
@@ -29,6 +33,42 @@ pub struct ProjectCompile {
     pub codeweb_project: Option<PathBuf>,
     /// 同步运行态快照（`conf/spinduck.runtime.toml`），默认关。
     pub sync_manifest: bool,
+    /// `--admit[=report|error]`：集合化判定开关（D9：CLI 层已强制 `--db`）。
+    pub admit: Option<AdmitMode>,
+    /// admit 的数据面库文件（`--db`）。
+    pub db: Option<PathBuf>,
+    /// `--set-oriented[=mode]`：覆盖 `[engine].set_oriented`（CLI > 项目）。
+    pub set_oriented: Option<SetOrientedMode>,
+    /// `--admit-record <f>`：判定工件输出路径（显式给才写，不隐式写项目树）。
+    pub admit_record: Option<PathBuf>,
+}
+
+/// admit 数据面来源：`Open` = 生产路径在项目内取快照/库/宏名；
+/// `Input` = 调用方注入字面量（`compile_project_admit_with_source` 测试接缝）。
+pub(crate) enum AdmitRequest {
+    Open { db: Option<PathBuf> },
+    Input(AdmitInput),
+}
+
+/// 一次 compile 的 admit 请求（模式已按 CLI > 项目解析完毕）。
+pub(crate) struct AdmitRun {
+    pub request: AdmitRequest,
+    pub mode: SetOrientedMode,
+    pub record: Option<PathBuf>,
+    /// `--admit=error`：firm `skipped` 计入退出码。
+    pub fail_on_firm: bool,
+}
+
+impl ProjectCompile {
+    /// admit 请求（无 `--admit` → None）。`project` 提供 `[engine].set_oriented` 兜底。
+    fn admit_run(&self, project: &ProjectConfig, request: AdmitRequest) -> Option<AdmitRun> {
+        self.admit.map(|mode| AdmitRun {
+            request,
+            mode: self.set_oriented.unwrap_or(project.set_oriented),
+            record: self.admit_record.clone(),
+            fail_on_firm: mode == AdmitMode::Error,
+        })
+    }
 }
 
 pub(super) fn compile_project_cmd(
@@ -42,7 +82,13 @@ pub(super) fn compile_project_cmd(
     let source = EmbeddedCodewebSource {
         auto_analyze: opts.analyze,
     };
-    compile_with_source(&project, &entries, opts.schema, &source, out)
+    let admit = opts.admit_run(
+        &project,
+        AdmitRequest::Open {
+            db: opts.db.clone(),
+        },
+    );
+    compile_with_source(&project, &entries, opts.schema, &source, admit, out)
 }
 
 /// 注入取图来源的项目态 compile：测试注入内存 JSON，其余口径与嵌入式生产一致。
@@ -51,11 +97,30 @@ pub fn compile_project_with_source(
     source: &impl CodewebSource,
     out: &mut dyn Write,
 ) -> Result<i32, EngineError> {
+    compile_project_admit_with_source(opts, source, None, out)
+}
+
+/// admit 数据面注入的姊妹入口（设计 v3.1 §3.4 测试接缝）：`admit_input`
+/// 为字面量快照/执行器/宏名集，供无真实 codeweb 项目的测试使用；
+/// 生产路径请走 [`compile_project_cmd`]（内部 `AdmitInput::open`）。
+pub fn compile_project_admit_with_source(
+    opts: ProjectCompile,
+    source: &impl CodewebSource,
+    admit_input: Option<AdmitInput>,
+    out: &mut dyn Write,
+) -> Result<i32, EngineError> {
     let (project, entries) = locate_project(&opts)?;
     if opts.sync_manifest {
         sync_manifest_line(&project, out)?;
     }
-    compile_with_source(&project, &entries, opts.schema, source, out)
+    let request = match admit_input {
+        Some(input) => AdmitRequest::Input(input),
+        None => AdmitRequest::Open {
+            db: opts.db.clone(),
+        },
+    };
+    let admit = opts.admit_run(&project, request);
+    compile_with_source(&project, &entries, opts.schema, source, admit, out)
 }
 
 fn locate_project(opts: &ProjectCompile) -> Result<(ProjectConfig, Vec<String>), EngineError> {
@@ -109,18 +174,21 @@ pub(crate) fn sync_manifest_line(
 }
 
 /// 计划落盘与退出码。`source` 由调用方注入（生产 = 嵌入实现，测试 = JSON 夹具）。
+/// `admit` 为 None 时行为与历史逐字一致（零回归，测试 7）。
 pub(crate) fn compile_with_source(
     project: &ProjectConfig,
     entries: &[String],
     schema: Option<String>,
     source: &impl CodewebSource,
+    admit: Option<AdmitRun>,
     out: &mut dyn Write,
 ) -> Result<i32, EngineError> {
     let plans = plans_from_source(project, entries, schema, source)?;
     let written = write_plans(project, &plans)?;
     render_plans(&plans, &written, out)?;
-    let failed = ir_failures(project, &plans)?;
-    for (rel, err) in &failed {
+    let ir = ir_failures(project, &plans)?;
+    let failed = &ir.failed;
+    for (rel, err) in failed {
         writeln!(out, "FAIL {rel}  [{}] {}", err.code, err.message).map_err(io_err)?;
     }
     let missing: usize = plans.iter().map(|plan| plan.missing.len()).sum();
@@ -142,7 +210,15 @@ pub(crate) fn compile_with_source(
         gate2b
     )
     .map_err(io_err)?;
-    Ok(if missing == 0 && failed.is_empty() {
+    // 判定块插在 compile: 摘要行之后（§3.2）；无 --admit 时完全不触发。
+    let fail_on_firm = admit.as_ref().is_some_and(|run| run.fail_on_firm);
+    let mut admit_firm_skipped = 0usize;
+    if let Some(run) = admit {
+        admit_firm_skipped = render_admit(project, entries, &run, ir.engine.as_ref(), out)?;
+    }
+    let base_ok = missing == 0 && failed.is_empty();
+    // §3.3：--admit=error 追加「firm skipped == 0」；report 与无 admit 不改退出码。
+    Ok(if base_ok && !(fail_on_firm && admit_firm_skipped > 0) {
         EXIT_OK
     } else {
         EXIT_FAIL
@@ -232,16 +308,21 @@ fn render_one(plan: &RunPlan, written: &PlanWrite, out: &mut dyn Write) -> Resul
     Ok(())
 }
 
+/// `ir_failures` 返回值：体检失败清单 + 闭包注册用的 Engine
+/// （admit 复用其 `catalog`/`macro_names`，设计 v3.1 §3.4）。
+struct IrFailures {
+    failed: Vec<(String, EngineError)>,
+    /// 闭包非空时的注册引擎；无闭包例程时为 None。
+    engine: Option<Engine>,
+}
+
 /// 闭包源文件共用一个 Engine。失败不改计划，只在摘要之后按体检的 FAIL 行打出。
 ///
 /// Gate 1B/2A（设计 V4 Stage 2–4）：对闭包内例程+表/视图 DDL 文件建
 /// `SchemaSnapshot` 并做对象/列引用检查，发现以 `BIZ-0152` 计入
 /// `failed`；与 `RunPlan[[missing]]` 重复的 relation 缺失去重（闭包
 /// 域已报的不重复报）。Gate 2B（Stub 库 prepare）二期接入。
-fn ir_failures(
-    project: &ProjectConfig,
-    plans: &[RunPlan],
-) -> Result<Vec<(String, EngineError)>, EngineError> {
+fn ir_failures(project: &ProjectConfig, plans: &[RunPlan]) -> Result<IrFailures, EngineError> {
     let rels: BTreeSet<&str> = plans
         .iter()
         .flat_map(|plan| plan.ddl_routines.iter().map(String::as_str))
@@ -265,6 +346,7 @@ fn ir_failures(
     }
     // 已失败文件：pipeline 不再重复报同一文件的 Gate 2A 拒绝
     let mut failed_rels: BTreeSet<String> = BTreeSet::new();
+    let mut engine = None;
     if !rels.is_empty() {
         let paths: Vec<PathBuf> = rels.iter().map(|rel| project.root.join(rel)).collect();
         let rules = rules_for_paths(&paths)?;
@@ -326,13 +408,14 @@ fn ir_failures(
                 &snap, &rules, &gate_sqls,
             )?);
         }
+        engine = Some(eng);
     } else {
         let gate = gate_failures(project, plans, &failed_rels, None);
         failed.extend(gate.findings);
         failed.extend(gate.rejected);
     }
     failed.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(failed)
+    Ok(IrFailures { failed, engine })
 }
 
 /// 从例程 IR 收集 Gate 2B 输入：全部静态 SQL 文本（含游标

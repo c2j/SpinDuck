@@ -6,7 +6,8 @@ use crate::catalog::CompiledRoutine;
 use crate::error::EngineError;
 use crate::exec::TraceSink;
 use crate::ir::set_oriented::{
-    entry_ok, ConversionPlan, OptimizeCtx, Report, SetOrientedMode, SkipReason, Status,
+    entry_ok, Arm, ConversionPlan, Discriminator, OptimizeCtx, Report, SetOrientedMode, SkipReason,
+    Status,
 };
 use crate::runtime::{Frame, RunControl, RunLimits, RunOutcome, RunSpan};
 
@@ -52,9 +53,20 @@ impl Engine {
         // 失败时事务内尚无副作用，ROLLBACK 重开后整段按原 IR 解释执行。
         // 计划期已证前缀与 fn 前导写集同视图底表不相交，探测通过 ⇒
         // 物化时点数据与探测时点一致。
-        if plans.iter().any(|p| !p.view_preludes.is_empty()) {
+        // D7 双臂：判别式选中臂的 view_preludes 同样在 pick_arm 内物化
+        // ——物化失败会中止事务且彼时用户代码已跑，无法安全回退，
+        // 故臂计划一并纳入前移探测（未选中臂的臂视图同样先建，
+        // 选中臂在裁决点按同名 CREATE OR REPLACE 重建覆盖，幂等）。
+        let view_plans = plans.iter().flat_map(|p| {
+            p.discriminator
+                .iter()
+                .flat_map(|d| d.arms.iter().map(|a| a.plan.as_ref()))
+                .chain(std::iter::once(p))
+        });
+        let view_plans: Vec<&ConversionPlan> = view_plans.collect();
+        if view_plans.iter().any(|p| !p.view_preludes.is_empty()) {
             let mut failed = false;
-            for p in &plans {
+            for p in &view_plans {
                 if self.materialize_views(p).is_err() {
                     failed = true;
                     break;
@@ -159,7 +171,37 @@ impl Engine {
         if !plan.view_preludes.is_empty() {
             self.materialize_views(plan)?;
         }
-        match entry_ok(self.ex.as_ref(), plan, &self.optimize_ctx(), frame)? {
+        // D7 双臂（§12.3(d)）：判别式取值选臂——恰一行整数标签才可证，
+        // NULL/不等值经 SQL `=` 三值语义已落 ELSE 臂（PL IF 口径，
+        // 与 PR#62 route::pick 一致）；标签越界/非整数/查询异常 →
+        // RouteDiscriminatorNotTotal 整段退回（防御位）。未选中臂
+        // 的守卫不求值。判别式与主计划前导同序物化（可内嵌 sd_vwN）。
+        let (arm_plan, arm_label) = match &plan.discriminator {
+            None => (plan, None),
+            Some(d) => match self.pick_arm(d, plan, routine, frame, sink)? {
+                ArmPick::Plan(p, a) => (p, Some(a)),
+                ArmPick::NotTotal => {
+                    self.push_report(
+                        &routine.name,
+                        Status::Skipped {
+                            reason: SkipReason::RouteDiscriminatorNotTotal,
+                        },
+                    );
+                    let out = self.run_prog(
+                        &routine.prog,
+                        frame,
+                        sink,
+                        limits,
+                        RunSpan {
+                            start_pc: plan.open_pc,
+                            stop_pc: Some(plan.close_pc + 1),
+                        },
+                    )?;
+                    return Ok((!matches!(out, RunOutcome::Stopped)).then_some(out));
+                }
+            },
+        };
+        match entry_ok(self.ex.as_ref(), arm_plan, &self.optimize_ctx(), frame)? {
             Err(reason) => {
                 self.push_report(&routine.name, Status::Skipped { reason });
                 let out = self.run_prog(
@@ -178,14 +220,16 @@ impl Engine {
                 self.push_report(
                     &routine.name,
                     Status::Converted {
-                        sql: plan.sql.clone(),
+                        sql: arm_plan.sql.clone(),
+                        arm: arm_label,
                     },
                 );
                 // fn_site 物化前导：与解释器 OpenCursor 时点同口径，
                 // 失败直接上抛（同点失败语义），绝不部分物化后续跑批写。
-                if !preluded && !plan.fn_preludes.is_empty() {
+                // pick_arm 已物化 Then 臂前导；ELSE 臂=主计划走既有口径。
+                if !preluded && arm_label != Some(Arm::Then) && !arm_plan.fn_preludes.is_empty() {
                     crate::runtime::interp::materialize_fn_preludes(
-                        &plan.fn_preludes,
+                        &arm_plan.fn_preludes,
                         frame,
                         self.ex.as_ref(),
                         sink,
@@ -193,11 +237,11 @@ impl Engine {
                         &routine.prog.var_types,
                     )?;
                 }
-                let rows = self.exec_region_sql(plan, frame, sink)?;
+                let rows = self.exec_region_sql(arm_plan, frame, sink)?;
                 // miss 仿真标量出口：NO_DATA_FOUND 处理器赋值回填——
                 // 存在 miss 行时取回逐行（均匀性已由入口守卫证明）
                 // 处理器赋值结果写回帧；无 miss 行保持批写前值。
-                for mo in &plan.miss_outs {
+                for mo in &arm_plan.miss_outs {
                     let bm = crate::runtime::interp::resolve_binds(&mo.binds, frame)?;
                     let mut stream = self.ex.query(&mo.sql, &bm)?;
                     if let Some(row) = stream.fetch_many(1).into_iter().next() {
@@ -206,10 +250,57 @@ impl Engine {
                         }
                     }
                 }
-                self.commit_region_tail(plan, rows, sink)?;
+                self.commit_region_tail(arm_plan, rows, sink)?;
                 Ok(None)
             }
         }
+    }
+
+    /// D7 判别式选臂（§12.3(d).2）：`d.sql` 在 SQL 侧产整型标签——
+    /// `0..arms.len()-1` → 对应臂计划（先补物化其前导），
+    /// `arms.len()` → 主计划（ELSE 臂 =值域补集；判别值 NULL 已在
+    /// SQL 侧落 ELSE，与 PL IF 语义一致）。越界/非整数/查询不产
+    /// 恰一行 → `NotTotal` 整段回退（防御位）。臂等值比较已在
+    /// 判别式 SQL 内完成（`=` 语义与原 IF 条件同源），此处不再做
+    /// SpinValue 跨类型比对。
+    fn pick_arm<'p>(
+        &self,
+        d: &'p Discriminator,
+        plan: &'p ConversionPlan,
+        routine: &CompiledRoutine,
+        frame: &mut Frame,
+        sink: &mut dyn TraceSink,
+    ) -> Result<ArmPick<'p>, EngineError> {
+        let mut stream = self.ex.query(&d.sql, &crate::exec::BindMap::new())?;
+        let tag = match stream.fetch_many(1).first().and_then(|r| r.first()) {
+            Some(crate::value::SpinValue::Int(t)) => *t,
+            _ => return Ok(ArmPick::NotTotal),
+        };
+        if tag == d.arms.len() as i64 {
+            return Ok(ArmPick::Plan(plan, Arm::Else));
+        }
+        let Some(arm) = usize::try_from(tag).ok().and_then(|i| d.arms.get(i)) else {
+            return Ok(ArmPick::NotTotal);
+        };
+        let p = arm.plan.as_ref();
+        // 臂计划前导：视图物化恒先于守卫；fn 前导同主计划
+        // preludes_first 口径——臂计划一旦被选中其守卫/批写
+        // 可能引用 sd_fn*/sd_bf*，统一前置物化（纯度已证，
+        // 幂等去重）。
+        if !p.view_preludes.is_empty() || !p.fn_preludes.is_empty() {
+            self.materialize_views(p)?;
+            if !p.fn_preludes.is_empty() {
+                crate::runtime::interp::materialize_fn_preludes(
+                    &p.fn_preludes,
+                    frame,
+                    self.ex.as_ref(),
+                    sink,
+                    &self.catalog,
+                    &routine.prog.var_types,
+                )?;
+            }
+        }
+        Ok(ArmPick::Plan(p, Arm::Then))
     }
 
     /// 视图物化前导执行：`CREATE OR REPLACE TEMP TABLE sd_vwN AS
@@ -305,10 +396,16 @@ impl Engine {
     }
 
     fn push_report(&mut self, routine: &str, status: Status) {
-        self.set_oriented_reports.push(Report {
+        let report = Report {
             routine: routine.to_string(),
             status,
-        });
+        };
+        self.set_oriented_reports.push(report.clone());
+        // D8：即时回调先于入队返回——`call --on-skip` 的判定行在区域
+        // 裁决点输出，不等整次调用返回（OFF 路径不产生报告，不触发）。
+        if let Some(cb) = &mut self.on_set_oriented_report {
+            cb(&report);
+        }
     }
 
     fn run_prog(
@@ -329,4 +426,11 @@ impl Engine {
             RunControl { limits, span },
         )
     }
+}
+
+/// D7 选臂结果：`Plan` = 选中计划与臂标签；`NotTotal` = 判别式
+/// 0/>1 行或 NULL，无法证选臂（§12.3(d).4 保守回退）。
+enum ArmPick<'a> {
+    Plan(&'a ConversionPlan, Arm),
+    NotTotal,
 }

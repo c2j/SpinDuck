@@ -184,6 +184,7 @@ mod tests {
             &entries,
             schema.map(str::to_string),
             &fake,
+            None,
             &mut buf,
         )
         .unwrap_or_else(|e| panic!("{e}"));
@@ -360,6 +361,7 @@ mod tests {
             &["pkg_a.prc_other".to_string()],
             None,
             &fake,
+            None,
             &mut Vec::new(),
         )
         .unwrap_err();

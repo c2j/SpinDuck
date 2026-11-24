@@ -228,7 +228,7 @@ impl WhereClause {
     }
 }
 
-pub(super) fn fallback_sql(default: &SpinValue) -> Result<String, SkipReason> {
+pub(crate) fn fallback_sql(default: &SpinValue) -> Result<String, SkipReason> {
     match default {
         SpinValue::Str(s) => Ok(format!("'{}'", s.replace('\'', "''"))),
         SpinValue::Int(i) => Ok(i.to_string()),

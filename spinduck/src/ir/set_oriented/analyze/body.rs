@@ -20,6 +20,13 @@ enum Gate {
     },
 }
 
+/// TrapGroup THEN 臂走查上下文：ELSE 臂区间（局部死证明豁免）与
+/// 处理器重置（arm_query 兜底默认值来源）。
+struct ArmIf {
+    else_range: std::ops::Range<usize>,
+    resets: Vec<(VarName, crate::value::SpinValue)>,
+}
+
 #[derive(Default)]
 pub(super) struct Body<'a> {
     pub insert_stmt: Option<&'a IrStmt>,
@@ -33,6 +40,16 @@ pub(super) struct Body<'a> {
     /// LookupTuple 槽位变量：调用被集合化跳过后不得再被赋值（防陈旧绑定）。
     tuple_vars: std::collections::BTreeSet<VarName>,
     pub route: Option<(VarName, String)>,
+    /// route 决策点（D7 双臂走查 divert 输入；两种 route 形态见
+    /// [`super::RouteSite`]）。
+    pub route_site: Option<super::RouteSite>,
+    /// 本次走查是否为 D7 THEN 臂（裸 SqlQuery 的 case_sink 受理面）。
+    then_arm: bool,
+    /// TrapGroup THEN 臂走查上下文（PR#62 口径）：ELSE 臂 pc 区间
+    /// （finish_arm 局部死豁免区）与处理器重置（arm_query 兜底默认）。
+    arm_if: Option<ArmIf>,
+    /// THEN 臂已收集的查找（pc, 查找），finish_arm 时成组并做死存储证明。
+    arm_lookups: Vec<(usize, lookup::LookupQuery)>,
     pub folded: Vec<(VarName, crate::value::SpinValue)>,
     pub inlined: Vec<(VarName, IrExpr)>,
     pub inline_checks: Vec<(VarName, IrExpr)>,
@@ -57,15 +74,84 @@ pub(super) struct Body<'a> {
 
 impl<'a> Body<'a> {
     pub(super) fn walk(ctx: &Context<'a, '_>) -> Result<Self, SkipReason> {
+        Self::walk_diverted(ctx, None)
+    }
+
+    /// D7 双臂（§12.3(b) 每臂独立走查）：在 route 决策点分流进
+    /// THEN 臂、臂尾跳到汇合后续走——公共后缀在本臂入口状态下独立
+    /// 走查，不做两臂事实合并。trap 形态臂含 trap 语义，预置
+    /// `has_trap`（PushTrap/PopTrap/handler 被 divert 跳过）。
+    pub(super) fn walk_then(
+        ctx: &Context<'a, '_>,
+        site: super::RouteSite,
+    ) -> Result<Self, SkipReason> {
+        Self::walk_diverted(ctx, Some(site))
+    }
+
+    fn walk_diverted(
+        ctx: &Context<'a, '_>,
+        site: Option<super::RouteSite>,
+    ) -> Result<Self, SkipReason> {
+        let redirects: Vec<(usize, usize)> = match site {
+            Some(super::RouteSite::Branch { pc, to }) => {
+                vec![(pc, pc + 1), (to - 1, ctx.region.close_pc - 1)]
+            }
+            // TrapGroup 不绕行：PushTrap 命中 trap() 后由 IF 组处理器按
+            // 臂分流——THEN 臂内联走查（arm_query + finish_arm，PR#62
+            // 口径），主臂 add_group(ELSE 组) + route/route_site 记录
+            // （D7 判别式 SQL 证据源）。
+            Some(super::RouteSite::TrapGroup { .. }) | None => Vec::new(),
+        };
+        let trap_route = matches!(site, Some(super::RouteSite::TrapGroup { .. }));
         let mut body = Self {
             agg_candidates: agg_candidates(ctx),
+            then_arm: site.is_some(),
             ..Default::default()
         };
+        if trap_route {
+            body.has_trap = true;
+        }
         let mut pc = ctx.region.open_pc + 3;
         while pc < ctx.region.close_pc - 1 {
+            if let Some((_, next)) = redirects.iter().find(|(at, _)| *at == pc) {
+                pc = *next;
+                continue;
+            }
             pc = body.statement(ctx, pc)?;
         }
+        // D7 THEN 臂事后冲突检查：折叠常量之后又被任一写汇/查找/内联
+        // 事实接管同名变量 → 折叠值对覆写前的读取不再成立，整体拒绝。
+        if site.is_some() {
+            for (v, _) in &body.folded {
+                if body.arm_fact_conflict(v, false) {
+                    return Err(SkipReason::UnsupportedControlFlow);
+                }
+            }
+        }
         Ok(body)
+    }
+
+    /// THEN 臂折叠常量的同名事实冲突检查：变量已被查找/写汇/内联/
+    /// 算术覆写/聚合/死存储等任一事实持有时拒绝（§12.3 臂内独立事实）。
+    /// `include_folded`：赋值时点检查含 folded 自身（重复赋值拒绝）；
+    /// 事后检查排除（folded 条目自身即被检对象）。
+    fn reject_arm_fact(&self, v: &VarName) -> Result<(), SkipReason> {
+        if self.arm_fact_conflict(v, true) {
+            return Err(SkipReason::UnsupportedControlFlow);
+        }
+        Ok(())
+    }
+
+    fn arm_fact_conflict(&self, v: &VarName, include_folded: bool) -> bool {
+        (include_folded && self.folded.iter().any(|(fv, _)| fv == v))
+            || self.inlined.iter().any(|(iv, _)| iv == v)
+            || self.sinks.iter().any(|(sv, _, _, _)| sv == v)
+            || self.arith_writes.iter().any(|w| w.var == *v)
+            || self.lookups.iter().any(|l| l.var == *v)
+            || self.aggs.iter().any(|a| a.var == *v)
+            || self.agg_vars.contains(v)
+            || self.tuple_vars.contains(v)
+            || self.dead.contains(v)
     }
 
     fn statement(&mut self, ctx: &Context<'a, '_>, pc: usize) -> Result<usize, SkipReason> {
@@ -110,8 +196,29 @@ impl<'a> Body<'a> {
                 into,
                 fn_sites,
             } => {
+                // THEN 臂内联走查（TrapGroup IF 组，PR#62 口径）：臂内
+                // SELECT INTO 按查找组成员准入（parse_total 全定义证明
+                // + 写集不相交 + 处理器重置兜底）。
+                if self.arm_if.is_some() {
+                    return self.arm_query(ctx, pc, sql, binds, into, fn_sites);
+                }
                 if !fn_sites.is_empty() {
                     return Err(SkipReason::UnresolvedFnSite);
+                }
+                // D7 THEN 臂：裸 SELECT INTO 仅受理 sys_dummy CASE 写汇
+                // （入口守卫已证 total，无 miss 语义）。
+                if self.then_arm {
+                    let [AssignTarget::Var(var)] = into.as_slice() else {
+                        return Err(SkipReason::UnsupportedControlFlow);
+                    };
+                    match lookup::parse_then_case_sink(sql, var.clone(), binds, &ctx.region.record)?
+                    {
+                        Some(lq) => {
+                            self.add_group(vec![lq])?;
+                            return Ok(pc + 1);
+                        }
+                        None => return Err(SkipReason::UnsupportedControlFlow),
+                    }
                 }
                 if !matches!(into.as_slice(), [AssignTarget::Var(_)]) || !binds.is_empty() {
                     return Err(SkipReason::UnsupportedControlFlow);
@@ -160,17 +267,36 @@ impl<'a> Body<'a> {
                 return Ok(pc + 2);
             }
         }
-        if let Some((cond, group, resume)) =
-            lookup::fallback_if_group_at(ctx.prog, pc, ctx.region, ctx.catalog)?
-        {
-            if self.route.is_some() {
+        if let Some(iff) = lookup::fallback_if_group_at(ctx.prog, pc, ctx.region, ctx.catalog)? {
+            if self.route.is_some() || self.arm_if.is_some() {
                 return Err(SkipReason::UnsupportedControlFlow);
             }
-            let r = route::cond(&cond, &self.lookups).ok_or(SkipReason::UnsupportedControlFlow)?;
-            self.add_group(group)?;
+            if self.then_arm {
+                // THEN 臂（D7 判别式选臂 + PR#62 臂内走查口径）：THEN 臂
+                // 语句经 arm_query 准入（parse_total 全定义 + 处理器重置
+                // 兜底），finish_arm 组内局部死证明；route 不记录——臂
+                // 计划无路由守卫，运行期判别式选臂（§12.3(d)）。
+                self.arm_if = Some(ArmIf {
+                    else_range: iff.else_range.clone(),
+                    resets: iff.resets.clone(),
+                });
+                let mut apc = iff.then_range.start;
+                while apc < iff.then_range.end {
+                    apc = self.statement(ctx, apc)?;
+                }
+                self.finish_arm(ctx)?;
+                return Ok(iff.resume);
+            }
+            let r =
+                route::cond(&iff.cond, &self.lookups).ok_or(SkipReason::UnsupportedControlFlow)?;
+            self.add_group(iff.group)?;
             self.route = Some(r);
+            self.route_site = Some(super::RouteSite::TrapGroup {
+                else_start: iff.else_start,
+                resume_pc: iff.resume,
+            });
             self.has_trap = true;
-            return Ok(resume);
+            return Ok(iff.resume);
         }
         if let Some(resume) = self.mixed_trap(ctx, pc)? {
             return Ok(resume);
@@ -180,6 +306,85 @@ impl<'a> Body<'a> {
         }
         self.has_trap = true;
         Ok(pc + 1)
+    }
+
+    /// THEN 臂走查的 SELECT INTO 准入（PR#62 口径）：与 ELSE 组成员同
+    /// 证明强度（parse_total 全定义、写集不相交、处理器重置兜底）；
+    /// fn_sites 与非单变量 INTO 保守拒绝。
+    fn arm_query(
+        &mut self,
+        ctx: &Context<'a, '_>,
+        pc: usize,
+        sql: &str,
+        binds: &[(String, BindSrc)],
+        into: &[AssignTarget],
+        fn_sites: &[crate::sql::FnSite],
+    ) -> Result<usize, SkipReason> {
+        if !fn_sites.is_empty() {
+            return Err(SkipReason::UnresolvedFnSite);
+        }
+        let [AssignTarget::Var(var)] = into else {
+            return Err(SkipReason::UnsupportedControlFlow);
+        };
+        let default = self
+            .arm_if
+            .as_ref()
+            .and_then(|arm| {
+                arm.resets
+                    .iter()
+                    .find(|(rv, _)| rv == var)
+                    .map(|(_, d)| d.clone())
+            })
+            .unwrap_or(crate::value::SpinValue::Null);
+        let query = lookup::parse_total(
+            sql,
+            var.clone(),
+            lookup::fallback_sql(&default)?,
+            binds,
+            &ctx.region.record,
+        )?;
+        let writes = region::write_set(ctx.prog, ctx.region, ctx.catalog)?;
+        if writes.contains(&query.table.0)
+            || query.in_filters.iter().any(|f| writes.contains(&f.table.0))
+        {
+            return Err(SkipReason::TargetReadDependency);
+        }
+        self.arm_lookups.push((pc, query));
+        Ok(pc + 1)
+    }
+
+    /// THEN 臂走查收尾（PR#62 口径）：未重置成员组内局部死证明（豁免
+    /// 区换成 ELSE 臂 pc——判别式臂计划不执行 ELSE 臂），查找成组。
+    /// 与 PR#62 差异：不记录 route——臂计划无路由守卫，运行期由
+    /// D7 判别式选臂（§12.3(d)），守卫集留空。
+    fn finish_arm(&mut self, ctx: &Context<'a, '_>) -> Result<(), SkipReason> {
+        let arm = self
+            .arm_if
+            .take()
+            .ok_or(SkipReason::UnsupportedControlFlow)?;
+        for (_, lq) in &self.arm_lookups {
+            if arm.resets.iter().any(|(rv, _)| rv == &lq.var) {
+                continue;
+            }
+            let mut allowed: Vec<usize> = self
+                .arm_lookups
+                .iter()
+                .filter(|(_, m)| m.case_sink.as_ref().is_some_and(|cs| cs.operand == lq.var))
+                .map(|(p, _)| *p)
+                .collect();
+            allowed.extend(arm.else_range.clone());
+            if !dead::read_only_within(ctx.prog, &lq.var, &allowed) {
+                return Err(SkipReason::UnsupportedControlFlow);
+            }
+        }
+        let group = self
+            .arm_lookups
+            .drain(..)
+            .map(|(_, q)| q)
+            .collect::<Vec<_>>();
+        self.add_group(group)?;
+        self.has_trap = true;
+        Ok(())
     }
 
     fn add_group(&mut self, mut group: Vec<lookup::LookupQuery>) -> Result<(), SkipReason> {
@@ -227,7 +432,9 @@ impl<'a> Body<'a> {
             }
         }
         // §3.4 IF 门：THEN 线性走查，字段覆写投影为外层 CASE。
+        // 臂内嵌套门投影无臂感知证明，THEN 臂走查内不开门。
         if self.gate.is_none()
+            && !self.then_arm
             && ctx.mode == SetOrientedMode::BatchAtomic
             && agg::gate_renderable(cond)
             && to > pc + 1
@@ -238,10 +445,14 @@ impl<'a> Body<'a> {
             return Ok(pc + 1);
         }
         // §3.3 算术覆写门：THEN 恰一条 `v := <DECIMAL 乘/减>`。
-        if let Some(next) = self.arith_gate(ctx, pc, cond, to, back_pc) {
-            return Ok(next);
+        // 臂内算术覆写缺兄弟臂对照证明，THEN 臂走查内不开。
+        if !self.then_arm {
+            if let Some(next) = self.arith_gate(ctx, pc, cond, to, back_pc) {
+                return Ok(next);
+            }
         }
         if self.route.is_some()
+            || self.then_arm
             || to <= pc + 1
             || to > back_pc
             || !matches!(ctx.prog.code.get(to - 1), Some(IrStmt::Jump(t)) if *t == back_pc)
@@ -250,6 +461,7 @@ impl<'a> Body<'a> {
         }
         self.route =
             Some(route::cond(cond, &self.lookups).ok_or(SkipReason::UnsupportedControlFlow)?);
+        self.route_site = Some(super::RouteSite::Branch { pc, to });
         Ok(to)
     }
 
@@ -281,11 +493,21 @@ impl<'a> Body<'a> {
             IrExpr::FuncCall { name, args, .. } => self.assign_call(ctx, v, name, args)?,
             IrExpr::Bin { op, l, r } => self.sink(ctx.region, v, (*op, l, r))?,
             IrExpr::Const(c) => {
+                // D7 THEN 臂：活常量赋值折叠为字面量事实（臂内独立，
+                // 不影响 ELSE 臂逐字路径）；真死存储仍走 dead。
+                if self.then_arm {
+                    if dead::eliminable(ctx.prog, v, c) {
+                        self.dead.push(v.clone());
+                    } else {
+                        self.reject_arm_fact(v)?;
+                        self.folded.push((v.clone(), c.clone()));
+                    }
                 // 聚合槽位的前置清零：INTO/处理器在所有路径上覆写，属死存储。
-                if !dead::eliminable(ctx.prog, v, c) && !self.agg_candidates.contains(v) {
+                } else if !dead::eliminable(ctx.prog, v, c) && !self.agg_candidates.contains(v) {
                     return Err(SkipReason::UnsupportedControlFlow);
+                } else {
+                    self.dead.push(v.clone());
                 }
-                self.dead.push(v.clone());
             }
             IrExpr::SqlFn { .. } => {
                 self.reject_reassignment(v)?;
@@ -340,11 +562,15 @@ impl<'a> Body<'a> {
         binds: &[(String, BindSrc)],
     ) -> Result<(), SkipReason> {
         self.validate_sinks(ctx, binds)?;
-        if self.folded.iter().any(|(v, _)| {
-            binds
-                .iter()
-                .any(|(_, src)| matches!(src, BindSrc::Var(bv) if bv == v))
-        }) {
+        // D7 THEN 臂活常量折叠：folded 变量可作 INSERT 绑定源——
+        // 投影层（copy/inline.rs）按字面量渲染，逐行同值。
+        if !self.then_arm
+            && self.folded.iter().any(|(v, _)| {
+                binds
+                    .iter()
+                    .any(|(_, src)| matches!(src, BindSrc::Var(bv) if bv == v))
+            })
+        {
             return Err(SkipReason::UnsupportedControlFlow);
         }
         for lq in &self.lookups {

@@ -79,8 +79,9 @@ pub fn compile_set_oriented_plans(
     let mut plans = BTreeMap::new();
     for name in catalog.names() {
         if let Some(routine) = catalog.lookup(&name) {
-            let candidate =
-                super::plan_from(routine, &source, &ctx)?.map(|conversion| CandidatePlan {
+            let candidate = super::plan_from(routine, &source, &ctx)?
+                .map_err(|e| e.reason)
+                .map(|conversion| CandidatePlan {
                     conversion,
                     fingerprint: snapshot.fingerprint.clone(),
                 });

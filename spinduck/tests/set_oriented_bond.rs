@@ -144,7 +144,7 @@ fn should_fallback_when_v_par_bond_has_zero_overlapping_or_query_error() {
 
     let (mut eng, seen) = engine_seen(&ddl1, &[routine.as_str()]);
     eng.call("caller_bond", &args()).unwrap();
-    let Status::Converted { sql } = eng.set_oriented_reports()[0].status.clone() else {
+    let Status::Converted { sql, .. } = eng.set_oriented_reports()[0].status.clone() else {
         panic!("{:?}", eng.set_oriented_reports());
     };
     assert_eq!(dst_rows(&eng), expected_rows, "BatchAtomic 与 Off 逐行一致");
