@@ -218,7 +218,7 @@ fn rows_copy_route(eng: &Engine) -> Vec<Vec<SpinValue>> {
 }
 
 #[test]
-fn should_route_else_branch_when_invariant_kind_guard_proves_then_unreachable() {
+fn should_reject_whole_region_when_then_arm_expression_write_unproven() {
     // 设计 §4.3 区域入口循环不变探针：v_kind 由兜底查找求得（0 行/多行 →
     // '0'，命中 NULL 保留），IF v_kind = '1' 双臂路由。
     // D7 双臂：THEN 臂 `INSERT ... VALUES (r.a + 1000)` 的表达式写在

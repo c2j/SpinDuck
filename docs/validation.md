@@ -5321,6 +5321,7 @@ PR-5 第一步取证（先于任何 D7 实现）。夹具：
 | `copy_if_trap` 判别值 NULL seed | `Converted` | `Converted(arm=else)` | NULL 经 SQL `=` 三值语义落 ELSE（PR#62 `route::pick` 同口径），**无收缩** |
 | `copy_partial_then` THEN 可达 seed | `Skipped(UnsupportedControlFlow)` | `Converted(arm=then)` | 兄弟臂独占写入变量按本臂恒 NULL 折叠（`CASE NULL WHEN`），**扩大可转面** |
 | purchase `kind_id='1'`（ON） | `Skipped(UnsupportedControlFlow)` | `Converted(arm=then)` | D7 目标场景，**扩大可转面** |
+| purchase `kind_id='0'`（OFF）`SET_ORIENTED` 行文本 | `… converted` | `… converted arm=else` | 双臂化后判别式选臂，判定行透出 `arm=` 片段（§3.2 同源渲染）；门 1 逐字口径的批准例外，生成 SQL 与退出码不变 |
 
 收缩仅 `copy_route` 一类（THEN 臂含不可证表达式写）；purchase/byfund
 语料无此形态，不受影响。
@@ -5393,4 +5394,8 @@ byfund Off ~0.15s vs Batch ~2.8s。Batch 耗时随规模亚线性（purchase
 - 不声称 `RouteDiscriminatorNotTotal` 有 SQL 数据面可达路径（防御位）。
 - 不声称 §12.3(c) 区域级缓存表计数器已实现（V54.4-P2 缺口）。
 - 不声称门 1 sha256 基线独立登记（逐字面由 corpus 守护承担）。
+- `arm=` 反映**求值时点**数据：admit 在 compile 时刻、call 在前缀
+  执行后各自求值判别式，两次之间开关表被改写时两侧 `arm=` 可合法
+  不一致——同源铁律只承诺同一 SQL 与同一标签口径，不承诺跨时点
+  稳定，下游不得把 `arm=` 当稳定契约消费。
 - 不声称 release 构建性能（全部数字为 debug 构建实测）。

@@ -412,3 +412,71 @@ fn should_print_skip_line_and_fail_only_under_on_skip_error() {
     assert_eq!(code, EXIT_OK, "{out}");
     assert!(out.contains("SET_ORIENTED copy_rows skipped"), "{out}");
 }
+
+/// D7 双臂判定行契约（设计 v3.1 §3.2/§12.6 测试 17 文本面）：
+/// `call --set-oriented=batch-atomic` 的 `SET_ORIENTED` 行必须透出
+/// 判别式选中臂 `arm=else|then`——渲染路径漏传 arm 时本断言变红。
+const DUAL_ARM_ROUTINE: &str = "CREATE PROCEDURE copy_partial IS v_yj VARCHAR2(10); v_ct VARCHAR2(10); v_route VARCHAR2(10); BEGIN \
+     FOR r IN SELECT a, k, yj_a, yj_b FROM source_rows LOOP \
+     BEGIN SELECT kind INTO v_route FROM route_tab WHERE op = 'X'; \
+     EXCEPTION WHEN OTHERS THEN v_route := '0'; END; \
+     BEGIN \
+     IF v_route = '1' THEN v_yj := 'U'; \
+     ELSE \
+     SELECT ct INTO v_ct FROM dim_tab WHERE dim_tab.k = r.k; \
+     SELECT CASE v_ct WHEN 'A' THEN r.yj_a WHEN 'B' THEN r.yj_b ELSE r.yj_a END INTO v_yj FROM sys_dummy; \
+     END IF; \
+     EXCEPTION WHEN OTHERS THEN v_yj := '0'; END; \
+     INSERT INTO target_rows(val, yj) VALUES (r.a, v_yj); \
+     END LOOP; END;\n";
+
+fn dual_arm_fixture(
+    root: &std::path::Path,
+    route_kind: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    use spinduck_core::exec::{BindMap, SqlExecutor};
+    use spinduck_core::sql::exec_native::DuckExecutor;
+    let sql = write(root, "copy_partial.sql", DUAL_ARM_ROUTINE);
+    let db = root.join("t.duckdb");
+    let ex = DuckExecutor::open(&db.to_string_lossy()).unwrap();
+    let seed = format!("INSERT INTO route_tab VALUES ('{route_kind}', 'X')");
+    for s in [
+        "CREATE TABLE source_rows(a BIGINT, k VARCHAR, yj_a VARCHAR, yj_b VARCHAR)",
+        "CREATE TABLE target_rows(val BIGINT, yj VARCHAR)",
+        "INSERT INTO source_rows VALUES (10, 'K1', 'AA1', 'BB1')",
+        "CREATE TABLE route_tab(kind VARCHAR, op VARCHAR)",
+        seed.as_str(),
+        "CREATE TABLE dim_tab(k VARCHAR, ct VARCHAR)",
+        "INSERT INTO dim_tab VALUES ('K1', 'A')",
+        "CREATE TABLE sys_dummy(dummy VARCHAR)",
+        "INSERT INTO sys_dummy VALUES ('X')",
+    ] {
+        ex.execute(s, &BindMap::new()).unwrap();
+    }
+    (sql, db)
+}
+
+#[test]
+fn should_print_selected_arm_on_set_oriented_line_for_dual_arm_plan() {
+    for (kind, arm) in [("0", "else"), ("1", "then")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sql, db) = dual_arm_fixture(tmp.path(), kind);
+        let args: Vec<String> = [
+            "call".to_string(),
+            "--file".into(),
+            sql.to_string_lossy().into_owned(),
+            "--db".into(),
+            db.to_string_lossy().into_owned(),
+            "--set-oriented=batch-atomic".into(),
+            "copy_partial".into(),
+        ]
+        .to_vec();
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (code, out, err) = cli(&argv);
+        assert_eq!(code, EXIT_OK, "{out} {err}");
+        assert!(
+            out.contains(&format!("SET_ORIENTED copy_partial converted arm={arm}")),
+            "kind={kind}: {out}"
+        );
+    }
+}

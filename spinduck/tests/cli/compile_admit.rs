@@ -97,6 +97,163 @@ fn project_opts(dir: &Path) -> ProjectCompile {
     }
 }
 
+/// D7 双臂判定行契约（§3.2 同源铁律文本面）：admit 数据面求值
+/// 判别式后，ADMIT 行透出与 `SET_ORIENTED` 同源的 `arm=` 片段——
+/// 渲染路径漏传 arm 时本断言变红。
+const DUAL_ARM_SQL: &str = "CREATE PROCEDURE copy_partial IS v_yj VARCHAR2(10); v_ct VARCHAR2(10); v_route VARCHAR2(10); BEGIN \
+     FOR r IN SELECT a, k, yj_a, yj_b FROM source_rows LOOP \
+     BEGIN SELECT kind INTO v_route FROM route_tab WHERE op = 'X'; \
+     EXCEPTION WHEN OTHERS THEN v_route := '0'; END; \
+     BEGIN \
+     IF v_route = '1' THEN v_yj := 'U'; \
+     ELSE \
+     SELECT ct INTO v_ct FROM dim_tab WHERE dim_tab.k = r.k; \
+     SELECT CASE v_ct WHEN 'A' THEN r.yj_a WHEN 'B' THEN r.yj_b ELSE r.yj_a END INTO v_yj FROM sys_dummy; \
+     END IF; \
+     EXCEPTION WHEN OTHERS THEN v_yj := '0'; END; \
+     INSERT INTO target_rows(val, yj) VALUES (r.a, v_yj); \
+     END LOOP; END;\n";
+
+const DUAL_ARM_DDL: &str =
+    "CREATE TABLE source_rows(a BIGINT, k VARCHAR, yj_a VARCHAR, yj_b VARCHAR);\n\
+     CREATE TABLE target_rows(val BIGINT, yj VARCHAR);\n\
+     CREATE TABLE route_tab(kind VARCHAR, op VARCHAR);\n\
+     CREATE TABLE dim_tab(k VARCHAR, ct VARCHAR);\n\
+     CREATE TABLE sys_dummy(dummy VARCHAR);\n";
+
+fn typed_table(name: &str, cols: &[(&str, SpinType)]) -> TableMetadata {
+    TableMetadata {
+        name: vec![name.to_string()],
+        columns: cols
+            .iter()
+            .map(|(n, t)| ColumnMetadata {
+                name: (*n).into(),
+                source_type: String::new(),
+                canonical_type: Some(t.clone()),
+                nullable: true,
+                default_expr_raw: None,
+            })
+            .collect(),
+        constraints: Vec::new(),
+        indexes: Vec::new(),
+        indexes_complete: true,
+        has_opaque_ddl: false,
+    }
+}
+
+fn dual_arm_snapshot() -> SchemaSnapshot {
+    SchemaSnapshot {
+        tables: vec![
+            typed_table(
+                "source_rows",
+                &[
+                    ("a", SpinType::BigInt),
+                    ("k", SpinType::Varchar),
+                    ("yj_a", SpinType::Varchar),
+                    ("yj_b", SpinType::Varchar),
+                ],
+            ),
+            typed_table(
+                "target_rows",
+                &[("val", SpinType::BigInt), ("yj", SpinType::Varchar)],
+            ),
+            typed_table(
+                "route_tab",
+                &[("kind", SpinType::Varchar), ("op", SpinType::Varchar)],
+            ),
+            typed_table(
+                "dim_tab",
+                &[("k", SpinType::Varchar), ("ct", SpinType::Varchar)],
+            ),
+            typed_table("sys_dummy", &[("dummy", SpinType::Varchar)]),
+        ],
+        diagnostics: Vec::new(),
+        fingerprint: "t".into(),
+    }
+}
+
+fn dual_arm_graph(file: &str) -> serde_json::Value {
+    let tables = [
+        ("source_rows", "read"),
+        ("target_rows", "write"),
+        ("route_tab", "read"),
+        ("dim_tab", "read"),
+        ("sys_dummy", "read"),
+    ];
+    let nodes: Vec<serde_json::Value> = std::iter::once(serde_json::json!({
+        "id": 1, "type": "procedure", "name": "copy_partial", "file": file
+    }))
+    .chain(
+        tables
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| serde_json::json!({"id": i + 2, "type": "table", "name": name})),
+    )
+    .collect();
+    let edges: Vec<serde_json::Value> = tables
+        .iter()
+        .enumerate()
+        .map(|(i, (_, mode))| {
+            serde_json::json!({
+                "source": 1, "target": i + 2, "type": "table_access",
+                "modes": [mode], "file": file, "line": 1
+            })
+        })
+        .collect();
+    serde_json::json!({ "nodes": nodes, "edges": edges })
+}
+
+#[test]
+fn compile_admit_should_render_selected_arm_for_dual_arm_plan() {
+    use spinduck_core::exec::{BindMap, SqlExecutor};
+    use spinduck_core::sql::DuckExecutor;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(root, "spinduck.toml", PROJECT_PLAN);
+    write(root, "codeweb.toml", "");
+    write(root, "sql/routines/copy_partial.sql", DUAL_ARM_SQL);
+    write(root, "sql/ddl/tables.sql", DUAL_ARM_DDL);
+    let file = root
+        .join("sql/routines/copy_partial.sql")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let export = JsonCodewebSource {
+        generator: "codeweb 0.9.9".to_string(),
+        json: serde_json::to_vec(&dual_arm_graph(&file)).unwrap(),
+    };
+    // admit 数据面：真实 DuckDB，route='0' → 判别式选 ELSE 臂。
+    let db = root.join("t.duckdb");
+    let ex = DuckExecutor::open(&db.to_string_lossy()).unwrap();
+    for s in [
+        "CREATE TABLE source_rows(a BIGINT, k VARCHAR, yj_a VARCHAR, yj_b VARCHAR)",
+        "CREATE TABLE target_rows(val BIGINT, yj VARCHAR)",
+        "CREATE TABLE route_tab(kind VARCHAR, op VARCHAR)",
+        "CREATE TABLE dim_tab(k VARCHAR, ct VARCHAR)",
+        "CREATE TABLE sys_dummy(dummy VARCHAR)",
+        "INSERT INTO source_rows VALUES (10, 'K1', 'AA1', 'BB1')",
+        "INSERT INTO route_tab VALUES ('0', 'X')",
+        "INSERT INTO dim_tab VALUES ('K1', 'A')",
+        "INSERT INTO sys_dummy VALUES ('X')",
+    ] {
+        ex.execute(s, &BindMap::new()).unwrap();
+    }
+    let input = AdmitInput {
+        snapshot: dual_arm_snapshot(),
+        executor: Some(Box::new(ex)),
+        macro_names: BTreeSet::new(),
+    };
+    let mut opts = project_opts(root);
+    opts.entries = vec!["copy_partial".to_string()];
+    opts.set_oriented = Some(spinduck_core::ir::set_oriented::SetOrientedMode::BatchAtomic);
+    let mut buf = Vec::new();
+    let code = compile_project_admit_with_source(opts, &export, Some(input), &mut buf)
+        .unwrap_or_else(|e| panic!("{}", e.message));
+    let out = String::from_utf8(buf).unwrap();
+    assert_eq!(code, EXIT_OK, "{out}");
+    assert!(out.contains("ADMIT copy_partial"), "{out}");
+    assert!(out.contains("arm=else"), "{out}");
+}
+
 #[test]
 fn compile_admit_should_reject_db_and_record_without_admit() {
     // §3.1 约束 1 + 测试 9：从属旗标不带 --admit = ENG-0010 用法错（退出码 2）。

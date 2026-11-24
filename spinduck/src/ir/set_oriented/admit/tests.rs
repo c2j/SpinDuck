@@ -1,3 +1,6 @@
+//! `compile --admit` 判定单元测试（设计 v3.1 §4.2/§6）：
+//! 静态/运行期两档 verdict、F1/F3 闸、守卫清单次序与工件字段。
+
 use super::super::metadata::{ColumnMetadata, TableMetadata};
 use super::*;
 use crate::catalog::compile_sources;
