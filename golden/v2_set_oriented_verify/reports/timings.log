@@ -1,0 +1,5 @@
+SpinDuck Off 100k   : 380222.2 ms  (1 轮，解释器逐行)
+SpinDuck On  100k   :  3891.8 ms  (batch-atomic，converted；另两轮 4004.9 / 3855.5 / 3935.9 ms，4 轮中位 ≈3913.9 ms)
+SpinDuck Strict 100k: 362156.0 ms  (skipped TransactionBoundaryInsideLoop → 回退原路径)
+SP openGauss 7.0.0-RC3 CALL: 148738 ms (gsql 客户端墙钟，含连接开销)
+noop call 固定开销   : ~246 ms

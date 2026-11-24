@@ -1,0 +1,9 @@
+目标表 dat_trd_repurchase（27 列）全列排序逐行比对，N=100000：
+  SpinDuck Off   rows=100000
+  SpinDuck On    rows=100000   off_target.json sha256 == on_target.json sha256 (e2b96153…)
+  SpinDuck Strict rows=100000  (回退路径，输出与 Off 一致)
+  openGauss 参照  rows=100000   NULL/空串归一化后逐行相等
+  off==on: True   off==ref: True   on==ref: True
+  OUT p_o_succeed = 0（三方一致）
+源表 mid_yjqs_detail：SpinDuck 侧 generate_series 100000 行 → COPY TO src.csv
+  (sha256 529abd68…) → 参照侧 \copy 载入，count=100000，两侧同源逐字一致。

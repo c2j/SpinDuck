@@ -1,0 +1,8 @@
+目标表四方全列排序逐行比对（数值按 Decimal 归一，消除 '.50' vs '0.50' 格式差）：
+  dat_fund_cjqs        rows=90160  off==on==strict==ref: True
+  dat_fund_xw_venture  rows=360    off==on==strict==ref: True
+  mid_yjqs_detail      rows=100000 (cjbh,fund_code,main_xwdm) off==on==strict==ref: True
+  qfqscjhbrbb_temp     rows=0      off==on==strict==ref: True
+  OUT p_o_succeed = 0（四方一致）
+源表 mid_yjqs_detail：两侧同一 gen_detail.sql（generate_series 互质乘子打散分组键），
+  各 100000 行；c_get_data 实际分组 90160（0100 品种 zqdm 周期 800 归并）。
