@@ -24,6 +24,11 @@ pub(super) struct PlanFlags {
     /// SO 行级混合（so-exception-row-hybrid）：dup 基数守卫改产行号
     /// 集 `exc_guards` 顶替整段退回；需计划期逃逸/行序证明齐备。
     pub hybrid: bool,
+    /// 混合物化失败会中止事务：前缀（含 fn 前导例程）写集必须可证
+    /// 为空，否则 `__sd_hcur` CTAS/重绑失败后无法安全回退（含用户
+    /// 写的事务被打入 aborted 态）。不满足时混合资格整体关闭，
+    /// 退回普通 SO/串行路径。
+    pub hybrid_prefix_clean: bool,
 }
 
 pub(super) fn generate(
@@ -300,7 +305,7 @@ fn finish(
     // 无异常行来源的计划保持原 SQL 形态（无 __sd_rn/段谓词），
     // `|E|` 恒空也无调度收益。
     let has_exc = resolved.iter().any(|(l, _)| l.render.exc_guard.is_some());
-    let hybrid_on = hspec.is_some() && has_exc;
+    let hybrid_on = hspec.is_some() && has_exc && flags.hybrid_prefix_clean;
     // 混合计划的 `sd_cur` 改读引擎物化临时表：物化 SELECT 随 spec
     // 下发，`__sd_rn` 只在物化时赋一次（P0-3b 行序证明的锚点）。
     let hspec = if hybrid_on {

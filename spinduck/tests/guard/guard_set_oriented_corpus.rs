@@ -511,11 +511,7 @@ fn should_keep_prc_trd_deal_purchase_single_region_conversion_unchanged() {
         .position(|e| {
             matches!(
                 e,
-                TraceEvent::SqlExec {
-                    sql: s,
-                    elapsed_us: 0,
-                    ..
-                } if s == sql
+                TraceEvent::SqlExec { sql: s, .. } if s == sql
             )
         })
         .expect("集合 SQL 的 TraceEvent::SqlExec");
@@ -581,11 +577,7 @@ fn should_keep_prc_trd_deal_purchase_single_region_conversion_unchanged() {
         .position(|e| {
             matches!(
                 e,
-                TraceEvent::SqlExec {
-                    sql: s,
-                    elapsed_us: 0,
-                    ..
-                } if s.starts_with("WITH sd_cur")
+                TraceEvent::SqlExec { sql: s, .. } if s.starts_with("WITH sd_cur")
             )
         })
         .expect("集合 SQL 的 TraceEvent::SqlExec");

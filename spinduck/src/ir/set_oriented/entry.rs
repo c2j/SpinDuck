@@ -103,7 +103,7 @@ pub(crate) struct ConversionPlan {
     pub(crate) route_alt: Option<Box<ConversionPlan>>,
 }
 
-pub(super) type BoundGuard = (String, Vec<(String, BindSrc)>);
+pub(crate) type BoundGuard = (String, Vec<(String, BindSrc)>);
 
 /// 两份 fn 物化前导逐项全等（表名/例程/去重 SQL/绑定/元数/依赖标记）。
 /// 分臂备选计划共用同一份入口期物化结果的前提——INSERT 位 sd_bfN 的
@@ -210,11 +210,11 @@ pub(crate) fn entry_ok(
 /// （P0-3 审核修复：此前非 Int 被 `if let` 静默丢弃）。
 pub(crate) fn exc_rows(
     ex: &dyn SqlExecutor,
-    plan: &ConversionPlan,
+    guards: &[BoundGuard],
     frame: &crate::runtime::Frame,
 ) -> Result<Option<std::collections::BTreeSet<u64>>, EngineError> {
     let mut rows = std::collections::BTreeSet::new();
-    for (sql, binds) in &plan.exc_guards {
+    for (sql, binds) in guards {
         let bm = crate::runtime::interp::resolve_binds(binds, frame)?;
         let mut stream = ex.query(sql, &bm)?;
         for row in stream.fetch_many(usize::MAX) {
@@ -256,5 +256,56 @@ fn drifted(ex: &dyn SqlExecutor, name: &Name, expected: &Table) -> Result<bool, 
         Some(t) => Ok(t.columns != expected.columns
             || (t.qualified != expected.qualified && expected.qualified != name.sql())),
         None => Ok(true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::FakeExecutor;
+    use crate::value::SpinValue;
+
+    fn guards() -> Vec<BoundGuard> {
+        vec![("SELECT __sd_rn FROM g".to_string(), Vec::new())]
+    }
+
+    /// 正常行号集：多条守卫并集、去重、0 基原样收集。
+    #[test]
+    fn should_collect_exception_row_numbers() {
+        let ex = FakeExecutor::with_rows(
+            vec!["rn".into()],
+            vec![
+                vec![SpinValue::Int(0)],
+                vec![SpinValue::Int(2)],
+                vec![SpinValue::Int(2)],
+            ],
+        );
+        let frame = crate::runtime::Frame::new();
+        let got = exc_rows(&ex, &guards(), &frame).unwrap();
+        assert_eq!(got, Some(std::collections::BTreeSet::from([0, 2])));
+    }
+
+    /// 畸形行号（非 Int / 负值）→ `None`：证据不可信，调用方必须
+    /// 整区域串行兜底，绝不静默当普通行。
+    #[test]
+    fn should_reject_malformed_exception_row_numbers() {
+        for bad in [
+            vec![SpinValue::Str("x".into())],
+            vec![SpinValue::Int(-1)],
+            vec![SpinValue::Null],
+        ] {
+            let ex = FakeExecutor::with_rows(vec!["rn".into()], vec![bad]);
+            let frame = crate::runtime::Frame::new();
+            assert_eq!(exc_rows(&ex, &guards(), &frame).unwrap(), None);
+        }
+    }
+
+    /// 空守卫结果集 → `Some(空集)`：无异常行，走普通 SO 批写。
+    #[test]
+    fn should_return_empty_set_when_no_exception_rows() {
+        let ex = FakeExecutor::with_rows(vec!["rn".into()], Vec::new());
+        let frame = crate::runtime::Frame::new();
+        let got = exc_rows(&ex, &guards(), &frame).unwrap();
+        assert_eq!(got, Some(std::collections::BTreeSet::new()));
     }
 }

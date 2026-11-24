@@ -5278,3 +5278,58 @@ unsafe-libyaml unmaintained），非本 PR 引入，单独跟进。
 - 不声称混合 SO 在 byfund_branch 上快于串行：实测 so_ba≈51s vs off≈43s
   （exc 占比高 → 段数≈|E|+1 固有成本），其价值是"此前整体拒绝的区域
   现在可转换"；性能最优路径仍是 LP（lp_safe≈42s）。
+
+## V53. PR#62 二轮评审修复实证（2026-11-25）
+
+### V53.1 修复项
+
+- **物化失败事务毒化（P1-1）**：`materialize_hcur` CTAS、
+  `rebind_hcur_cursor`/`hcur_order_ok` 取数查询失败会把事务打入
+  aborted 态。修复双层：计划期 `hybrid_prefix_clean` 门禁
+  （新增 `region::prefix_pending_writes`——前缀 `[0,open_pc)` 挂起写
+  集须为空，`TxCommit`/`TxRollback` 清空已提交写，`TxCommitIfWritten`
+  与例程内部提交不可证、保守计入；fn 前导例程写集同口径）；运行期
+  各失败点 `ROLLBACK + BEGIN TRANSACTION` 复位（视图物化探测同口径）。
+  前缀有挂起写/opaque → 不产混合计划。
+- **重建数据源修正（实测暴露的潜在 bug）**：`ensure_hcur` 重建原先
+  重跑 `hcur_sql`——游标源表被循环体写改后内容漂移，实测触发
+  `ENG-0032 sd_cur rematerialize order drift`（byfund_branch
+  scale=1000）。改为：schema 经 `LIMIT 0` 空结果物化（列名/类型
+  保留），数据由冻结 `shared_rows` 逐块 `INSERT ... VALUES` 装载
+  （`sql_literal` 字面量化，256 行/块）——重建内容与游标绑定序
+  由构造保证，不再依赖源表不可变假设。
+- **临时表泄漏（P3-2）**：物化成功后 `exc_rows` `?` 出口与畸形/
+  兜底早退逐一显式 `drop_hcur_table`；`run_hybrid_region` 自持清理
+  覆盖内部全部出口。
+- **报告口径（P2-1）**：`Status::Converted.sql` 上报占位符版
+  （`__SD_HCUR__`），实测输出确认不含 `__sd_hcur_<seq>` 会话名。
+- **引号标识符（P2-2）**：`callmat::sql_read_tables` token 扫描兜底
+  遇 `"` 引号标识符保守 `Err(())`（过度拒绝安全方向），单测锁定。
+- **elapsed_us（P3-1）**：`writebuf::execute_traced` 与
+  `set_oriented::exec_sql` 改实测耗时（与 `sqlstmts` 同口径：
+  先执行后发事件，错误路径同样上报）。
+- **CI 覆盖（P1-2）**：`set_oriented_dummy` 新增
+  `scenario_miss_dup_hybrid`（维度重复 → 非空 exc → Converted +
+  行集/OUT ≡ Off）；`exc_rows` 重构为收 `&[BoundGuard]` 并补三态
+  单测（正常集/畸形→None/空集）。
+
+### V53.2 实证
+
+- `zz_so_status_byfund_branch`（临时探针，已删）：byfund_branch
+  scale=1000 下 SO `Converted`（混合路径），期间真实触发
+  `ensure_hcur` 重建路径（重放行原生例程回滚撤销临时表）并经
+  冻结行重建通过 `hcur_order_ok` 校验；测试全程 842s（并发负载
+  下），`outs/state` 与 Off 等价由 `v4_byfund_branch_equiv` 系
+  列用例覆盖。
+- `cargo test --test set_oriented_dummy`（含新混合守护）、
+  `cargo test --lib`（748 项，含 exc_rows/callmat 新单测）通过。
+
+### V53.3 不声称
+
+- 不声称重建路径性能无损：`ensure_hcur` 重建为罕见路径（仅当
+  重放行例程调用回滚撤销临时表时触发），5000 行规模下约 20 条
+  分块 INSERT；100k 级极端情形未单独压测。
+- `load_hcur_rows` 对 `SpinValue::Blob/Record` 生成 `<blob>`/
+  `<record>` 占位字面量会产生解析错误——游标列出现该类型时
+  ensure_hcur 上抛（响亮失败非静默错数据）；byfund/purchase
+  实测游标列均为标量，未触发。

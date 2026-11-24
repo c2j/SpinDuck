@@ -216,6 +216,26 @@ entry_exec`（interp.rs，多停止点+入口豁免 opt-in——`start==stop`
    混合的正确性价值在于"此前整体拒绝的区域现在可转换"，
    该种子上 LP 仍是更快路径（SO 系优先序不变）。
 
+### 6.1 复审修订（PR#62 二轮）
+
+- **物化失败事务毒化（P1-1）**：`materialize_hcur` 的 CTAS 与
+  `rebind_hcur_cursor`/`hcur_order_ok` 的取数查询失败会把事务打入
+  aborted 态（KERNEL-0010），直接串行兜底全线失败。修复 = 计划期
+  `hybrid_prefix_clean` 门禁（`prefix_pending_writes`：前缀挂起写
+  集须为空——`TxCommit`/`TxRollback` 清空已提交写，`TxCommitIfWritten`
+  与例程内部提交不可证、保守计入）+ 运行期失败处 `ROLLBACK +
+  BEGIN TRANSACTION` 复位（与视图物化探测同口径，前缀已证无挂起
+  用户写，回滚零损失）。前缀有挂起写/opaque → 不产混合计划，
+  退回普通 SO/串行。
+- **临时表泄漏（P3-2）**：物化成功后的 `exc_rows` `?` 出口与
+  畸形/兜底早退逐一显式 `drop_hcur_table`；`run_hybrid_region`
+  自持清理覆盖内部全部出口。
+- **报告口径（P2-1）**：`Status::Converted.sql` 上报占位符版
+  （`__SD_HCUR__`），不再含会话唯一临时表名 `__sd_hcur_<seq>`。
+- **CI 覆盖（P1-2）**：`set_oriented_dummy` 新增
+  `scenario_miss_dup_hybrid`（维度重复 → 非空 exc → Converted +
+  行集/OUT ≡ Off）；`exc_rows` 三态单测（正常集/畸形→None/空集）。
+
 ## 7. 与既有机制的关系
 
 - **不替代 LP**：LP 是"前缀并行+后缀主线程"的逐行模型；本机制是

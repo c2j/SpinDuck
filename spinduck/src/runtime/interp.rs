@@ -24,6 +24,7 @@ pub(in crate::runtime) mod writebuf;
 
 pub(crate) use binds::resolve_binds;
 pub(crate) use dynamic::materialize_fn_preludes;
+pub(crate) use dynamic::sql_literal;
 pub(crate) use trace::spinduck_trace_event;
 
 /// 单次运行结果。

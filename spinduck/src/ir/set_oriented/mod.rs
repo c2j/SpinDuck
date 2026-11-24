@@ -274,10 +274,17 @@ fn plan_from(
                                 Err(SkipReason::LiveOutState)
                             } else {
                                 let alt_copy = alt_copy.filter(|c| !live_param_hit(c, routine));
+                                // 混合物化失败会中止事务：前缀（含 fn
+                                // 前导例程）写集必须可证为空，否则
+                                // `__sd_hcur` CTAS/重绑失败后无法安全
+                                // 回退（含用户写的事务进 aborted 态）。
+                                let hybrid_clean =
+                                    hybrid_prefix_clean(&routine.prog, &region, &copy, ctx.catalog);
                                 let flags = generate::PlanFlags {
                                     tail_commit: tail,
                                     then_arm: false,
                                     hybrid: hybrid::analyze(&routine.prog, &region).is_some(),
+                                    hybrid_prefix_clean: hybrid_clean,
                                 };
                                 match generate(&mut copy, source, ctx, &region, flags)? {
                                     Err(reason) => {
@@ -298,6 +305,7 @@ fn plan_from(
                                                 then_arm: true,
                                                 hybrid: hybrid::analyze(&routine.prog, &region)
                                                     .is_some(),
+                                                hybrid_prefix_clean: hybrid_clean,
                                             };
                                             if let Ok(Ok(alt_plan)) =
                                                 generate(&mut alt, source, ctx, &region, alt_flags)
@@ -340,6 +348,31 @@ fn live_param_hit(copy: &CopyLoop<'_>, routine: &CompiledRoutine) -> bool {
         || copy.dead.iter().any(live_param)
         || copy.aggs.iter().any(|a| live_param(&a.var))
         || copy.arith_writes.iter().any(|w| live_param(&w.var))
+}
+
+/// 混合计划前缀干净度证明：`[0, open_pc)` 的**挂起写**（遇
+/// `TxCommit`/`TxRollback` 清空，已提交写不被物化失败兜底的
+/// ROLLBACK 丢弃）+ fn 前导例程写集必须全空且无 opaque。混合
+/// 物化 `__sd_hcur` 失败会中止事务，前缀有未提交用户写时无法
+/// 安全回退——此时混合资格整体关闭。
+fn hybrid_prefix_clean(
+    prog: &IrProg,
+    region: &region::CursorRegion,
+    copy: &CopyLoop<'_>,
+    catalog: &crate::catalog::RoutineCatalog,
+) -> bool {
+    let (mut writes, mut opaque) = region::prefix_pending_writes(prog, region.open_pc, catalog);
+    for name in copy
+        .fn_sites
+        .iter()
+        .map(|s| s.name.as_str())
+        .chain(copy.insert_sites.iter().map(|s| s.name.as_str()))
+    {
+        let (w, o) = region::routine_write_set(catalog, name);
+        writes.extend(w);
+        opaque |= o;
+    }
+    writes.is_empty() && !opaque
 }
 
 /// 例程 IN 形参名集（小写）：批写投影仅承认这些循环不变输入。

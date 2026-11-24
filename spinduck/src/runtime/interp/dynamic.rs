@@ -198,7 +198,7 @@ pub(crate) fn materialize_fn_preludes(
 }
 
 /// SpinValue → SQL 字面量（文本型转义；数值/布尔按文本直出）。
-pub(super) fn sql_literal(v: &SpinValue) -> String {
+pub(crate) fn sql_literal(v: &SpinValue) -> String {
     match v {
         SpinValue::Null => "NULL".to_string(),
         SpinValue::Str(s) => format!("'{}'", s.replace('\'', "''")),

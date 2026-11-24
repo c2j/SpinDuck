@@ -138,14 +138,16 @@ fn execute_traced(
     sink: &mut dyn TraceSink,
     sql: &str,
 ) -> Result<(), EngineError> {
+    let t = std::time::Instant::now();
+    let out = ex.execute(sql, &BindMap::new());
     if sink.is_enabled() {
         sink.on_event(TraceEvent::SqlExec {
             sql: sql.to_string(),
             binds: BindMap::new(),
-            elapsed_us: 0,
+            elapsed_us: t.elapsed().as_micros() as u64,
         });
     }
-    ex.execute(sql, &BindMap::new()).map(|_| ())
+    out.map(|_| ())
 }
 
 fn replay_group(

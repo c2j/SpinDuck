@@ -336,6 +336,12 @@ fn sql_read_tables(sql: &str, out: &mut BTreeSet<String>) -> Result<(), ()> {
         .filter_map(|t| sql.get(t.span.start..t.span.end))
         .map(|s| s.to_ascii_lowercase())
         .collect();
+    // 引号标识符（`"lut"`）首字符非字母/下划线会被下方收集器静默
+    // 跳过 → 漏收真表（假阴性，危险方向）。引擎产 SQL 可能输出
+    // 引号形式，无法安全归一化时整体保守拒绝（过度拒绝安全）。
+    if words.iter().any(|w| w.starts_with('"')) {
+        return Err(());
+    }
     const STOP: &[&str] = &[
         "select",
         "from",
@@ -403,4 +409,30 @@ fn sql_read_tables(sql: &str, out: &mut BTreeSet<String>) -> Result<(), ()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 非 shape 点查形态的 SELECT 走 token 扫描兜底：裸表名正常收集。
+    #[test]
+    fn should_collect_unquoted_table_names() {
+        let mut out = BTreeSet::new();
+        assert!(sql_read_tables("SELECT a, b FROM lut WHERE k = 1", &mut out).is_ok());
+        assert!(out.contains("lut"), "读表集合: {out:?}");
+    }
+
+    /// 引号标识符（`"lut"`）无法安全归一化 → 保守 `Err(())`：
+    /// 漏收真表是危险方向（假阴性放行 LP → CallSnapshot 陈旧读），
+    /// 过度拒绝安全（PR#62 复审 P2-2）。
+    #[test]
+    fn should_reject_quoted_identifiers_conservatively() {
+        // 非点查形态（聚合）强制走 token 扫描兜底。
+        let mut out = BTreeSet::new();
+        assert!(
+            sql_read_tables("SELECT COUNT(*) FROM \"lut\" GROUP BY k", &mut out).is_err(),
+            "引号标识符必须保守拒绝: {out:?}"
+        );
+    }
 }
