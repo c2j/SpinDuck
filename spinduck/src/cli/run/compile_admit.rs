@@ -134,8 +134,13 @@ fn write_summary(verdicts: &[AdmissionVerdict], out: &mut dyn Write) -> Result<(
 /// 判定行：`skipped reason=X` 片段与 `call` 的 `SET_ORIENTED` 同源（§3.2 铁律）。
 fn render_verdict(v: &AdmissionVerdict, out: &mut dyn Write) -> Result<(), EngineError> {
     match &v.verdict {
-        Verdict::Converted => writeln!(out, "ADMIT {} converted", v.routine),
-        Verdict::Conditional => writeln!(out, "ADMIT {} conditional", v.routine),
+        Verdict::Converted => writeln!(out, "ADMIT {}", super::converted_body(&v.routine, v.arm)),
+        Verdict::Conditional => writeln!(
+            out,
+            "ADMIT {} conditional{}",
+            v.routine,
+            super::arm_suffix(v.arm)
+        ),
         Verdict::StaticOnly => writeln!(out, "ADMIT {} static-only", v.routine),
         Verdict::Skipped(reason) => match v.confidence {
             Confidence::Firm => {

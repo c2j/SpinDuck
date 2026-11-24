@@ -10,6 +10,7 @@
 
 use spinduck_core::engine::Engine;
 use spinduck_core::exec::BindMap;
+use spinduck_core::ir::set_oriented::admit::{admit_verify, AdmitInput};
 use spinduck_core::ir::set_oriented::{Arm, SetOrientedMode, Status};
 use spinduck_core::project::ProjectConfig;
 use spinduck_core::rules::RuleRegistry;
@@ -214,19 +215,72 @@ fn d7_purchase_batch_matches_interpreter_all_quadrants() {
             Status::Converted { arm, .. } => Some(*arm),
             _ => None,
         });
-        let skipped = statuses.iter().find_map(|s| match s {
-            Status::Skipped { reason } => Some(*reason),
-            _ => None,
-        });
         match label {
-            "else" => assert_eq!(arm, Some(Some(Arm::Else)), "{label}: {statuses:?}"),
-            "then" => assert_eq!(arm, Some(Some(Arm::Then)), "{label}: {statuses:?}"),
-            "absent" => {
-                // miss 兜底值进 ELSE 值域或判 NotTotal——两者都须与
-                // 解释器逐值一致（上面已锁），此处只锁不静默 Converted。
-                assert!(arm.is_some() || skipped.is_some(), "{label}: {statuses:?}");
+            "else" | "absent" => {
+                // absent = switch 行缺席 → 查找 0 行落异常兜底常量
+                // （非 NULL、≠'1'）→ ELSE 值域补集，同选 ELSE 臂。
+                assert_eq!(arm, Some(Some(Arm::Else)), "{label}: {statuses:?}");
             }
+            "then" => assert_eq!(arm, Some(Some(Arm::Then)), "{label}: {statuses:?}"),
             _ => unreachable!(),
         }
+    }
+}
+
+/// 测试 17（§12.6 同源铁律）：`compile --admit` 的判别式选臂必须与
+/// `call` 的 `SET_ORIENTED` arm 一致——admit 数据面用 `try_clone`
+/// 共享同一 DuckDB 实例，switch 数据两侧相同。
+#[test]
+fn d7_admit_and_call_report_same_selected_arm() {
+    let routine = "pkg_split_trade_step3_sh.prc_trd_deal_purchase";
+    for (label, kind_id, expected) in [
+        ("else", Some("0"), Arm::Else),
+        ("then", Some("1"), Arm::Then),
+    ] {
+        let root = golden_root().join("case_corpus_purchase");
+        let project = ProjectConfig::load(&root).expect("项目加载");
+        let rules = RuleRegistry::default()
+            .with_project_rules(&project.rules_files)
+            .expect("规则加载");
+        let ex = DuckExecutor::open_in_memory().expect("open duckdb");
+        // admit 与 call 必须看到同一编目级数据：try_clone 共享 DB instance。
+        let admit_ex = ex.try_clone().expect("admit 连接克隆");
+        let mut eng = Engine::new(Box::new(ex), rules.clone());
+        eng.set_oriented = SetOrientedMode::BatchAtomic;
+        deploy_project(&mut eng, &project).expect("部署");
+        set_switch(&mut eng, kind_id.expect("象限 kind_id"));
+        let snapshot =
+            spinduck_core::plan::codeweb::schema_snapshot(&root, &rules).expect("codeweb 快照");
+        let input = AdmitInput {
+            snapshot,
+            executor: Some(Box::new(admit_ex)),
+            macro_names: std::collections::BTreeSet::new(),
+        };
+        let verdicts = admit_verify(
+            &eng.catalog,
+            &input,
+            SetOrientedMode::BatchAtomic,
+            &[routine.to_string()],
+        )
+        .expect("admit_verify");
+        let verdict = verdicts
+            .iter()
+            .find(|v| v.routine.contains("prc_trd_deal_purchase"))
+            .expect("purchase 判定存在");
+        let args = [SpinValue::Str("20250715".to_string()), SpinValue::Null];
+        eng.call(routine, &args).expect("例程调用");
+        let call_arm = eng
+            .set_oriented_reports()
+            .iter()
+            .find_map(|r| match &r.status {
+                Status::Converted { arm, .. } => *arm,
+                _ => None,
+            });
+        assert_eq!(verdict.arm, Some(expected), "{label}: ADMIT 臂标签");
+        assert_eq!(call_arm, Some(expected), "{label}: SET_ORIENTED 臂标签");
+        assert_eq!(
+            verdict.arm, call_arm,
+            "{label}: ADMIT 与 SET_ORIENTED 选中臂不同源"
+        );
     }
 }

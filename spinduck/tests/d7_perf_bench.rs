@@ -191,7 +191,7 @@ fn bench_purchase_off_vs_batch() {
     }
     for switch in [Some("0"), Some("1")] {
         let label = if switch == Some("1") { "ON " } else { "OFF" };
-        // 预热+计时各两轮取最优（JIT/页缓存噪声）
+        // 100k 规模单轮计时（Off 单次 ~2min，不取多轮最优）
         let mut best_off = f64::MAX;
         let mut best_bat = f64::MAX;
         let mut st_off = Vec::new();

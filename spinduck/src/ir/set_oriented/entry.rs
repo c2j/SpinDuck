@@ -90,11 +90,12 @@ pub(crate) struct ConversionPlan {
     pub(crate) discriminator: Option<Discriminator>,
 }
 
-/// 双臂判别式（§12.3(a/d)）：`sql` 返回整型标签——`-1` = 判别值
-/// NULL（`RouteDiscriminatorNotTotal` 整段回退）、`0..arms.len()-1`
-/// = 对应臂计划、`arms.len()` = ELSE 臂（主计划本体，值域补集）。
-/// 臂等值比较在 SQL 侧完成（`=` 语义与原 IF 条件同源），不经
-/// SpinValue 跨类型比对。
+/// 双臂判别式（§12.3(a/d)）：`sql` 返回整型标签——`0..arms.len()-1`
+/// = 对应臂计划、`arms.len()` = ELSE 臂（主计划本体，值域补集；
+/// 判别值 NULL 经 SQL `=` 三值语义同落 ELSE，与 PL IF 及 PR#62
+/// `route::pick` 口径一致）。标签越界/非整数/查询不产恰一行 →
+/// `RouteDiscriminatorNotTotal` 整段回退（防御位）。臂等值比较在
+/// SQL 侧完成（`=` 语义与原 IF 条件同源），不经 SpinValue 跨类型比对。
 #[derive(Clone)]
 pub(crate) struct Discriminator {
     pub sql: String,

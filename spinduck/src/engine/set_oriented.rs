@@ -53,9 +53,20 @@ impl Engine {
         // 失败时事务内尚无副作用，ROLLBACK 重开后整段按原 IR 解释执行。
         // 计划期已证前缀与 fn 前导写集同视图底表不相交，探测通过 ⇒
         // 物化时点数据与探测时点一致。
-        if plans.iter().any(|p| !p.view_preludes.is_empty()) {
+        // D7 双臂：判别式选中臂的 view_preludes 同样在 pick_arm 内物化
+        // ——物化失败会中止事务且彼时用户代码已跑，无法安全回退，
+        // 故臂计划一并纳入前移探测（未选中臂的臂视图同样先建，
+        // 选中臂在裁决点按同名 CREATE OR REPLACE 重建覆盖，幂等）。
+        let view_plans = plans.iter().flat_map(|p| {
+            p.discriminator
+                .iter()
+                .flat_map(|d| d.arms.iter().map(|a| a.plan.as_ref()))
+                .chain(std::iter::once(p))
+        });
+        let view_plans: Vec<&ConversionPlan> = view_plans.collect();
+        if view_plans.iter().any(|p| !p.view_preludes.is_empty()) {
             let mut failed = false;
-            for p in &plans {
+            for p in &view_plans {
                 if self.materialize_views(p).is_err() {
                     failed = true;
                     break;
@@ -160,8 +171,10 @@ impl Engine {
         if !plan.view_preludes.is_empty() {
             self.materialize_views(plan)?;
         }
-        // D7 双臂（§12.3(d)）：判别式取值选臂——恰一行非 NULL 才可证；
-        // 0/>1 行/NULL → RouteDiscriminatorNotTotal 整段退回。未选中臂
+        // D7 双臂（§12.3(d)）：判别式取值选臂——恰一行整数标签才可证，
+        // NULL/不等值经 SQL `=` 三值语义已落 ELSE 臂（PL IF 口径，
+        // 与 PR#62 route::pick 一致）；标签越界/非整数/查询异常 →
+        // RouteDiscriminatorNotTotal 整段退回（防御位）。未选中臂
         // 的守卫不求值。判别式与主计划前导同序物化（可内嵌 sd_vwN）。
         let (arm_plan, arm_label) = match &plan.discriminator {
             None => (plan, None),
@@ -244,10 +257,12 @@ impl Engine {
     }
 
     /// D7 判别式选臂（§12.3(d).2）：`d.sql` 在 SQL 侧产整型标签——
-    /// `-1`（NULL）/越界/非整数 → `NotTotal` 整段回退；`0..arms.len()-1`
-    /// → 对应臂计划（先补物化其前导），`arms.len()` → 主计划（ELSE 臂
-    /// =值域补集）。臂等值比较已在判别式 SQL 内完成（`=` 语义与原
-    /// IF 条件同源），此处不再做 SpinValue 跨类型比对。
+    /// `0..arms.len()-1` → 对应臂计划（先补物化其前导），
+    /// `arms.len()` → 主计划（ELSE 臂 =值域补集；判别值 NULL 已在
+    /// SQL 侧落 ELSE，与 PL IF 语义一致）。越界/非整数/查询不产
+    /// 恰一行 → `NotTotal` 整段回退（防御位）。臂等值比较已在
+    /// 判别式 SQL 内完成（`=` 语义与原 IF 条件同源），此处不再做
+    /// SpinValue 跨类型比对。
     fn pick_arm<'p>(
         &self,
         d: &'p Discriminator,

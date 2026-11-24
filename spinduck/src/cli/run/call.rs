@@ -300,9 +300,10 @@ pub(crate) fn call_engine(
         eng.on_set_oriented_report = Some(Box::new(|report| {
             use crate::ir::set_oriented::Status;
             let line = match &report.status {
-                Status::Converted { .. } => {
-                    format!("SET_ORIENTED {} converted", report.routine)
-                }
+                Status::Converted { arm, .. } => format!(
+                    "SET_ORIENTED {}",
+                    super::converted_body(&report.routine, *arm)
+                ),
                 Status::Skipped { reason } => format!(
                     "SET_ORIENTED {}",
                     super::skipped_reason_body(&report.routine, *reason)
@@ -533,7 +534,11 @@ fn render_set_oriented_reports(
     use crate::ir::set_oriented::Status;
     for report in eng.set_oriented_reports() {
         match &report.status {
-            Status::Converted { .. } => writeln!(out, "SET_ORIENTED {} converted", report.routine),
+            Status::Converted { arm, .. } => writeln!(
+                out,
+                "SET_ORIENTED {}",
+                super::converted_body(&report.routine, *arm)
+            ),
             Status::Skipped { reason } => writeln!(
                 out,
                 "SET_ORIENTED {}",

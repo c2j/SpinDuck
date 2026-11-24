@@ -396,8 +396,8 @@ binds = ["seat_code", "inure_begin_date", "inure_end_date"]
 | D7 | purchase 的 `kind_id='1'` **形态支持**是否纳入本版 | **定稿：纳入本版**（人类指示）。设计 = §12，落地 = PR-5；前置请示项 = §12.7 |
 | D8 | B2 判定行前移的输出通道（§5） | **定稿：Engine 报告回调字段**（`on_set_oriented_report: Option<Box<dyn FnMut(&Report)>>`，`push_report` 内同步调用；不改 `TraceSink`/`SqlExecutor` 接缝签名，无需 Ask first）。备选 `TraceSink` 新事件 = 接缝契约变更，若选它须先 Ask first 并同步 §11.2 JSONL 契约 |
 | D9 | `--admit` 是否强制要求 `--db` | **定稿：强制**。`--admit` 不带 `--db` → 用法错（ENG-0010 口径）。F2 修复后无数据面只剩形状类 firm 判定，CLI 层直接堵死误用面；库级 `admit_verify` 保留 `executor=None` 路径供测试与未来只读面，输出恒为 `StaticOnly`/`conservative` 并显式打 `no-db` 标记。因此测试 3/4c 在**库级**断言（CLI 契约层测不到 no-db 面） |
-| **D10** | `SkipReason::RouteDiscriminatorNotTotal` 是否算 `[rejects]` 增项（§12.3(d)） | **建议：不算**——它是回退而非拒绝，兼容范围未收缩；但须同步 `config/rewrite-rules.toml` 注释并挂探针（AGENTS §6：`assumed → verified`）。仍属 Ask first，需业务确认 |
-| **D11** | 双臂报告形态：`Status::Converted { sql, arm }` 还是 `Report.note`（§12.3(e)） | **建议：加 `arm` 枚举字段**（可进门禁断言）。代价 = `Status`/`Report` 形状变更、触及人类既有测试断言（测试权限表里是只读项）→ Ask first。`note` 字符串只在 D11 被否时作过渡，且明确「不进契约断言」 |
+| **D10** | `SkipReason::RouteDiscriminatorNotTotal` 是否算 `[rejects]` 增项（§12.3(d)） | **定稿（PR-5 评审修订）：不算**——判别值 NULL 已按 PL IF 语义落 ELSE 臂（与 PR#62 `route::pick` 同口径），NotTotal 退化为防御位（判别式不产恰一行整数标签时兜底，当前形态 SQL 数据面不可达）。**兼容面收缩如实登记**：双臂要求两臂均可证，THEN 臂不可证的 route 区域由「批 ELSE」退为整段解释（例：`copy_route` 的 `r.a+1000` 表达式写）；该收缩是「单臂失败整体失败」语义的既定后果，逐例登记于 validation V54 |
+| **D11** | 双臂报告形态：`Status::Converted { sql, arm }` 还是 `Report.note`（§12.3(e)） | **定稿（PR-5 落地）：`Status::Converted { sql, arm: Option<Arm> }`**——`None` = 单臂/今日形态，`Some(Then|Else)` = 双臂运行期判别式选中臂；人类既有断言已按批准的形状变更同步（`matches!(Converted{..})` 兼容新字段） |
 
 ---
 
@@ -524,10 +524,13 @@ pub struct ConversionPlan {
 **(d) 运行期**（`engine/set_oriented.rs::adjudicate_region`）
 
 1. 前导物化次序**不变**（`preludes_first` → fn 前导 → 视图物化，`:129-161`）；
-2. 新增：判别式求值（bind-free、恰一行、非 NULL）→ 选臂；
+2. 新增：判别式求值（bind-free、恰一行）→ 选臂。判别值 NULL 与一切
+   不等值同落 ELSE 臂——SQL `=` 三值语义 + CASE ELSE 分支，与 PL
+   `IF`（条件非 TRUE 即走 ELSE）及 PR#62 `route::pick` 口径一致；
 3. 选中臂跑自己那份守卫链（sys_dummy → drift → snapshot → top1 → ~~route~~ → expr，次序不变）；
-4. 新增保守回退条件：判别式 0 行 / >1 行 / NULL / 值落在 arms 值域外 →
-   `SkipReason::RouteDiscriminatorNotTotal`，整段按原 IR 解释执行；
+4. 新增保守回退条件：判别式查询不产恰一行整数标签（越界/非整数/查询异常）→
+   `SkipReason::RouteDiscriminatorNotTotal`，整段按原 IR 解释执行
+   （防御位：当前判别式形态恒产 0/1，SQL 数据面不可达）；
    选中臂守卫失败 → 该臂的原始拒因，同样整段回退（**绝不半批写**）；
 5. 批写、`miss_outs`、`tail_commit`、`RunSpan` 边界全部按选中臂的计划走。
 
@@ -564,9 +567,9 @@ SET_ORIENTED pkg_split_trade_step3_sh.prc_trd_deal_purchase converted arm=then s
 
 ### 12.5 放行门（三道，缺一不得合入）
 
-1. **零回归门**：byfund + purchase（switch='0'）两语料的生成 SQL、`SET_ORIENTED` 行、退出码
+1. **零回归门**：`discriminator = None` 的全部既有计划——byfund + purchase（switch='0'）两语料的生成 SQL、`SET_ORIENTED` 行、退出码
    与基线**逐字一致**；基线由 §12.4 G5 的当前 main 重测产出（**不是** v0.2.1 的 `REPORT.md:188`），
-   sha256 与重测记录一并入 `docs/validation.md`。
+   sha256 与重测记录一并入 `docs/validation.md`。**例外如实登记**：双臂化后 THEN 臂不可证的 route 区域整体拒绝（D10 收缩项），其 `SET_ORIENTED` 行由 `Converted` 变为 `Skipped(臂拒因)`——属批准的语义变更，逐例登记 V54，不在「逐字一致」承诺面内。
 2. **状态合并门**：守护测试构造「两臂对同一变量写不同常量、后缀读它」的 fixture，断言后缀
    **不**沿用任单臂事实（§12.3(b) 第 4 步）。此测试的期望值在后续重构中不得变更。
 3. **四象限等价门**：OFF/ON × 单行/多行/无命中/NULL，选中臂批写 vs 逐行解释的
@@ -579,7 +582,7 @@ SET_ORIENTED pkg_split_trade_step3_sh.prc_trd_deal_purchase converted arm=then s
 | :--- | :--- | :--- | :--- |
 | 13 | 守护 | `should_keep_else_only_plan_verbatim_with_arms_field` | 门 1 的代码侧锁：`discriminator = None` 时生成 SQL 与守卫序列逐字不变 |
 | 14 | 单元 | `should_analyze_both_route_arms_and_merge_disagreeing_facts` | 臂分叉 + 出口合并：两臂异值变量在后缀不得作为 folded 常量出现（门 2） |
-| 15 | 单元 | `should_fall_back_when_route_discriminator_not_single_valued` | 判别式 0 行 / 2 行 / NULL → `Skipped(RouteDiscriminatorNotTotal)` 且原区域完整执行（无半批写） |
+| 15 | 单元 | `should_select_else_arm_for_null_and_fallback_discriminator` | 判别值 NULL / 查找 0 行 / 多行 → 均落 ELSE 臂 Converted（PL IF 口径，PR#62 同源）；`RouteDiscriminatorNotTotal` 仅防御位（标签越界/非整数），SQL 数据面不可达 |
 | 16 | 集成（native） | `should_convert_purchase_when_commission_switch_is_one` | ON 数据下选 `then` 臂、批写与逐行结果一致（门 3 的可执行面；数据前置见 §12.7） |
 | 17 | CLI 契约 | `admit_and_call_should_report_same_selected_arm` | `ADMIT … arm=then` 与 `SET_ORIENTED … arm=then` 同函数产出（§3.2 同源铁律在双臂下的延伸） |
 

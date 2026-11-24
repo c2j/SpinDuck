@@ -5304,3 +5304,93 @@ PR-5 第一步取证（先于任何 D7 实现）。夹具：
   ON 臂批写 vs 逐行解释的 `dat_trd_repurchase` 比对尚未跑）。
 - 不声称 `--admit` 面输出：本轮只取运行期 reports；compile --admit
   的 purchase 判定行待 CLI 层补测。
+
+## V54 D7 双臂路由转换落地证据与兼容面收缩登记（设计 v3.1 §12，PR-5）
+
+实现 commit `6e57f85` + 评审修订（臂前导前移探测、NULL→ELSE 口径）。
+机制：`RouteSite` 记录 Branch/TrapGroup 决策点 → THEN 臂 divert 走查 +
+独立 `generate()`（单臂失败整体 `PlanRejection`，不降级单臂）→
+`ConversionPlan.discriminator` 运行期选臂；`Status::Converted.arm`
+报告选中臂。
+
+### V54.1 兼容面收缩逐例登记（批准的「单臂失败整体失败」语义后果）
+
+| 例程/形态 | v3.0（main） | D7 后 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `copy_route`（THEN 臂 `r.a+1000` 表达式写） | `Converted`（批 ELSE，route 守卫证 THEN 不可达） | `Skipped(UnsupportedWrite)` | 臂内无残余 trap 可证「无需坏行过滤」，单臂失败整体拒绝 |
+| `copy_if_trap` 判别值 NULL seed | `Converted` | `Converted(arm=else)` | NULL 经 SQL `=` 三值语义落 ELSE（PR#62 `route::pick` 同口径），**无收缩** |
+| `copy_partial_then` THEN 可达 seed | `Skipped(UnsupportedControlFlow)` | `Converted(arm=then)` | 兄弟臂独占写入变量按本臂恒 NULL 折叠（`CASE NULL WHEN`），**扩大可转面** |
+| purchase `kind_id='1'`（ON） | `Skipped(UnsupportedControlFlow)` | `Converted(arm=then)` | D7 目标场景，**扩大可转面** |
+
+收缩仅 `copy_route` 一类（THEN 臂含不可证表达式写）；purchase/byfund
+语料无此形态，不受影响。
+
+### V54.2 正确性证据
+
+- `d7_purchase_batch_matches_interpreter_all_quadrants`：OFF/ON/absent
+  三象限 `dat_trd_repurchase` 全列 + `p_o_succeed` 与 Off 逐值一致，
+  arm 标签断言（else/absent→`Arm::Else`，then→`Arm::Then`）。
+- byfund corpus：`Converted` + Off/Batch 行集全等（既有守护保持绿）。
+- `copy_if_trap` 四 seed（含 NULL/多行判别值）→ 全部 `Converted(arm=else)`，
+  行集与 Off 全等；`('1','X')` → `Converted(arm=then)` 写 'U' 一致。
+- 臂前导前移探测（评审 P1-3 修复）：`lateral::
+  should_probe_then_arm_view_preludes_before_user_code`——THEN 臂
+  视图物化必失败（`CAST('abc' AS INTEGER)`）时前移探测覆盖臂计划，
+  ROLLBACK 后整段解释执行，调用成功 + `Skipped(UnprovenQueryTotalness)`；
+  对照 `should_convert_arm_view_preludes_when_materialization_succeeds`
+  证明健康臂视图照常 Converted 选臂（排除计划期拒绝假象）。
+
+### V54.3 性能取证（100k 规模，进程内 DuckDB debug 构建）
+
+载体 `tests/d7_perf_bench.rs`（`SD_BENCH=1` 显式启用，默认跳过——
+非门禁取证工具）。`mid_yjqs_detail` 自连接放大：purchase 98,304 行、
+byfund 65,536 行；计时 = `eng.call()` 全程（含 BatchAtomic 首次计划
+编译与判别式求值），单轮。
+
+| 用例 | Off（解释器） | BatchAtomic | 结论 |
+| :--- | :--- | :--- | :--- |
+| purchase switch OFF→ELSE 臂 | 127.4s 后 `ENG-0032` 步数预算超限，**调用失败** | **4.40s** `Converted(arm=else)` | 该规模下解释器不可行，批写唯一可行路径 |
+| purchase switch ON→THEN 臂 | 119.0s 同上失败 | **5.99s** `Converted(arm=then)` | 同上，双臂均验证 |
+| byfund | 0.55s | 5.39–6.13s `Converted`（两轮） | **~10× 回退** |
+
+小规模对照（~3k 行）：purchase Off ~6.5–8.5s vs Batch ~1.3–1.7s（~5×）；
+byfund Off ~0.15s vs Batch ~2.8s。Batch 耗时随规模亚线性（purchase
+3k→98k 数据 ×32、耗时仅 ×3.4）。
+
+**byfund 回退机理**：生成 SQL 对 `par_fund_seat_para`（10 次）、
+`jyfy_temp` 等工作表做逐组相关子查询重扫；解释器每行 ~8µs 轻量逻辑
+反而更便宜。处置决定待业务评审（豁免机制 / SQL join 化 / 接受现状），
+本版如实登记为已知限制。
+
+### V54.4 评审修订记录（PR#63 评审 → 处置）
+
+- **P1-3 臂前导探测绕过** → 已修：臂计划 `view_preludes` 纳入前移
+  探测（`engine/set_oriented.rs`），守护测试双向锁定。
+- **P1-1 兼容面收缩口径** → 已修：D10/§12.5 门 1 措辞改为如实登记
+  （见 V54.1）；NULL 判别值向 PR#62 `route::pick` 口径靠拢
+  （NULL→ELSE 臂 Converted，撤销 `-1`→NotTotal 设计）。
+- **P1-2 门 1/2 代码锁** → 已修：测试 14 落地为
+  `set_oriented::tests::should_analyze_both_route_arms_with_independent_facts`
+  （两臂独立事实不互串断言）；测试 17 落地为
+  `d7_admit_and_call_report_same_selected_arm`（admit_verify 与
+  call 在 OFF/ON 象限 arm 标签一致，`try_clone` 共享同一 DuckDB）；
+  测试 15 由 fallback 四 seed（含 NULL/多行判别值→ELSE 臂）与
+  purchase absent 象限覆盖；测试 13 由 entry 单测（discriminator
+  缺席 + route_guards 保留）与 corpus 逐字守护覆盖；purchase_switch
+  恒真断言已修。
+- **P2 区域级缓存表计数器（§12.3(c)）** → 采用评审备选的前提锁定：
+  `lateral::should_convert_arm_view_preludes_when_materialization_succeeds`
+  fixture 改为两臂均落视图（THEN=`v_bad`、ELSE=`v_ok`），两臂
+  `view_preludes` 同名 `sd_vw0` 而内容不同；两象限行集与 Off 全等
+  证明「选中臂前导最后物化生效」前提成立。计数器本身仍为后续项，
+  G4 取证时复核。
+- **P3 文件规模** → `admit.rs`/`mod.rs`/`generate.rs` 超 500 行线，
+  拆分为后续项。
+
+### V54.5 不声称
+
+- 不声称 byfund BatchAtomic 性能可接受（~10× 回退已实测，处置未决）。
+- 不声称 `RouteDiscriminatorNotTotal` 有 SQL 数据面可达路径（防御位）。
+- 不声称 §12.3(c) 区域级缓存表计数器已实现（V54.4-P2 缺口）。
+- 不声称门 1 sha256 基线独立登记（逐字面由 corpus 守护承担）。
+- 不声称 release 构建性能（全部数字为 debug 构建实测）。

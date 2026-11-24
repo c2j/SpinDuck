@@ -149,6 +149,24 @@ pub(crate) fn skipped_reason_body(
     format!("{routine} skipped reason={reason:?}")
 }
 
+/// `converted` 判定行主体：双臂计划（§12 D7）附 `arm=then|else`，
+/// 单臂恒无后缀——`SET_ORIENTED`/`ADMIT` 两前缀共用同一函数（§3.2 铁律）。
+pub(crate) fn converted_body(routine: &str, arm: Option<crate::ir::set_oriented::Arm>) -> String {
+    match arm {
+        Some(a) => format!("{routine} converted arm={}", a.as_str()),
+        None => format!("{routine} converted"),
+    }
+}
+
+/// `arm=` 后缀片段：conditional 等非 converted 判定行同样透出选中臂
+/// （判别式已在 admit 数据面求值，臂标签与 converted 行同源）。
+pub(crate) fn arm_suffix(arm: Option<crate::ir::set_oriented::Arm>) -> String {
+    match arm {
+        Some(a) => format!(" arm={}", a.as_str()),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn argv(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
