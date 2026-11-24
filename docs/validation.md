@@ -5309,15 +5309,16 @@ PR-5 第一步取证（先于任何 D7 实现）。夹具：
 
 实现 commit `6e57f85` + 评审修订（臂前导前移探测、NULL→ELSE 口径）。
 机制：`RouteSite` 记录 Branch/TrapGroup 决策点 → THEN 臂 divert 走查 +
-独立 `generate()`（单臂失败整体 `PlanRejection`，不降级单臂）→
-`ConversionPlan.discriminator` 运行期选臂；`Status::Converted.arm`
-报告选中臂。
+独立 `generate()` → `ConversionPlan.discriminator` 运行期选臂；
+`Status::Converted.arm` 报告选中臂。**降级口径（V54.7 修订）**：
+THEN 臂分析/生成任一证明失败 → 静默降级单臂（`discriminator=None` +
+主计划 `route_guards` 守 THEN 不可达），不再整体 `PlanRejection`。
 
-### V54.1 兼容面收缩逐例登记（批准的「单臂失败整体失败」语义后果）
+### V54.1 兼容面收缩逐例登记（「单臂失败整体失败」语义后果；V54.7 已部分回退）
 
 | 例程/形态 | v3.0（main） | D7 后 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `copy_route`（THEN 臂 `r.a+1000` 表达式写） | `Converted`（批 ELSE，route 守卫证 THEN 不可达） | `Skipped(UnsupportedWrite)` | 臂内无残余 trap 可证「无需坏行过滤」，单臂失败整体拒绝 |
+| `copy_route`（THEN 臂 `r.a+1000` 表达式写） | `Converted`（批 ELSE，route 守卫证 THEN 不可达） | ~~`Skipped(UnsupportedWrite)`~~ → 降级后 ELSE 数据 `Converted{arm:None}`、THEN 数据 `Skipped(UnsupportedControlFlow)` | 臂内无残余 trap 可证「无需坏行过滤」；V54.7 降级口径下备选失败只丢 THEN 臂，主计划保留 |
 | `copy_if_trap` 判别值 NULL seed | `Converted` | `Converted(arm=else)` | NULL 经 SQL `=` 三值语义落 ELSE（PR#62 `route::pick` 同口径），**无收缩** |
 | `copy_partial_then` THEN 可达 seed | `Skipped(UnsupportedControlFlow)` | `Converted(arm=then)` | 兄弟臂独占写入变量按本臂恒 NULL 折叠（`CASE NULL WHEN`），**扩大可转面** |
 | purchase `kind_id='1'`（ON） | `Skipped(UnsupportedControlFlow)` | `Converted(arm=then)` | D7 目标场景，**扩大可转面** |
@@ -5326,6 +5327,7 @@ PR-5 第一步取证（先于任何 D7 实现）。夹具：
 收缩仅 `copy_route` 一类（THEN 臂含不可证表达式写）；purchase/byfund
 语料无此形态。purchase 的唯一影响是判定行 `arm=` 后缀（上表末行），
 属输出契约增量而非收缩——生成 SQL、退出码、行集均不变。
+**V54.7 降级口径后本表 `copy_route` 行已再变**（见下节）。
 
 ### V54.2 正确性证据
 
@@ -5439,3 +5441,46 @@ byfund Off ~0.15s vs Batch ~2.8s。Batch 耗时随规模亚线性（purchase
   覆盖 conditional 行 `arm_suffix`；新 CLI 测试登记 V54.4 映射。
 - **N-5 fixture 去重** → 已修：`DUAL_ARM_COPY_PARTIAL`/
   `DUAL_ARM_SCHEMA` 上收到 `tests/cli.rs`，call/compile_admit 共用。
+
+### V54.7 复审降级口径 + THEN 臂准入超集（合并模拟评审会签，PR#63 第四轮）
+
+来源：PR#63 评审 comment-7126643938 + 合并树 `sim/pr62-63-merged`
+（main + PR#62 + PR#63 三方合并）V55.4 根因分析。三项处置：
+
+1. **THEN 臂证明失败 → 静默降级单臂**（语义会签，反转「单臂失败
+   整体拒绝」）：`analyze_then_arm` 失败 `.ok()` 丢弃备选；
+   `gen_arm_plan` 先证 THEN 臂 `generate()`，失败同样降级
+   （`generate(...)?.ok()`，`EngineError` 仍上抛）。降级产物 =
+   `discriminator=None` 单臂 ELSE 计划 + `route_guards` 守
+   「THEN 不可达」：ELSE 活跃数据 `Converted{arm:None}`，THEN
+   活跃数据运行态守卫拒绝 `Skipped{UnsupportedControlFlow}`——
+   该拒绝点即 PR#62 `try_loop_parallel_region` 接管触发点，
+   恢复 SO→LP 派发缺口（本分支无 LP，`Parallelized` 断言随
+   PR#62 合入补齐）。**与合并树的差异如实登记**：合并树仅降级
+   分析期失败、生成期失败仍整体拒绝；本分支按会签口径把降级
+   扩到生成期（`copy_route` 表达式写场景由此转为降级而非
+   `Skipped{UnsupportedWrite}`），覆盖面更大且同样保守。
+2. **THEN 臂准入超集**（合并树 `arm_query`/`finish_arm` 移植）：
+   TrapGroup 路由 IF 的 THEN 臂不再限 `parse_then_case_sink`
+   （case_sink×sys_dummy），改走 `lookup::parse_total` 全定义
+   证明 + 处理器重置兜底 + 组内局部死（豁免区 = ELSE 臂 pc
+   区间）；`finish_arm` 不记 route（臂计划无路由守卫，运行期
+   判别式选臂）。`fallback_if_group_at` 升级结构化 `IfGroup`
+   返回（cond/group/resume/else_start/then_range/else_range/
+   resets），`RouteSite::TrapGroup` 去 `push_pc`。守护
+   `fallback::should_convert_route_if_when_both_arms_are_
+   convertible`（合并树移植，THEN=普通 SELECT INTO+CASE 写汇
+   双臂 route='1'/'0' 均 `Converted`）转绿；byfund TrapGroup
+   路由 IF 形态由此可证。
+3. **`set_oriented_lookup_top1.rs` 生效性复核**：复审称「未注册
+   + 无父模块声明」——实测 `guard_set_oriented_lookup.rs:37`
+   `#[path] mod top1` 自 `6e57f85` 起已挂接，`guard_set_
+   oriented_lookup` 目标在 Cargo.toml:132 已注册，14 个用例
+   实际在跑（独立编译报错仅因误当独立目标）。断言按降级口径
+   重写：`top1::should_downgrade_to_single_arm_and_reject_then_
+   at_runtime_when_arm_unproven`（ELSE 数据 `Converted{arm:None}`
+   ×4 seed；THEN 数据 `'1'/'X'` → `Skipped{UnsupportedControlFlow}`
+   + 行集与 Off 全等）；新增
+   `fallback::should_reject_at_runtime_for_lp_takeover_when_then_
+   arm_unconvertible`（THEN 臂双变量 INTO 不可证 → 分析期降级 →
+   运行态拒绝，SO 侧接管点守护）。

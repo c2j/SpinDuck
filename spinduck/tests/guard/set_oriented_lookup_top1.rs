@@ -218,13 +218,15 @@ fn rows_copy_route(eng: &Engine) -> Vec<Vec<SpinValue>> {
 }
 
 #[test]
-fn should_reject_whole_region_when_then_arm_expression_write_unproven() {
+fn should_downgrade_to_single_arm_and_reject_then_at_runtime_when_arm_unproven() {
     // 设计 §4.3 区域入口循环不变探针：v_kind 由兜底查找求得（0 行/多行 →
     // '0'，命中 NULL 保留），IF v_kind = '1' 双臂路由。
-    // D7 双臂：THEN 臂 `INSERT ... VALUES (r.a + 1000)` 的表达式写在
-    // 臂内无残余 trap 可证「无需坏行过滤」→ 臂生成 UnsupportedWrite，
-    // 按「单臂失败整体失败」整个区域拒绝转换（与判别数据无关，
-    // 解释器回退后行集仍与 Off 全等）。
+    // 降级口径（PR#62 route_alt 语义会签）：THEN 臂 `INSERT ... VALUES
+    // (r.a + 1000)` 表达式写在臂内无残余 trap 可证「无需坏行过滤」→
+    // 臂分析失败 → 静默降级单臂 ELSE 计划（discriminator=None，主计划
+    // route_guards 守 THEN 不可达）。ELSE 活跃数据 → Converted{arm:None}；
+    // THEN 活跃数据 → 运行态守卫拒绝 → Skipped{UnsupportedControlFlow}
+    // （PR#62 合入后该拒绝点交 loop-parallel 接管）；行集与 Off 全等。
     for seed in [
         "INSERT INTO swh_all_kind VALUES ('1', 'OTHER')",
         "INSERT INTO swh_all_kind VALUES ('0', 'X')",
@@ -239,15 +241,17 @@ fn should_reject_whole_region_when_then_arm_expression_write_unproven() {
         eng.set_oriented = SetOrientedMode::BatchAtomic;
         eng.call("copy_route", &[]).unwrap();
         assert_eq!(rows_copy_route(&eng), expected, "seed: {seed}");
-        assert_eq!(
-            eng.set_oriented_reports()[0].status,
-            Status::Skipped {
-                reason: SkipReason::UnsupportedWrite
-            },
+        assert!(
+            matches!(
+                eng.set_oriented_reports()[0].status,
+                Status::Converted { arm: None, .. }
+            ),
             "seed: {seed}, report: {:?}",
             eng.set_oriented_reports()[0]
         );
     }
+    // THEN 臂活跃（判别值 '1'）：降级计划的运行态 route 守卫证明
+    // 「THEN 不可达」失败 → SO 拒绝 → 解释器回退（行集仍与 Off 全等）。
     let seed = "INSERT INTO swh_all_kind VALUES ('1', 'X')";
     let mut baseline = setup_copy_route(seed);
     baseline.call("copy_route", &[]).unwrap();
@@ -261,7 +265,7 @@ fn should_reject_whole_region_when_then_arm_expression_write_unproven() {
     assert_eq!(
         eng.set_oriented_reports()[0].status,
         Status::Skipped {
-            reason: SkipReason::UnsupportedWrite
+            reason: SkipReason::UnsupportedControlFlow
         }
     );
 }

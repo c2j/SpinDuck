@@ -508,3 +508,170 @@ fn should_reject_route_lookup_with_frame_bound_filter() {
         eng.set_oriented_reports()[0]
     );
 }
+
+fn setup_copy_both_arms(route: &str) -> Engine {
+    // 双臂均可集合化的路由 IF（purchase kind IF 同构，合并树移植）：
+    // THEN/ELSE 各含「维表查找 + sys_dummy CASE 写汇」，写集一致
+    // {v_ct, v_yj}，处理器仅重置 v_yj，v_ct 为组内局部死。
+    let sql = "CREATE PROCEDURE copy_both_arms IS v_yj VARCHAR2(10); v_ct VARCHAR2(10); v_route VARCHAR2(10); BEGIN \
+        FOR r IN SELECT a, k, yj_a, yj_b FROM source_rows LOOP \
+        BEGIN SELECT kind INTO v_route FROM route_tab WHERE op = 'X'; \
+        EXCEPTION WHEN OTHERS THEN v_route := '0'; END; \
+        BEGIN \
+        IF v_route = '1' THEN \
+        SELECT ct_t INTO v_ct FROM dim_tab WHERE dim_tab.k = 'T1'; \
+        SELECT CASE v_ct WHEN 'A' THEN r.yj_a ELSE r.yj_b END INTO v_yj FROM sys_dummy; \
+        ELSE \
+        SELECT ct INTO v_ct FROM dim_tab WHERE dim_tab.k = r.k; \
+        SELECT CASE v_ct WHEN 'A' THEN r.yj_a WHEN 'B' THEN r.yj_b ELSE r.yj_a END INTO v_yj FROM sys_dummy; \
+        END IF; \
+        EXCEPTION WHEN OTHERS THEN v_yj := '0'; END; \
+        INSERT INTO target_rows(val, yj) VALUES (r.a, v_yj); \
+        END LOOP; END;";
+    let mut eng = Engine::new(
+        Box::new(DuckExecutor::open_in_memory().unwrap()),
+        RuleRegistry::default(),
+    );
+    for ddl in [
+        "CREATE TABLE source_rows(a BIGINT, k VARCHAR, yj_a VARCHAR, yj_b VARCHAR)",
+        "CREATE TABLE target_rows(val BIGINT, yj VARCHAR)",
+        "INSERT INTO source_rows VALUES (10, 'K1', 'AA1', 'BB1'), (20, 'K2', 'AA2', 'BB2'), (30, 'K3', 'AA3', 'BB3')",
+        "CREATE TABLE route_tab(kind VARCHAR, op VARCHAR)",
+        &format!("INSERT INTO route_tab VALUES ('{route}', 'X')"),
+        "CREATE TABLE dim_tab(k VARCHAR, ct VARCHAR, ct_t VARCHAR)",
+        "INSERT INTO dim_tab VALUES ('K1', 'A', 'A'), ('K2', 'B', 'B'), ('T1', 'X', 'A')",
+        "CREATE TABLE sys_dummy(dummy VARCHAR)",
+        "INSERT INTO sys_dummy VALUES ('X')",
+    ] {
+        eng.ex.execute(ddl, &BindMap::new()).unwrap();
+    }
+    eng.register(sql).unwrap();
+    eng
+}
+
+fn rows_copy_both_arms(eng: &Engine) -> Vec<Vec<SpinValue>> {
+    eng.ex
+        .query(
+            "SELECT val, yj FROM target_rows ORDER BY val",
+            &BindMap::new(),
+        )
+        .unwrap()
+        .fetch_many(20)
+}
+
+#[test]
+fn should_convert_route_if_when_both_arms_are_convertible() {
+    // 分臂判别式：THEN/ELSE 均可集合化时判别式选臂——THEN 臂激活
+    // 不再整体 Skipped，按 THEN 语义 Converted（合并树移植，D7 准入超集）。
+    for route in ["1", "0"] {
+        let mut baseline = setup_copy_both_arms(route);
+        baseline.call("copy_both_arms", &[]).unwrap();
+        let expected = rows_copy_both_arms(&baseline);
+
+        let mut eng = setup_copy_both_arms(route);
+        eng.set_oriented = SetOrientedMode::BatchAtomic;
+        eng.call("copy_both_arms", &[]).unwrap();
+        assert_eq!(rows_copy_both_arms(&eng), expected, "route: {route}");
+        assert!(
+            matches!(
+                eng.set_oriented_reports()[0].status,
+                Status::Converted { .. }
+            ),
+            "route: {route}, report: {:?}",
+            eng.set_oriented_reports()[0]
+        );
+    }
+}
+
+#[test]
+fn should_reject_at_runtime_for_lp_takeover_when_then_arm_unconvertible() {
+    // SO→LP 派发缺口守护（合并树 should_parallelize_region_when_then_arm_
+    // unconvertible 的 SO 侧；本分支无 loop-parallel，LP Parallelized 断言
+    // 随 PR#62 合入补齐）。THEN 臂 `SELECT id, payload INTO v_fee, v_extra`
+    // 为双变量 INTO——臂内准入拒绝 → analyze_then_arm 失败 → 静默降级
+    // 单臂（discriminator=None，route_guards 守 THEN 不可达）；kind='1'
+    // 数据走 THEN → 运行态守卫拒绝 → Skipped{UnsupportedControlFlow}，
+    // 该拒绝点即 PR#62 try_loop_parallel_region 的接管触发点。
+    // kind='0' 走 ELSE → 单臂 Converted；两种数据行集均与 Off 全等。
+    const ROUTE_PROC_WIDE: &str = "CREATE PROCEDURE p_route_wide IS \
+    v_kind VARCHAR; v_fee VARCHAR; v_extra VARCHAR; \
+    BEGIN \
+    FOR r IN SELECT id, payload FROM source_rows LOOP \
+        BEGIN \
+            SELECT kind_id INTO v_kind FROM switches WHERE operation_kind = 'SW'; \
+        EXCEPTION WHEN OTHERS THEN v_kind := '0'; END; \
+        BEGIN \
+            IF v_kind = '1' THEN \
+                SELECT id, payload INTO v_fee, v_extra FROM source_rows WHERE source_rows.id = r.id; \
+            ELSE \
+                SELECT fee INTO v_fee FROM fee_tbl WHERE fee_tbl.id = r.id; \
+            END IF; \
+        EXCEPTION WHEN OTHERS THEN v_fee := 'D'; END; \
+        INSERT INTO target_rows(id, fee) VALUES (r.id, v_fee); \
+    END LOOP; END;";
+    for kind in ["1", "0"] {
+        let setup = |eng: &mut Engine| {
+            for sql in [
+                "CREATE TABLE source_rows(id BIGINT, payload VARCHAR)",
+                "CREATE TABLE target_rows(id BIGINT, fee VARCHAR)",
+                "CREATE TABLE switches(operation_kind VARCHAR, kind_id VARCHAR)",
+                "CREATE TABLE fee_tbl(id BIGINT, fee VARCHAR)",
+                "CREATE TABLE sys_dummy AS SELECT 1",
+                "INSERT INTO source_rows VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')",
+                "INSERT INTO fee_tbl VALUES (1,'f1'),(2,'f2'),(3,'f3'),(4,'f4'),(5,'f5')",
+                &format!("INSERT INTO switches VALUES ('SW', '{kind}')"),
+            ] {
+                eng.ex.execute(sql, &BindMap::new()).unwrap();
+            }
+            eng.register(ROUTE_PROC_WIDE).unwrap();
+        };
+        let mut baseline = Engine::new(
+            Box::new(DuckExecutor::open_in_memory().unwrap()),
+            RuleRegistry::default(),
+        );
+        setup(&mut baseline);
+        baseline.call("p_route_wide", &[]).unwrap();
+        let expected = baseline
+            .ex
+            .query(
+                "SELECT id, fee FROM target_rows ORDER BY id",
+                &BindMap::new(),
+            )
+            .unwrap()
+            .fetch_many(20);
+
+        let mut eng = Engine::new(
+            Box::new(DuckExecutor::open_in_memory().unwrap()),
+            RuleRegistry::default(),
+        );
+        setup(&mut eng);
+        eng.set_oriented = SetOrientedMode::BatchAtomic;
+        eng.call("p_route_wide", &[]).unwrap();
+        let actual = eng
+            .ex
+            .query(
+                "SELECT id, fee FROM target_rows ORDER BY id",
+                &BindMap::new(),
+            )
+            .unwrap()
+            .fetch_many(20);
+        assert_eq!(actual, expected, "kind: {kind}");
+        let report = &eng.set_oriented_reports()[0];
+        if kind == "1" {
+            // THEN 活跃：降级单臂计划运行态守卫拒绝 → SO 缺口（LP 接管点）。
+            assert_eq!(
+                report.status,
+                Status::Skipped {
+                    reason: SkipReason::UnsupportedControlFlow
+                },
+                "kind: {kind}, report: {report:?}"
+            );
+        } else {
+            // ELSE 活跃：降级单臂 ELSE 计划 Converted{arm:None}。
+            assert!(
+                matches!(report.status, Status::Converted { arm: None, .. }),
+                "kind: {kind}, report: {report:?}"
+            );
+        }
+    }
+}

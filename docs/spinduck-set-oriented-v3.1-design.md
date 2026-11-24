@@ -398,7 +398,7 @@ binds = ["seat_code", "inure_begin_date", "inure_end_date"]
 | D7 | purchase 的 `kind_id='1'` **形态支持**是否纳入本版 | **定稿：纳入本版**（人类指示）。设计 = §12，落地 = PR-5；前置请示项 = §12.7 |
 | D8 | B2 判定行前移的输出通道（§5） | **定稿：Engine 报告回调字段**（`on_set_oriented_report: Option<Box<dyn FnMut(&Report)>>`，`push_report` 内同步调用；不改 `TraceSink`/`SqlExecutor` 接缝签名，无需 Ask first）。备选 `TraceSink` 新事件 = 接缝契约变更，若选它须先 Ask first 并同步 §11.2 JSONL 契约 |
 | D9 | `--admit` 是否强制要求 `--db` | **定稿：强制**。`--admit` 不带 `--db` → 用法错（ENG-0010 口径）。F2 修复后无数据面只剩形状类 firm 判定，CLI 层直接堵死误用面；库级 `admit_verify` 保留 `executor=None` 路径供测试与未来只读面，输出恒为 `StaticOnly`/`conservative` 并显式打 `no-db` 标记。因此测试 3/4c 在**库级**断言（CLI 契约层测不到 no-db 面） |
-| **D10** | `SkipReason::RouteDiscriminatorNotTotal` 是否算 `[rejects]` 增项（§12.3(d)） | **定稿（PR-5 评审修订）：不算**——判别值 NULL 已按 PL IF 语义落 ELSE 臂（与 PR#62 `route::pick` 同口径），NotTotal 退化为防御位（判别式不产恰一行整数标签时兜底，当前形态 SQL 数据面不可达）。**兼容面收缩如实登记**：双臂要求两臂均可证，THEN 臂不可证的 route 区域由「批 ELSE」退为整段解释（例：`copy_route` 的 `r.a+1000` 表达式写）；该收缩是「单臂失败整体失败」语义的既定后果，逐例登记于 validation V54 |
+| **D10** | `SkipReason::RouteDiscriminatorNotTotal` 是否算 `[rejects]` 增项（§12.3(d)） | **定稿（PR-5 评审修订）：不算**——判别值 NULL 已按 PL IF 语义落 ELSE 臂（与 PR#62 `route::pick` 同口径），NotTotal 退化为防御位（判别式不产恰一行整数标签时兜底，当前形态 SQL 数据面不可达）。**兼容面收缩如实登记**：双臂要求两臂均可证；**降级口径（合并模拟评审会签，V54.7）**——THEN 臂分析/生成任一证明失败 → 静默降级单臂（`discriminator=None` + 主计划 `route_guards` 守 THEN 不可达），ELSE 活跃数据 `Converted{arm:None}`、THEN 活跃数据运行态守卫拒绝 `Skipped{UnsupportedControlFlow}`（SO→LP 派发缺口接管点）；逐例登记于 validation V54.1/V54.7 |
 | **D11** | 双臂报告形态：`Status::Converted { sql, arm }` 还是 `Report.note`（§12.3(e)） | **定稿（PR-5 落地）：`Status::Converted { sql, arm: Option<Arm> }`**——`None` = 单臂/今日形态，`Some(Then|Else)` = 双臂运行期判别式选中臂；人类既有断言已按批准的形状变更同步（`matches!(Converted{..})` 兼容新字段） |
 
 ---
@@ -577,7 +577,7 @@ SET_ORIENTED pkg_split_trade_step3_sh.prc_trd_deal_purchase converted arm=then s
 
 1. **零回归门**：`discriminator = None` 的全部既有计划——byfund + purchase（switch='0'）两语料的生成 SQL、`SET_ORIENTED` 行、退出码
    与基线**逐字一致**；基线由 §12.4 G5 的当前 main 重测产出（**不是** v0.2.1 的 `REPORT.md:188`），
-   sha256 与重测记录一并入 `docs/validation.md`。**例外如实登记**：双臂化后 THEN 臂不可证的 route 区域整体拒绝（D10 收缩项），其 `SET_ORIENTED` 行由 `Converted` 变为 `Skipped(臂拒因)`——属批准的语义变更，逐例登记 V54，不在「逐字一致」承诺面内。
+   sha256 与重测记录一并入 `docs/validation.md`。**例外如实登记**：双臂化后 THEN 臂不可证的 route 区域**降级单臂**（V54.7 会签，取代原「整体拒绝」登记）：ELSE 活跃数据仍 `Converted`（`arm=none`），THEN 活跃数据运行态 `Skipped(UnsupportedControlFlow)`——属批准的语义变更，逐例登记 V54.1/V54.7，不在「逐字一致」承诺面内。
    第二处批准例外：仍 `Converted` 的双臂判定行按 §3.2 同源渲染透出 `arm=then|else` 片段（`converted` → `converted arm=…`），属输出契约增量而非生成 SQL/退出码变化，逐例登记 V54.1。
 2. **状态合并门**：守护测试构造「两臂对同一变量写不同常量、后缀读它」的 fixture，断言后缀
    **不**沿用任单臂事实（§12.3(b) 第 4 步）。此测试的期望值在后续重构中不得变更。

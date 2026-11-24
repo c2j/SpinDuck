@@ -30,13 +30,11 @@ struct Prepared<'a> {
 pub(super) enum RouteSite {
     /// branch() 形态：`JumpIfNot` pc 与 ELSE 入口 `to`。
     Branch { pc: usize, to: usize },
-    /// trap() `fallback_if_group` 形态：PushTrap pc、ELSE 入口
-    /// `else_start`（SqlQuery 组首语句）、汇合后 `resume_pc`。
-    TrapGroup {
-        push_pc: usize,
-        else_start: usize,
-        resume_pc: usize,
-    },
+    /// trap() `fallback_if_group` 形态：ELSE 入口 `else_start`
+    /// （SqlQuery 组首语句）与汇合后 `resume_pc`。`push_pc` 不再
+    /// 携带：TrapGroup 臂走查经 trap() 内联分流（PR#62 口径），
+    /// 无需绕行重定向。
+    TrapGroup { else_start: usize, resume_pc: usize },
 }
 
 /// 一次区域走查的产物：CopyLoop + 尾部标志 +（D7）route 决策点。
@@ -59,7 +57,8 @@ pub(super) fn analyze_region<'a>(
 }
 
 /// D7 双臂 THEN 臂走查（§12.3(b)）：同一区域、同一入口状态快照下
-/// 独立产出臂计划；失败由调用方决定整体拒绝（单臂失败 = 整体失败）。
+/// 独立产出臂计划；分析失败由调用方降级单臂（route_alt 口径，
+/// 备选失败只丢弃备选不连坐主计划）。
 pub(super) fn analyze_then_arm<'a>(
     prog: &'a IrProg,
     region: &'a region::CursorRegion,

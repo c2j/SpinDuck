@@ -173,23 +173,25 @@ fn plan_from(
                         Err(reason) => Err(PlanRejection::firm(reason)),
                         Ok(ra) => {
                             // D7 双臂（§12.3/§12.7）：route_site 存在时 THEN
-                            // 臂独立走查+生成；单臂失败 = 整体拒绝（不静默
-                            // 退回单臂计划）。ELSE 臂 = 今日走查产物。
+                            // 臂独立走查+生成。臂分析证明失败 → 静默降级
+                            // 单臂（PR#62 route_alt 口径：备选失败只丢弃备
+                            // 选，不连坐主计划）——discriminator=None，主
+                            // 计划 route_guards 守「THEN 不可达」，运行态
+                            // 数据走 THEN 时守卫拒绝整段回退解释器（本分支
+                            // 无 loop-parallel 派发，PR#62 合入后该缺口交
+                            // LP 接管）。两臂均可证时才升级判别式选臂。
+                            // ELSE 臂 = 今日走查产物。
                             let then_ra = match ra.route_site {
                                 None => None,
-                                Some(site) => {
-                                    match analyze_then_arm(
-                                        &routine.prog,
-                                        &region,
-                                        mode,
-                                        ctx.catalog,
-                                        &in_params,
-                                        site,
-                                    ) {
-                                        Err(reason) => return Ok(Err(PlanRejection::firm(reason))),
-                                        Ok(t) => Some(t),
-                                    }
-                                }
+                                Some(site) => analyze_then_arm(
+                                    &routine.prog,
+                                    &region,
+                                    mode,
+                                    ctx.catalog,
+                                    &in_params,
+                                    site,
+                                )
+                                .ok(),
                             };
                             gen_arm_plan(ra, routine, source, ctx, &region, mode, then_ra)?
                         }
@@ -203,7 +205,9 @@ fn plan_from(
 
 /// 单臂/双臂计划生成（D7 §12.3）：`then_ra = Some` 时 ELSE 臂标
 /// `dual_arm`（generate 换判别式）、THEN 臂独立 generate 后填入
-/// `Discriminator.arms`。单臂失败 = 整体 `PlanRejection`。
+/// `Discriminator.arms`。主臂失败 = 整体 `PlanRejection`；THEN 臂
+/// 生成失败 = 静默降级单臂（route_alt 口径覆盖分析+生成两阶段，
+/// 主计划 route_guards 兜底「THEN 不可达」）。
 fn gen_arm_plan<'a>(
     ra: analyze::RegionAnalysis<'a>,
     routine: &CompiledRoutine,
@@ -213,11 +217,7 @@ fn gen_arm_plan<'a>(
     mode: SetOrientedMode,
     then_ra: Option<analyze::RegionAnalysis<'a>>,
 ) -> Result<Result<entry::ConversionPlan, PlanRejection>, EngineError> {
-    let dual = then_ra.is_some();
     let mut ra = ra;
-    if dual {
-        ra.copy.dual_arm = true;
-    }
     // 下沉/查找变量若是 OUT/INOUT 形参，出口写回不可消除
     if live_param_hit(&ra.copy, routine) {
         return Ok(Err(PlanRejection::firm(SkipReason::LiveOutState)));
@@ -228,6 +228,28 @@ fn gen_arm_plan<'a>(
     let arm_nulls = then_ra
         .as_ref()
         .map(|t| arm_null_candidates(routine, region, ra.route_site, &ra.copy, &t.copy));
+    // 先证 THEN 臂可生成：失败静默降级（丢弃备选不连坐主计划），
+    // 主臂按单臂口径 generate（discriminator=None + route_guards）。
+    let then_plan = match then_ra {
+        None => None,
+        Some(then) => {
+            if live_param_hit(&then.copy, routine) {
+                return Ok(Err(PlanRejection::firm(SkipReason::LiveOutState)));
+            }
+            let mut tcopy = then.copy;
+            if let Some(nulls) = &arm_nulls {
+                for v in nulls {
+                    tcopy
+                        .folded
+                        .push((v.clone(), crate::value::SpinValue::Null));
+                }
+            }
+            generate(&mut tcopy, source, ctx, region, then.tail_commit)?.ok()
+        }
+    };
+    if then_plan.is_some() {
+        ra.copy.dual_arm = true;
+    }
     let mut copy = ra.copy;
     let mut plan = match generate(&mut copy, source, ctx, region, ra.tail_commit)? {
         Err(reason) => {
@@ -240,31 +262,12 @@ fn gen_arm_plan<'a>(
         }
         Ok(p) => p,
     };
-    let Some(then) = then_ra else {
-        return Ok(Ok(plan));
-    };
-    if live_param_hit(&then.copy, routine) {
-        return Ok(Err(PlanRejection::firm(SkipReason::LiveOutState)));
-    }
-    let mut tcopy = then.copy;
-    if let Some(nulls) = arm_nulls {
-        for v in nulls {
-            tcopy.folded.push((v, crate::value::SpinValue::Null));
+    if let Some(tplan) = then_plan {
+        if let Some(d) = &mut plan.discriminator {
+            d.arms.push(entry::RouteArm {
+                plan: Box::new(tplan),
+            });
         }
-    }
-    let tplan = match generate(&mut tcopy, source, ctx, region, then.tail_commit)? {
-        Err(reason) => {
-            return Ok(Err(PlanRejection {
-                reason: rollback_scope_reason(mode, then.has_trap, reason),
-                probe_suspect: matches!(source, schema::Source::Static(_)),
-            }))
-        }
-        Ok(p) => p,
-    };
-    if let Some(d) = &mut plan.discriminator {
-        d.arms.push(entry::RouteArm {
-            plan: Box::new(tplan),
-        });
     }
     Ok(Ok(plan))
 }
