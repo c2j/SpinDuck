@@ -5399,3 +5399,34 @@ byfund Off ~0.15s vs Batch ~2.8s。Batch 耗时随规模亚线性（purchase
   不一致——同源铁律只承诺同一 SQL 与同一标签口径，不承诺跨时点
   稳定，下游不得把 `arm=` 当稳定契约消费。
 - 不声称 release 构建性能（全部数字为 debug 构建实测）。
+- 不声称 §12.3(e) 目标可观测形态已实现：逐臂明细行
+  （`arm=… verdict=… unchecked=…`）、`guards=N/M` 计数、
+  `arm=none` 字段、未选中臂 `Unchecked(control-flow-excluded)`、
+  守卫级 `arm=` 均**未实现**。当前面只有：判定行 `arm=then|else`
+  后缀（converted/conditional 同源）+ 守卫清单只列选中臂。
+- 不声称 route 判别式/守卫支持帧绑定：渲染产物含 `$v_*` 占位符
+  即计划期 `Skipped(UnsupportedControlFlow)`（bind-free 前提由
+  `route::reject_frame_binds` 词法扫描强制，V54.6-N1）。
+
+### V54.6 评审修订记录（PR#63 第三轮 → 处置）
+
+- **N-1 route/判别式帧绑定崩溃（P2，v0.2.4 存量缺陷）** → 已修：
+  `route::discriminator`/`route::guard` 渲染后经 `shape::Tokens`
+  词法扫描 `$v_*` 占位符，命中即 `Skipped(UnsupportedControlFlow)`
+  计划期拒绝——`call`/`compile --admit` 两路均安全回退解释器，
+  不再 KERNEL-0010。守护测试
+  `fallback::should_reject_route_lookup_with_frame_bound_filter`
+  （修复前实测 KERNEL-0010 `Invalid parameter name: v_v_f`，
+  修复后 Skipped + 行集全等）。`entry.rs` bind-free 注释同步更正。
+- **N-2 门 1 例外缺口** → 已修：设计 §12.5 门 1 增第二处批准例外
+  （仍 Converted 的双臂判定行透出 `arm=` 片段）。
+- **N-3 可观测口径** → 已修：设计 §12.3(e) 示例标注为目标形态并
+  列出未实现项；§12.7 Ask-first 第 1 条注明 `control-flow-excluded`
+  本版不实现；V54.5 不声称清单同步补齐。
+- **N-4 测试收紧** → 已修：admit 断言改整行锚定
+  `ADMIT copy_partial converted arm=else|then` 并覆盖 THEN 象限；
+  `call` 侧断言同步整行锚定 + `err == ""`；新增
+  `run::tests::should_render_arm_suffix_on_conditional_verdict_line`
+  覆盖 conditional 行 `arm_suffix`；新 CLI 测试登记 V54.4 映射。
+- **N-5 fixture 去重** → 已修：`DUAL_ARM_COPY_PARTIAL`/
+  `DUAL_ARM_SCHEMA` 上收到 `tests/cli.rs`，call/compile_admit 共用。

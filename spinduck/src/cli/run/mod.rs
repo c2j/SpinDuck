@@ -212,6 +212,24 @@ mod tests {
     }
 
     #[test]
+    fn should_render_arm_suffix_on_conditional_verdict_line() {
+        // §12.3(e)：conditional 判定行与 converted 同源透出选中臂——
+        // `ADMIT <r> conditional arm=then|else`（单臂无后缀）。
+        use crate::ir::set_oriented::Arm;
+        let line =
+            |arm: Option<Arm>| format!("ADMIT {} conditional{}", "copy_partial", arm_suffix(arm));
+        assert_eq!(
+            line(Some(Arm::Then)),
+            "ADMIT copy_partial conditional arm=then"
+        );
+        assert_eq!(
+            line(Some(Arm::Else)),
+            "ADMIT copy_partial conditional arm=else"
+        );
+        assert_eq!(line(None), "ADMIT copy_partial conditional");
+    }
+
+    #[test]
     fn should_fail_project_compile_when_project_file_is_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let (code, out) = run_str(&["compile", "--dir", &tmp.path().to_string_lossy()]);

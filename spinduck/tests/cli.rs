@@ -66,6 +66,32 @@ mod trace;
 #[path = "cli/usage.rs"]
 mod usage;
 
+/// D7 双臂守护 fixture（`call`/`compile_admit` 共用，防 PL 与 schema 文本漂移）：
+/// `copy_partial` 例程——route 查找 `op = 'X'` 判别 `v_route='1'` 选臂，
+/// THEN 臂活常量赋值、ELSE 臂含关联查找 + CASE 写汇。
+pub(crate) const DUAL_ARM_COPY_PARTIAL: &str = "CREATE PROCEDURE copy_partial IS v_yj VARCHAR2(10); v_ct VARCHAR2(10); v_route VARCHAR2(10); BEGIN \
+     FOR r IN SELECT a, k, yj_a, yj_b FROM source_rows LOOP \
+     BEGIN SELECT kind INTO v_route FROM route_tab WHERE op = 'X'; \
+     EXCEPTION WHEN OTHERS THEN v_route := '0'; END; \
+     BEGIN \
+     IF v_route = '1' THEN v_yj := 'U'; \
+     ELSE \
+     SELECT ct INTO v_ct FROM dim_tab WHERE dim_tab.k = r.k; \
+     SELECT CASE v_ct WHEN 'A' THEN r.yj_a WHEN 'B' THEN r.yj_b ELSE r.yj_a END INTO v_yj FROM sys_dummy; \
+     END IF; \
+     EXCEPTION WHEN OTHERS THEN v_yj := '0'; END; \
+     INSERT INTO target_rows(val, yj) VALUES (r.a, v_yj); \
+     END LOOP; END;\n";
+
+/// `DUAL_ARM_COPY_PARTIAL` 的五表 schema（建表语句，按依赖序）。
+pub(crate) const DUAL_ARM_SCHEMA: &[&str] = &[
+    "CREATE TABLE source_rows(a BIGINT, k VARCHAR, yj_a VARCHAR, yj_b VARCHAR)",
+    "CREATE TABLE target_rows(val BIGINT, yj VARCHAR)",
+    "CREATE TABLE route_tab(kind VARCHAR, op VARCHAR)",
+    "CREATE TABLE dim_tab(k VARCHAR, ct VARCHAR)",
+    "CREATE TABLE sys_dummy(dummy VARCHAR)",
+];
+
 pub(crate) const EXIT_OK: i32 = 0;
 pub(crate) const EXIT_FAIL: i32 = 1;
 pub(crate) const EXIT_USAGE: i32 = 2;

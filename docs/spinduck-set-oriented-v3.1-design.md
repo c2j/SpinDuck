@@ -548,7 +548,13 @@ ADMIT   arm=else  verdict=conditional unchecked=top1(frame),expr(frame)
 SET_ORIENTED pkg_split_trade_step3_sh.prc_trd_deal_purchase converted arm=then sql="…"
 ```
 
-* 未选中臂的守卫**不求值**、状态恒 `Unchecked(control-flow-excluded)`（新增取值域项），且
+> **实现口径（v3.1 落地时收窄，如实登记）**：上例是目标可观测形态，**非**当前
+> 已实现面。当前实现只在判定行透出 `arm=then|else`（converted 与 conditional
+> 两行同源），守卫清单只列**选中臂**的守卫；逐臂明细行（`arm=… verdict=…`）、
+> `guards=N/M` 计数、未选中臂 `Unchecked(control-flow-excluded)` 均**未实现**，
+> 留作后续 PR（V54.5 不声称清单同步登记）。
+
+* 目标形态：未选中臂的守卫**不求值**、状态恒 `Unchecked(control-flow-excluded)`（新增取值域项，**未实现**），且
   不计入 firm `skipped`——它是确定的控制流事实，不是证据缺口，与 §2.1 总原则一致。
 * `call` 与 `admit` 的臂行仍走同一个 `verdict_line`（§3.2 同源铁律）。
 * `Status::Converted { sql }` 加 `arm` 字段属 `Status`/`Report` 形状变更、会动到人类既有断言
@@ -570,6 +576,7 @@ SET_ORIENTED pkg_split_trade_step3_sh.prc_trd_deal_purchase converted arm=then s
 1. **零回归门**：`discriminator = None` 的全部既有计划——byfund + purchase（switch='0'）两语料的生成 SQL、`SET_ORIENTED` 行、退出码
    与基线**逐字一致**；基线由 §12.4 G5 的当前 main 重测产出（**不是** v0.2.1 的 `REPORT.md:188`），
    sha256 与重测记录一并入 `docs/validation.md`。**例外如实登记**：双臂化后 THEN 臂不可证的 route 区域整体拒绝（D10 收缩项），其 `SET_ORIENTED` 行由 `Converted` 变为 `Skipped(臂拒因)`——属批准的语义变更，逐例登记 V54，不在「逐字一致」承诺面内。
+   第二处批准例外：仍 `Converted` 的双臂判定行按 §3.2 同源渲染透出 `arm=then|else` 片段（`converted` → `converted arm=…`），属输出契约增量而非生成 SQL/退出码变化，逐例登记 V54.1。
 2. **状态合并门**：守护测试构造「两臂对同一变量写不同常量、后缀读它」的 fixture，断言后缀
    **不**沿用任单臂事实（§12.3(b) 第 4 步）。此测试的期望值在后续重构中不得变更。
 3. **四象限等价门**：OFF/ON × 单行/多行/无命中/NULL，选中臂批写 vs 逐行解释的
@@ -595,8 +602,9 @@ G0 站点、门 1 基线 sha256；§0 预留的编号在此兑现）。
 以下每一项都属 AGENTS 的 Ask first，**默认不做，逐项请示**：
 
 1. **准入语义变更**：路由守卫从「证明 THEN 不可达」改为「按取值选臂」，并新增
-   `SkipReason::RouteDiscriminatorNotTotal`（20 变体 → 21）与 `Unchecked` 取值域新项
-   `control-flow-excluded`。`[rejects]` 清单**不增项**（选臂不是拒绝），但须同步规则注释与探针。
+   `SkipReason::RouteDiscriminatorNotTotal`（20 变体 → 21）。`[rejects]` 清单**不增项**
+   （选臂不是拒绝），但须同步规则注释与探针。`Unchecked` 取值域新项
+   `control-flow-excluded` **本版不实现**（§12.3(e) 口径收窄，留作后续 PR）。
 2. **`Status`/`Report` 形状加 `arm` 字段**（D11）——会动到人类既有断言，测试权限表里是只读项。
 3. **golden fixture**：现语料 `swh_all_kind` 只有 `('COMMISSION_SWITCH','0',…)`
    （`cases/datasets/seed.sql:24-25`），且**没有任何 `par_fund_seat_para` 数据行**（seed.sql 的

@@ -64,9 +64,9 @@ pub(super) fn discriminator(l: &ResolvedLookup, lit: &str) -> Result<String, Ski
         "CASE WHEN {} THEN {} ELSE {} END",
         l.render.hit, l.render.value, l.render.default_sql
     );
-    Ok(format!(
-        "SELECT CASE WHEN ({inner}) = {lit} THEN 0 ELSE 1 END"
-    ))
+    let sql = format!("SELECT CASE WHEN ({inner}) = {lit} THEN 0 ELSE 1 END");
+    reject_frame_binds(&sql)?;
+    Ok(sql)
 }
 
 /// 入口守卫 SQL：查找值（命中 NULL 保留、0/多行落兜底）与常量等值
@@ -75,8 +75,26 @@ pub(super) fn guard(l: &ResolvedLookup, lit: &str) -> Result<String, SkipReason>
     if !l.render.key_checks.is_empty() {
         return Err(SkipReason::UnsupportedControlFlow);
     }
-    Ok(format!(
+    let sql = format!(
         "SELECT ((CASE WHEN {} THEN {} ELSE {} END) = {lit}) IS NOT TRUE",
         l.render.hit, l.render.value, l.render.default_sql
-    ))
+    );
+    reject_frame_binds(&sql)?;
+    Ok(sql)
+}
+
+/// 判别式/守卫在入口与选臂两处均以**空绑定**求值（bind-free 前提，
+/// §12.3(d)）：渲染产物含 `$v_*` 占位符即帧依赖，计划期拒绝——
+/// 否则运行期空 BindMap 求值会 KERNEL-0010 崩溃而非 Skipped 回退
+/// （v0.2.4 存量缺陷，PR#62/#63 同态复现）。词法扫描避开字面量
+/// 内的 `$v_` 文本；Tokens 不可解析同样保守拒绝。
+fn reject_frame_binds(sql: &str) -> Result<(), SkipReason> {
+    let bound = match super::shape::Tokens::new(sql) {
+        Some(t) => t.words().iter().any(|w| w.starts_with("$v_")),
+        None => true,
+    };
+    if bound {
+        return Err(SkipReason::UnsupportedControlFlow);
+    }
+    Ok(())
 }

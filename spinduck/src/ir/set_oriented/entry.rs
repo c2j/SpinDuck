@@ -300,7 +300,8 @@ fn count_guard(
     ))
 }
 
-/// 路由守卫：无绑定求值，首行 TRUE = THEN 分支不可达。
+/// 路由守卫：无绑定求值（bind-free 由 `route::guard`/`route::discriminator`
+/// 计划期占位符扫描保证，含 `$v_*` 即拒绝），首行 TRUE = THEN 分支不可达。
 fn route_guard(ex: &dyn SqlExecutor, sql: &str) -> Result<bool, EngineError> {
     let mut stream = ex.query(sql, &crate::exec::BindMap::new())?;
     Ok(matches!(

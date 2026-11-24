@@ -448,3 +448,63 @@ fn should_reject_partial_fallback_when_intermediate_is_live_out() {
         }
     );
 }
+
+fn setup_copy_route_bound() -> Engine {
+    // N-1 回归 fixture：route 查找过滤引用帧变量 v_f（循环不变量但帧绑定），
+    // 判别式渲染产物含 `$v_*` 占位符；bind-free 前提不成立，计划期必须拒绝。
+    let sql = "CREATE PROCEDURE copy_route_bound IS v_yj VARCHAR2(10); v_ct VARCHAR2(10); v_route VARCHAR2(10); v_f VARCHAR2(10); BEGIN \
+        v_f := 'X'; \
+        FOR r IN SELECT a, k, yj_a, yj_b FROM source_rows LOOP \
+        BEGIN SELECT kind INTO v_route FROM route_tab WHERE op = v_f; \
+        EXCEPTION WHEN OTHERS THEN v_route := '0'; END; \
+        BEGIN \
+        IF v_route = '1' THEN v_yj := 'U'; \
+        ELSE \
+        SELECT ct INTO v_ct FROM dim_tab WHERE dim_tab.k = r.k; \
+        SELECT CASE v_ct WHEN 'A' THEN r.yj_a WHEN 'B' THEN r.yj_b ELSE r.yj_a END INTO v_yj FROM sys_dummy; \
+        END IF; \
+        EXCEPTION WHEN OTHERS THEN v_yj := '0'; END; \
+        INSERT INTO target_rows(val, yj) VALUES (r.a, v_yj); \
+        END LOOP; END;";
+    let mut eng = Engine::new(
+        Box::new(DuckExecutor::open_in_memory().unwrap()),
+        RuleRegistry::default(),
+    );
+    for ddl in [
+        "CREATE TABLE source_rows(a BIGINT, k VARCHAR, yj_a VARCHAR, yj_b VARCHAR)",
+        "CREATE TABLE target_rows(val BIGINT, yj VARCHAR)",
+        "INSERT INTO source_rows VALUES (10, 'K1', 'AA1', 'BB1'), (20, 'K2', 'AA2', 'BB2'), (30, 'K3', 'AA3', 'BB3')",
+        "CREATE TABLE route_tab(kind VARCHAR, op VARCHAR)",
+        "INSERT INTO route_tab VALUES ('1', 'X')",
+        "CREATE TABLE dim_tab(k VARCHAR, ct VARCHAR)",
+        "INSERT INTO dim_tab VALUES ('K1', 'A'), ('K2', 'B')",
+        "CREATE TABLE sys_dummy(dummy VARCHAR)",
+        "INSERT INTO sys_dummy VALUES ('X')",
+    ] {
+        eng.ex.execute(ddl, &BindMap::new()).unwrap();
+    }
+    eng.register(sql).unwrap();
+    eng
+}
+
+#[test]
+fn should_reject_route_lookup_with_frame_bound_filter() {
+    // N-1：route 判别式/守卫以空 BindMap 求值；过滤含帧变量时计划期
+    // 必须 Skipped(UnsupportedControlFlow) 回退解释器——不得 KERNEL-0010 崩溃。
+    let mut baseline = setup_copy_route_bound();
+    baseline.call("copy_route_bound", &[]).unwrap();
+    let expected = rows_copy_partial(&baseline);
+
+    let mut eng = setup_copy_route_bound();
+    eng.set_oriented = SetOrientedMode::BatchAtomic;
+    eng.call("copy_route_bound", &[]).unwrap();
+    assert_eq!(rows_copy_partial(&eng), expected);
+    assert_eq!(
+        eng.set_oriented_reports()[0].status,
+        Status::Skipped {
+            reason: SkipReason::UnsupportedControlFlow
+        },
+        "report: {:?}",
+        eng.set_oriented_reports()[0]
+    );
+}

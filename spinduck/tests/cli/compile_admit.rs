@@ -3,7 +3,7 @@
 //! （`compile_project_admit_with_source` + 字面量 `AdmitInput`）、
 //! 无旗标零输出回归。
 
-use super::{cli, write, EXIT_OK, EXIT_USAGE};
+use super::{cli, write, DUAL_ARM_COPY_PARTIAL, DUAL_ARM_SCHEMA, EXIT_OK, EXIT_USAGE};
 use spinduck_core::cli::args::AdmitMode;
 use spinduck_core::cli::{compile_project_admit_with_source, ProjectCompile};
 use spinduck_core::ir::set_oriented::admit::AdmitInput;
@@ -97,30 +97,6 @@ fn project_opts(dir: &Path) -> ProjectCompile {
     }
 }
 
-/// D7 双臂判定行契约（§3.2 同源铁律文本面）：admit 数据面求值
-/// 判别式后，ADMIT 行透出与 `SET_ORIENTED` 同源的 `arm=` 片段——
-/// 渲染路径漏传 arm 时本断言变红。
-const DUAL_ARM_SQL: &str = "CREATE PROCEDURE copy_partial IS v_yj VARCHAR2(10); v_ct VARCHAR2(10); v_route VARCHAR2(10); BEGIN \
-     FOR r IN SELECT a, k, yj_a, yj_b FROM source_rows LOOP \
-     BEGIN SELECT kind INTO v_route FROM route_tab WHERE op = 'X'; \
-     EXCEPTION WHEN OTHERS THEN v_route := '0'; END; \
-     BEGIN \
-     IF v_route = '1' THEN v_yj := 'U'; \
-     ELSE \
-     SELECT ct INTO v_ct FROM dim_tab WHERE dim_tab.k = r.k; \
-     SELECT CASE v_ct WHEN 'A' THEN r.yj_a WHEN 'B' THEN r.yj_b ELSE r.yj_a END INTO v_yj FROM sys_dummy; \
-     END IF; \
-     EXCEPTION WHEN OTHERS THEN v_yj := '0'; END; \
-     INSERT INTO target_rows(val, yj) VALUES (r.a, v_yj); \
-     END LOOP; END;\n";
-
-const DUAL_ARM_DDL: &str =
-    "CREATE TABLE source_rows(a BIGINT, k VARCHAR, yj_a VARCHAR, yj_b VARCHAR);\n\
-     CREATE TABLE target_rows(val BIGINT, yj VARCHAR);\n\
-     CREATE TABLE route_tab(kind VARCHAR, op VARCHAR);\n\
-     CREATE TABLE dim_tab(k VARCHAR, ct VARCHAR);\n\
-     CREATE TABLE sys_dummy(dummy VARCHAR);\n";
-
 fn typed_table(name: &str, cols: &[(&str, SpinType)]) -> TableMetadata {
     TableMetadata {
         name: vec![name.to_string()],
@@ -207,51 +183,53 @@ fn dual_arm_graph(file: &str) -> serde_json::Value {
 fn compile_admit_should_render_selected_arm_for_dual_arm_plan() {
     use spinduck_core::exec::{BindMap, SqlExecutor};
     use spinduck_core::sql::DuckExecutor;
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    write(root, "spinduck.toml", PROJECT_PLAN);
-    write(root, "codeweb.toml", "");
-    write(root, "sql/routines/copy_partial.sql", DUAL_ARM_SQL);
-    write(root, "sql/ddl/tables.sql", DUAL_ARM_DDL);
-    let file = root
-        .join("sql/routines/copy_partial.sql")
-        .to_string_lossy()
-        .replace('\\', "/");
-    let export = JsonCodewebSource {
-        generator: "codeweb 0.9.9".to_string(),
-        json: serde_json::to_vec(&dual_arm_graph(&file)).unwrap(),
-    };
-    // admit 数据面：真实 DuckDB，route='0' → 判别式选 ELSE 臂。
-    let db = root.join("t.duckdb");
-    let ex = DuckExecutor::open(&db.to_string_lossy()).unwrap();
-    for s in [
-        "CREATE TABLE source_rows(a BIGINT, k VARCHAR, yj_a VARCHAR, yj_b VARCHAR)",
-        "CREATE TABLE target_rows(val BIGINT, yj VARCHAR)",
-        "CREATE TABLE route_tab(kind VARCHAR, op VARCHAR)",
-        "CREATE TABLE dim_tab(k VARCHAR, ct VARCHAR)",
-        "CREATE TABLE sys_dummy(dummy VARCHAR)",
-        "INSERT INTO source_rows VALUES (10, 'K1', 'AA1', 'BB1')",
-        "INSERT INTO route_tab VALUES ('0', 'X')",
-        "INSERT INTO dim_tab VALUES ('K1', 'A')",
-        "INSERT INTO sys_dummy VALUES ('X')",
-    ] {
-        ex.execute(s, &BindMap::new()).unwrap();
+    // route='0' → ELSE 臂、route='1' → THEN 臂：判别式两象限都须透出 arm=。
+    for (kind, arm) in [("0", "else"), ("1", "then")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "spinduck.toml", PROJECT_PLAN);
+        write(root, "codeweb.toml", "");
+        write(root, "sql/routines/copy_partial.sql", DUAL_ARM_COPY_PARTIAL);
+        write(root, "sql/ddl/tables.sql", &DUAL_ARM_SCHEMA.join(";\n"));
+        let file = root
+            .join("sql/routines/copy_partial.sql")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let export = JsonCodewebSource {
+            generator: "codeweb 0.9.9".to_string(),
+            json: serde_json::to_vec(&dual_arm_graph(&file)).unwrap(),
+        };
+        // admit 数据面：真实 DuckDB，route seed 决定判别式选臂。
+        let db = root.join("t.duckdb");
+        let ex = DuckExecutor::open(&db.to_string_lossy()).unwrap();
+        let seed = format!("INSERT INTO route_tab VALUES ('{kind}', 'X')");
+        for s in DUAL_ARM_SCHEMA.iter().copied().chain([
+            "INSERT INTO source_rows VALUES (10, 'K1', 'AA1', 'BB1')",
+            seed.as_str(),
+            "INSERT INTO dim_tab VALUES ('K1', 'A')",
+            "INSERT INTO sys_dummy VALUES ('X')",
+        ]) {
+            ex.execute(s, &BindMap::new()).unwrap();
+        }
+        let input = AdmitInput {
+            snapshot: dual_arm_snapshot(),
+            executor: Some(Box::new(ex)),
+            macro_names: BTreeSet::new(),
+        };
+        let mut opts = project_opts(root);
+        opts.entries = vec!["copy_partial".to_string()];
+        opts.set_oriented = Some(spinduck_core::ir::set_oriented::SetOrientedMode::BatchAtomic);
+        let mut buf = Vec::new();
+        let code = compile_project_admit_with_source(opts, &export, Some(input), &mut buf)
+            .unwrap_or_else(|e| panic!("{}", e.message));
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(code, EXIT_OK, "{out}");
+        assert!(
+            out.lines()
+                .any(|l| l == format!("ADMIT copy_partial converted arm={arm}")),
+            "kind={kind}: {out}"
+        );
     }
-    let input = AdmitInput {
-        snapshot: dual_arm_snapshot(),
-        executor: Some(Box::new(ex)),
-        macro_names: BTreeSet::new(),
-    };
-    let mut opts = project_opts(root);
-    opts.entries = vec!["copy_partial".to_string()];
-    opts.set_oriented = Some(spinduck_core::ir::set_oriented::SetOrientedMode::BatchAtomic);
-    let mut buf = Vec::new();
-    let code = compile_project_admit_with_source(opts, &export, Some(input), &mut buf)
-        .unwrap_or_else(|e| panic!("{}", e.message));
-    let out = String::from_utf8(buf).unwrap();
-    assert_eq!(code, EXIT_OK, "{out}");
-    assert!(out.contains("ADMIT copy_partial"), "{out}");
-    assert!(out.contains("arm=else"), "{out}");
 }
 
 #[test]
