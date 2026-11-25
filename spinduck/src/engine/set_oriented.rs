@@ -4,7 +4,7 @@
 use super::Engine;
 use crate::catalog::CompiledRoutine;
 use crate::error::EngineError;
-use crate::exec::TraceSink;
+use crate::exec::{SqlExecutor, TraceSink};
 use crate::ir::set_oriented::{
     entry_ok, Arm, ConversionPlan, Discriminator, OptimizeCtx, Report, SetOrientedMode, SkipReason,
     Status,
@@ -51,7 +51,7 @@ impl Engine {
                 if let Some(out) = self.try_loop_parallel(routine, frame, sink, limits)? {
                     return Ok(out);
                 }
-                return self.run_prog(&routine.prog, frame, sink, limits, RunSpan::default());
+                return self.run_fallback(&routine.prog, frame, sink, limits, RunSpan::default());
             }
             Ok(p) => vec![p],
         };
@@ -90,7 +90,7 @@ impl Engine {
                         reason: SkipReason::UnprovenQueryTotalness,
                     },
                 );
-                return self.run_prog(&routine.prog, frame, sink, limits, RunSpan::default());
+                return self.run_fallback(&routine.prog, frame, sink, limits, RunSpan::default());
             }
         }
         let mut cursor_pc = 0usize;
@@ -221,7 +221,7 @@ impl Engine {
                             return Ok(Some(out));
                         }
                     }
-                    let out = self.run_prog(
+                    let out = self.run_fallback(
                         &routine.prog,
                         frame,
                         sink,
@@ -250,7 +250,7 @@ impl Engine {
                         return Ok(Some(out));
                     }
                 }
-                let out = self.run_prog(
+                let out = self.run_fallback(
                     &routine.prog,
                     frame,
                     sink,
@@ -1178,10 +1178,51 @@ impl Engine {
         limits: RunLimits,
         span: RunSpan,
     ) -> Result<RunOutcome, EngineError> {
+        self.run_prog_on(self.ex.as_ref(), prog, frame, sink, limits, span)
+    }
+
+    /// Skipped 回退统一入口（issue #65）：区域内可证的静态 `SELECT INTO`
+    /// 由 `lookup_outcome` 包装执行器做逐键 outcome 缓存；无可证站点
+    /// 或区域不可抽取时与 `run_prog` 逐字同路径。
+    fn run_fallback(
+        &self,
+        prog: &crate::ir::IrProg,
+        frame: &mut Frame,
+        sink: &mut dyn TraceSink,
+        limits: RunLimits,
+        span: RunSpan,
+    ) -> Result<RunOutcome, EngineError> {
+        if let Ok(region) = crate::ir::set_oriented::region::extract(prog) {
+            // 分段续跑（守卫运行态拒绝）只允许缓存与 span 边界一致的
+            // 区域，防止把别的区域的站点证据套到本段。
+            let span_matches = span.start_pc == 0
+                || (span.start_pc == region.open_pc && span.stop_pc == Some(region.close_pc + 1));
+            if span_matches {
+                if let Some(ex) = crate::ir::set_oriented::lookup_outcome::prepare(
+                    prog,
+                    &region,
+                    self.ex.as_ref(),
+                ) {
+                    return self.run_prog_on(&ex, prog, frame, sink, limits, span);
+                }
+            }
+        }
+        self.run_prog(prog, frame, sink, limits, span)
+    }
+
+    fn run_prog_on(
+        &self,
+        ex: &dyn SqlExecutor,
+        prog: &crate::ir::IrProg,
+        frame: &mut Frame,
+        sink: &mut dyn TraceSink,
+        limits: RunLimits,
+        span: RunSpan,
+    ) -> Result<RunOutcome, EngineError> {
         crate::runtime::run_spanned(
             prog,
             frame,
-            self.ex.as_ref(),
+            ex,
             sink,
             &self.catalog,
             0,

@@ -430,7 +430,7 @@ fn bind_subset(binds: &BindMap, names: &[String]) -> Result<BindMap, EngineError
     Ok(out)
 }
 
-fn mentioned(sql: &str) -> Option<HashSet<String>> {
+pub(crate) fn mentioned(sql: &str) -> Option<HashSet<String>> {
     // 无分号 INSERT 只失效写表，免去万行合并 VALUES 的全串分词；
     // INSERT … SELECT 读到的表不被写入，不再过度失效。
     if let Some(target) = insert_target(sql) {
@@ -539,7 +539,7 @@ pub(super) enum KeyPart {
 }
 
 impl KeyPart {
-    fn from_value(v: &SpinValue) -> Option<Self> {
+    pub(crate) fn from_value(v: &SpinValue) -> Option<Self> {
         match v {
             SpinValue::Null => Some(Self::Null),
             SpinValue::Bool(b) => Some(Self::Bool(*b)),

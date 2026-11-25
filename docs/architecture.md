@@ -343,6 +343,21 @@ CASE 仅 TRUE 命中，省略 ELSE 返回 NULL。SQL 渲染和闭包遍历覆盖
 保持原 SELECT INTO 的步数预算及错误/回滚边界。该路径仍有一次 SQL 调用，不声称
 零次下发，也不放宽现有混合类型 CASE 的内核报错。实证见 validation V46。
 
+### 3.5.3 集合化回退逐键 lookup 缓存
+
+集合化守卫拒绝（`Skipped`）后区域按原 IR 逐行解释执行，其中静态
+`SELECT INTO` 每行一次内核点查。对守卫文法已证的站点（游标记录字段等值键
++ 静态残余谓词，键列与游标字段类型严格一致，`LIKE`/函数/子查询/动态
+SQL/`ORDER BY … LIMIT` 一律不接管，`lookup_cache` 已识别形态让位），
+回退 `RunSpan` 外包一层 `FallbackExecutor`：首个探测行触发一次
+`GROUP BY` 键列 + `COUNT(*)` + `CASE WHEN COUNT(*)=1 THEN MAX(列)`
+聚合预计算，此后按"站点 + 全部行变绑定值"命中缓存，直接合成与原路径
+一致的 `NO_DATA_FOUND`/`TOO_MANY_ROWS`/单行结果；trace `SqlExec` 仍由
+解释器逐行照发。绑定含 NULL、键超上限（200k distinct）或预计算失败的
+站点降级走原 SQL；写语句按表名失效、回滚全清，`Ready` 索引作废后懒重建。
+缓存只服务本次回退调用，不跨调用/跨区域复用。机制见
+`src/ir/set_oriented/lookup_outcome/`，实证见 validation V57。
+
 ### 3.6 目录与持久化
 
 例程定义存 DuckDB 内部表 `spinduck_routines(name, kind, source, registered_at)`。

@@ -16,6 +16,7 @@ mod generate;
 mod hybrid;
 use generate::generate;
 mod lookup;
+pub(crate) mod lookup_outcome;
 pub mod metadata;
 mod planbinds;
 pub(crate) mod region;

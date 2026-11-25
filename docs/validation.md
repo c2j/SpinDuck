@@ -5711,3 +5711,62 @@ PR#62 devin 按评审任务（task_id=pr62-fix-001）完成三：
   1.3×（混合路径的段批写+异常行重放固有成本），供数据特征选型。
 - 探针报告：`golden/v4_loop_parallel_verify/reports/probe_run.log`
   （16/16，1451.50s）。
+
+## V57. issue #65：集合化回退逐键 lookup 缓存实证（2026-11-25）
+
+> 任务：`ISSUE65-TASK.md`（不入库）。分支 `tuning/spinduck-65`。
+
+### V57.1 机制落点
+
+- 新增 `src/ir/set_oriented/lookup_outcome/`：`site.rs` 计划期证据
+  （`shape::select` 形态 + 顶层合取项切分（BETWEEN 感知）+ 等值键
+  `BindSrc::Field` 归属区域记录 + `schema::load` 双端 kind 严格一致 +
+  `lookup_cache::shape::recognize` 让位）；`cache.rs` 区域级
+  `FallbackExecutor`（首个探测触发 `GROUP BY`+`COUNT(*)`+`CASE WHEN
+  COUNT(*)=1 THEN MAX(列)` 聚合预计算，distinct 键 ≤200k、构建行
+  ≤1M，超限/失败 `Disabled` 降级原路径）。
+- 接入点：`engine/set_oriented.rs` 的 `run_fallback`——计划期
+  `Skipped`（`LiveOutState` 等）、视图物化失败回退、守卫运行态拒绝
+  （`entry_ok`/`RouteDiscriminatorNotTotal`）四处原 `run_prog` 统一改走；
+  `run_prog` 本体委托 `run_prog_on(ex, …)`，无站点时与原路径逐字一致。
+- 失效：`execute` 按 `lookup_cache::mentioned` 表名命中/回滚 →
+  `Ready` 回 `Pending` 懒重建（重建见最新事务态）；`Disabled` 不复活。
+- 复用可见性：`lookup_cache::{mentioned, KeyPart::from_value}` 提为
+  `pub(crate)`（签名零变化）。
+
+### V57.2 四面实证（`set_oriented_issue65_repro`，语义断言零改动）
+
+| 面 | Off 内核 lookup | BatchAtomic 内核 lookup | 说明 |
+|---|---|---|---|
+| A（等值+日期区间） | 1 | 1 | `lookup_cache` 让位，行为不变 |
+| B（等值+数值区间） | 6 | **0 原形态 + 1 聚合** | #65 目标面，N→1 |
+| LIKE（负对照） | 6 | 6 | 非 total 形态保持原路径 |
+| Case2（Top-1 并列） | 0 | 0 | 守卫拒绝整段，与 Off 一致 |
+
+- B 面唯一允许的断言修改已落地：`lookup_calls` 6→0，另断言
+  `asset_kind` 相关 query 恰 1 条（GROUP BY/COUNT 聚合形态）。
+- trace `SqlExec` 逐行 6 条、INSERT/COMMIT 序列与 Off 逐字一致、
+  carryover/NULL/p_msg 语义全等（四测试全绿）。
+
+### V57.3 性能（release，`SPINDUCK_ISSUE65_ROWS=100000`）
+
+```
+issue65 bench n=100000
+  off:   24094 ms, kernel lookups=100000
+  batch: 11626 ms, kernel lookups=0
+```
+
+- 内核原形态 lookup N→1（0 原形态 + 1 次 GROUP BY 聚合扫描）；
+- 回退区域端到端耗时 **−51.7%**（24.1s→11.6s），超过 ≥30% 门槛；
+- 残余耗时为逐行解释器/INSERT/COMMIT 固有成本，非 lookup。
+
+### V57.4 不声称
+
+- 不声称残余谓词任意形态安全：残余合取项已禁子查询/模式匹配/
+  cast/json/数组/正则/除法取模/非确定性关键字，但 `+ - *` 等算术
+  在极端数据下的执行期错误面与原逐行路径存在理论次序差（与守卫
+  聚合扫描同一暴露类）；键列类型不一致、游标不可静态解析、视图
+  表等一律不接管。
+- 不声称守卫运行态拒绝路径（`entry_ok`/`RouteDiscriminatorNotTotal`）
+  有专项性能用例——机制同路覆盖，全量测试绿；专属 benchmark 未建。
+- 预计算行/键上限（1M 行/200k 键）为保守工程值，超限静默降级原路径。

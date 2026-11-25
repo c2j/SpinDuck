@@ -138,12 +138,24 @@ fn should_issue65_face_b_numeric_range_keep_semantics_and_baseline_cost() {
         off_exec_seq,
         "Skipped 回退的 INSERT/COMMIT 序列必须与 Off 逐字一致"
     );
-    // 成本基线（#65 修改点）：Off 与 BatchAtomic 均逐行 6 次内核 lookup。
+    // 成本（#65 落地口径）：Off 仍逐行 6 次；BatchAtomic 回退经区域级
+    // outcome 缓存——原形态内核 lookup 0 次，预计算聚合扫描恰 1 次
+    // （GROUP BY/COUNT 形态，`lookup_calls` 口径外）。
     assert_eq!(off_lookups, 6, "B 面 Off 基线：逐行内核 lookup×6");
     assert_eq!(
         lookup_calls(&fx.queries),
-        6,
-        "B 面回退基线：6 游标行 = 6 次原形态内核 lookup（#65 目标 N→1，PR 改 0）"
+        0,
+        "B 面回退：原形态内核 lookup×0（#65 预计算接管）"
+    );
+    let asset_kind_queries = fx
+        .queries
+        .borrow()
+        .iter()
+        .filter(|s| s.to_ascii_uppercase().contains("ASSET_KIND"))
+        .count();
+    assert_eq!(
+        asset_kind_queries, 1,
+        "B 面预计算：asset_kind 聚合扫描恰 1 次（内核 lookup N→1）"
     );
     // trace 不变式：逐行 SqlExec 事件 6 条（PR 后必须仍为 6）。
     assert_eq!(
