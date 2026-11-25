@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use super::cursor::{CursorAttrKind, CursorState};
 
 /// 执行帧（单过程实例；PACKAGE 级状态在 M7 引入 PackageState）。
-#[derive(Debug, Default)]
+/// `Clone` 供 loop-parallel Worker 的逐行帧快照（游标行数据 `Arc` 共享）。
+#[derive(Debug, Default, Clone)]
 pub struct Frame {
     vars: BTreeMap<String, SpinValue>,
     /// 游标状态表（过程局部，§7.3）
@@ -132,6 +133,11 @@ impl Frame {
         self.cursors
             .get_mut(&name.0.to_ascii_lowercase())
             .ok_or_else(|| EngineError::business(140, format!("cursor {} is not open", name.0)))
+    }
+
+    /// loop-parallel：只读访问游标状态（Worker 派发前的物化行导出）。
+    pub(crate) fn cursor_state(&self, name: &VarName) -> Option<&CursorState> {
+        self.cursors.get(&name.0.to_ascii_lowercase())
     }
 
     /// 游标 schema 副本（FETCH INTO %ROWTYPE 预建 RECORD 用）。

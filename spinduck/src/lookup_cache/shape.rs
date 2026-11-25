@@ -9,7 +9,7 @@ use ogsql_parser::ast::{
 };
 use ogsql_parser::parser::Parser;
 
-pub(super) mod sqlgen;
+pub(crate) mod sqlgen;
 use ogsql_parser::token::tokenizer::Tokenizer;
 use sqlgen::{
     col_name, flatten_and, parse_limit, parse_order, peel, proj_of, render_col, render_lit,
@@ -18,7 +18,7 @@ use sqlgen::{
 
 /// 一次构建查询。SQL 已带上日期区间和字面量等值，`binds` 是区间参数名。
 #[derive(Debug)]
-pub(super) struct Build {
+pub(crate) struct Build {
     pub sql: String,
     pub binds: Vec<String>,
     pub width: usize,
@@ -26,7 +26,7 @@ pub(super) struct Build {
 
 /// 探测时才能求值的键或列表成员。
 #[derive(Debug)]
-pub(super) enum ProbeVal {
+pub(crate) enum ProbeVal {
     Bind(String),
     Lit(SpinValue),
     /// `concat(substring($bind, start, len), suffix)`，席位类别候选的改写形态。
@@ -39,20 +39,20 @@ pub(super) enum ProbeVal {
 }
 
 #[derive(Debug)]
-pub(super) struct Filter {
+pub(crate) struct Filter {
     pub at: usize,
     pub vals: Vec<ProbeVal>,
 }
 
 #[derive(Debug)]
-pub(super) struct SortKey {
+pub(crate) struct SortKey {
     pub at: usize,
     pub desc: bool,
     pub nulls_first: bool,
 }
 
 #[derive(Debug)]
-pub(super) struct RowPlan {
+pub(crate) struct RowPlan {
     pub key_at: Vec<usize>,
     pub key_binds: Vec<String>,
     pub filters: Vec<Filter>,
@@ -64,7 +64,7 @@ pub(super) struct RowPlan {
 }
 
 #[derive(Debug)]
-pub(super) struct SemiPlan {
+pub(crate) struct SemiPlan {
     pub outer_key_at: Vec<usize>,
     pub outer_key_binds: Vec<String>,
     pub outer_match_at: usize,
@@ -75,20 +75,20 @@ pub(super) struct SemiPlan {
 }
 
 #[derive(Debug)]
-pub(super) enum Kind {
+pub(crate) enum Kind {
     Rows(RowPlan),
     Semi(SemiPlan),
 }
 
 #[derive(Debug)]
-pub(super) struct Plan {
+pub(crate) struct Plan {
     pub tables: Vec<String>,
     pub builds: Vec<Build>,
     pub kind: Kind,
 }
 
 impl Plan {
-    pub(super) fn proj_len(&self) -> usize {
+    pub(crate) fn proj_len(&self) -> usize {
         match &self.kind {
             Kind::Rows(r) => r.proj_at.len(),
             Kind::Semi(s) => s.outer_proj_at.len(),
@@ -96,7 +96,7 @@ impl Plan {
     }
 
     /// 构建用到的区间绑定，按出现顺序去重。不同日期是不同的缓存键。
-    pub(super) fn range_binds(&self) -> Vec<String> {
+    pub(crate) fn range_binds(&self) -> Vec<String> {
         let mut out = Vec::new();
         for build in &self.builds {
             for name in &build.binds {
@@ -110,7 +110,7 @@ impl Plan {
 }
 
 /// 认一条改写后的 SELECT。`None` 表示本缓存不接管。
-pub(super) fn recognize(sql: &str) -> Option<Plan> {
+pub(crate) fn recognize(sql: &str) -> Option<Plan> {
     let sel = parse_select(sql)?;
     if !is_plain(&sel) {
         return None;

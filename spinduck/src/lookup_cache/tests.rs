@@ -79,7 +79,7 @@ impl SqlExecutor for Rec {
 }
 
 pub(super) fn cache(inner: Box<dyn SqlExecutor>) -> LookupExecutor {
-    LookupExecutor::new(inner, Rc::new(LookupState::default()))
+    LookupExecutor::new(Rc::from(inner), Rc::new(LookupState::default()))
 }
 
 fn row(vals: &[&str]) -> Row {
@@ -340,7 +340,10 @@ fn should_clear_on_call_boundary() {
     let (rec, calls) = Rec::new(vec![row(&["S1", "7"])]);
     rec.push(vec![row(&["S1", "7"])]);
     let state = Rc::new(LookupState::default());
-    let ex = LookupExecutor::new(Box::new(rec), state.clone());
+    let ex = LookupExecutor::new(
+        Rc::from(Box::new(rec) as Box<dyn SqlExecutor>),
+        state.clone(),
+    );
     let _ = ex
         .query(PURCHASE, &purchase_binds("20260105", "S1"))
         .unwrap();
@@ -481,4 +484,162 @@ fn should_treat_or_of_equalities_as_an_in_list() {
     let rows = ex.query(sql, &binds).unwrap().fetch_many(2);
     assert_eq!(rows, vec![vec![SpinValue::Str("kind-wins".into())]]);
     assert_eq!(calls.borrow().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// loop-parallel 预热协议：try_prewarm_only / FrozenSlot / export_frozen（§5）
+// ---------------------------------------------------------------------------
+
+const FORM_SQL: &str = "SELECT s FROM t_form WHERE id = $v_p";
+
+fn form_binds() -> BindMap {
+    let mut binds = BindMap::new();
+    binds.insert("$v_p".to_string(), SpinValue::Int(1));
+    binds
+}
+
+fn form_build_rows() -> Vec<Row> {
+    vec![vec![SpinValue::Int(1), SpinValue::Str("hit".into())]]
+}
+
+/// 只失败一次的执行器：第一次 query 返回内核错，之后正常回脚本行。
+struct FlakyRec {
+    calls: Rc<RefCell<Vec<String>>>,
+    fail: Cell<bool>,
+    rows: Vec<Row>,
+}
+
+impl SqlExecutor for FlakyRec {
+    fn query(&self, sql: &str, _binds: &BindMap) -> Result<RowStream, EngineError> {
+        self.calls.borrow_mut().push(sql.to_string());
+        if self.fail.replace(false) {
+            return Err(EngineError::kernel(1, "prewarm boom"));
+        }
+        Ok(RowStream::new(vec!["c".into()], self.rows.clone()))
+    }
+
+    fn execute(&self, _sql: &str, _binds: &BindMap) -> Result<ExecOutcome, EngineError> {
+        Ok(ExecOutcome { rows_affected: 0 })
+    }
+}
+
+#[test]
+fn should_prewarm_only_reject_unrecognizable_sql_without_touching_inner() {
+    let (rec, calls) = Rec::new(vec![row(&["x"])]);
+    let ex = cache(Box::new(rec));
+    // shape::recognize 内存判定失败：绝不向 DuckDB 下发任何 SQL。
+    let out = ex.try_prewarm_only("SELECT weird_expr(1) FROM t", &BindMap::new());
+    assert!(matches!(out, PrewarmOutcome::UnsupportedShapeNoSql));
+    assert!(
+        calls.borrow().is_empty(),
+        "不得有任何预热 SQL: {:?}",
+        calls.borrow()
+    );
+}
+
+#[test]
+fn should_prewarm_only_freeze_slot_and_serve_later_queries() {
+    let (rec, calls) = Rec::new(form_build_rows());
+    let ex = cache(Box::new(rec));
+    let binds = form_binds();
+    let out = ex.try_prewarm_only(FORM_SQL, &binds);
+    assert!(matches!(out, PrewarmOutcome::Frozen));
+    assert_eq!(
+        calls.borrow().len(),
+        1,
+        "仅建索引扫描一次: {:?}",
+        calls.borrow()
+    );
+    // 预热建立的槽位被常规 query 复用，不再下发 SQL。
+    let rows = ex.query(FORM_SQL, &binds).unwrap().fetch_many(2);
+    assert_eq!(rows, vec![vec![SpinValue::Str("hit".into())]]);
+    assert_eq!(calls.borrow().len(), 1);
+}
+
+#[test]
+fn should_prewarm_only_report_sql_failed_without_polluting_slot() {
+    // 构建 SQL 报错：SqlFailed 且不写 Slot::Off——常规 query 仍可重试
+    // 构建（FlakyRec 第二次成功），证明没有被"永久旁路"污染。
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let ex = LookupExecutor::new(
+        Rc::new(FlakyRec {
+            calls: calls.clone(),
+            fail: Cell::new(true),
+            rows: form_build_rows(),
+        }),
+        Rc::new(LookupState::default()),
+    );
+    let binds = form_binds();
+    let out = ex.try_prewarm_only(FORM_SQL, &binds);
+    assert!(matches!(out, PrewarmOutcome::SqlFailed));
+    assert!(
+        ex.state.slots.borrow().is_empty(),
+        "SqlFailed 不得留下任何槽位（含 Slot::Off）"
+    );
+    let rows = ex.query(FORM_SQL, &binds).unwrap().fetch_many(2);
+    assert_eq!(rows, vec![vec![SpinValue::Str("hit".into())]]);
+    assert_eq!(calls.borrow().len(), 2, "预热失败后 query 重试构建");
+}
+
+#[test]
+fn should_export_frozen_snapshot_probe_without_sql() {
+    let (rec, calls) = Rec::new(form_build_rows());
+    let ex = cache(Box::new(rec));
+    let binds = form_binds();
+    assert!(matches!(
+        ex.try_prewarm_only(FORM_SQL, &binds),
+        PrewarmOutcome::Frozen
+    ));
+    let snap = ex.export_frozen();
+    // 快照探测命中冻结负载，零额外 SQL。
+    let mut stream = snap.probe(FORM_SQL, &binds).expect("快照应命中");
+    assert_eq!(
+        stream.fetch_many(2),
+        vec![vec![SpinValue::Str("hit".into())]]
+    );
+    assert_eq!(calls.borrow().len(), 1);
+    // 未预热的形状/键 → None（Worker 交权信号），同样零 SQL。
+    assert!(snap.probe("SELECT weird_expr(1) FROM t", &binds).is_none());
+    let mut other = BindMap::new();
+    other.insert("$v_p".to_string(), SpinValue::Int(2));
+    // 未命中键：要么交权（None），要么返回空结果——绝不返回错误行。
+    if let Some(mut miss) = snap.probe(FORM_SQL, &other) {
+        assert!(miss.fetch_many(2).is_empty());
+    }
+}
+
+#[test]
+fn should_keep_exported_snapshot_after_live_slot_invalidation() {
+    // §5.2：快照是时间点 Arc 克隆——live 侧写入失效不影响已导出快照
+    // （快照有效性由运行期 reset_session/TxRollback 监视器负责）。
+    let (rec, calls) = Rec::new(form_build_rows());
+    rec.push(vec![vec![
+        SpinValue::Int(1),
+        SpinValue::Str("rebuilt".into()),
+    ]]);
+    let ex = cache(Box::new(rec));
+    let binds = form_binds();
+    assert!(matches!(
+        ex.try_prewarm_only(FORM_SQL, &binds),
+        PrewarmOutcome::Frozen
+    ));
+    let snap = ex.export_frozen();
+    // 写 t_form → live 槽位失效；常规 query 重建（第二次扫描）。
+    ex.execute("INSERT INTO t_form VALUES (1, 'x')", &BindMap::new())
+        .unwrap();
+    let live = ex.query(FORM_SQL, &binds).unwrap().fetch_many(2);
+    assert_eq!(live, vec![vec![SpinValue::Str("rebuilt".into())]]);
+    assert_eq!(calls.borrow().len(), 2, "live 侧失效后重建");
+    // 已导出快照仍返回冻结时的旧行。
+    let frozen = snap.probe(FORM_SQL, &binds).unwrap().fetch_many(2);
+    assert_eq!(frozen, vec![vec![SpinValue::Str("hit".into())]]);
+}
+
+#[test]
+fn should_keep_frozen_snapshot_types_send_sync() {
+    // R4-P2-5 编译期前提：std::thread::scope 要求负载 Send + Sync。
+    fn need<T: Send + Sync>() {}
+    need::<FrozenLookupSnapshot>();
+    need::<FrozenSlot>();
+    need::<std::sync::Arc<FrozenSlot>>();
 }

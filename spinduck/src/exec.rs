@@ -13,14 +13,32 @@ pub type BindMap = BTreeMap<String, SpinValue>;
 pub type Row = Vec<SpinValue>;
 
 /// 查询结果流（快照语义：OPEN 时产出；FETCH 逐行拉取）。
+///
+/// 行存储为 `Arc<Vec<Row>>`：loop-parallel 的 Worker 需要按 `row_idx`
+/// 只读共享同一份物化行，而 `pos` 是每个消费者本地的游标位置——
+/// 共享行存储不改变 `fetch_many`/`reset`/`len` 的既有语义。
+/// `Clone` 仅复制 `pos` 与 `Arc` 引用（行数据零拷贝共享）。
+#[derive(Clone)]
 pub struct RowStream {
     pub schema: Vec<String>,
-    rows: Vec<Row>,
+    rows: std::sync::Arc<Vec<Row>>,
     pos: usize,
 }
 
 impl RowStream {
     pub fn new(schema: Vec<String>, rows: Vec<Row>) -> Self {
+        Self {
+            schema,
+            rows: std::sync::Arc::new(rows),
+            pos: 0,
+        }
+    }
+    /// 只读共享行存储（loop-parallel Worker 快照用；克隆仅增引用计数）。
+    pub(crate) fn shared_rows(&self) -> std::sync::Arc<Vec<Row>> {
+        self.rows.clone()
+    }
+    /// 由已共享的行存储重建流（`pos` 归零——每个消费者本地位置）。
+    pub(crate) fn from_shared(schema: Vec<String>, rows: std::sync::Arc<Vec<Row>>) -> Self {
         Self {
             schema,
             rows,
@@ -59,8 +77,8 @@ pub struct ExecOutcome {
 /// （config 侧有反向锚点注释指向此处，V24 评审应修 10）。
 const PURE_SCALAR_FNS: [&str; 5] = ["substring", "strftime", "strptime", "to_days", "date_diff"];
 
-/// 记忆化条目：结果 schema + 全行集（RowStream 可重建的最小集）。
-type MemoRows = (Vec<String>, Vec<Row>);
+/// 记忆化条目：结果 schema + 全行集（`Arc` 与 RowStream 零拷贝共享）。
+type MemoRows = (Vec<String>, std::sync::Arc<Vec<Row>>);
 
 #[derive(Debug, Default)]
 pub struct MemoCache {
@@ -145,14 +163,14 @@ impl SqlExecutor for MemoizingExecutor {
             return self.inner.query(sql, binds);
         };
         if let Some((schema, rows)) = self.cache.entries.borrow().get(&key) {
-            return Ok(RowStream::new(schema.clone(), rows.clone()));
+            return Ok(RowStream::from_shared(schema.clone(), rows.clone()));
         }
         self.inner_calls.set(self.inner_calls.get() + 1);
         let out = self.inner.query(sql, binds)?;
         self.cache
             .entries
             .borrow_mut()
-            .insert(key, (out.schema.clone(), out.rows.clone()));
+            .insert(key, (out.schema.clone(), out.shared_rows()));
         Ok(out)
     }
 
@@ -162,7 +180,7 @@ impl SqlExecutor for MemoizingExecutor {
         // 清缓存后透传。只收窄到 MACRO 形态——sqlfn 物化路径每行一次
         // CREATE OR REPLACE TEMP TABLE，若对任意 DDL 失效，带下沉的
         // 游标循环每行清空缓存，记忆化在这类过程上不成立（复核应修 A）。
-        if is_macro_ddl(sql) {
+        if is_macro_ddl(sql) || is_rollback_stmt(sql) {
             self.cache.clear();
         }
         self.inner.execute(sql, binds)
@@ -202,6 +220,18 @@ pub(crate) fn is_macro_ddl(sql: &str) -> bool {
     } else {
         is(0, "DROP") && kind(1)
     }
+}
+
+/// ROLLBACK 语句判定（结果缓存失效口径）：前导注释剥离后首关键字为
+/// `ROLLBACK`（含 `ROLLBACK TO <name>`）。事务回滚改变可见数据，
+/// memo/lookup 两级结果缓存必须整体清空——`invalidate` 的表名提取
+/// 对事务控制语句天然失效（不产生任何表名），这是串行路径上
+/// "回滚后读到回滚前缓存值"的已知漏洞（P0-1 审核修复）。
+pub(crate) fn is_rollback_stmt(sql: &str) -> bool {
+    strip_leading_comments(sql)
+        .split_whitespace()
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("rollback"))
 }
 
 /// 剥离可叠加的前导注释（行 `--` 与块 `/* */`）。
@@ -383,6 +413,23 @@ mod tests {
         let ex = FakeExecutor::default();
         let mut s = ex.query("SELECT 1", &BindMap::new()).unwrap();
         assert_eq!(s.fetch_many(2).len(), 0);
+    }
+
+    #[test]
+    fn should_share_row_storage_without_moving_position() {
+        // loop-parallel 契约：shared_rows 与流本体共享同一 Arc 分配，
+        // 且克隆句柄不影响本流的消费位置。
+        let mut s = RowStream::new(
+            vec!["a".into()],
+            vec![vec![SpinValue::Int(1)], vec![SpinValue::Int(2)]],
+        );
+        let shared = s.shared_rows();
+        assert!(std::sync::Arc::ptr_eq(&shared, &s.shared_rows()));
+        assert_eq!(shared.len(), 2);
+        assert_eq!(s.fetch_many(1), vec![vec![SpinValue::Int(1)]]);
+        // 共享句柄仍是全量物化行（Worker 按 row_idx 自行取行）。
+        assert_eq!(shared[1], vec![SpinValue::Int(2)]);
+        assert_eq!(s.fetch_many(1), vec![vec![SpinValue::Int(2)]]);
     }
 
     struct CountingExec {

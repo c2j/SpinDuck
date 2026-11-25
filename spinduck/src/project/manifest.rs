@@ -24,6 +24,21 @@ pub struct ManifestSync {
     pub removed_legacy: Option<PathBuf>,
 }
 
+/// `loop_parallel` 的快照形态：旋钮全默认时写规范名字符串（与手写
+/// `loop_parallel = "safe"` 同形），显式旋钮时写表以免丢配置。
+fn loop_parallel_manifest_value(cfg: &crate::ir::loop_parallel::LoopParallelConfig) -> toml::Value {
+    let knobs_default = cfg.threads == 0 && cfg.chunk_size == 256 && cfg.min_rows == 256;
+    if knobs_default {
+        return cfg.mode.as_str().into();
+    }
+    let mut t = toml::value::Table::new();
+    t.insert("mode".into(), cfg.mode.as_str().into());
+    t.insert("threads".into(), (cfg.threads as i64).into());
+    t.insert("chunk_size".into(), (cfg.chunk_size as i64).into());
+    t.insert("min_rows".into(), (cfg.min_rows as i64).into());
+    t.into()
+}
+
 /// 生成快照文本（唯一序列化口径：由 [`sync_runtime_manifest`] 落盘）。
 pub fn manifest_text(project: &ProjectConfig) -> Result<String, EngineError> {
     let mut doc = toml::value::Table::new();
@@ -33,6 +48,10 @@ pub fn manifest_text(project: &ProjectConfig) -> Result<String, EngineError> {
     doc.insert("project".into(), prj.into());
     let mut engine = toml::value::Table::new();
     engine.insert("set_oriented".into(), project.set_oriented.as_str().into());
+    engine.insert(
+        "loop_parallel".into(),
+        loop_parallel_manifest_value(&project.loop_parallel),
+    );
     doc.insert("engine".into(), engine.into());
 
     let mut rt = toml::value::Table::new();

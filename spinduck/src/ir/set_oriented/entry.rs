@@ -76,6 +76,18 @@ pub(crate) struct ConversionPlan {
     /// 有序 Top-1 入口并列一致性守卫 SQL（期望 COUNT(*) = 0）及其须随行的
     /// 形参绑定（LATERAL 静态过滤含 BETWEEN 等；入口从运行帧解析后求值）。
     pub(super) top1_guards: Vec<(String, Vec<(String, BindSrc)>)>,
+    /// 混合调度异常行守卫（so-exception-row-hybrid）：每条返回违规行
+    /// `__sd_rn`（0 基）集合；非空时引擎走"正常行批段+异常行单行重放"。
+    /// 仅 `PlanFlags.hybrid` 计划填充，此时对应 dup 守卫已从
+    /// `top1_guards` 移除（不再整段退回）。
+    pub(crate) exc_guards: Vec<BoundGuard>,
+    /// 混合调度规格（游标/FETCH pc/唯一出口 pc）；`exc_guards` 非空
+    /// 的充要条件——引擎据此走分段批写+单行重放。
+    pub(crate) hybrid: Option<super::hybrid::HybridSpec>,
+    /// 混合段批写 SQL 模板（含 `__SD_LO__`/`__SD_HI__` 占位符）；
+    /// `sql` 字段为占位符替换 NULL 后的全行版本（exc 空集路径直发，
+    /// 与无混合计划行为等价）。
+    pub(crate) seg_sql: Option<String>,
     /// IF 路由入口守卫 SQL（期望 TRUE = THEN 分支不可达，§4.3）。
     pub(super) route_guards: Vec<String>,
     /// 内联表达式入口无抛错守卫 SQL（期望 COUNT = 0，§4.5-2）：以 TRY_
@@ -111,7 +123,7 @@ pub(crate) struct RouteArm {
     pub plan: Box<ConversionPlan>,
 }
 
-pub(super) type BoundGuard = (String, Vec<(String, BindSrc)>);
+pub(crate) type BoundGuard = (String, Vec<(String, BindSrc)>);
 
 pub(super) fn bind_guards(
     guards: Vec<String>,
@@ -310,6 +322,36 @@ fn route_guard(ex: &dyn SqlExecutor, sql: &str) -> Result<bool, EngineError> {
     ))
 }
 
+/// 混合调度异常行集（so-exception-row-hybrid §3）：逐条 `exc_guards`
+/// 求值并集，返回 0 基行号集合（对齐 `CursorState::seek_before` 与批写
+/// `__sd_rn` 区间）。守卫 SQL/绑定与 `top1_guards` 同口径（计划期已
+/// 补齐 $v_ 形参）。
+///
+/// 返回值三态：`Some(空集)` = 无异常行走普通 SO；`Some(集)` = 混合
+/// 调度；`None` = 守卫产出畸形行号（非 Int/负值/空行）——证据不可信，
+/// 调用方必须整区域串行兜底，**绝不**把畸形值静默当普通行跳过
+/// （P0-3 审核修复：此前非 Int 被 `if let` 静默丢弃）。
+pub(crate) fn exc_rows(
+    ex: &dyn SqlExecutor,
+    guards: &[BoundGuard],
+    frame: &crate::runtime::Frame,
+) -> Result<Option<std::collections::BTreeSet<u64>>, EngineError> {
+    let mut rows = std::collections::BTreeSet::new();
+    for (sql, binds) in guards {
+        let bm = crate::runtime::interp::resolve_binds(binds, frame)?;
+        let mut stream = ex.query(sql, &bm)?;
+        for row in stream.fetch_many(usize::MAX) {
+            match row.first() {
+                Some(crate::value::SpinValue::Int(rn)) if *rn >= 0 => {
+                    rows.insert(*rn as u64);
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+    Ok(Some(rows))
+}
+
 fn snapshot_matches(
     ex: &dyn SqlExecutor,
     plan: &ConversionPlan,
@@ -398,6 +440,9 @@ mod tests {
             route_guards: route,
             expr_guards: expr,
             miss_outs: Vec::new(),
+            exc_guards: Vec::new(),
+            hybrid: None,
+            seg_sql: None,
             discriminator: None,
         }
     }
@@ -524,5 +569,52 @@ mod tests {
         let sqls = seen.borrow();
         assert_eq!(sqls.last().map(String::as_str), Some("SELECT FALSE"));
         assert_eq!(sqls.len(), 6, "expr 守卫不得执行: {sqls:?}");
+    }
+
+    use crate::exec::FakeExecutor;
+    use crate::value::SpinValue;
+
+    fn guards() -> Vec<BoundGuard> {
+        vec![("SELECT __sd_rn FROM g".to_string(), Vec::new())]
+    }
+
+    /// 正常行号集：多条守卫并集、去重、0 基原样收集。
+    #[test]
+    fn should_collect_exception_row_numbers() {
+        let ex = FakeExecutor::with_rows(
+            vec!["rn".into()],
+            vec![
+                vec![SpinValue::Int(0)],
+                vec![SpinValue::Int(2)],
+                vec![SpinValue::Int(2)],
+            ],
+        );
+        let frame = crate::runtime::Frame::new();
+        let got = exc_rows(&ex, &guards(), &frame).unwrap();
+        assert_eq!(got, Some(std::collections::BTreeSet::from([0, 2])));
+    }
+
+    /// 畸形行号（非 Int / 负值）→ `None`：证据不可信，调用方必须
+    /// 整区域串行兜底，绝不静默当普通行。
+    #[test]
+    fn should_reject_malformed_exception_row_numbers() {
+        for bad in [
+            vec![SpinValue::Str("x".into())],
+            vec![SpinValue::Int(-1)],
+            vec![SpinValue::Null],
+        ] {
+            let ex = FakeExecutor::with_rows(vec!["rn".into()], vec![bad]);
+            let frame = crate::runtime::Frame::new();
+            assert_eq!(exc_rows(&ex, &guards(), &frame).unwrap(), None);
+        }
+    }
+
+    /// 空守卫结果集 → `Some(空集)`：无异常行，走普通 SO 批写。
+    #[test]
+    fn should_return_empty_set_when_no_exception_rows() {
+        let ex = FakeExecutor::with_rows(vec!["rn".into()], Vec::new());
+        let frame = crate::runtime::Frame::new();
+        let got = exc_rows(&ex, &guards(), &frame).unwrap();
+        assert_eq!(got, Some(std::collections::BTreeSet::new()));
     }
 }

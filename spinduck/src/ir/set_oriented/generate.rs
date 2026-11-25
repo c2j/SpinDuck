@@ -1,7 +1,9 @@
 //! 集合化计划生成：结构证据、内联提升、快照复核与批写绑定。
 
 use super::planbinds::{query_binds, route_guards, with_param_binds};
-use super::{catalog_summary, copy, entry, filter, lookup, region, resolve, route, schema, shape};
+use super::{
+    catalog_summary, copy, entry, filter, hybrid, lookup, region, resolve, route, schema, shape,
+};
 use super::{CopyLoop, EngineError, OptimizeCtx, SkipReason, VarName};
 
 struct Inputs {
@@ -15,12 +17,32 @@ struct Inputs {
     target: schema::Table,
 }
 
+/// 计划生成标志：尾提交授权 + SO 行级混合开关（PR#62 loop-parallel
+/// 协议）；双臂路由由 `CopyLoop.dual_arm` 驱动（D7 判别式），不设
+/// THEN 臂生成开关——臂计划本体由 `plan_from::gen_arm_plan` 独立
+/// generate 后填入 `Discriminator.arms`。
+#[derive(Clone, Copy)]
+pub(super) struct PlanFlags {
+    pub tail_commit: bool,
+    /// SO 行级混合（so-exception-row-hybrid）：dup 基数守卫改产行号
+    /// 集 `exc_guards` 顶替整段退回；需计划期逃逸/行序证明齐备。
+    pub hybrid: bool,
+    /// 混合物化失败会中止事务：前缀（含 fn 前导例程）写集必须可证
+    /// 为空，否则 `__sd_hcur` CTAS/重绑失败后无法安全回退（含用户
+    /// 写的事务被打入 aborted 态）。不满足时混合资格整体关闭，
+    /// 退回普通 SO/串行路径。
+    pub hybrid_prefix_clean: bool,
+    /// `--batch-commit`（WriteBuffer 延迟提交）：段批写直发内核、
+    /// 与重放行的交错回滚无法共用同一提交边界——混合计划整体关闭。
+    pub batch_commit: bool,
+}
+
 pub(super) fn generate(
     copy: &mut CopyLoop<'_>,
     ex: &schema::Source<'_>,
     ctx: &OptimizeCtx<'_>,
     region: &region::CursorRegion,
-    tail_commit: bool,
+    flags: PlanFlags,
 ) -> Result<Result<entry::ConversionPlan, SkipReason>, EngineError> {
     let inputs = match load_inputs(copy, ex)? {
         Ok(inputs) => inputs,
@@ -108,7 +130,7 @@ pub(super) fn generate(
         resolved_tuples,
         resolved_aggs,
         region,
-        tail_commit,
+        flags,
     ) {
         Ok(p) => Ok(Ok(p)),
         Err(reason) => Ok(Err(reason)),
@@ -274,21 +296,55 @@ fn finish(
     resolved_tuples: Vec<(lookup::ResolvedTuple, resolve::LookupTables)>,
     resolved_aggs: Vec<(super::agg::ResolvedAgg, resolve::LookupTables)>,
     region: &region::CursorRegion,
-    tail_commit: bool,
+    flags: PlanFlags,
 ) -> Result<entry::ConversionPlan, SkipReason> {
     let projections: Vec<lookup::ResolvedLookup> =
         resolved.iter().map(|(l, _)| l.clone()).collect();
+    // 混合资格重证（mod.rs 已用同一 analyze 置 flags.hybrid）：
+    // spec 随计划下发，驱动入口 exc 求值与引擎分段/重放调度。
+    let hspec = if flags.hybrid {
+        hybrid::analyze(copy.prog, region)
+    } else {
+        None
+    };
+    // 混合仅在存在 exc_guard（miss_emu dup 行号守卫）时启用：
+    // 无异常行来源的计划保持原 SQL 形态（无 __sd_rn/段谓词），
+    // `|E|` 恒空也无调度收益。
+    let has_exc = resolved.iter().any(|(l, _)| l.render.exc_guard.is_some());
+    let hybrid_on = hspec.is_some() && has_exc && flags.hybrid_prefix_clean && !flags.batch_commit;
+    // 混合计划的 `sd_cur` 改读引擎物化临时表：物化 SELECT 随 spec
+    // 下发，`__sd_rn` 只在物化时赋一次（P0-3b 行序证明的锚点）。
+    let mut hspec = if hybrid_on {
+        hspec.map(|mut h| {
+            h.hcur_sql = super::copy::sd_cur_rows(&inputs.select, &inputs.cur);
+            h
+        })
+    } else {
+        None
+    };
+    // 混合启用时，miss_emu 的 dup 守卫（tie_guard 槽位）改由
+    // exc_guards 行号集承载——顶替"任一 dup 行即整段退回"。
     let top1_guards: Vec<entry::BoundGuard> = resolved
         .iter()
         .flat_map(|(l, _)| {
-            l.render
-                .tie_guard
-                .clone()
-                .map(|g| (g, l.render.guard_binds.clone()))
+            let tie = if hybrid_on && l.render.exc_guard.is_some() {
+                None
+            } else {
+                l.render.tie_guard.clone()
+            };
+            tie.map(|g| (g, l.render.guard_binds.clone()))
                 .into_iter()
                 .chain(l.render.miss_guards.iter().cloned())
         })
         .collect();
+    let exc_guards: Vec<entry::BoundGuard> = if hybrid_on {
+        resolved
+            .iter()
+            .filter_map(|(l, _)| l.render.exc_guard.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     // miss 仿真标量出口：按查找程序序应用（后写覆盖先写）。
     let mut miss_outs: Vec<lookup::MissOut> = projections
         .iter()
@@ -298,7 +354,10 @@ fn finish(
     // D7 双臂（§12.3）：ELSE 臂不再需要「THEN 不可达」守卫——改由
     // 运行期判别式取值选臂；`discriminator.sql` 与 route 守卫共用
     // 同一份查找渲染证据。臂计划本体由 plan_from 另行 generate 后填入。
-    let (route_guards, discriminator) = if copy.dual_arm {
+    // （PR#62 的 route_alt 备选计划机制由判别式取代：守卫互斥选臂
+    // 升级为标签选臂，且经 admit 报告臂结构；route::pick 口径已并入
+    // discriminator SQL 的 `=` 三值语义。）
+    let (mut route_guards, discriminator) = if copy.dual_arm {
         let (v, lit) = copy
             .route
             .as_ref()
@@ -328,24 +387,43 @@ fn finish(
         &projections,
         &tuple_views,
         &agg_views,
+        hybrid_on,
     )?;
+    // 混合计划：`sql` 存占位符全范围替换版（exc 空集直发路径），
+    // `seg_sql` 存含 __SD_LO__/__SD_HI__ 占位符的分段模板。
+    let (mut sql, mut seg_sql) = if hybrid_on {
+        (
+            generated
+                .sql
+                .replace("__SD_LO__", "NULL")
+                .replace("__SD_HI__", "NULL"),
+            Some(generated.sql.clone()),
+        )
+    } else {
+        (generated.sql.clone(), None)
+    };
     let binds = with_param_binds(copy, &generated, query_binds(copy, &resolved));
     // verbatim 游标的 cur_scan 原文含 $v_ 绑定：守卫 SQL 按 token 出现
     // 情况从全量绑定集补齐（guard_binds 只覆盖查找自身过滤绑定）。
-    let top1_guards: Vec<entry::BoundGuard> = top1_guards
-        .into_iter()
-        .map(|(sql, mut gbinds)| {
-            if let Some(t) = shape::Tokens::new(&sql) {
-                for (ph, src) in &binds {
-                    if t.words().iter().any(|w| w == ph) && !gbinds.iter().any(|(p, _)| p == ph) {
-                        gbinds.push((ph.clone(), src.clone()));
+    let fill_binds = |guards: Vec<entry::BoundGuard>| -> Vec<entry::BoundGuard> {
+        guards
+            .into_iter()
+            .map(|(sql, mut gbinds)| {
+                if let Some(t) = shape::Tokens::new(&sql) {
+                    for (ph, src) in &binds {
+                        if t.words().iter().any(|w| w == ph) && !gbinds.iter().any(|(p, _)| p == ph)
+                        {
+                            gbinds.push((ph.clone(), src.clone()));
+                        }
                     }
                 }
-            }
-            (sql, gbinds)
-        })
-        .collect();
-    let expr_guards = entry::bind_guards(generated.expr_guards, &binds)?;
+                (sql, gbinds)
+            })
+            .collect()
+    };
+    let mut top1_guards = fill_binds(top1_guards);
+    let mut exc_guards = fill_binds(exc_guards);
+    let mut expr_guards = entry::bind_guards(generated.expr_guards, &binds)?;
     // fn_site 物化前导：游标 WHERE site 的 distinct_sql 为编译期原文
     // （含源表与过滤），INSERT 位 site 为 copy_sql 生成的
     // distinct-over-sd_cur 查询（needs_sd_cur，依赖游标表先行物化）。
@@ -364,10 +442,43 @@ fn finish(
     fn_preludes.extend(generated.fn_preludes);
     // 视图物化前导：普通查找落在视图上时由 viewdep 产出（每查找一张
     // sd_vwN 临时表）；先于入口守卫执行（守卫可内嵌 sd_vwN 派生表）。
-    let view_preludes: Vec<entry::ViewPrelude> = projections
+    let mut view_preludes: Vec<entry::ViewPrelude> = projections
         .iter()
         .filter_map(|l| l.view_prelude.clone())
         .collect();
+    // V55.4：计划侧游标位例程缓存统一改名 `sd_fnN`→`sd_pfnN`。
+    // 解释器重放路径按 statement 级生成 `sd_fn{i}`——与计划缓存同名
+    // 时 `CREATE OR REPLACE` 互相覆写（重放行 INSERT 位例程会冲掉
+    // 游标 WHERE 例程缓存，miss_outs/守卫读到异函数键形态 → 静默
+    // 错值）。解释器只产 `sd_fn{数字}`，`sd_pfn` 命名空间永不冲突；
+    // `sd_bfN`（INSERT 位缓存，重放不产）不在改名范围。
+    sql = rename_cursor_fn_cache(&sql);
+    seg_sql = seg_sql.map(|s| rename_cursor_fn_cache(&s));
+    for (s, _) in top1_guards
+        .iter_mut()
+        .chain(exc_guards.iter_mut())
+        .chain(expr_guards.iter_mut())
+    {
+        *s = rename_cursor_fn_cache(s);
+    }
+    for s in &mut route_guards {
+        *s = rename_cursor_fn_cache(s);
+    }
+    for m in &mut miss_outs {
+        m.sql = rename_cursor_fn_cache(&m.sql);
+    }
+    if let Some(h) = &mut hspec {
+        h.hcur_sql = rename_cursor_fn_cache(&h.hcur_sql);
+    }
+    for p in &mut fn_preludes {
+        p.table = rename_cursor_fn_cache(&p.table);
+        // INSERT 位前导的 distinct-over-sd_cur 查询内嵌游标扫描，
+        // 其中的游标缓存子查询同样引用 sd_fnN——必须与 table 同步改名。
+        p.distinct_sql = rename_cursor_fn_cache(&p.distinct_sql);
+    }
+    for v in &mut view_preludes {
+        v.sql = rename_cursor_fn_cache(&v.sql);
+    }
     // 守卫 SQL（verbatim cur_scan / 写守卫缓存子查询）引用 sd_fn*/sd_bf*
     // 临时表时，物化前导必须先于入口守卫执行，否则守卫查询打到不存在的表。
     // 视图前导存在时 fn 前导同样提前：fn 例程调用可回滚会话本地建表，
@@ -384,13 +495,13 @@ fn finish(
                     .is_some_and(|t| t.words().iter().any(|w| tables.contains(&w.as_str())))
             })
     } || !view_preludes.is_empty();
-    Ok(entry::ConversionPlan {
-        sql: generated.sql,
+    let plan = entry::ConversionPlan {
+        sql,
         binds,
         fn_preludes,
         view_preludes,
         preludes_first,
-        tail_commit,
+        tail_commit: flags.tail_commit,
         open_pc: region.open_pc,
         close_pc: region.close_pc,
         source: inputs.select.table,
@@ -404,6 +515,9 @@ fn finish(
             .chain(resolved_aggs.into_iter().flat_map(|(_, ts)| ts))
             .collect(),
         top1_guards,
+        exc_guards,
+        hybrid: if hybrid_on { hspec } else { None },
+        seg_sql,
         route_guards,
         expr_guards,
         miss_outs: miss_outs
@@ -415,5 +529,31 @@ fn finish(
             })
             .collect(),
         discriminator,
-    })
+    };
+    Ok(plan)
+}
+
+/// `sd_fn<数字>` token 改名为 `sd_pfn<数字>`（V55.4 游标缓存隔离）。
+/// 前边界：串首或非标识符字符；后边界：必须紧跟 ASCII 数字——
+/// `sd_fn` 前缀的其它形态（如 `sd_fna`）不动。逐字节扫描但按
+/// UTF-8 字符边界复制，中文等多字节内容原样保留。
+fn rename_cursor_fn_cache(sql: &str) -> String {
+    let b = sql.as_bytes();
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut i = 0;
+    while i < b.len() {
+        let hit = b[i..].starts_with(b"sd_fn")
+            && b.get(i + 5).is_some_and(|c| c.is_ascii_digit())
+            && (i == 0 || !ident(b[i - 1]));
+        if hit {
+            out.push_str("sd_pfn");
+            i += 5;
+        } else {
+            let len = sql[i..].chars().next().map_or(1, |c| c.len_utf8());
+            out.push_str(&sql[i..i + len]);
+            i += len;
+        }
+    }
+    out
 }

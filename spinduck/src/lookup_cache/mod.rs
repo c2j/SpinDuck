@@ -10,7 +10,7 @@
 //! 或 `LIMIT` 在排序键上并列时，原样下发，不改变结果。
 
 mod probe;
-mod shape;
+pub(crate) mod shape;
 
 use crate::error::EngineError;
 use crate::exec::{BindMap, ExecOutcome, Row, RowStream, SqlExecutor};
@@ -21,6 +21,7 @@ use shape::{Kind, Plan, ProbeVal, RowPlan, SemiPlan};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 #[cfg(test)]
 mod tests;
@@ -39,16 +40,33 @@ impl LookupState {
     pub fn clear(&self) {
         self.slots.borrow_mut().clear();
     }
+
+    /// 事务回滚失效（P0-1 审核）：只丢数据承载的 `Slot::Ready`，
+    /// 保留 `Slot::Off` 降级标记。`Off` 槽位本就不服务数据（恒
+    /// fallback 到 `inner.query`），跨回滚保留它既正确又避免回滚后
+    /// 重复执行必然失败的 build SQL——那条失败语句会把事务打入
+    /// aborted 态，改变后续语句成败序列（`set_oriented_dummy`
+    /// 视图 CAST 场景实测）。
+    pub(crate) fn invalidate_on_rollback(&self) {
+        self.slots
+            .borrow_mut()
+            .retain(|_, slot| matches!(slot, Slot::Off { .. }));
+    }
 }
 
 /// 包在执行器外层。不改 [`SqlExecutor`] 签名。
+///
+/// `inner`/`state` 均为 `Rc` 共享：`Engine` 除把本执行器装进 `ex` 链外，
+/// 另持一份克隆句柄供 loop-parallel 的 `try_prewarm_only` /
+/// `export_frozen` 使用（两者必须落在**同一条**底层连接与缓存状态上）。
+#[derive(Clone)]
 pub struct LookupExecutor {
-    inner: Box<dyn SqlExecutor>,
+    inner: Rc<dyn SqlExecutor>,
     state: Rc<LookupState>,
 }
 
 impl LookupExecutor {
-    pub fn new(inner: Box<dyn SqlExecutor>, state: Rc<LookupState>) -> Self {
+    pub fn new(inner: Rc<dyn SqlExecutor>, state: Rc<LookupState>) -> Self {
         Self { inner, state }
     }
 }
@@ -77,9 +95,7 @@ impl SqlExecutor for LookupExecutor {
                 self.state.slots.borrow_mut().insert(
                     id.clone(),
                     Slot::Ready {
-                        plan: Box::new(plan),
-                        index: Box::new(index),
-                        names,
+                        frozen: Arc::new(FrozenSlot { plan, index, names }),
                     },
                 );
                 self.answer(&id, sql, binds)
@@ -96,7 +112,14 @@ impl SqlExecutor for LookupExecutor {
     }
 
     fn execute(&self, sql: &str, binds: &BindMap) -> Result<ExecOutcome, EngineError> {
-        self.invalidate(sql);
+        // 事务控制语句不产生表名，`invalidate` 的表名提取对其天然
+        // 失效——回滚改变可见数据，必须按回滚口径失效 Ready 数据槽
+        // （P0-1 审核：否则回滚后读到回滚前的缓存值）。
+        if crate::exec::is_rollback_stmt(sql) {
+            self.state.invalidate_on_rollback();
+        } else {
+            self.invalidate(sql);
+        }
         self.inner.execute(sql, binds)
     }
 }
@@ -106,9 +129,10 @@ impl LookupExecutor {
         let outcome = {
             let slots = self.state.slots.borrow();
             match slots.get(id) {
-                Some(Slot::Ready { plan, index, names }) => {
-                    (probe::probe(plan, index, binds), names.clone())
-                }
+                Some(Slot::Ready { frozen }) => (
+                    probe::probe(&frozen.plan, &frozen.index, binds),
+                    frozen.names.clone(),
+                ),
                 _ => (probe::ProbeOut::Fallback, Vec::new()),
             }
         };
@@ -142,29 +166,148 @@ impl LookupExecutor {
         };
         self.state.slots.borrow_mut().retain(|_, slot| {
             let tables = match slot {
-                Slot::Ready { plan, .. } => &plan.tables,
+                Slot::Ready { frozen } => &frozen.plan.tables,
                 Slot::Off { tables } => tables,
             };
             !tables.iter().any(|table| names.contains(table))
         });
     }
+
+    /// 三步安全预热协议的 Step B（loop-parallel 设计 §5.1）：只建冻结槽位，
+    /// 绝不写 `Slot::Off`、绝不兜底执行 `inner.query` 原语句。
+    ///
+    /// - `shape::recognize` / `range_key` 在内存中判定，失败返回
+    ///   [`PrewarmOutcome::UnsupportedShapeNoSql`]（零 SQL 下发）；
+    /// - 槽位已存在或 range 含 NULL（空结果语义无需建槽）返回 `Frozen`；
+    /// - 建索引 SQL 报错返回 [`PrewarmOutcome::SqlFailed`]，由调用方
+    ///   `reset_session` + `lookup.clear()` 后退回串行（R3-P1-1）。
+    pub(crate) fn try_prewarm_only(&self, sql: &str, binds: &BindMap) -> PrewarmOutcome {
+        let Some(plan) = shape::recognize(sql) else {
+            return PrewarmOutcome::UnsupportedShapeNoSql;
+        };
+        let Some(range) = range_key(&plan, binds) else {
+            return PrewarmOutcome::UnsupportedShapeNoSql;
+        };
+        if range.iter().any(|part| matches!(part, KeyPart::Null)) {
+            return PrewarmOutcome::Frozen;
+        }
+        let id = CacheId {
+            sql: sql.to_string(),
+            range,
+        };
+        if self.state.slots.borrow().contains_key(&id) {
+            return PrewarmOutcome::Frozen;
+        }
+        match self.build(&plan, binds) {
+            Ok(index) => {
+                let names = output_schema(sql, plan.proj_len());
+                self.state.slots.borrow_mut().insert(
+                    id,
+                    Slot::Ready {
+                        frozen: Arc::new(FrozenSlot { plan, index, names }),
+                    },
+                );
+                PrewarmOutcome::Frozen
+            }
+            Err(_) => PrewarmOutcome::SqlFailed,
+        }
+    }
+
+    /// 导出只读快照（§5.2）：仅克隆 `Arc` 指针，零负载拷贝。
+    /// 快照有效性由调用方按"洁净入口 + 无 reset_session/TxRollback"
+    /// 双条件保证；live 侧失效不影响已导出快照。
+    pub(crate) fn export_frozen(&self) -> FrozenLookupSnapshot {
+        FrozenLookupSnapshot {
+            slots: self
+                .state
+                .slots
+                .borrow()
+                .iter()
+                .filter_map(|(id, slot)| match slot {
+                    Slot::Ready { frozen } => Some((id.clone(), frozen.clone())),
+                    Slot::Off { .. } => None,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// `try_prewarm_only` 的三态结果（loop-parallel 设计 §5.1）。
+#[derive(Debug)]
+pub(crate) enum PrewarmOutcome {
+    /// 已有缓存或成功建出 `Arc<FrozenSlot>`。
+    Frozen,
+    /// `shape::recognize` / `range_key` 内存判定不支持——零 SQL 下发。
+    UnsupportedShapeNoSql,
+    /// 建索引 SQL 执行失败（未写 `Slot::Off`、未兜底原查询；
+    /// 错误按设计 §5.1 显式吞掉——不得以预热错误替换例程原错误，
+    /// 调用方统一退回串行）。
+    SqlFailed,
+}
+
+/// `Slot::Ready` 的只读负载（§5.2 零拷贝冻结）：`Arc` 共享给 Worker。
+#[derive(Debug)]
+pub(crate) struct FrozenSlot {
+    pub plan: Plan,
+    pub index: Index,
+    /// 建槽时解析一次的输出列名。
+    pub names: Vec<String>,
+}
+
+/// Worker 侧只读快照：`CacheId -> Arc<FrozenSlot>` 的时间点克隆。
+/// `probe` 只读不写、零 SQL；未命中/探测回退返回 `None` 交权主线程。
+#[derive(Debug, Default, Clone)]
+pub(crate) struct FrozenLookupSnapshot {
+    slots: HashMap<CacheId, Arc<FrozenSlot>>,
+}
+
+impl FrozenLookupSnapshot {
+    /// Worker 侧快照体积估算（LP 报告 `peak_snapshot_bytes`；
+    /// 估算口径见 [`Index::approx_bytes`]）。
+    pub(crate) fn approx_bytes(&self) -> usize {
+        self.slots
+            .values()
+            .map(|frozen| {
+                frozen.index.approx_bytes()
+                    + frozen.names.iter().map(|n| n.len() + 16).sum::<usize>()
+                    + frozen
+                        .plan
+                        .tables
+                        .iter()
+                        .map(|t| t.len() + 16)
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// 与 [`LookupExecutor::query`] 同口径的命中判定，但只查冻结槽位：
+    /// `None` = 形状不支持 / 未预热 / 探测回退（Worker 必须交权）。
+    pub(crate) fn probe(&self, sql: &str, binds: &BindMap) -> Option<RowStream> {
+        let plan = shape::recognize(sql)?;
+        let range = range_key(&plan, binds)?;
+        if range.iter().any(|part| matches!(part, KeyPart::Null)) {
+            return Some(empty_stream(sql, plan.proj_len()));
+        }
+        let id = CacheId {
+            sql: sql.to_string(),
+            range,
+        };
+        let frozen = self.slots.get(&id)?;
+        match probe::probe(&frozen.plan, &frozen.index, binds) {
+            probe::ProbeOut::Rows(rows) => Some(RowStream::new(frozen.names.clone(), rows)),
+            probe::ProbeOut::Fallback => None,
+        }
+    }
 }
 
 #[derive(Debug)]
 enum Slot {
-    Ready {
-        plan: Box<Plan>,
-        index: Box<Index>,
-        /// 建槽时解析一次的输出列名（命中路径不再重解析 SQL）
-        names: Vec<String>,
-    },
-    Off {
-        tables: Vec<String>,
-    },
+    Ready { frozen: Arc<FrozenSlot> },
+    Off { tables: Vec<String> },
 }
 
 #[derive(Debug)]
-pub(super) enum Index {
+pub(crate) enum Index {
     Rows(HashMap<Vec<KeyPart>, Vec<Row>>),
     Semi {
         outer: HashMap<Vec<KeyPart>, Vec<Row>>,
@@ -189,6 +332,38 @@ impl Index {
             }
         };
         index.ok_or_else(|| EngineError::invariant(67, "lookup build stream count mismatch"))
+    }
+
+    /// 快照体积估算（LP 报告 `peak_snapshot_bytes`）：单元格数 ×
+    /// `SpinValue` 粒度 + 行/键固定开销。堆布局估算而非精确字节，
+    /// 仅供容量观测，不做正确性判据。
+    fn approx_bytes(&self) -> usize {
+        const CELL: usize = std::mem::size_of::<SpinValue>();
+        const ROW_OVERHEAD: usize = 48;
+        const KEY_OVERHEAD: usize = 32;
+        let bucket = |k: &[KeyPart], rows: &[Row]| {
+            KEY_OVERHEAD
+                + std::mem::size_of_val(k)
+                + rows.len() * ROW_OVERHEAD
+                + rows.iter().map(|r| r.len()).sum::<usize>() * CELL
+        };
+        match self {
+            Index::Rows(map) => map.iter().map(|(k, rows)| bucket(k, rows)).sum(),
+            Index::Semi { outer, inner } => {
+                outer.iter().map(|(k, rows)| bucket(k, rows)).sum::<usize>()
+                    + inner
+                        .iter()
+                        .map(|(k, set)| {
+                            KEY_OVERHEAD
+                                + std::mem::size_of_val(k)
+                                + set
+                                    .iter()
+                                    .map(|_| std::mem::size_of::<KeyPart>())
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>()
+            }
+        }
     }
 }
 

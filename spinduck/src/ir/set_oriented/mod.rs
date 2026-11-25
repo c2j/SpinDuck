@@ -13,11 +13,12 @@ mod entry;
 mod expr;
 mod filter;
 mod generate;
+mod hybrid;
 use generate::generate;
 mod lookup;
 pub mod metadata;
 mod planbinds;
-mod region;
+pub(crate) mod region;
 mod resolve;
 mod route;
 mod schema;
@@ -25,16 +26,24 @@ mod shape;
 mod vguard;
 mod viewdep;
 
-pub(crate) use entry::{entry_ok, ConversionPlan, Discriminator, FnPrelude};
+pub(crate) use entry::{entry_ok, exc_rows, ConversionPlan, Discriminator, FnPrelude};
+pub(crate) use hybrid::HybridSpec;
 
 use super::{AssignTarget, BinOp, BindSrc, CursorSource, IrExpr, IrProg, IrStmt, VarName};
 use crate::catalog::{CompiledRoutine, ParamMode};
 use crate::error::EngineError;
 use crate::exec::SqlExecutor;
 use analyze::{analyze_region, analyze_then_arm};
+
+/// 混合调度 `sd_cur` 物化表占位符（PR#62 P0-3b）：计划期 SQL 内嵌此
+/// 字面量，引擎在入口期替换为唯一临时表名（`__sd_hcur_<seq>`）后
+/// 执行——`__sd_rn` 只在物化时赋一次，异常守卫/段批写共用同一编号。
+pub(crate) const SD_HCUR_TABLE: &str = "__SD_HCUR__";
+
 mod status;
 pub(crate) use status::PlanRejection;
 pub use status::{Arm, GuardKind, GuardScope, OnSkip, Report, SetOrientedMode, SkipReason, Status};
+
 /// 下沉算子：PL 除法（整数 `//`）与拼接（双 NULL CASE）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum SinkOp {
@@ -177,10 +186,10 @@ fn plan_from(
                             // 单臂（PR#62 route_alt 口径：备选失败只丢弃备
                             // 选，不连坐主计划）——discriminator=None，主
                             // 计划 route_guards 守「THEN 不可达」，运行态
-                            // 数据走 THEN 时守卫拒绝整段回退解释器（本分支
-                            // 无 loop-parallel 派发，PR#62 合入后该缺口交
-                            // LP 接管）。两臂均可证时才升级判别式选臂。
-                            // ELSE 臂 = 今日走查产物。
+                            // 数据走 THEN 时守卫拒绝经 SO→LP 派发缺口交
+                            // loop-parallel（PR#62 语义，合并树实装）。
+                            // 两臂均可证时才升级判别式选臂（恰一行标签，
+                            // admit 上报臂结构）。
                             let then_ra = match ra.route_site {
                                 None => None,
                                 Some(site) => analyze_then_arm(
@@ -228,8 +237,10 @@ fn gen_arm_plan<'a>(
     let arm_nulls = then_ra
         .as_ref()
         .map(|t| arm_null_candidates(routine, region, ra.route_site, &ra.copy, &t.copy));
-    // 先证 THEN 臂可生成：失败静默降级（丢弃备选不连坐主计划），
-    // 主臂按单臂口径 generate（discriminator=None + route_guards）。
+    let hybrid_spec = hybrid::analyze(&routine.prog, region);
+    // 先证 THEN 臂可生成（0657715 口径：分析/生成任一失败即降级）：
+    // 失败静默丢弃（不连坐主计划），主臂按单臂口径 generate
+    // （discriminator=None + route_guards 守「THEN 不可达」）。
     let then_plan = match then_ra {
         None => None,
         Some(then) => {
@@ -244,14 +255,44 @@ fn gen_arm_plan<'a>(
                         .push((v.clone(), crate::value::SpinValue::Null));
                 }
             }
-            generate(&mut tcopy, source, ctx, region, then.tail_commit)?.ok()
+            // SO 行级混合门控（主/THEN 臂同口径）：混合物化失败会中止
+            // 事务——前缀写集须可证为空；batch-commit 与重放交错回滚
+            // 无法共用提交边界。
+            let hybrid_clean_then = hybrid_prefix_clean(&routine.prog, region, &tcopy, ctx.catalog);
+            let hybrid_on_then = hybrid_spec.is_some() && hybrid_clean_then && !ctx.batch_commit;
+            generate(
+                &mut tcopy,
+                source,
+                ctx,
+                region,
+                generate::PlanFlags {
+                    tail_commit: then.tail_commit,
+                    hybrid: hybrid_on_then,
+                    hybrid_prefix_clean: hybrid_clean_then,
+                    batch_commit: ctx.batch_commit,
+                },
+            )?
+            .ok()
         }
     };
     if then_plan.is_some() {
         ra.copy.dual_arm = true;
     }
+    let hybrid_clean = hybrid_prefix_clean(&routine.prog, region, &ra.copy, ctx.catalog);
+    let hybrid_on = hybrid_spec.is_some() && hybrid_clean && !ctx.batch_commit;
     let mut copy = ra.copy;
-    let mut plan = match generate(&mut copy, source, ctx, region, ra.tail_commit)? {
+    let mut plan = match generate(
+        &mut copy,
+        source,
+        ctx,
+        region,
+        generate::PlanFlags {
+            tail_commit: ra.tail_commit,
+            hybrid: hybrid_on,
+            hybrid_prefix_clean: hybrid_clean,
+            batch_commit: ctx.batch_commit,
+        },
+    )? {
         Err(reason) => {
             return Ok(Err(PlanRejection {
                 reason: rollback_scope_reason(mode, ra.has_trap, reason),
@@ -381,6 +422,31 @@ fn live_param_hit(copy: &CopyLoop<'_>, routine: &CompiledRoutine) -> bool {
         || copy.dead.iter().any(live_param)
         || copy.aggs.iter().any(|a| live_param(&a.var))
         || copy.arith_writes.iter().any(|w| live_param(&w.var))
+}
+
+/// 混合计划前缀干净度证明：`[0, open_pc)` 的**挂起写**（遇
+/// `TxCommit`/`TxRollback` 清空，已提交写不被物化失败兜底的
+/// ROLLBACK 丢弃）+ fn 前导例程写集必须全空且无 opaque。混合
+/// 物化 `__sd_hcur` 失败会中止事务，前缀有未提交用户写时无法
+/// 安全回退——此时混合资格整体关闭。
+fn hybrid_prefix_clean(
+    prog: &IrProg,
+    region: &region::CursorRegion,
+    copy: &CopyLoop<'_>,
+    catalog: &crate::catalog::RoutineCatalog,
+) -> bool {
+    let (mut writes, mut opaque) = region::prefix_pending_writes(prog, region.open_pc, catalog);
+    for name in copy
+        .fn_sites
+        .iter()
+        .map(|s| s.name.as_str())
+        .chain(copy.insert_sites.iter().map(|s| s.name.as_str()))
+    {
+        let (w, o) = region::routine_write_set(catalog, name);
+        writes.extend(w);
+        opaque |= o;
+    }
+    writes.is_empty() && !opaque
 }
 
 /// 例程 IN 形参名集（小写）：批写投影仅承认这些循环不变输入。

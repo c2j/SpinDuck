@@ -561,6 +561,8 @@ fn rows_copy_both_arms(eng: &Engine) -> Vec<Vec<SpinValue>> {
 
 #[test]
 fn should_convert_route_if_when_both_arms_are_convertible() {
+    // 分臂备选计划：THEN/ELSE 均可集合化时，入口按路由条件选择对应计划
+    // ——THEN 臂激活时不再 Skipped，而是按 THEN 语义 Converted。
     // 分臂判别式：THEN/ELSE 均可集合化时判别式选臂——THEN 臂激活
     // 不再整体 Skipped，按 THEN 语义 Converted（合并树移植，D7 准入超集）。
     for route in ["1", "0"] {

@@ -205,15 +205,16 @@ pub(super) fn render(
     // miss 行取值 = INTO 变量初始化常量（经 default_sql 渲染进
     // `CASE WHEN hit THEN value ELSE init END`）；处理器赋值由
     // 批写后标量出口回填。
-    let (tie_guard, default_sql, miss_guards, miss_out) = match &lq.miss_emu {
+    let (tie_guard, default_sql, miss_guards, miss_out, exc_guard) = match &lq.miss_emu {
         Some(emu) => {
-            let (dup, guards, out) = miss_guards(lq, table, cur_scan, &dims, &filter, emu);
-            (dup, emu.init_sql.clone(), guards, out)
+            let (dup, guards, out, exc) = miss_guards(lq, table, cur_scan, &dims, &filter, emu);
+            (dup, emu.init_sql.clone(), guards, out, exc)
         }
         None => (
             Some(guard_sql(lq, table, cur_scan, &dims, &filter)),
             lq.default_sql.clone(),
             Vec::new(),
+            None,
             None,
         ),
     };
@@ -228,6 +229,7 @@ pub(super) fn render(
         guard_binds: lq.filter_binds.clone(),
         miss_guards,
         miss_out,
+        exc_guard,
     })
 }
 
@@ -247,9 +249,26 @@ fn miss_guards(
     Option<String>,
     Vec<super::entry::BoundGuard>,
     Option<MissOut>,
+    Option<super::entry::BoundGuard>,
 ) {
     let scan = guard_scan(lq, table, cur_scan, dims, filter);
     let dup = format!("SELECT COUNT(*) {scan} WHERE COALESCE(_b.__cnt, 0) > 1");
+    // 混合调度行号版守卫（so-exception-row-hybrid §3）：与 dup 同谓词，
+    // 投影违规行 `__sd_rn`（0 基）。行号读自引擎物化的 `sd_cur` 临时表
+    // （`__SD_HCUR__` 占位符运行期替换）——编号只在物化时赋一次，
+    // 守卫/段批写/重放共用，引擎另做游标流序位置校验（P0-3b）。
+    // 仅 miss_emu 路径产出：dup 行 = TOO_MANY_ROWS 异常行，交解释器
+    // 单行重放复现 handler 副作用。
+    let exc = format!(
+        "SELECT _cur.__sd_rn {} WHERE COALESCE(_b.__cnt, 0) > 1",
+        guard_scan(
+            lq,
+            table,
+            &format!("SELECT * FROM {}", crate::ir::set_oriented::SD_HCUR_TABLE),
+            dims,
+            filter
+        )
+    );
     let mixed = format!(
         "SELECT CAST((COUNT(*) FILTER (WHERE _b.__cnt IS NULL) > 0 AND COUNT(*) FILTER (WHERE _b.__cnt IS NOT NULL) > 0) AS BIGINT) {scan}"
     );
@@ -285,7 +304,7 @@ fn miss_guards(
             binds,
         });
     }
-    (Some(dup), guards, out)
+    (Some(dup), guards, out, Some((exc, lq.filter_binds.clone())))
 }
 
 /// 守卫共用的 FROM..ON 尾段：`(cur_scan) _cur LEFT JOIN`（维度分组

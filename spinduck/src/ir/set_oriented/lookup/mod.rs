@@ -268,6 +268,10 @@ pub(super) struct LookupRender {
     /// miss 仿真入口守卫（期望求值 = 0）：命中/落空混合拒绝 +
     /// 处理器赋值逐行结果非均匀拒绝。绑定与 tie_guard 同口径。
     pub miss_guards: Vec<(String, Vec<(String, BindSrc)>)>,
+    /// dup 守卫的行号版变体（so-exception-row-hybrid）：返回违规行
+    /// `__sd_rn`（0 基）集合而非计数；仅 miss_emu 路径产出，混合
+    /// 调度启用时顶替 tie_guard(dup) 的整段退回语义。
+    pub exc_guard: Option<(String, Vec<(String, BindSrc)>)>,
     /// 批写后标量出口（miss 仿真处理器赋值回填）。
     pub miss_out: Option<MissOut>,
 }

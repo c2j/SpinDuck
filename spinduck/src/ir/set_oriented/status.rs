@@ -114,6 +114,13 @@ pub enum SkipReason {
     /// 有序 Top-1 排序键无 PK/UNIQUE，入口按组并列一致性检查发现
     /// 异值并列（含 NULL 与值并列），首行选择存在真实歧义。
     AmbiguousTop1Tie,
+    /// SO 行级混合前置证明失败（PR#62 P0-3：异常行号越界/游标基数
+    /// 漂移/守卫行号畸形）：整区域回退串行解释执行，零写入已产生。
+    HybridPreflightFailed,
+    /// `__sd_hcur` 入口物化/游标流重绑失败的串行兜底——与守卫证据类
+    /// `HybridPreflightFailed` 区分（物化失败可由内核行为/DDL 触发，
+    /// 非守卫行号证据问题）。
+    HybridHcurMaterializeFailed,
     UnsupportedCall,
     /// 多 OUT 参数被调函数的 LookupTuple 证明失败：处理器漏赋 OUT/返回值、
     /// 处理器 Raise、或成功路径拷贝表达式可抛错（设计 §3.2）。
@@ -147,6 +154,8 @@ impl SkipReason {
             Self::UnprovenSysDummyInvariant => "unproven-sys-dummy-invariant",
             Self::UnprovenQueryTotalness => "unproven-query-totalness",
             Self::AmbiguousTop1Tie => "ambiguous-top1-tie",
+            Self::HybridPreflightFailed => "hybrid-preflight-failed",
+            Self::HybridHcurMaterializeFailed => "hybrid-hcur-materialize-failed",
             Self::UnsupportedCall => "unsupported-call",
             Self::MultiOutCallImpure => "multi-out-call-impure",
             Self::UnresolvedFnSite => "unresolved-fn-site",
@@ -174,6 +183,8 @@ impl SkipReason {
             "unproven-sys-dummy-invariant" => Self::UnprovenSysDummyInvariant,
             "unproven-query-totalness" => Self::UnprovenQueryTotalness,
             "ambiguous-top1-tie" => Self::AmbiguousTop1Tie,
+            "hybrid-preflight-failed" => Self::HybridPreflightFailed,
+            "hybrid-hcur-materialize-failed" => Self::HybridHcurMaterializeFailed,
             "unsupported-call" => Self::UnsupportedCall,
             "multi-out-call-impure" => Self::MultiOutCallImpure,
             "unresolved-fn-site" => Self::UnresolvedFnSite,

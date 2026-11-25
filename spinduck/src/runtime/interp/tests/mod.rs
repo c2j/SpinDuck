@@ -400,3 +400,122 @@ fn count_loop_body() -> Vec<PlStatement> {
         },
     ]
 }
+
+// ---- SO 混合单行重放（so-exception-row-hybrid §3.1）----
+
+use crate::exec::TraceNoopSink;
+use crate::ir::{AssignTarget, CursorSource, IrExpr, IrProg, IrStmt};
+
+/// 手工 IR：pc0 OPEN c；pc1 FETCH c→x（fetch_pc）；pc2 s:=x；
+/// pc3 JumpIf(exit_on)→5；pc4 Jump(1) 回边；pc5 Nop（exit_pc=5）。
+fn replay_test_prog(exit_on: bool) -> IrProg {
+    let vn = |s: &str| VarName(s.to_string());
+    IrProg {
+        code: vec![
+            IrStmt::OpenCursor {
+                cursor: vn("c"),
+                source: CursorSource::Static {
+                    sql: "SELECT a FROM t".to_string(),
+                    binds: vec![],
+                    fn_sites: vec![],
+                },
+            },
+            IrStmt::Fetch {
+                cursor: vn("c"),
+                targets: vec![AssignTarget::Var(vn("x"))],
+                record: false,
+            },
+            IrStmt::Assign {
+                target: AssignTarget::Var(vn("s")),
+                expr: IrExpr::Var(vn("x")),
+            },
+            IrStmt::JumpIf {
+                cond: IrExpr::Const(SpinValue::Bool(exit_on)),
+                to: 5,
+            },
+            IrStmt::Jump(1),
+            IrStmt::Nop,
+        ],
+        var_types: Default::default(),
+        local_ddl: Vec::new(),
+    }
+}
+
+fn replay_ex() -> FakeExecutor {
+    FakeExecutor::with_rows(
+        vec!["a".to_string()],
+        vec![
+            vec![SpinValue::Int(10)],
+            vec![SpinValue::Int(20)],
+            vec![SpinValue::Int(30)],
+        ],
+    )
+}
+
+/// 前缀只跑 OPEN（span stop=fetch_pc=1），返回已开游标的 frame。
+fn replay_prefix(prog: &IrProg, ex: &FakeExecutor) -> Frame {
+    let mut f = Frame::new();
+    let mut sink = TraceNoopSink;
+    let cat = crate::catalog::RoutineCatalog::new();
+    let out = run_spanned(
+        prog,
+        &mut f,
+        ex,
+        &mut sink,
+        &cat,
+        0,
+        RunControl {
+            limits: RunLimits::default(),
+            span: RunSpan {
+                start_pc: 0,
+                stop_pc: Some(1),
+                exit_pc: None,
+                entry_exec: false,
+            },
+        },
+    )
+    .expect("prefix");
+    assert_eq!(out, RunOutcome::Stopped);
+    f
+}
+
+#[test]
+fn should_replay_cursor_row_via_real_fetch_and_stop_at_next_iteration() {
+    // exit_on=false：Fetch(行1=20)+体+回边 → Stopped@fetch_pc → IterDone；
+    // 真实 Fetch 语义：x/s 均被赋为第 2 行值（seek_before(1) 行号对齐）。
+    let prog = replay_test_prog(false);
+    let ex = replay_ex();
+    let mut f = replay_prefix(&prog, &ex);
+    let mut sink = TraceNoopSink;
+    let cat = crate::catalog::RoutineCatalog::new();
+    let spec = ReplaySpec {
+        cursor: &VarName("c".to_string()),
+        row_index: 1,
+        fetch_pc: 1,
+        exit_pc: 5,
+        limits: RunLimits::default(),
+    };
+    let out = replay_cursor_row(&prog, &mut f, &spec, &ex, &mut sink, &cat, 0).expect("replay");
+    assert_eq!(out, RowReplay::IterDone);
+    assert_eq!(f.get(&VarName("x".to_string())), Some(&SpinValue::Int(20)));
+    assert_eq!(f.get(&VarName("s".to_string())), Some(&SpinValue::Int(20)));
+}
+
+#[test]
+fn should_report_loop_exited_when_body_takes_exit_edge() {
+    // exit_on=true：体内 JumpIf 命中 exit_pc → LoopExited（混合调度须中止余段）。
+    let prog = replay_test_prog(true);
+    let ex = replay_ex();
+    let mut f = replay_prefix(&prog, &ex);
+    let mut sink = TraceNoopSink;
+    let cat = crate::catalog::RoutineCatalog::new();
+    let spec = ReplaySpec {
+        cursor: &VarName("c".to_string()),
+        row_index: 0,
+        fetch_pc: 1,
+        exit_pc: 5,
+        limits: RunLimits::default(),
+    };
+    let out = replay_cursor_row(&prog, &mut f, &spec, &ex, &mut sink, &cat, 0).expect("replay");
+    assert_eq!(out, RowReplay::LoopExited);
+}

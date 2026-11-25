@@ -486,6 +486,9 @@ fn entry_plan() -> ConversionPlan {
         route_guards: Vec::new(),
         expr_guards: Vec::new(),
         miss_outs: Vec::new(),
+        exc_guards: Vec::new(),
+        hybrid: None,
+        seg_sql: None,
         discriminator: None,
     }
 }

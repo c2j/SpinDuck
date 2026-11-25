@@ -25,6 +25,87 @@ pub struct EvalEnv<'a> {
     pub sink: &'a mut dyn crate::exec::TraceSink,
 }
 
+/// 零数据库纯表达式求值（loop-parallel Worker 沙箱，设计 §3.1 门禁 1
+/// 「`eval` 求值路径不触碰 `env.ex`」的执行面）：仅覆盖
+/// `Const`/`Var`/`Field`/`Bin`/`Case`/`Not`/`IsNull`；其余变体一律
+/// `ENG` 不变量错误——静态门禁保证不会到达，防御性拒绝优于静默错值。
+pub fn eval_pure(e: &IrExpr, frame: &mut Frame) -> Result<SpinValue, EngineError> {
+    match e {
+        IrExpr::Const(v) => Ok(v.clone()),
+        IrExpr::Var(name) => frame
+            .get(name)
+            .cloned()
+            .ok_or_else(|| EngineError::business(122, format!("undefined variable {}", name.0))),
+        IrExpr::Field { rec, field } => frame.record_field(rec, field).cloned(),
+        IrExpr::IsNull(inner) => {
+            let v = eval_pure(inner, frame)?;
+            Ok(SpinValue::Bool(matches!(v, SpinValue::Null)))
+        }
+        IrExpr::Not(inner) => match eval_pure(inner, frame)? {
+            SpinValue::Null => Ok(SpinValue::Null),
+            SpinValue::Bool(b) => Ok(SpinValue::Bool(!b)),
+            other => Err(EngineError::business(
+                123,
+                format!("NOT requires boolean, got {}", other.display()),
+            )),
+        },
+        IrExpr::Bin { op, l, r } => {
+            let l = eval_pure(l, frame)?;
+            let r = eval_pure(r, frame)?;
+            eval_bin(*op, &l, &r)
+        }
+        IrExpr::Case {
+            operand,
+            whens,
+            else_expr,
+        } => eval_case_pure(operand.as_deref(), whens, else_expr.as_deref(), frame),
+        IrExpr::CursorAttr { .. }
+        | IrExpr::SqlFn { .. }
+        | IrExpr::FuncCall { .. }
+        | IrExpr::Lookup { .. } => Err(EngineError::invariant(
+            66,
+            "non-pure expression reached worker eval (loop-parallel gate violation)",
+        )),
+    }
+}
+
+/// `eval_pure` 的 CASE 分支（与 `eval_case` 同三值语义，零数据库）。
+fn eval_case_pure(
+    operand: Option<&IrExpr>,
+    whens: &[(IrExpr, IrExpr)],
+    else_expr: Option<&IrExpr>,
+    frame: &mut Frame,
+) -> Result<SpinValue, EngineError> {
+    let selected = operand.map(|e| eval_pure(e, frame)).transpose()?;
+    for (condition, result) in whens {
+        let hit = match &selected {
+            Some(value) => {
+                eval_bin(BinOp::Eq, value, &eval_pure(condition, frame)?)? == SpinValue::Bool(true)
+            }
+            None => eval_cond_pure(condition, frame)? == Some(true),
+        };
+        if hit {
+            return eval_pure(result, frame);
+        }
+    }
+    match else_expr {
+        Some(e) => eval_pure(e, frame),
+        None => Ok(SpinValue::Null),
+    }
+}
+
+/// `eval_pure` 的三值条件（`JumpIf*` 用）。
+fn eval_cond_pure(e: &IrExpr, frame: &mut Frame) -> Result<Option<bool>, EngineError> {
+    match eval_pure(e, frame)? {
+        SpinValue::Null => Ok(None),
+        SpinValue::Bool(b) => Ok(Some(b)),
+        other => Err(EngineError::business(
+            123,
+            format!("condition must be boolean, got {}", other.display()),
+        )),
+    }
+}
+
 /// 三值逻辑条件求值：Some(bool) 确定性；None = UNKNOWN（EXIT WHEN 按 false）。
 pub fn eval_cond(e: &IrExpr, env: &mut EvalEnv<'_>) -> Result<Option<bool>, EngineError> {
     match eval(e, env)? {
@@ -213,7 +294,7 @@ fn eval_builtin(
         .unwrap_or(SpinValue::Null))
 }
 
-fn eval_bin(op: BinOp, l: &SpinValue, r: &SpinValue) -> Result<SpinValue, EngineError> {
+pub(crate) fn eval_bin(op: BinOp, l: &SpinValue, r: &SpinValue) -> Result<SpinValue, EngineError> {
     use SpinValue as V;
     // NULL 传播：算术/比较任一侧 NULL → NULL；AND/OR 走三值逻辑
     let null_prop = matches!(

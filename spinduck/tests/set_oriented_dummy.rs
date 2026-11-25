@@ -258,6 +258,7 @@ fn should_reject_sys_dummy_block_when_not_total_and_verify_decimal_mul_sub() {
     scenario_dec_wide_fallback();
     scenario_miss_emu();
     scenario_miss_fallbacks();
+    scenario_miss_dup_hybrid();
     scenario_view_cast_fallback();
     scenario_const_view();
     scenario_mixed_trap_skip();
@@ -415,6 +416,35 @@ fn scenario_miss_fallbacks() {
     );
     assert_eq!(dst_rows(&eng), expected_rows);
     assert_eq!(actual.outs, expected.outs, "回退后 OUT 须与 Off 一致");
+}
+
+/// 混合调度守护（so-exception-row-hybrid §6）：维度重复键 → 非空
+/// exc 行集 → `Status::Converted`（混合路径），异常行单行重放 +
+/// 正常行段批写的行集/OUT 与 Off 逐值一致。此前混合半区在常驻
+/// CI 零覆盖（仅 golden 探针验证），本用例补齐。
+fn scenario_miss_dup_hybrid() {
+    // bond_para 中 S1 重复（too_many_rows 异常行），S2 唯一命中；
+    // cur_rows = S1,S2,S2 → exc={0}，段 [1,3) 批写 + 行 0 重放。
+    let ddl = miss_ddl(
+        &["('S1','K1')", "('S1','K2')", "('S2','K3')"],
+        &["('S1',10.50,'a')", "('S2',20.25,'b')", "('S2',30.75,'c')"],
+    );
+    let routines = [caller_miss()];
+    let mut off = engine_with_routines(&miss_refs(&ddl), SetOrientedMode::Off, &routines);
+    let expected = off.call("caller_miss", &args()).unwrap();
+    let expected_rows = dst_rows(&off);
+    assert_eq!(expected_rows.len(), 3, "Off 语义基线: {expected_rows:?}");
+
+    let mut eng = engine_with_routines(&miss_refs(&ddl), SetOrientedMode::BatchAtomic, &routines);
+    let actual = eng.call("caller_miss", &args()).unwrap();
+    let Status::Converted { .. } = eng.set_oriented_reports()[0].status.clone() else {
+        panic!(
+            "维度重复必须走混合 Converted: {:?}",
+            eng.set_oriented_reports()
+        );
+    };
+    assert_eq!(dst_rows(&eng), expected_rows, "混合调度与 Off 逐行一致");
+    assert_eq!(actual.outs, expected.outs, "OUT 形参须与 Off 一致");
 }
 
 /// 混合兜底 trap 回归（PR#59 评审）：保护区内 SELECT INTO 之后的语句

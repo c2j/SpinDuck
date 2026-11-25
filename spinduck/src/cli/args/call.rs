@@ -34,6 +34,7 @@ pub(super) fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
     let mut on_skip = None;
     let mut on_skip_error_if: std::collections::BTreeSet<crate::ir::set_oriented::SkipReason> =
         std::collections::BTreeSet::new();
+    let mut loop_parallel = None;
     let mut step_budget: Option<u64> = None;
     let mut rules = None;
     let mut trace = None;
@@ -105,6 +106,16 @@ pub(super) fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
                         })?;
                     on_skip_error_if.insert(reason);
                 }
+            }
+            flag if flag == "--loop-parallel" || flag.starts_with("--loop-parallel=") => {
+                if loop_parallel.is_some() {
+                    return Err(dup_flag_err("--loop-parallel"));
+                }
+                let name = flag.strip_prefix("--loop-parallel=").unwrap_or("safe");
+                loop_parallel = Some(
+                    crate::ir::loop_parallel::LoopParallelMode::from_name(name)
+                        .ok_or_else(|| usage_err("--loop-parallel[=off|safe]"))?,
+                );
             }
             "--step-budget" => {
                 if step_budget.is_some() {
@@ -206,6 +217,7 @@ pub(super) fn parse_call(rest: &[String]) -> Result<Command, EngineError> {
         set_oriented,
         on_skip,
         on_skip_error_if,
+        loop_parallel,
         step_budget,
         trace,
         trace_format: trace_format.unwrap_or_default(),
@@ -248,6 +260,7 @@ mod tests {
                     set_oriented: Some(mode),
                     on_skip: None,
                     on_skip_error_if: std::collections::BTreeSet::new(),
+                    loop_parallel: None,
                     step_budget: None,
                     trace: None,
                     trace_format: TraceFormat::Text,
@@ -356,6 +369,7 @@ mod tests {
                 set_oriented: None,
                 on_skip: None,
                 on_skip_error_if: std::collections::BTreeSet::new(),
+                loop_parallel: None,
                 step_budget: None,
                 trace: None,
                 trace_format: TraceFormat::Text,
@@ -390,6 +404,7 @@ mod tests {
                 set_oriented: None,
                 on_skip: None,
                 on_skip_error_if: std::collections::BTreeSet::new(),
+                loop_parallel: None,
                 step_budget: None,
                 trace: None,
                 trace_format: TraceFormat::Text,
@@ -414,6 +429,7 @@ mod tests {
                 set_oriented: None,
                 on_skip: None,
                 on_skip_error_if: std::collections::BTreeSet::new(),
+                loop_parallel: None,
                 step_budget: Some(20_000_000),
                 trace: None,
                 trace_format: TraceFormat::Text,

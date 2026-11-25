@@ -1,0 +1,12 @@
+=== V4 loop-parallel 真实语料验证（case_corpus_purchase，进程内 DuckDB 1.5.5）===
+分支: feat-loop-parallel   日期: 2026-11-22
+
+例程 | 规模 | 等价性(OUT+全表) | Safe 判定 | 性能 off_min/safe_min
+pkg_split_trade_step3_sh.prc_trd_deal_purchase | 小(3行) | EQ | Skipped InsufficientParallelWork | -
+pkg_split_trade_step3_sh.prc_trd_deal_purchase | 大(600行) | EQ | Skipped InsufficientParallelWork | 135ms / 126ms
+pkg_split_trade_step3_sh.prc_trd_hz_byfund | 小(2组) | EQ | Skipped MaterializedFnSitePresent | -
+pkg_split_trade_step3_sh.prc_trd_hz_byfund | 大(~1000组) | EQ | Skipped MaterializedFnSitePresent | 8040ms / 8069ms
+
+结论：两个真实存储过程在当前门禁设计下均保守 Skipped——
+purchase 在静态最小工作量门禁即拒（行键 SELECT INTO 不可预热 → G_pure 为空），
+byfund 在 fn_sites 物化门禁拒。Safe≡Off 业务输出逐值全等，性能中性（无回归）。

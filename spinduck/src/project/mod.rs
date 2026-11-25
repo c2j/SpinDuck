@@ -20,6 +20,7 @@ pub use entry::EntryConfig;
 pub use manifest::{manifest_text, sync_runtime_manifest, ManifestSync, SNAPSHOT_FILE};
 
 use crate::error::EngineError;
+use crate::ir::loop_parallel::{LoopParallelConfig, LoopParallelMode};
 use crate::ir::set_oriented::SetOrientedMode;
 use crate::project::fs::{cfg_err, list_dir_suffix, read_text, sql_files};
 use std::path::{Path, PathBuf};
@@ -35,6 +36,8 @@ pub struct ProjectConfig {
     /// `[engine].set_oriented_on_skip`（可选）：`call` 判定行前移策略
     /// （report/error；CLI `--on-skip` 覆盖）。
     pub set_oriented_on_skip: Option<crate::ir::set_oriented::OnSkip>,
+    /// `[engine].loop_parallel`：集合化退回后的二级降级并行通道（默认全关）。
+    pub loop_parallel: LoopParallelConfig,
     pub ddl_dir: PathBuf,
     pub routines_dir: PathBuf,
     pub stubs_dirs: Vec<PathBuf>,
@@ -140,6 +143,58 @@ fn engine_options(
         }
     };
     Ok((mode, on_skip))
+}
+
+/// `[engine].loop_parallel`：`"off"|"safe"` / 布尔 / `{ mode, threads, chunk_size, min_rows }`。
+fn loop_parallel_option(v: &toml::Value) -> Result<LoopParallelConfig, EngineError> {
+    let bad = || {
+        EngineError::env(
+            30,
+            "spinduck.toml: [engine].loop_parallel 必须为布尔值、off/safe 或含 mode/threads/chunk_size/min_rows 的表",
+        )
+    };
+    let Some(engine) = v.get("engine") else {
+        return Ok(LoopParallelConfig::default());
+    };
+    let table = engine
+        .as_table()
+        .ok_or_else(|| EngineError::env(30, "spinduck.toml: [engine] 必须为表"))?;
+    let Some(value) = table.get("loop_parallel") else {
+        return Ok(LoopParallelConfig::default());
+    };
+    let mut cfg = LoopParallelConfig::default();
+    match value {
+        toml::Value::Boolean(on) => {
+            cfg.mode = if *on {
+                LoopParallelMode::Safe
+            } else {
+                LoopParallelMode::Off
+            }
+        }
+        toml::Value::String(name) => {
+            cfg.mode = LoopParallelMode::from_name(name).ok_or_else(bad)?;
+        }
+        toml::Value::Table(t) => {
+            if let Some(m) = t.get("mode") {
+                cfg.mode =
+                    LoopParallelMode::from_name(m.as_str().ok_or_else(bad)?).ok_or_else(bad)?;
+            }
+            for (key, slot) in [
+                ("threads", &mut cfg.threads),
+                ("chunk_size", &mut cfg.chunk_size),
+                ("min_rows", &mut cfg.min_rows),
+            ] {
+                if let Some(n) = t.get(key) {
+                    *slot = n
+                        .as_integer()
+                        .and_then(|x| usize::try_from(x).ok())
+                        .ok_or_else(bad)?;
+                }
+            }
+        }
+        _ => return Err(bad()),
+    }
+    Ok(cfg)
 }
 
 fn is_runtime_snapshot(file: &Path) -> bool {
@@ -263,11 +318,13 @@ impl ProjectConfig {
         }
 
         let (set_oriented, set_oriented_on_skip) = engine_options(&v)?;
+        let loop_parallel = loop_parallel_option(&v)?;
         Ok(Self {
             name: name.to_string(),
             kernel: kernel.to_string(),
             set_oriented,
             set_oriented_on_skip,
+            loop_parallel,
             ddl_dir: get_path("ddl", "sql/ddl"),
             routines_dir: get_path("routines", "sql/routines"),
             stubs_dirs,

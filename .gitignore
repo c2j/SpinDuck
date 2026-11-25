@@ -29,6 +29,8 @@ tarpaulin-report.html
 
 # ───────────── 日志 / 临时文件 ─────────────
 *.log
+# 验收证据日志例外：golden 验证报告引用的实测输出须入库
+!golden/**/reports/*.log
 *.tmp
 *.bak
 *.orig

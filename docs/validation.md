@@ -5406,6 +5406,210 @@ byfund Off ~0.15s vs Batch ~2.8s。Batch 耗时随规模亚线性（purchase
   不一致——同源铁律只承诺同一 SQL 与同一标签口径，不承诺跨时点
   稳定，下游不得把 `arm=` 当稳定契约消费。
 - 不声称 release 构建性能（全部数字为 debug 构建实测）。
+<<<<<<< HEAD
+## V55. loop-parallel + SO 行级混合落地与 PR#62 评审修复实证（2026-11-24）
+
+> 编号说明：PR#62 与 PR#63 各自将实证登记为 V52（编号撞车）；合并模拟
+> 中 PR#62 段顺延为 V55，PR#63 的 V52（on-skip 判定行）/V53/V54 保留原号。
+
+### V55.1 评审必修项修复与守护测试
+
+- **回滚缓存失效（P0-1）**：`RollbackWatch` 恒启用 + `LookupState::invalidate_on_rollback()`
+  （只清 `Slot::Ready` 数据槽、保留 `Slot::Off` 降级标记）。实证反例：
+  `tests/loop_parallel.rs::should_invalidate_frozen_snapshot_after_mid_loop_rollback`
+  ——前缀未提交 `UPDATE lut` + 第 3 行 `ROLLBACK`，Safe/Off 两模式行 4/5 均读回
+  回滚后值 10（修复前 Off 模式串行路径即读到回滚前 1010，属既有串行漏洞）。
+  `set_oriented_dummy::should_reject_sys_dummy_block_when_not_total_and_verify_
+  decimal_mul_sub` 同步验证：全清方案会使回滚后重跑必然失败的 build SQL
+  （视图全量物化 CAST 错）把事务打入 aborted 态丢行，Ready-only 口径两全。
+- **例程物化读写相交（P0-2）**：`tests/loop_parallel.rs::
+  should_not_serve_stale_call_snapshot_when_loop_writes_callee_read_table`
+  锁定门禁 7 拒绝（callee `SqlQuery` 读表并入 `R_prefix`）。
+- **混合前置证明（P0-3）**：`sd_cur` 单次物化 `__sd_hcur_<seq>` + 游标流重绑定
+  消除无序 GROUP BY 行序漂移；`exc_rows` 畸形 → `HybridPreflightFailed`
+  安全串行回退。实证：byfund_branch SO `Skipped{AmbiguousTop1Tie}` →
+  `Converted`（混合路径），探针连跑 3/3 稳定 Converted（修复前 2/3 抖动）。
+- **trace 契约（P1）**：Worker `SqlQuery` 补发 `IrStmt{SqlQuery}`；
+  `SqlExec.elapsed_us` 全站点实测；`peak_snapshot_bytes` 真实化。
+
+### V55.2 门禁
+
+`cargo fmt --all -- --check`、`cargo clippy --all-features --tests -- -D warnings`、
+`cargo test --features cli`（65 个测试目标全绿，742 lib + 全部集成）通过。
+`cargo audit`：7 个存量传递依赖公告（zip 6.0.0 ×6、bincode/chrono/
+unsafe-libyaml unmaintained），非本 PR 引入，单独跟进。
+
+### V55.3 不声称
+
+- 不声称 `zz_top1_pick_probe` 类环境行为探针留在常驻 CI：已按评审移除
+  （其结论——GROUP BY 无 ORDER BY 行序不稳定——已由 P0-3b 物化方案
+  架构性消解，断言本身依赖内核实现细节会随升级漂移）。
+- 不声称混合 SO 在 byfund_branch 上快于串行：实测 so_ba≈51s vs off≈43s
+  （exc 占比高 → 段数≈|E|+1 固有成本），其价值是"此前整体拒绝的区域
+  现在可转换"；性能最优路径仍是 LP（lp_safe≈42s）。
+
+### V55.4 合并模拟基准（PR#62 × PR#63 双 head 合并树，2026-11-24）
+
+模拟分支 `sim/pr62-63-merged`（main 867a731 + PR#62 head 00da4c6 + PR#63
+head 5f5358b 三方合并，门禁 fmt/clippy/test 1270 全绿）上以 V4 探针重跑
+purchase/byfund 100k 矩阵（debug 构建、8 线程、`golden/v4_loop_parallel_verify/
+reports/probe_run.log`）：
+
+| 场景 | off | so_ba | lp_safe | so_lp | 结论 |
+|---|---|---|---|---|---|
+| purchase_base (~9.6 万游标行) | 56136 | 14605 | 14597 | **11104** | SO 3.8×/LP 3.8×/SO+LP 5.1× |
+| purchase_branch_k0 (kind='0'，arm=Else) | 127196 | 10629 | 61983 | **6336** | SO 12.0×；D7 判别式选臂 `Some(Else)` |
+| purchase_branch_k1 (kind='1'，arm=Then) | 140125 | 11485 | 65770 | **9619** | SO 12.2×；D7 判别式选臂 `Some(Then)`——**PR#62 route_alt 首轮 Skipped 再选臂的形态在合并树上消失**，首轮即 `Converted{arm=Then}` |
+| byfund_base (5000 分组) | 469166 | 23878 | 228513 | **9529** | SO 19.6×；`__sd_hcur` 物化跨 3 次调用稳定，SO+LP 49.7× 全场最优 |
+| byfund_branch (5000 分组·异常行) | 521908 | **ENG-0032** | 276340 | **ENG-0032** | lp_safe 1.9×；混合 SO 见下 |
+
+D7 判别式运行期选臂证据：k1 两配置 `Converted{arm: Some(Then)}`、k0 两配置
+`Converted{arm: Some(Else)}`、非路由区域 `arm: None`——PR#63 的结构化臂
+报告与 PR#62 的 LP/混合通道在同一合并树上同时成立。
+
+#### byfund_branch 混合 SO 确定性失败：两层根因（归因诊断记录）
+
+`v4_perf_byfund_branch` so_ba/so_lp 在合并树（5a3d1a9 起）确定性失败：
+`ENG-0032 "sd_cur rematerialize order drift"`（两轮独立复现；pre-5a3d1a9
+合并树同场景 3 轮全过）。带桩诊断（`ensure_hcur`/`materialize_hcur`
+临时埋点）定位出**两层问题**，第一层已修，第二层为 PR#62 设计层缺口：
+
+**层 1（已修）：重建序无确定性保证。** `ensure_hcur` 以同文本
+`spec.hcur_sql` 重建 `__sd_hcur_N`，其注释假设「同查询同数据重建序
+应稳定」——段批写后优化器统计变化可改变 `ROW_NUMBER() OVER ()` 的
+赋序管线。修复：`copy/badrow.rs::sd_cur_rows` 物化 SELECT 追加**全列
+`ORDER BY`**（`select.columns` 输出名，verbatim 恒等映射口径两种游标
+形态皆正确）——序由内容唯一决定（GROUP BY 分组键唯一即全序；整行重复
+互换不可观测），物化与重建共用同一文本，重建必然复现原序。修复后
+call #1 的 7 次重建全部按规范序恒等复现。
+
+**层 2（已登记，未修——PR#62 设计层缺口）：重放路径例程缓存名冲突。**
+修复层 1 后失败依旧，且诊断显示失败轮重建结果为 **0 行**（tbl=0 vs
+shared=1005）而非顺序漂移——`ENG-0032` 的 "order drift" 消息属误导性
+表述。真实因果链：SO 计划期为游标 WHERE 例程（`fnc_get_fund_data_mode`）
+的缓存分配 `sd_fn0`、为 INSERT 位例程（`fnc_get_rate_info2`）改名
+`sd_bf0` 避让；但异常行重放的原生执行按 statement 级命名
+（`sqlfn/plan.rs::format!("sd_fn{i}")`，语句内站点序）把 rate_info2
+缓存也建为 `sd_fn0`——**重放写换 `sd_fn0` 内容后，hcur_sql 的 WHERE
+查找全不匹配 → 全行过滤 → 重建空集**。时序证据：call #1 期间
+`sd_fn0` 恒为 fund_data_mode 的 4 行（重放查找打错缓存靠缺省兜底，
+未暴露）；call #2 重放时点 `sd_fn0` 空缺 → rate_info2 数据写入 →
+下一次 `ensure_hcur` 重建即空集。即重放行例程缓存与 SO 计划缓存共享
+命名空间无协调，属 PR#62 混合重放设计层缺口（其分支 16/16 为时序
+侥幸）。守护测试
+`guard_set_oriented_hybrid_hcur::should_survive_hybrid_hcur_rebuild_
+across_calls`（scale(200) 约 68s 确定性复现）以 `#[ignore]` 登记原因，
+PR#62 修复（建议：重放缓存按函数语义命名与计划缓存共用一份，或重放
+前将计划缓存内容预种到解释器命名空间）后移除 ignore 转绿。
+
+> 注意：层 2 的隐蔽面比 ENG-0032 更深——call #1 不失败，但重放行的
+> rate_info2 查找打到了 fund_data_mode 的缓存上（键形态不同必不匹配），
+> 依赖缺省值兜底；若缺省值 ≠ 真实例程返回值，重放行写入即偏离 Off。
+> 本轮语料因异常行副作用被约束为序不变（BRANCH_COVERAGE.md 种子约束）
+> 而未暴露，等价性守护无法覆盖此缺口。
+
+#### 合并语义变更登记（评审口径）
+
+- 双臂机制统一为 PR#63 D7 判别式；PR#62 route_alt 退役。THEN 臂独立
+  证明失败 → 静默降级单臂（route_alt 口径），主计划 route_guards 守
+  「THEN 不可达」，运行态拒绝仍经 SO→LP 派发缺口交 LP（两 PR 语义同时
+  成立）。
+- THEN 臂 SELECT INTO 准入合成两侧超集：PR#62 `arm_query/finish_arm`
+  （parse_total 全定义 + 处理器重置兜底 + 组内局部死）+ PR#63 活常量
+  折叠 + `parse_then_case_sink`。
+- `guard_set_oriented_lookup::should_convert_route_if_when_both_arms_are_
+  convertible`（PR#62 新增）在统一设计下转绿：TrapGroup 形态 D7 臂走查
+  打通（原 PR#63 臂内仅受理 sys_dummy CASE 形态，普通 SELECT INTO 被拒）。
+- `tests/loop_parallel.rs`：原 `should_parallelize_region_when_route_guard_
+  rejects_at_runtime` 场景在统一设计下 SO 期即转换（THEN 臂可折叠加持），
+  改名 `should_convert_dual_arm_region_when_both_arms_convertible` 断言
+  `Converted{arm=Then}` + LP 报告为空；新增
+  `should_parallelize_region_when_then_arm_unconvertible` 以 THEN 臂双变量
+  INTO（不可证）场景原样保留 `Skipped{UnsupportedControlFlow}` +
+  LP `Parallelized` 断言——SO→LP 派发缺口继续有守护。
+- `SkipReason::HybridPreflightFailed` 补 kebab 名 `hybrid-preflight-failed`
+  （PR#62 未注册，`--on-skip-error-if` 需要可引用名）。
+- docs 编号：PR#62/PR#63 各自登记 V52 撞号，PR#62 段顺延为 V55。
+## V56. PR#62 二轮评审修复实证（2026-11-25）
+
+> 编号说明：本段由 PR#62 devin 以 V53 自编号，与 PR#63 的 V53 撞号，
+> 合并树顺延为 V56（PR#62 此前实证见 V55）。
+
+### V53.1 修复项
+
+- **物化失败事务毒化（P1-1）**：`materialize_hcur` CTAS、
+  `rebind_hcur_cursor`/`hcur_order_ok` 取数查询失败会把事务打入
+  aborted 态。修复双层：计划期 `hybrid_prefix_clean` 门禁
+  （新增 `region::prefix_pending_writes`——前缀 `[0,open_pc)` 挂起写
+  集须为空，`TxCommit`/`TxRollback` 清空已提交写，`TxCommitIfWritten`
+  与例程内部提交不可证、保守计入；fn 前导例程写集同口径）；运行期
+  各失败点 `ROLLBACK + BEGIN TRANSACTION` 复位（视图物化探测同口径）。
+  前缀有挂起写/opaque → 不产混合计划。
+- **重建数据源修正（实测暴露的潜在 bug）**：`ensure_hcur` 重建原先
+  重跑 `hcur_sql`——游标源表被循环体写改后内容漂移，实测触发
+  `ENG-0032 sd_cur rematerialize order drift`（byfund_branch
+  scale=1000）。改为：schema 经 `LIMIT 0` 空结果物化（列名/类型
+  保留），数据由冻结 `shared_rows` 逐块 `INSERT ... VALUES` 装载
+  （`sql_literal` 字面量化，256 行/块）——重建内容与游标绑定序
+  由构造保证，不再依赖源表不可变假设。
+- **临时表泄漏（P3-2）**：物化成功后 `exc_rows` `?` 出口与畸形/
+  兜底早退逐一显式 `drop_hcur_table`；`run_hybrid_region` 自持清理
+  覆盖内部全部出口。
+- **报告口径（P2-1）**：`Status::Converted.sql` 上报占位符版
+  （`__SD_HCUR__`），实测输出确认不含 `__sd_hcur_<seq>` 会话名。
+- **引号标识符（P2-2）**：`callmat::sql_read_tables` token 扫描兜底
+  遇 `"` 引号标识符保守 `Err(())`（过度拒绝安全方向），单测锁定。
+- **elapsed_us（P3-1）**：`writebuf::execute_traced` 与
+  `set_oriented::exec_sql` 改实测耗时（与 `sqlstmts` 同口径：
+  先执行后发事件，错误路径同样上报）。
+- **CI 覆盖（P1-2）**：`set_oriented_dummy` 新增
+  `scenario_miss_dup_hybrid`（维度重复 → 非空 exc → Converted +
+  行集/OUT ≡ Off）；`exc_rows` 重构为收 `&[BoundGuard]` 并补三态
+  单测（正常集/畸形→None/空集）。
+
+### V53.2 实证
+
+- `zz_so_status_byfund_branch`（临时探针，已删）：byfund_branch
+  scale=1000 下 SO `Converted`（混合路径），期间真实触发
+  `ensure_hcur` 重建路径（重放行原生例程回滚撤销临时表）并经
+  冻结行重建通过 `hcur_order_ok` 校验；测试全程 842s（并发负载
+  下），`outs/state` 与 Off 等价由 `v4_byfund_branch_equiv` 系
+  列用例覆盖。
+- `cargo test --test set_oriented_dummy`（含新混合守护）、
+  `cargo test --lib`（748 项，含 exc_rows/callmat 新单测）通过。
+
+### V53.3 不声称
+
+- 不声称重建路径性能无损：`ensure_hcur` 重建为罕见路径（仅当
+  重放行例程调用回滚撤销临时表时触发），5000 行规模下约 20 条
+  分块 INSERT；100k 级极端情形未单独压测。
+- `load_hcur_rows` 对 `SpinValue::Blob/Record` 生成 `<blob>`/
+  `<record>` 占位字面量会产生解析错误——游标列出现该类型时
+  ensure_hcur 上抛（响亮失败非静默错数据）；byfund/purchase
+  实测游标列均为标量，未触发。
+
+### V55.4a 终局集成与 a3ab5b0 复审验证（2026-11-25）
+
+PR#62 devin 按评审任务（task_id=pr62-fix-001）完成三：
+
+- **层 2 静默错值面**：计划侧游标位例程缓存 `sd_fnN`→`sd_pfnN` 命名空间
+  隔离（`rename_cursor_fn_cache` 词法边界扫描，覆盖 sql/seg_sql/守卫/
+  miss_outs/fn_preludes/view_preludes；解释器重放只产 `sd_fn{数字}`，
+  结构性无冲突）；新增守护 `guard_set_oriented_hybrid_fncache`（含修复前
+  Red 证据：6 行 vs 4 行分歧实测；accrual/accrual_tax 与 Off 逐值断言），
+  并修正段批写被共享事务回滚抹除的问题（段写后 COMMIT+BEGIN 边界；
+  batch_commit 下混合计划整体关闭）。
+- **ENG-0032 分因**：`HcurOrder` 四成因枚举 +
+  `SkipReason::HybridHcurMaterializeFailed`（入口物化失败与守卫证据类
+  区分）。
+- **层 1**：`sd_cur_rows` 全列 ORDER BY（与合并树 b990cc7 同源互认）。
+
+复审独立验证（opencode，feat-loop-parallel worktree @a3ab5b0）：fmt/clippy
+`-D warnings` 全绿；`cargo test --features cli` 1238 passed / 0 failed
+（zz 探针截断前）；**byfund_branch 场景独立复验 1 passed / 0 failed**
+（1422s，四配置 OUT 断言全过，ENG-0032 未再现——d854214 回灌方案 + a3ab5b0
+命名隔离叠加生效）。终局集成预期：byfund_branch 集合化恢复可用。
+=======
 - 不声称 §12.3(e) 目标可观测形态已实现：逐臂明细行
   （`arm=… verdict=… unchecked=…`）、`guards=N/M` 计数、
   `arm=none` 字段、未选中臂 `Unchecked(control-flow-excluded)`、
@@ -5484,3 +5688,26 @@ byfund Off ~0.15s vs Batch ~2.8s。Batch 耗时随规模亚线性（purchase
    `fallback::should_reject_at_runtime_for_lp_takeover_when_then_
    arm_unconvertible`（THEN 臂双变量 INTO 不可证 → 分析期降级 →
    运行态拒绝，SO 侧接管点守护）。
+>>>>>>> 0657715
+
+### V55.4b 终局集成矩阵（两 PR 修复全部落地后，2026-11-25）
+
+终局树 = main + PR#62 head a3ab5b0 + PR#63 head 0657715 全量合并
+（1281 测试全绿）。byfund_branch **集合化恢复可用**（层 2 命名隔离 +
+回灌重建叠加生效，ENG-0032 未再现）：
+
+| 场景 | off | so_ba | lp_safe | so_lp | 最优 |
+|---|---|---|---|---|---|
+| purchase_base | 13.7s | 5.1s（2.7×） | 5.8s | **3.7s（3.7×）** | so_lp |
+| purchase_branch_k0（arm=Else） | 29.6s | 2.8s（10.6×） | 27.0s | **2.9s（10.2×）** | so_lp |
+| purchase_branch_k1（arm=Then） | 32.7s | 3.9s（8.3×） | 28.3s | **3.7s（8.8×）** | so_lp |
+| byfund_base | 134.3s | 4.3s（31.5×） | 82.7s | **4.2s（31.7×）** | so_lp≈so_ba |
+| byfund_branch | 140.6s | 110.3s（1.3×） | **78.8s（1.8×）** | 107.1s（1.3×） | lp_safe |
+
+- 等价：全部场景/配置 OUT 与用户表状态逐值 EQ（9 处 outs=EQ 断言行）。
+- D7 选臂：k1 `Converted{arm:Some(Then)}`、k0 `Converted{arm:Some(Else)}`
+  （本轮矩阵报表口径同 V55.4）。
+- byfund_branch 通道结论：lp_safe 1.8× 为该场景最优；集合化可用但仅
+  1.3×（混合路径的段批写+异常行重放固有成本），供数据特征选型。
+- 探针报告：`golden/v4_loop_parallel_verify/reports/probe_run.log`
+  （16/16，1451.50s）。

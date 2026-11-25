@@ -11,6 +11,7 @@ use super::schema::{Column, Default, Table};
 use super::shape::{self, Name};
 use super::{agg, entry, expr, lookup, substitute_binds, BindSrc, CopyLoop, SinkOp, SkipReason};
 use badrow::sd_cur_cte;
+pub(in crate::ir::set_oriented) use badrow::sd_cur_rows;
 use inline::{inline_projection, ProjEnv};
 
 pub(super) struct CopySql {
@@ -27,6 +28,10 @@ pub(super) fn copy_sql(
     lookups: &[lookup::ResolvedLookup],
     tuples: &[lookup::ResolvedTuple],
     aggs: &[agg::ResolvedAgg],
+    // rn = 混合调度（so-exception-row-hybrid）：sd_cur 附 `__sd_rn`
+    // 0 基行号列，外层 WHERE 追加 `BETWEEN __SD_LO__/__SD_HI__` 段谓词
+    // 占位符（引擎按段替换）。
+    rn: bool,
 ) -> Result<CopySql, SkipReason> {
     let (select, insert) = shapes;
     let (source, target) = tables;
@@ -89,6 +94,7 @@ pub(super) fn copy_sql(
         (insert, target),
         projections,
         (guards, ctes, joins),
+        rn,
     );
     Ok(CopySql {
         sql,
@@ -125,7 +131,7 @@ fn fn_distincts(
                     &mut |v| expression_var(region, v, env),
                 )?);
             }
-            let with = std::iter::once(sd_cur_cte(select, source))
+            let with = std::iter::once(sd_cur_cte(select, source, false))
                 .chain(env.ctes.iter().cloned())
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -426,15 +432,27 @@ fn render_copy(
     sink: (&shape::Insert, &Table),
     projections: Vec<String>,
     parts: (Vec<String>, Vec<String>, Vec<String>),
+    rn: bool,
 ) -> String {
     let (insert, target) = sink;
     let (guards, ctes, joins) = parts;
-    let filter = if guards.is_empty() {
+    let mut filter = if guards.is_empty() {
         String::new()
     } else {
         format!(" WHERE ({})", guards.join(") AND ("))
     };
-    let sd_cur = sd_cur_cte(select, source);
+    if rn {
+        // 混合段谓词：占位符由引擎按段替换为字面量；NULL = 无界
+        // （exc 空集时普通 SO 路径以 NULL,NULL 覆盖全行，行为不变）。
+        // __SD_HI__ 为排他上界（0 基半开区间）。
+        let pred = "(sd_cur.__sd_rn >= COALESCE(__SD_LO__, -1)) AND (sd_cur.__sd_rn < COALESCE(__SD_HI__, 9223372036854775807))";
+        filter = if filter.is_empty() {
+            format!(" WHERE {pred}")
+        } else {
+            format!("{filter} AND {pred}")
+        };
+    }
+    let sd_cur = sd_cur_cte(select, source, rn);
     let with = std::iter::once(sd_cur)
         .chain(ctes)
         .collect::<Vec<_>>()

@@ -344,6 +344,34 @@ pub(crate) fn prefix_write_set(
     (out.writes, out.opaque)
 }
 
+/// 前缀"挂起写"扫描（混合物化回退安全专用）：按语句序累计写集，
+/// `TxCommit`/`TxRollback` 清空挂起集——已提交写不会被混合物化失败
+/// 后的 `ROLLBACK + BEGIN` 兜底丢弃；`TxCommitIfWritten` 以最近一次
+/// 写影响行数为条件、不可静态证明必然提交，保守不清空。opaque
+/// （动态 SQL/不可枚举副作用）按"可能挂起写"累计，同样随提交边界
+/// 清空。例程内部的提交点不可分解，仍按整调用计入挂起（过度拒绝，
+/// 安全方向）。
+pub(crate) fn prefix_pending_writes(
+    prog: &IrProg,
+    open_pc: usize,
+    catalog: &crate::catalog::RoutineCatalog,
+) -> (BTreeSet<String>, bool) {
+    let mut pending = WriteScan::default();
+    let mut visiting = Vec::new();
+    for stmt in prog.code.iter().take(open_pc) {
+        match stmt {
+            IrStmt::TxCommit | IrStmt::TxRollback => pending = WriteScan::default(),
+            _ => scan_stmt_writes(
+                std::slice::from_ref(stmt),
+                catalog,
+                &mut visiting,
+                &mut pending,
+            ),
+        }
+    }
+    (pending.writes, pending.opaque)
+}
+
 /// 例程写集：fn_site 物化前导调用的例程按同口径枚举（整个 prog
 /// 扫描，保守超集——调用可达任意写点均计入）。
 pub(crate) fn routine_write_set(

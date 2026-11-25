@@ -15,6 +15,7 @@ pub(super) fn case_gate(lq: &LookupQuery, table: &Table) -> LookupRender {
         guard_binds: Vec::new(),
         miss_guards: Vec::new(),
         miss_out: None,
+        exc_guard: None,
     }
 }
 
@@ -37,6 +38,7 @@ pub(super) fn scalar(lq: &LookupQuery, table: &Table, filter: &str) -> LookupRen
         guard_binds: Vec::new(),
         miss_guards: Vec::new(),
         miss_out: None,
+        exc_guard: None,
     }
 }
 
@@ -92,6 +94,7 @@ pub(super) fn grouped(
         guard_binds: Vec::new(),
         miss_guards: Vec::new(),
         miss_out: None,
+        exc_guard: None,
     })
 }
 

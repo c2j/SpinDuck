@@ -22,14 +22,16 @@ pub(super) fn query(
 ) -> Result<(), EngineError> {
     materialize_fn_sites(sites, env)?;
     let bound = resolve_binds(binds, env.frame)?;
+    let t = std::time::Instant::now();
+    let out = env.ex.query(sql, &bound);
     if env.sink.is_enabled() {
         env.sink.on_event(TraceEvent::SqlExec {
             sql: sql.to_string(),
             binds: bound.clone(),
-            elapsed_us: 0,
+            elapsed_us: t.elapsed().as_micros() as u64,
         });
     }
-    let mut stream = env.ex.query(sql, &bound)?;
+    let mut stream = out?;
     let rows = stream.fetch_many(2);
     write_into(env, into, &rows)
 }
@@ -43,14 +45,16 @@ pub(super) fn exec(
 ) -> Result<usize, EngineError> {
     materialize_fn_sites(sites, env)?;
     let bound = resolve_binds(binds, env.frame)?;
+    let t = std::time::Instant::now();
+    let out = env.ex.execute(sql, &bound);
     if env.sink.is_enabled() {
         env.sink.on_event(TraceEvent::SqlExec {
             sql: sql.to_string(),
             binds: bound.clone(),
-            elapsed_us: 0,
+            elapsed_us: t.elapsed().as_micros() as u64,
         });
     }
-    Ok(env.ex.execute(sql, &bound)?.rows_affected)
+    Ok(out?.rows_affected)
 }
 
 /// EXECUTE IMMEDIATE（可选 INTO：与静态 SELECT INTO 同语义）。
@@ -61,19 +65,30 @@ pub(super) fn exec_dynamic(
 ) -> Result<(), EngineError> {
     let v = eval_expr(env, text_expr)?;
     let (sql, _) = prepare_dynamic_sql(&v.as_str_loose(), env)?;
+    if into_targets.is_empty() {
+        let t = std::time::Instant::now();
+        let out = env.ex.execute(&sql, &BindMap::new());
+        if env.sink.is_enabled() {
+            env.sink.on_event(TraceEvent::SqlExec {
+                sql: sql.clone(),
+                binds: BindMap::new(),
+                elapsed_us: t.elapsed().as_micros() as u64,
+            });
+        }
+        out?;
+        return Ok(());
+    }
+    // INTO：与静态 SELECT INTO 同语义（0/1/>1 行）
+    let t = std::time::Instant::now();
+    let out = env.ex.query(&sql, &BindMap::new());
     if env.sink.is_enabled() {
         env.sink.on_event(TraceEvent::SqlExec {
             sql: sql.clone(),
             binds: BindMap::new(),
-            elapsed_us: 0,
+            elapsed_us: t.elapsed().as_micros() as u64,
         });
     }
-    if into_targets.is_empty() {
-        env.ex.execute(&sql, &BindMap::new())?;
-        return Ok(());
-    }
-    // INTO：与静态 SELECT INTO 同语义（0/1/>1 行）
-    let mut stream = env.ex.query(&sql, &BindMap::new())?;
+    let mut stream = out?;
     let rows = stream.fetch_many(2);
     write_into(env, into_targets, &rows)
 }

@@ -118,3 +118,7 @@ mod tests {
         assert!(reject_frame_binds("SELECT * FROM t WHERE op = \"$v_v_f\"").is_ok());
     }
 }
+
+// THEN 臂判定 SQL 的历史形态（PR#62 route_alt 备选计划入口选臂，
+// "条件 IS TRUE"）。已由 D7 判别式取代：同一值表达式的等值比较并入
+// `discriminator` 的 CASE 标签 SQL；保留注释为口径追溯，不再保留死码。
