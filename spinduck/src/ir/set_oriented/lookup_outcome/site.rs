@@ -7,6 +7,7 @@
 
 use super::super::schema::{self, Table};
 use super::super::shape::{self, Name, Select};
+use super::residual::{self, ResidualCtx, ResidualOk};
 use super::SiteSpec;
 use crate::exec::SqlExecutor;
 use crate::ir::set_oriented::region::CursorRegion;
@@ -24,21 +25,21 @@ struct SiteCtx<'a> {
 }
 
 /// 区域内全部候选站点的预计算规格；无可证站点返回空表。
-pub(super) fn collect(prog: &IrProg, region: &CursorRegion, ex: &dyn SqlExecutor) -> Vec<SiteSpec> {
-    let (written_vars, written_fields) = region_writes(prog, region);
-    let cursor = cursor_select(prog, region);
-    let mut ctx = SiteCtx {
-        region,
-        cursor: cursor.as_ref(),
-        written_vars: &written_vars,
-        written_fields: &written_fields,
-        ex,
-        tables: HashMap::new(),
-    };
+/// `routine` 用于站点身份（例程名 + 出现 PC），仅作诊断标记。
+pub(super) fn collect(
+    prog: &IrProg,
+    region: &CursorRegion,
+    ex: &dyn SqlExecutor,
+    routine: &str,
+) -> Vec<SiteSpec> {
     // 同 SQL 不同绑定表的站点无法共享索引键空间，整句禁用缓存。
-    let mut seen: HashMap<String, Vec<(String, BindSrc)>> = HashMap::new();
+    type Seen = HashMap<String, (Vec<(String, BindSrc)>, Vec<usize>)>;
+    let mut seen: Seen = HashMap::new();
     let mut conflict: HashSet<String> = HashSet::new();
-    for stmt in &prog.code[region.open_pc..=region.close_pc] {
+    for (i, stmt) in prog.code[region.open_pc..=region.close_pc]
+        .iter()
+        .enumerate()
+    {
         let IrStmt::SqlQuery {
             sql,
             binds,
@@ -51,18 +52,21 @@ pub(super) fn collect(prog: &IrProg, region: &CursorRegion, ex: &dyn SqlExecutor
         if !fn_sites.is_empty() || into.is_empty() {
             continue;
         }
-        match seen.get(sql) {
+        match seen.get_mut(sql) {
             None => {
-                seen.insert(sql.clone(), binds.clone());
+                seen.insert(sql.clone(), (binds.clone(), vec![region.open_pc + i]));
             }
-            Some(prev) if *prev != *binds => {
-                conflict.insert(sql.clone());
+            Some((prev, pcs)) => {
+                if *prev != *binds {
+                    conflict.insert(sql.clone());
+                } else {
+                    pcs.push(region.open_pc + i);
+                }
             }
-            Some(_) => {}
         }
     }
     let mut specs = Vec::new();
-    for (sql, binds) in seen {
+    for (sql, (binds, pcs)) in seen {
         if conflict.contains(&sql) {
             continue;
         }
@@ -70,11 +74,42 @@ pub(super) fn collect(prog: &IrProg, region: &CursorRegion, ex: &dyn SqlExecutor
         if crate::lookup_cache::shape::recognize(&sql).is_some() {
             continue;
         }
-        if let Some(spec) = analyze(&sql, &binds, &mut ctx) {
+        let pcs = pcs
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join("+");
+        let scope = format!("{routine}@{pcs}");
+        if let Some(spec) = analyze_one(prog, region, &sql, &binds, ex, &scope) {
             specs.push(spec);
         }
     }
     specs
+}
+
+/// 单站点重证入口（写失效后按当前 schema 重新走完整证据链；
+/// `collect` 与 `cache` 的懒重建共用，保证两条路径口径一致）。
+pub(super) fn analyze_one(
+    prog: &IrProg,
+    region: &CursorRegion,
+    sql: &str,
+    binds: &[(String, BindSrc)],
+    ex: &dyn SqlExecutor,
+    scope: &str,
+) -> Option<SiteSpec> {
+    let (written_vars, written_fields) = region_writes(prog, region);
+    let cursor = cursor_select(prog, region);
+    let mut ctx = SiteCtx {
+        region,
+        cursor: cursor.as_ref(),
+        written_vars: &written_vars,
+        written_fields: &written_fields,
+        ex,
+        tables: HashMap::new(),
+    };
+    let mut spec = analyze(sql, binds, &mut ctx)?;
+    spec.scope = scope.to_string();
+    Some(spec)
 }
 
 /// 区域写集：变量与记录字段两路（循环不变证据的反面）。
@@ -143,10 +178,20 @@ fn analyze(sql: &str, binds: &[(String, BindSrc)], ctx: &mut SiteCtx<'_>) -> Opt
         return None;
     }
     let bind_map: HashMap<&str, &BindSrc> = binds.iter().map(|(p, s)| (p.as_str(), s)).collect();
+    // 结构证据先行：残余谓词的列 kind 相容证明与键类型对齐共用。
+    let dim_table = load_table(ctx.ex, &mut ctx.tables, &sel.table)?;
+    let cursor = ctx.cursor?;
+    let cursor_table = load_table(ctx.ex, &mut ctx.tables, &cursor.table)?;
+    let rctx = ResidualCtx {
+        bind_map: &bind_map,
+        written_vars: ctx.written_vars,
+        dim: &dim_table,
+        sel: &sel,
+    };
     let mut keys: Vec<(Name, String)> = Vec::new();
     let mut key_fields: Vec<(VarName, String)> = Vec::new();
     let mut residual: Vec<String> = Vec::new();
-    let mut inv_phs: Vec<String> = Vec::new();
+    let mut typed = ResidualOk::default();
     for conj in split_conjuncts(sel.filter.as_deref().unwrap_or("")) {
         match key_conjunct(&conj, &bind_map, ctx.region, &sel) {
             Some((col, ph, rec, field)) => {
@@ -154,28 +199,9 @@ fn analyze(sql: &str, binds: &[(String, BindSrc)], ctx: &mut SiteCtx<'_>) -> Opt
                 key_fields.push((rec, field));
             }
             None => {
-                let mut ok = true;
-                for w in &conj {
-                    if let Some(src) = bind_map.get(w.as_str()) {
-                        match src {
-                            BindSrc::Var(v) if !ctx.written_vars.contains(v) => {
-                                if !inv_phs.contains(w) {
-                                    inv_phs.push(w.clone());
-                                }
-                            }
-                            _ => {
-                                ok = false;
-                                break;
-                            }
-                        }
-                    } else if w.starts_with('$') || banned_residual(w) {
-                        ok = false;
-                        break;
-                    }
-                }
-                if !ok {
-                    return None;
-                }
+                // 残余合取项必须过全定义谓词证明（B1：不可证 total
+                // 的形态——算术/函数/子查询/类型不安全比较——整站禁用）。
+                residual::check(&conj, &rctx, &mut typed)?;
                 residual.push(conj.join(" "));
             }
         }
@@ -187,28 +213,37 @@ fn analyze(sql: &str, binds: &[(String, BindSrc)], ctx: &mut SiteCtx<'_>) -> Opt
     {
         return None;
     }
-    // 类型对齐证据：键列 kind == 游标字段源列 kind（守卫 key_checks 同口径）。
-    let dim_table = load_table(ctx.ex, &mut ctx.tables, &sel.table)?;
-    let cursor = ctx.cursor?;
-    let cursor_table = load_table(ctx.ex, &mut ctx.tables, &cursor.table)?;
+    // 类型对齐证据：键列 kind == 游标字段源列 kind（守卫 key_checks 同口径）；
+    // 浮点键列有损舍入（B4）一律禁用；键绑定值构建期按 kind 复核。
     for (col, ph) in &keys {
         let field = match bind_map.get(ph.as_str()) {
             Some(BindSrc::Field { field, .. }) => field.to_ascii_lowercase(),
             _ => return None,
         };
         let dim_kind = column_kind(&dim_table, col)?;
+        if matches!(
+            dim_kind.as_str(),
+            "double" | "float" | "real" | "float4" | "float8"
+        ) {
+            return None;
+        }
         let src = cursor.source_of(&Name(field.clone()))?;
         let cur_kind = column_kind(&cursor_table, src)?;
         if dim_kind != cur_kind {
             return None;
         }
+        typed.typed_binds.push((ph.clone(), dim_kind));
     }
     // 投影源列必须存在于维度表：形态误解析（如 DISTINCT）在此拦截，
     // 避免构建期绑定错误徒增一次失败查询。
     for src in &sel.sources {
         column_kind(&dim_table, src)?;
     }
-    Some(build_spec(sql, &sel, &keys, &residual, &inv_phs))
+    let mut spec = build_spec(sql, &sel, &keys, &residual, &typed.inv_phs);
+    spec.binds = binds.to_vec();
+    spec.typed_binds = typed.typed_binds;
+    spec.watch = watch_tables(&sel, cursor);
+    Some(spec)
 }
 
 /// WHERE 顶层合取项切分：`BETWEEN a AND b` 的 AND 不属于合取边界。
@@ -291,42 +326,15 @@ fn is_ident(w: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// 残余合取项禁用 token：子查询/模式匹配/函数调用/cast/json 与数组
-/// 算子/正则/除法取模（执行期错误面）/ 非确定性关键字。
-fn banned_residual(w: &str) -> bool {
-    matches!(
-        w,
-        "(" | ")"
-            | "select"
-            | "like"
-            | "ilike"
-            | "similar"
-            | "escape"
-            | "exists"
-            | "case"
-            | "cast"
-            | "::"
-            | "->"
-            | "->>"
-            | "#>"
-            | "#>>"
-            | "@>"
-            | "<@"
-            | "~"
-            | "?"
-            | "["
-            | "]"
-            | "/"
-            | "%"
-            | "||"
-            | "random"
-            | "current_date"
-            | "current_time"
-            | "current_timestamp"
-            | "localtime"
-            | "localtimestamp"
-            | "today"
-    )
+/// 失效监视表集合：维度表 + 游标源表（键类型证明依赖两端 schema，
+/// 任一被写/DDL 都必须重证）。
+fn watch_tables(sel: &Select, cursor: &Select) -> Vec<String> {
+    let mut out = vec![sel.table.0.to_ascii_lowercase()];
+    let cur = cursor.table.0.to_ascii_lowercase();
+    if !out.contains(&cur) {
+        out.push(cur);
+    }
+    out
 }
 
 fn load_table(
@@ -370,7 +378,12 @@ fn build_spec(
             i
         ));
     }
-    let mut build = format!("SELECT {} FROM {}", cols.join(", "), sel.table.sql());
+    // 别名必须保留：残余/键合取项的 `t.col` 限定符依赖它解析（P1）。
+    let from = match &sel.alias {
+        Some(a) => format!("{} AS {}", sel.table.sql(), a.sql()),
+        None => sel.table.sql(),
+    };
+    let mut build = format!("SELECT {} FROM {}", cols.join(", "), from);
     if !residual.is_empty() {
         build.push_str(&format!(" WHERE {}", residual.join(" AND ")));
     }
@@ -380,11 +393,14 @@ fn build_spec(
     }
     SiteSpec {
         sql: sql.to_string(),
-        table: sel.table.0.to_ascii_lowercase(),
+        binds: Vec::new(),
+        watch: Vec::new(),
         key_phs: keys.iter().map(|(_, ph)| ph.clone()).collect(),
         build_sql: build,
         inv_phs: inv_phs.to_vec(),
+        typed_binds: Vec::new(),
         schema: sel.columns.iter().map(|c| c.0.clone()).collect(),
+        scope: String::new(),
     }
 }
 
@@ -434,7 +450,7 @@ mod tests {
             filter: None,
             verbatim: None,
         };
-        let binds = vec![
+        let binds = [
             (
                 "$v_r__a".to_string(),
                 BindSrc::Field {

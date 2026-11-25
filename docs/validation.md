@@ -5720,17 +5720,27 @@ PR#62 devin 按评审任务（task_id=pr62-fix-001）完成三：
 
 - 新增 `src/ir/set_oriented/lookup_outcome/`：`site.rs` 计划期证据
   （`shape::select` 形态 + 顶层合取项切分（BETWEEN 感知）+ 等值键
-  `BindSrc::Field` 归属区域记录 + `schema::load` 双端 kind 严格一致 +
-  `lookup_cache::shape::recognize` 让位）；`cache.rs` 区域级
-  `FallbackExecutor`（首个探测触发 `GROUP BY`+`COUNT(*)`+`CASE WHEN
-  COUNT(*)=1 THEN MAX(列)` 聚合预计算，distinct 键 ≤200k、构建行
-  ≤1M，超限/失败 `Disabled` 降级原路径）。
+  `BindSrc::Field` 归属区域记录 + `residual.rs` 残余全定义谓词证明
+  （审核 B1：比较/IS NULL/BETWEEN/IN + 布尔连接，操作数限列/字面量/
+  `$v_` 不变量绑定/NULL，逐对类型相容；算术等不可证形态整站禁用）+
+  `schema::load` 双端 kind 严格一致 + 浮点键列禁用（审核 B4）+
+  `lookup_cache::shape::recognize` 让位 + 别名保留（P1））；
+  `cache.rs` 区域级 `FallbackExecutor`（首个探测触发 `GROUP BY`+
+  `COUNT(*)`+`CASE WHEN COUNT(*)=1 THEN MAX(列)` 聚合预计算，distinct
+  键 ≤200k、构建行 ≤1M，超限/失败 `Disabled` 降级原路径）。
 - 接入点：`engine/set_oriented.rs` 的 `run_fallback`——计划期
   `Skipped`（`LiveOutState` 等）、视图物化失败回退、守卫运行态拒绝
   （`entry_ok`/`RouteDiscriminatorNotTotal`）四处原 `run_prog` 统一改走；
   `run_prog` 本体委托 `run_prog_on(ex, …)`，无站点时与原路径逐字一致。
-- 失效：`execute` 按 `lookup_cache::mentioned` 表名命中/回滚 →
-  `Ready` 回 `Pending` 懒重建（重建见最新事务态）；`Disabled` 不复活。
+- 探测键 = 键占位符 + 不变量占位符**全部**绑定值（审核 B2）；不变量
+  值与构建值不一致 → bypass 原路径；站点身份含例程名 + PC。
+- 失效：`execute` 按 `lookup_cache::mentioned` 监视表名（维度表+
+  游标源表）命中/回滚 → 站点 **SiteSpec 整体作废**，下次探测按当前
+  schema 重走 `site::analyze_one` 全证据链重证（审核 B3，不复用旧
+  proof）；`Disabled` 不复活，重证失败本轮禁用。
+- 构建失败运行期兜底（审核 B1）：先 `SELECT 1` 探事务健康度，已
+  aborted 则 `ROLLBACK`+`BEGIN` 恢复（与 `reset_session` 同一已知
+  差异口径）再降级原路径，绝不在死事务上继续执行。
 - 复用可见性：`lookup_cache::{mentioned, KeyPart::from_value}` 提为
   `pub(crate)`（签名零变化）。
 
@@ -5760,13 +5770,38 @@ issue65 bench n=100000
 - 回退区域端到端耗时 **−51.7%**（24.1s→11.6s），超过 ≥30% 门槛；
 - 残余耗时为逐行解释器/INSERT/COMMIT 固有成本，非 lookup。
 
-### V57.4 不声称
+### V57.4 审核修复（PR#66 二轮，`set_oriented_issue65_regression`）
 
-- 不声称残余谓词任意形态安全：残余合取项已禁子查询/模式匹配/
-  cast/json/数组/正则/除法取模/非确定性关键字，但 `+ - *` 等算术
-  在极端数据下的执行期错误面与原逐行路径存在理论次序差（与守卫
-  聚合扫描同一暴露类）；键列类型不一致、游标不可静态解析、视图
-  表等一律不接管。
+外部审核复现 4 个语义问题 + 2 个测试缺陷 + P1 项，逐项 TDD 修复：
+
+| 项 | 复现（修复前实测） | 修复 | 回归测试 |
+|---|---|---|---|
+| B1 预计算污染事务 | `pri*pri>0` 残余 + Z 行 `pri=BIGINT_MAX`：Batch 报 `KERNEL-0010 TransactionContext aborted` | 残余全定义谓词证明（算术整站禁用）+ 构建失败先探事务、aborted 则 ROLLBACK+BEGIN 恢复再降级 | `should_issue65_b1_arith_residual_never_reaches_build`（Off/Batch 均 `KA`） |
+| B2 缓存身份不完整 | 内层 `p_biz_date=20200101` 先建缓存，外层 `=20220601` 误命中 → 外层输出 `K2020`（应 `K2024`） | 探测键 = 键 + 不变量**全部**绑定值；不变量不一致 bypass；站点身份含例程名+PC | `should_issue65_b2_nested_routine_binds_isolated` |
+| B3 DDL 后旧 proof 复用 | 首次 lookup 前 `CREATE OR REPLACE TABLE` 把键列 VARCHAR→BIGINT：Batch 输出 `MISS`（应 `KA`） | 写失效丢弃整个 SiteSpec，重建重走 `schema::load` 全证据链 | `should_issue65_b3_ddl_rebuilds_site_proof` |
+| B4 DOUBLE 键有损舍入 | `1.0`/`1.0000004` 经 6 位小数折叠同键 | 键列含浮点类型（DOUBLE/FLOAT/REAL）整站禁用 | `should_issue65_b4_double_key_column_disables_cache`（原形态 lookup 保持逐行） |
+| T1 mark 时序 | `executes_mark` 在 `call` 后取 → `executes_since` 空==空恒真 | mark 移到 `call` 前（Off/Batch 两侧） | repro 两测试（语义序列断言恢复真实约束） |
+| T2 perf 硬门禁 | 仅记录无断言 | `off==n`、`batch==0` 原形态 + `asset_kind` 聚合恰 1、`batch_ms<=off_ms` 无条件；≥30% 由 `SPINDUCK_ISSUE65_GATE=1` 显式开启 | `set_oriented_issue65_perf` |
+| P1 别名站点 | `FROM t AS a` + `t.` 限定列：回退正确但缓存未生效（lookup×6） | build_sql 保留 `AS` 别名 | `should_issue65_alias_site_uses_cache`（lookup×0 + 聚合×1） |
+
+- clippy 门禁升级为 `cargo clippy --all-features --tests -- -D warnings`，
+  修复 `unused_mut`/`doc_lazy_continuation`/`useless_vec`/`complex type`。
+- 性能硬门禁运行方式：`SPINDUCK_ISSUE65_GATE=1 cargo test --release
+  --features cli --test set_oriented_issue65_perf`（issue 验收口径
+  release + `SPINDUCK_ISSUE65_ROWS=100000`；≥30% 断言仅在显式开启时
+  生效，隔离 CI 计时抖动）。
+
+### V57.5 不声称
+
+- 不声称残余谓词任意形态安全：残余合取项经全定义谓词证明（仅比较/
+  IS NULL/BETWEEN/IN + 布尔连接，操作数限列/字面量/`$v_` 不变量绑定/
+  NULL，逐对类型相容），其余形态一律整站禁用——不存在"理论次序差"
+  面（原表述撤回：B1 修复前算术残余确有实测差异，`pri*pri` 溢出
+  导致事务 aborted，见 V57.4）。键列类型不一致、浮点键列、游标
+  不可静态解析、视图表等一律不接管。
 - 不声称守卫运行态拒绝路径（`entry_ok`/`RouteDiscriminatorNotTotal`）
   有专项性能用例——机制同路覆盖，全量测试绿；专属 benchmark 未建。
 - 预计算行/键上限（1M 行/200k 键）为保守工程值，超限静默降级原路径。
+- 构建失败恢复路径（ROLLBACK+BEGIN）沿用 `reset_session` 已知差异
+  口径：撤销上次 COMMIT 后的本段 DML——仅在"残余不可证形态漏网且
+  构建执行期出错"的复合场景触发，正常路径不可达。

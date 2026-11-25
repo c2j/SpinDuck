@@ -44,7 +44,10 @@ fn should_issue65_fallback_rows_equal_off_and_record_baseline_cost() {
     let batch_ms = t1.elapsed().as_millis();
     let batch_lookups = lookup_calls(&fx.queries);
 
-    // Assert：等价性优先，计时仅记录（门槛断言随 #65 PR 追加）。
+    // Assert：等价性优先；issue #65 硬门禁——内核原形态 lookup N→1
+    // （off==n、batch==0 原形态 + 恰 1 次 asset_kind 聚合）、端到端
+    // 不慢于基线；≥30% 区域耗时下降由 SPINDUCK_ISSUE65_GATE=1 显式
+    // 开启（CI 计时抖动隔离，issue 验收口径为 release 10 万行）。
     let reports = fx.eng.set_oriented_reports();
     assert_eq!(reports.len(), 1);
     assert!(
@@ -52,7 +55,7 @@ fn should_issue65_fallback_rows_equal_off_and_record_baseline_cost() {
         "status={:?} 应为 Skipped",
         reports[0].status
     );
-    let mut off_stream_rows = result_rows_limit(&mut off.eng, n + 10);
+    let off_stream_rows = result_rows_limit(&mut off.eng, n + 10);
     let batch_stream_rows = result_rows_limit(&mut fx.eng, n + 10);
     assert_eq!(off_stream_rows.len(), n, "Off 行数");
     assert_eq!(
@@ -68,6 +71,38 @@ fn should_issue65_fallback_rows_equal_off_and_record_baseline_cost() {
         batch_stream_rows[1][2],
         spinduck_core::value::SpinValue::Null
     );
+
+    // 硬门禁 1：内核 lookup N→1。Off 逐行 n 次；BatchAtomic 原形态
+    // 0 次，预计算聚合扫描（GROUP BY/COUNT 形态）恰 1 次。
+    assert_eq!(off_lookups, n, "Off 内核 lookup 应为逐行 n 次");
+    assert_eq!(
+        batch_lookups, 0,
+        "BatchAtomic 原形态内核 lookup 应为 0（预计算接管）"
+    );
+    let asset_kind_queries = fx
+        .queries
+        .borrow()
+        .iter()
+        .filter(|s| s.to_ascii_uppercase().contains("ASSET_KIND"))
+        .count();
+    assert_eq!(
+        asset_kind_queries, 1,
+        "预计算聚合扫描应恰 1 次（内核 lookup N→1）"
+    );
+    // 硬门禁 2：端到端不慢于基线（无条件断言）。
+    assert!(
+        batch_ms <= off_ms,
+        "回退端到端不慢于 Off 基线：batch={batch_ms}ms off={off_ms}ms"
+    );
+    // 硬门禁 3：≥30% 区域耗时下降——仅 SPINDUCK_ISSUE65_GATE=1 时断言
+    // （issue 验收口径：release + SPINDUCK_ISSUE65_ROWS=100000）。
+    if std::env::var("SPINDUCK_ISSUE65_GATE").as_deref() == Ok("1") {
+        let reduction = off_ms.saturating_sub(batch_ms);
+        assert!(
+            reduction * 10 >= off_ms * 3,
+            "区域耗时应降低 ≥30%：off={off_ms}ms batch={batch_ms}ms"
+        );
+    }
 
     // 记录基线成本（#65 PR 对比口径）。
     println!("issue65 bench n={n}");

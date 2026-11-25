@@ -3,7 +3,7 @@
 //!
 //! 案例形态取自 issue #65 脱敏 Case 1：游标循环内标量 `SELECT INTO`
 //! + `NO_DATA_FOUND`/`TOO_MANY_ROWS` 具名处理器 + 逐行 `COMMIT`；
-//! 入口守卫因 mixed miss/dup 拒绝 → 整段回退解释器逐行重跑。
+//!   入口守卫因 mixed miss/dup 拒绝 → 整段回退解释器逐行重跑。
 //!
 //! #65 复现基线分四个面（2026-11-25 实测，见各常量注释）：
 //! - **A 面**（日期区间过滤）：`lookup_cache`（PR#62 遗产）已接管，
@@ -438,3 +438,214 @@ pub const BENCH_PROC: &str = "CREATE PROCEDURE issue65_bench IS \
     COMMIT; \
     END LOOP; \
     END;";
+
+// ===== issue #65 审核修复回归夹具（第二轮）=====
+
+/// B1 回归：残余谓词含算术（`pri * pri > 0`）——不可证 total，
+/// 必须整站禁用缓存；Z 行 BIGINT_MAX 使聚合预计算必然溢出。
+pub const ARITH_SETUP: [&str; 5] = [
+    TRADE_ROWS_DDL,
+    "CREATE TABLE asset_kind(security_id VARCHAR, kind VARCHAR, pri BIGINT)",
+    RESULT_ROWS_DDL,
+    "INSERT INTO trade_rows VALUES (1,'A')",
+    "INSERT INTO asset_kind VALUES ('A','KA',1),('Z','KZ',9223372036854775807)",
+];
+
+pub const PROC_ARITH: &str = "CREATE PROCEDURE issue65_arith IS \
+    v_kind VARCHAR2(10); \
+    BEGIN \
+    v_kind := ''; \
+    FOR r IN SELECT seq, security_id FROM trade_rows ORDER BY seq LOOP \
+    BEGIN \
+    SELECT kind INTO v_kind FROM asset_kind \
+    WHERE security_id = r.security_id AND pri * pri > 0; \
+    EXCEPTION \
+    WHEN NO_DATA_FOUND THEN v_kind := 'MISS'; \
+    WHEN TOO_MANY_ROWS THEN v_kind := 'DUP'; \
+    END; \
+    INSERT INTO result_rows VALUES (r.seq, r.security_id, v_kind); \
+    COMMIT; \
+    END LOOP; \
+    END;";
+
+pub fn setup_arith() -> Case1Fixture {
+    setup_case1_with(&ARITH_SETUP, PROC_ARITH)
+}
+
+/// B2 回归：内外层例程同 SQL 文本、不同不变量绑定（p_biz_date）。
+/// 内层 date=1 先触发预计算，外层 date=2 不得误用内层缓存。
+pub const NESTED_SETUP: [&str; 6] = [
+    TRADE_ROWS_DDL,
+    "CREATE TABLE asset_kind(security_id VARCHAR, kind VARCHAR, valid_from VARCHAR, valid_to VARCHAR)",
+    "CREATE TABLE inner_result(seq BIGINT, kind VARCHAR)",
+    "CREATE TABLE outer_result(seq BIGINT, kind VARCHAR)",
+    "INSERT INTO trade_rows VALUES (1,'A')",
+    // 同键 'A' 两行：日期区间各自只命中一行（date=1→K2020，date=2→K2024）。
+    "INSERT INTO asset_kind VALUES \
+     ('A','K2020','20200101','20211231'),\
+     ('A','K2024','20220101','20291231')",
+];
+
+/// 内层例程：与外层同 SQL 文本（security_id 等值键 + 日期不变量残余），
+/// p_biz_date=20200101。经 `>=`/`<=` 写法避开 lookup_cache 形态识别。
+pub const PROC_NESTED_INNER: &str = "CREATE PROCEDURE issue65_inner IS \
+    v_kind VARCHAR2(10); p_biz_date VARCHAR2(8); \
+    BEGIN \
+    v_kind := ''; p_biz_date := '20200101'; \
+    FOR r IN SELECT seq, security_id FROM trade_rows ORDER BY seq LOOP \
+    BEGIN \
+    SELECT kind INTO v_kind FROM asset_kind \
+    WHERE security_id = r.security_id \
+    AND p_biz_date >= valid_from AND p_biz_date <= valid_to; \
+    EXCEPTION \
+    WHEN NO_DATA_FOUND THEN v_kind := 'MISS'; \
+    WHEN TOO_MANY_ROWS THEN v_kind := 'DUP'; \
+    END; \
+    INSERT INTO inner_result VALUES (r.seq, v_kind); \
+    COMMIT; \
+    END LOOP; \
+    END;";
+
+/// 外层例程：先 CALL 内层（其探测先建缓存），再跑同形态循环，
+/// p_biz_date=20220601。
+pub const PROC_NESTED_OUTER: &str = "CREATE PROCEDURE issue65_outer IS \
+    v_kind VARCHAR2(10); p_biz_date VARCHAR2(8); \
+    BEGIN \
+    v_kind := ''; p_biz_date := '20220601'; \
+    issue65_inner(); \
+    FOR r IN SELECT seq, security_id FROM trade_rows ORDER BY seq LOOP \
+    BEGIN \
+    SELECT kind INTO v_kind FROM asset_kind \
+    WHERE security_id = r.security_id \
+    AND p_biz_date >= valid_from AND p_biz_date <= valid_to; \
+    EXCEPTION \
+    WHEN NO_DATA_FOUND THEN v_kind := 'MISS'; \
+    WHEN TOO_MANY_ROWS THEN v_kind := 'DUP'; \
+    END; \
+    INSERT INTO outer_result VALUES (r.seq, v_kind); \
+    COMMIT; \
+    END LOOP; \
+    END;";
+
+pub fn setup_nested() -> Case1Fixture {
+    let exec = CountingExecutor::open();
+    let queries = exec.queries.clone();
+    let executes = exec.executes.clone();
+    let mut eng = Engine::new(Box::new(exec), RuleRegistry::default());
+    for ddl in NESTED_SETUP {
+        eng.ex.execute(ddl, &BindMap::new()).expect("nested DDL");
+    }
+    eng.register(PROC_NESTED_INNER).expect("register inner");
+    eng.register(PROC_NESTED_OUTER).expect("register outer");
+    Case1Fixture {
+        eng,
+        queries,
+        executes,
+    }
+}
+
+pub fn table_rows(eng: &mut Engine, sql: &str) -> Vec<Vec<SpinValue>> {
+    let mut s = eng.ex.query(sql, &BindMap::new()).expect("read table");
+    s.fetch_many(100)
+}
+
+/// B3 回归：首次 lookup 前 DDL 重建键列类型（VARCHAR→BIGINT）。
+/// 旧 schema proof 不得复用——重建后键类型不等，站点必须重证禁用。
+pub const DDL_SETUP: [&str; 5] = [
+    TRADE_ROWS_DDL,
+    "CREATE TABLE asset_kind(security_id VARCHAR, kind VARCHAR, pri BIGINT)",
+    RESULT_ROWS_DDL,
+    "INSERT INTO trade_rows VALUES (1,'1')",
+    "INSERT INTO asset_kind VALUES ('1','KA',5)",
+];
+
+pub const PROC_DDL: &str = "CREATE PROCEDURE issue65_ddl IS \
+    v_kind VARCHAR2(10); \
+    BEGIN \
+    CREATE OR REPLACE TABLE asset_kind AS \
+    SELECT CAST(security_id AS BIGINT) AS security_id, kind, pri FROM asset_kind; \
+    v_kind := ''; \
+    FOR r IN SELECT seq, security_id FROM trade_rows ORDER BY seq LOOP \
+    BEGIN \
+    SELECT kind INTO v_kind FROM asset_kind \
+    WHERE security_id = r.security_id AND pri BETWEEN 1 AND 9; \
+    EXCEPTION \
+    WHEN NO_DATA_FOUND THEN v_kind := 'MISS'; \
+    WHEN TOO_MANY_ROWS THEN v_kind := 'DUP'; \
+    END; \
+    INSERT INTO result_rows VALUES (r.seq, r.security_id, v_kind); \
+    COMMIT; \
+    END LOOP; \
+    END;";
+
+pub fn setup_ddl() -> Case1Fixture {
+    setup_case1_with(&DDL_SETUP, PROC_DDL)
+}
+
+/// B4 回归：DOUBLE 键经 exec_native 6 位小数有损舍入，不同键折叠。
+/// 键列含浮点类型必须整站禁用缓存。
+pub const DOUBLE_SETUP: [&str; 5] = [
+    "CREATE TABLE trade_rows(seq BIGINT, security_id DOUBLE)",
+    "CREATE TABLE asset_kind(security_id DOUBLE, kind VARCHAR, pri BIGINT)",
+    "CREATE TABLE result_rows(seq BIGINT, security_id DOUBLE, kind VARCHAR)",
+    "INSERT INTO trade_rows VALUES (1,1.0),(2,1.0000004)",
+    "INSERT INTO asset_kind VALUES (1.0,'K0',5),(1.0000004,'K1',5)",
+];
+
+pub const PROC_DOUBLE: &str = "CREATE PROCEDURE issue65_double IS \
+    v_kind VARCHAR2(10); \
+    BEGIN \
+    v_kind := ''; \
+    FOR r IN SELECT seq, security_id FROM trade_rows ORDER BY seq LOOP \
+    BEGIN \
+    SELECT kind INTO v_kind FROM asset_kind \
+    WHERE security_id = r.security_id AND pri BETWEEN 1 AND 9; \
+    EXCEPTION \
+    WHEN NO_DATA_FOUND THEN v_kind := 'MISS'; \
+    WHEN TOO_MANY_ROWS THEN v_kind := 'DUP'; \
+    END; \
+    INSERT INTO result_rows VALUES (r.seq, r.security_id, v_kind); \
+    COMMIT; \
+    END LOOP; \
+    END;";
+
+pub fn setup_double() -> Case1Fixture {
+    setup_case1_with(&DOUBLE_SETUP, PROC_DOUBLE)
+}
+
+/// P1 回归：带别名的 B 面站点应同样吃到缓存（`FROM t AS a` + 限定列）。
+pub const ALIAS_SETUP: [&str; 6] = [
+    TRADE_ROWS_DDL,
+    "CREATE TABLE asset_kind(security_id VARCHAR, kind VARCHAR, pri BIGINT)",
+    RESULT_ROWS_DDL,
+    MSG_OUT_DDL,
+    CURSOR_SEEDS,
+    "INSERT INTO asset_kind VALUES \
+     ('A','K_BOND',5),\
+     ('C','K_FUND',5),\
+     ('D',NULL,5),\
+     ('E','K_DUP1',5),\
+     ('E','K_DUP2',5)",
+];
+
+pub const PROC_ALIAS: &str = "CREATE PROCEDURE issue65_alias IS \
+    v_kind VARCHAR2(10); p_msg VARCHAR2(100); \
+    BEGIN \
+    v_kind := ''; p_msg := '0'; \
+    FOR r IN SELECT seq, security_id FROM trade_rows ORDER BY seq LOOP \
+    BEGIN \
+    SELECT kind INTO v_kind FROM asset_kind AS t \
+    WHERE t.security_id = r.security_id AND t.pri BETWEEN 1 AND 9; \
+    EXCEPTION \
+    WHEN NO_DATA_FOUND THEN p_msg := 'missing:' || r.security_id; \
+    WHEN TOO_MANY_ROWS THEN p_msg := 'duplicate:' || r.security_id; \
+    END; \
+    INSERT INTO result_rows VALUES (r.seq, r.security_id, v_kind); \
+    COMMIT; \
+    END LOOP; \
+    INSERT INTO msg_out VALUES (p_msg); \
+    END;";
+
+pub fn setup_alias() -> Case1Fixture {
+    setup_case1_with(&ALIAS_SETUP, PROC_ALIAS)
+}

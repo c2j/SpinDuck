@@ -51,7 +51,7 @@ impl Engine {
                 if let Some(out) = self.try_loop_parallel(routine, frame, sink, limits)? {
                     return Ok(out);
                 }
-                return self.run_fallback(&routine.prog, frame, sink, limits, RunSpan::default());
+                return self.run_fallback(routine, frame, sink, limits, RunSpan::default());
             }
             Ok(p) => vec![p],
         };
@@ -90,7 +90,7 @@ impl Engine {
                         reason: SkipReason::UnprovenQueryTotalness,
                     },
                 );
-                return self.run_fallback(&routine.prog, frame, sink, limits, RunSpan::default());
+                return self.run_fallback(routine, frame, sink, limits, RunSpan::default());
             }
         }
         let mut cursor_pc = 0usize;
@@ -222,7 +222,7 @@ impl Engine {
                         }
                     }
                     let out = self.run_fallback(
-                        &routine.prog,
+                        routine,
                         frame,
                         sink,
                         limits,
@@ -251,7 +251,7 @@ impl Engine {
                     }
                 }
                 let out = self.run_fallback(
-                    &routine.prog,
+                    routine,
                     frame,
                     sink,
                     limits,
@@ -1186,12 +1186,13 @@ impl Engine {
     /// 或区域不可抽取时与 `run_prog` 逐字同路径。
     fn run_fallback(
         &self,
-        prog: &crate::ir::IrProg,
+        routine: &CompiledRoutine,
         frame: &mut Frame,
         sink: &mut dyn TraceSink,
         limits: RunLimits,
         span: RunSpan,
     ) -> Result<RunOutcome, EngineError> {
+        let prog = &routine.prog;
         if let Ok(region) = crate::ir::set_oriented::region::extract(prog) {
             // 分段续跑（守卫运行态拒绝）只允许缓存与 span 边界一致的
             // 区域，防止把别的区域的站点证据套到本段。
@@ -1202,6 +1203,7 @@ impl Engine {
                     prog,
                     &region,
                     self.ex.as_ref(),
+                    &routine.name,
                 ) {
                     return self.run_prog_on(&ex, prog, frame, sink, limits, span);
                 }

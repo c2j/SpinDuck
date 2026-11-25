@@ -347,16 +347,25 @@ CASE 仅 TRUE 命中，省略 ELSE 返回 NULL。SQL 渲染和闭包遍历覆盖
 
 集合化守卫拒绝（`Skipped`）后区域按原 IR 逐行解释执行，其中静态
 `SELECT INTO` 每行一次内核点查。对守卫文法已证的站点（游标记录字段等值键
-+ 静态残余谓词，键列与游标字段类型严格一致，`LIKE`/函数/子查询/动态
-SQL/`ORDER BY … LIMIT` 一律不接管，`lookup_cache` 已识别形态让位），
-回退 `RunSpan` 外包一层 `FallbackExecutor`：首个探测行触发一次
-`GROUP BY` 键列 + `COUNT(*)` + `CASE WHEN COUNT(*)=1 THEN MAX(列)`
-聚合预计算，此后按"站点 + 全部行变绑定值"命中缓存，直接合成与原路径
-一致的 `NO_DATA_FOUND`/`TOO_MANY_ROWS`/单行结果；trace `SqlExec` 仍由
-解释器逐行照发。绑定含 NULL、键超上限（200k distinct）或预计算失败的
-站点降级走原 SQL；写语句按表名失效、回滚全清，`Ready` 索引作废后懒重建。
-缓存只服务本次回退调用，不跨调用/跨区域复用。机制见
-`src/ir/set_oriented/lookup_outcome/`，实证见 validation V57。
++ 残余合取项过 `residual` 全定义谓词证明——仅比较/`IS NULL`/`BETWEEN`/
+`IN` 与布尔连接，操作数限列、字面量、`$v_` 不变量绑定或 NULL，逐对做
+类型相容证明；算术/函数/子查询/模式匹配/cast/除法取模等一律不接管；
+键列与游标字段类型严格一致且非浮点——DOUBLE/FLOAT/REAL 键有损舍入
+整站禁用；`LIKE`/动态 SQL/Top-1、`lookup_cache` 已识别形态让位；
+`FROM t AS a` 别名保留进聚合 SQL），回退 `RunSpan` 外包一层
+`FallbackExecutor`：首个探测行触发一次 `GROUP BY` 键列 + `COUNT(*)` +
+`CASE WHEN COUNT(*)=1 THEN MAX(列)` 聚合预计算，此后按"站点 +
+**全部**绑定值（行变键 + 不变量占位符）"命中缓存，不变量值与构建值
+不一致（嵌套例程同文本不同实参）bypass 原路径；直接合成与原路径一致的
+`NO_DATA_FOUND`/`TOO_MANY_ROWS`/单行结果；trace `SqlExec` 仍由解释器
+逐行照发。绑定含 NULL、键超上限（200k distinct）、类型复核不通过或
+预计算失败的站点降级走原 SQL；预计算报错若事务已 aborted，先
+`ROLLBACK`+`BEGIN` 恢复（与 `reset_session` 同一已知差异口径）再降级，
+绝不在死事务上继续原 SQL。写语句按监视表名（维度表+游标源表）使站点
+**规格作废**——下次探测按当前 schema 重走 `schema::load` 全证据链重证
+（DDL 改列类型不复用旧 proof），回滚全清。缓存只服务本次回退调用，
+不跨调用/跨区域复用。机制见 `src/ir/set_oriented/lookup_outcome/`，
+实证见 validation V57。
 
 ### 3.6 目录与持久化
 

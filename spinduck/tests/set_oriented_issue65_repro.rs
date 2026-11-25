@@ -64,13 +64,15 @@ fn assert_skipped(exactly: usize, eng: &mut spinduck_core::engine::Engine) {
 fn should_issue65_face_a_date_range_already_cached_by_lookup_executor() {
     // Arrange：A 面夹具（等值 + 日期区间，issue Case 1 原形）。
     let mut off = setup_case1();
+    let off_mark = executes_mark(&off.executes);
     off.eng.call("issue65_case1", &[]).expect("off call");
     let off_lookups = lookup_calls(&off.queries);
-    let off_exec_seq = executes_since(executes_mark(&off.executes), &off.executes);
+    let off_exec_seq = executes_since(off_mark, &off.executes);
 
     let mut fx = setup_case1();
     let (mut recorder, trace_sqls) = SqlExecRecorder::new();
     fx.eng.set_oriented = SetOrientedMode::BatchAtomic;
+    let fx_mark = executes_mark(&fx.executes);
 
     // Act
     fx.eng
@@ -82,7 +84,7 @@ fn should_issue65_face_a_date_range_already_cached_by_lookup_executor() {
     assert_eq!(result_rows(&mut fx.eng), expected_case1_rows());
     assert_eq!(msg_out(&mut fx.eng), expected_case1_msg());
     assert_eq!(
-        executes_since(executes_mark(&fx.executes), &fx.executes),
+        executes_since(fx_mark, &fx.executes),
         off_exec_seq,
         "Skipped 回退的 INSERT/COMMIT 序列必须与 Off 逐字一致"
     );
@@ -111,13 +113,15 @@ fn should_issue65_face_a_date_range_already_cached_by_lookup_executor() {
 fn should_issue65_face_b_numeric_range_keep_semantics_and_baseline_cost() {
     // Arrange：B 面夹具（等值 + 数值区间，缓存识别器未接管形态）。
     let mut off = setup_case1_num();
+    let off_mark = executes_mark(&off.executes);
     off.eng.call("issue65_case1", &[]).expect("off call");
     let off_lookups = lookup_calls(&off.queries);
-    let off_exec_seq = executes_since(executes_mark(&off.executes), &off.executes);
+    let off_exec_seq = executes_since(off_mark, &off.executes);
 
     let mut fx = setup_case1_num();
     let (mut recorder, trace_sqls) = SqlExecRecorder::new();
     fx.eng.set_oriented = SetOrientedMode::BatchAtomic;
+    let fx_mark = executes_mark(&fx.executes);
 
     // Act
     fx.eng
@@ -134,7 +138,7 @@ fn should_issue65_face_b_numeric_range_keep_semantics_and_baseline_cost() {
         "逐行 COMMIT×6 + 调用尾提交×1"
     );
     assert_eq!(
-        executes_since(executes_mark(&fx.executes), &fx.executes),
+        executes_since(fx_mark, &fx.executes),
         off_exec_seq,
         "Skipped 回退的 INSERT/COMMIT 序列必须与 Off 逐字一致"
     );

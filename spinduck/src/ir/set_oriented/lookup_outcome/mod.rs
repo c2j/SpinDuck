@@ -1,21 +1,25 @@
 //! 集合化回退路径的逐键 lookup 结果缓存（issue #65）。
 //!
-//! 守卫证据已证的静态 `SELECT INTO`（游标记录字段等值键 + 静态残余
-//! 过滤）在 Skipped 回退中逐行下发原 SQL：N 个游标行 = N 次内核
+//! 守卫证据已证的静态 `SELECT INTO`（游标记录字段等值键 + 全定义
+//! 残余谓词）在 Skipped 回退中逐行下发原 SQL：N 个游标行 = N 次内核
 //! lookup。本模块在回退 `RunSpan` 外包一层 [`SqlExecutor`]：首个探测
 //! 行触发一次 `GROUP BY` 聚合预计算（`COUNT(*)` + `CASE WHEN
 //! COUNT(*)=1 THEN MAX(投影列)`，与守卫聚合扫描同一判定口径），
-//! 此后按"站点 + 全部行变绑定值"命中缓存，合成与原路径一致的
+//! 此后按"站点 + 全部绑定值"命中缓存，合成与原路径一致的
 //! `NO_DATA_FOUND`/`TOO_MANY_ROWS`/单行结果；trace `SqlExec` 仍由
 //! 解释器逐行照发，绑定文本逐字不变。
 //!
-//! 证据与禁用面（与守卫 `key_checks` 同口径）：键列与游标字段类型
-//! 严格一致才可证；LIKE/函数/子查询/动态 SQL/Top-1 排序截断、
-//! `lookup_cache` 已识别的形态一律不接管。缓存只服务本次回退调用，
-//! 不跨调用/跨区域复用；写语句按表名失效、回滚全清；绑定含 NULL
-//! 或非常量键的探测 bypass 原路径；distinct key 超上限禁用缓存。
+//! 证据与禁用面（与守卫 `key_checks` 同口径 + 审核修复）：键列与
+//! 游标字段类型严格一致才可证，浮点键列（有损舍入）整站禁用；
+//! 残余合取项必须过 `residual` 全定义谓词证明（算术/函数/子查询/
+//! 类型不安全比较一律禁用）；LIKE/动态 SQL/Top-1、`lookup_cache`
+//! 已识别形态不接管。缓存只服务本次回退调用；写语句按表名使站点
+//! **规格作废重证**（schema 可能已变，旧 proof 不复用）、回滚全清；
+//! 绑定含 NULL、探测不变量值与构建值不一致（嵌套例程）或 distinct
+//! key 超上限时 bypass/禁用走原路径。
 
 mod cache;
+mod residual;
 mod site;
 
 use crate::exec::SqlExecutor;
@@ -25,12 +29,15 @@ use crate::ir::IrProg;
 pub(crate) use cache::FallbackExecutor;
 
 /// 单个可缓存 `SELECT INTO` 站点的预计算规格（`site` 分析产物，`cache` 消费）。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct SiteSpec {
     /// IR `SqlQuery` 原文：执行器按文本精确匹配站点。
     pub sql: String,
-    /// 目标表名（小写）：写失效匹配键。
-    pub table: String,
+    /// 站点绑定表（重证输入）：`(占位符, BindSrc)` 原表。
+    pub binds: Vec<(String, crate::ir::BindSrc)>,
+    /// 失效监视表集合（小写）：维度表 + 游标源表——写/DDL 命中
+    /// 任一即作废本规格并重证（B3：不得复用旧 schema/type proof）。
+    pub watch: Vec<String>,
     /// 行变键占位符（与 GROUP BY 列同序）。
     pub key_phs: Vec<String>,
     /// 聚合预计算 SQL：`GROUP BY` 键列 + `COUNT(*)` + `CASE WHEN
@@ -38,18 +45,25 @@ pub(super) struct SiteSpec {
     pub build_sql: String,
     /// build_sql 引用的不变量占位符（探测时从绑定表取子集下发）。
     pub inv_phs: Vec<String>,
+    /// 运行期类型复核项：`(占位符, 列 kind)`——构建前按绑定值
+    /// `SpinValue` 变体复核（键绑定 + 残余 `$v_` 绑定），不相容禁用。
+    pub typed_binds: Vec<(String, String)>,
     /// 结果列名（SELECT 输出名），合成 `RowStream` 的 schema。
     pub schema: Vec<String>,
+    /// 站点身份（例程名 + 出现 PC 列表），诊断标记。
+    pub scope: String,
 }
 
 /// 回退区域的候选缓存执行器：扫描区域内静态 `SELECT INTO`，对守卫
 /// 文法可证的站点生成聚合 outcome 索引；无可证站点返回 `None`，
 /// 调用方走原解释器路径（行为逐字不变）。
+/// `prog`/`region` 随执行器保留：写失效后按当前 schema 重证站点。
 pub(crate) fn prepare<'a>(
-    prog: &IrProg,
-    region: &CursorRegion,
+    prog: &'a IrProg,
+    region: &'a CursorRegion,
     ex: &'a dyn SqlExecutor,
+    routine: &str,
 ) -> Option<FallbackExecutor<'a>> {
-    let sites = site::collect(prog, region, ex);
-    cache::wrap(ex, sites)
+    let sites = site::collect(prog, region, ex, routine);
+    cache::wrap(ex, prog, region, sites)
 }
