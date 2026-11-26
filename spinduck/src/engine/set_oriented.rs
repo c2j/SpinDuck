@@ -1205,6 +1205,10 @@ impl Engine {
                     self.ex.as_ref(),
                     &routine.name,
                 ) {
+                    // R3：压入例程作用域——嵌套例程经 run_with_catalog
+                    // 复用本执行器，其同 SQL 文本查询按 owner 失配
+                    // bypass，站点身份成为匹配一等键。
+                    let _scope = crate::ir::set_oriented::lookup_outcome::push_scope(&routine.name);
                     return self.run_prog_on(&ex, prog, frame, sink, limits, span);
                 }
             }

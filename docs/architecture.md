@@ -348,20 +348,29 @@ CASE 仅 TRUE 命中，省略 ELSE 返回 NULL。SQL 渲染和闭包遍历覆盖
 集合化守卫拒绝（`Skipped`）后区域按原 IR 逐行解释执行，其中静态
 `SELECT INTO` 每行一次内核点查。对守卫文法已证的站点（游标记录字段等值键
 + 残余合取项过 `residual` 全定义谓词证明——仅比较/`IS NULL`/`BETWEEN`/
-`IN` 与布尔连接，操作数限列、字面量、`$v_` 不变量绑定或 NULL，逐对做
-类型相容证明；算术/函数/子查询/模式匹配/cast/除法取模等一律不接管；
-键列与游标字段类型严格一致且非浮点——DOUBLE/FLOAT/REAL 键有损舍入
-整站禁用；`LIKE`/动态 SQL/Top-1、`lookup_cache` 已识别形态让位；
-`FROM t AS a` 别名保留进聚合 SQL），回退 `RunSpan` 外包一层
+`IN` 与布尔连接，操作数限列、字面量、`$v_` 不变量绑定或 NULL；**残余
+两侧声明类型严格相等**才放行（同类型族不够，BIGINT vs DECIMAL(38,38)
+跨类型比较在无关行上 cast 失败会中止事务），字面量/绑定值还须落在对侧
+类型无损域内；算术/函数/子查询/模式匹配/cast/除法取模等一律不接管；
+键列与游标字段**实际输出**源列 kind 严格一致且非浮点——DOUBLE/FLOAT/REAL
+键有损舍入整站禁用，verbatim 游标的表达式投影键（如 `col + 0.0`）输出
+类型不可证同样整站禁用；`LIKE`/动态 SQL/Top-1、`lookup_cache` 已识别
+形态让位；`FROM t AS a` 别名保留进聚合 SQL），回退 `RunSpan` 外包一层
 `FallbackExecutor`：首个探测行触发一次 `GROUP BY` 键列 + `COUNT(*)` +
 `CASE WHEN COUNT(*)=1 THEN MAX(列)` 聚合预计算，此后按"站点 +
 **全部**绑定值（行变键 + 不变量占位符）"命中缓存，不变量值与构建值
-不一致（嵌套例程同文本不同实参）bypass 原路径；直接合成与原路径一致的
+不一致 bypass 原路径；**探测期逐绑定复核 SpinValue 变体与列 kind
+相容**，不相容（嵌套例程不同键表示、表达式游标键等）一律 bypass 走
+原 SQL，绝不合成 Missing；直接合成与原路径一致的
 `NO_DATA_FOUND`/`TOO_MANY_ROWS`/单行结果；trace `SqlExec` 仍由解释器
-逐行照发。绑定含 NULL、键超上限（200k distinct）、类型复核不通过或
-预计算失败的站点降级走原 SQL；预计算报错若事务已 aborted，先
-`ROLLBACK`+`BEGIN` 恢复（与 `reset_session` 同一已知差异口径）再降级，
-绝不在死事务上继续原 SQL。写语句按监视表名（维度表+游标源表）使站点
+逐行照发。站点身份（一等匹配键）= 例程名 + 区域 PC：`run_fallback`
+压入例程作用域、`CallRoutine` 压入被调例程名（线程本地栈），嵌套例程
+经 `run_with_catalog` 复用调用方执行器时按栈顶例程名与执行器 owner
+失配 bypass，禁止跨例程按 SQL 文本命中。绑定含 NULL、键超上限
+（200k distinct）、类型复核不通过或预计算失败的站点降级走原 SQL；
+构建错误若落在执行期（事务已 aborted）属不可达状态，按 ENG 不变量
+fail-loud（`EngineError::invariant`）——**禁止用 ROLLBACK 回滚用户
+未提交写入**做缓存降级。写语句按监视表名（维度表+游标源表）使站点
 **规格作废**——下次探测按当前 schema 重走 `schema::load` 全证据链重证
 （DDL 改列类型不复用旧 proof），回滚全清。缓存只服务本次回退调用，
 不跨调用/跨区域复用。机制见 `src/ir/set_oriented/lookup_outcome/`，

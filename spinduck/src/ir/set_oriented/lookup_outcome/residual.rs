@@ -36,11 +36,11 @@ pub(super) struct ResidualOk {
     pub typed_binds: Vec<(String, String)>,
 }
 
-/// 字面量类型（词法形态判定）。
+/// 字面量类型（词法形态判定；`Int` 携带值供无损域复核）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lit {
     Str,
-    Int,
+    Int(i64),
     Dec,
     Bool,
 }
@@ -244,9 +244,10 @@ fn check_pair(a: &Opd, b: &Opd, out: &mut ResidualOk) -> Option<()> {
         return Some(());
     }
     match (a, b) {
-        (Col { kind: k1, .. }, Col { kind: k2, .. }) => {
-            (k1 == k2 || (numeric_kind(k1) && numeric_kind(k2))).then_some(())
-        }
+        // 列↔列：声明类型必须逐字相同（审核 R1：同数值族不够——
+        // BIGINT vs DECIMAL(38,38) 的跨类型比较存在执行期 cast
+        // 错误面，预计算扫全表会放大为事务 aborted）。
+        (Col { kind: k1, .. }, Col { kind: k2, .. }) => (k1 == k2).then_some(()),
         (Col { kind, .. }, Lit(l)) | (Lit(l), Col { kind, .. }) => lit_ok(*l, kind).then_some(()),
         (Col { kind, .. }, Bind(ph)) | (Bind(ph), Col { kind, .. }) => {
             out.typed_binds.push((ph.clone(), kind.clone()));
@@ -256,31 +257,70 @@ fn check_pair(a: &Opd, b: &Opd, out: &mut ResidualOk) -> Option<()> {
     }
 }
 
-/// 字面量 ↔ 列 kind 白名单：Str 仅对 varchar；数值仅对数值域；
-/// Bool 仅对 boolean。其余组合存在执行期转换错误面，禁用。
+/// 字面量 ↔ 列 kind 无损域白名单（审核 R1）：Str 仅对 varchar；
+/// 整数字面量按目标 kind 值域复核（tinyint/smallint/integer/bigint
+/// 范围、decimal(p,s) 整数位、double 恒可转换）；小数仅对 double
+/// （decimal 字面量精度/标度对齐证明本轮不做，保守禁用）；Bool 仅
+/// 对 boolean。其余组合存在执行期转换错误面，禁用。
 fn lit_ok(lit: Lit, kind: &str) -> bool {
     match lit {
         Lit::Str => kind == "varchar",
-        Lit::Int | Lit::Dec => numeric_kind(kind),
+        Lit::Int(v) => int_fits_kind(v, kind),
+        Lit::Dec => kind == "double",
         Lit::Bool => kind == "boolean",
     }
 }
 
-/// 数值域 kind：整数族 + double + decimal(p,s)。
-fn numeric_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "bigint" | "integer" | "smallint" | "tinyint" | "double"
-    ) || kind.starts_with("decimal(")
+/// 整数值 ↔ 列 kind 无损域：整数族按位宽、`decimal(p,s)` 按整数位
+/// `p-s`、double 恒成立（有损但 total，原路径同口径）。
+fn int_fits_kind(v: i64, kind: &str) -> bool {
+    match kind {
+        "bigint" | "double" => true,
+        "integer" => i32::try_from(v).is_ok(),
+        "smallint" => i16::try_from(v).is_ok(),
+        "tinyint" => i8::try_from(v).is_ok(),
+        k if k.starts_with("decimal(") => decimal_int_digits_fit(v, k),
+        _ => false,
+    }
 }
 
-/// 运行期绑定值 ↔ 列 kind 复核（构建前调用；`SpinValue` 变体口径）。
+/// `decimal(p,s)` 列对整数值的容纳判定：整数位 `p-s` ≥ |v| 的十进制
+/// 位数（v=0 恒可容纳）。
+fn decimal_int_digits_fit(v: i64, kind: &str) -> bool {
+    let Some((p, s)) = decimal_parts(kind) else {
+        return false;
+    };
+    let int_digits = p.saturating_sub(s);
+    if v == 0 {
+        return true;
+    }
+    let digits = v.unsigned_abs().ilog10() + 1;
+    digits <= int_digits
+}
+
+/// `decimal(p,s)` kind 串 → (precision, scale)。
+fn decimal_parts(kind: &str) -> Option<(u32, u32)> {
+    let inner = kind.strip_prefix("decimal(")?.strip_suffix(')')?;
+    let (p, s) = inner.split_once(',')?;
+    Some((p.parse().ok()?, s.parse().ok()?))
+}
+
+/// 运行期绑定值 ↔ 列 kind 复核（构建前与每次探测调用；`SpinValue`
+/// 变体 + 值域双重口径——参数按列类型落位，越域/变体不符即禁用，
+/// 绝不下发会执行期报错的 SQL）。
 pub(super) fn runtime_ok(value: &crate::value::SpinValue, kind: &str) -> bool {
     use crate::value::SpinValue as V;
     match value {
         V::Null => true,
         V::Bool(_) => kind == "boolean",
-        V::Int(_) | V::Decimal(..) => numeric_kind(kind),
+        V::Int(v) => int_fits_kind(*v, kind),
+        // Decimal：double 恒可转；decimal(P,S) 要求精度/标度不超目标；
+        // 整数族有小数位即转换错误面 → 禁用。
+        V::Decimal(_, p, s) => {
+            kind == "double"
+                || decimal_parts(kind)
+                    .is_some_and(|(cp, cs)| u32::from(*p) <= cp && u32::from(*s) <= cs)
+        }
         V::Str(_) => kind == "varchar",
         V::Blob(_) | V::Record(_) => false,
     }
@@ -291,8 +331,8 @@ fn literal(w: &str) -> Option<Lit> {
     if w.starts_with('\'') {
         return Some(Lit::Str);
     }
-    if w.parse::<i64>().is_ok() {
-        return Some(Lit::Int);
+    if let Ok(v) = w.parse::<i64>() {
+        return Some(Lit::Int(v));
     }
     if w.parse::<f64>().is_ok() {
         return Some(Lit::Dec);

@@ -171,6 +171,15 @@ fn cursor_select(prog: &IrProg, region: &CursorRegion) -> Option<Select> {
         .ok()
 }
 
+/// 合取项分类产物：等值键 / 键字段 / 残余文本 / 类型复核项。
+#[derive(Default)]
+struct Conjuncts {
+    keys: Vec<(Name, String)>,
+    key_fields: Vec<(VarName, String)>,
+    residual: Vec<String>,
+    typed: ResidualOk,
+}
+
 /// 单站点证据链：形态 → 合取项分类 → 类型对齐 → 聚合 SQL 生成。
 fn analyze(sql: &str, binds: &[(String, BindSrc)], ctx: &mut SiteCtx<'_>) -> Option<SiteSpec> {
     let sel = shape::select(sql).ok()?;
@@ -188,62 +197,94 @@ fn analyze(sql: &str, binds: &[(String, BindSrc)], ctx: &mut SiteCtx<'_>) -> Opt
         dim: &dim_table,
         sel: &sel,
     };
-    let mut keys: Vec<(Name, String)> = Vec::new();
-    let mut key_fields: Vec<(VarName, String)> = Vec::new();
-    let mut residual: Vec<String> = Vec::new();
-    let mut typed = ResidualOk::default();
-    for conj in split_conjuncts(sel.filter.as_deref().unwrap_or("")) {
-        match key_conjunct(&conj, &bind_map, ctx.region, &sel) {
-            Some((col, ph, rec, field)) => {
-                keys.push((col, ph.clone()));
-                key_fields.push((rec, field));
-            }
-            None => {
-                // 残余合取项必须过全定义谓词证明（B1：不可证 total
-                // 的形态——算术/函数/子查询/类型不安全比较——整站禁用）。
-                residual::check(&conj, &rctx, &mut typed)?;
-                residual.push(conj.join(" "));
-            }
-        }
-    }
+    let mut conj = Conjuncts::default();
+    classify_conjuncts(&sel, ctx.region, &rctx, &mut conj)?;
     // 键字段在区域内被显式改写 → 逐键结果不可证。
-    if key_fields
+    if conj
+        .key_fields
         .iter()
         .any(|(rec, field)| ctx.written_fields.contains(&(rec.clone(), field.clone())))
     {
         return None;
     }
-    // 类型对齐证据：键列 kind == 游标字段源列 kind（守卫 key_checks 同口径）；
-    // 浮点键列有损舍入（B4）一律禁用；键绑定值构建期按 kind 复核。
-    for (col, ph) in &keys {
+    let kctx = KeyCtx {
+        cursor,
+        cursor_table: &cursor_table,
+        dim_table: &dim_table,
+    };
+    check_key_types(&conj.keys, &bind_map, &kctx, &mut conj.typed)?;
+    // 投影源列必须存在于维度表：形态误解析（如 DISTINCT）在此拦截，
+    // 避免构建期绑定错误徒增一次失败查询。
+    for src in &sel.sources {
+        column_kind(&dim_table, src)?;
+    }
+    let mut spec = build_spec(sql, &sel, &conj.keys, &conj.residual, &conj.typed.inv_phs);
+    spec.binds = binds.to_vec();
+    spec.typed_binds = conj.typed.typed_binds;
+    spec.watch = watch_tables(&sel, cursor);
+    Some(spec)
+}
+
+/// WHERE 合取项逐项分类：等值键归键，其余过残余全定义谓词证明。
+fn classify_conjuncts(
+    sel: &Select,
+    region: &CursorRegion,
+    rctx: &ResidualCtx<'_>,
+    out: &mut Conjuncts,
+) -> Option<()> {
+    for conj in split_conjuncts(sel.filter.as_deref().unwrap_or("")) {
+        match key_conjunct(&conj, rctx.bind_map, region, sel) {
+            Some((col, ph, rec, field)) => {
+                out.keys.push((col, ph.clone()));
+                out.key_fields.push((rec, field));
+            }
+            // 残余合取项必须过全定义谓词证明（B1/R1：不可证 total
+            // 的形态——算术/跨类型比较/函数/子查询——整站禁用）。
+            None => {
+                residual::check(&conj, rctx, &mut out.typed)?;
+                out.residual.push(conj.join(" "));
+            }
+        }
+    }
+    Some(())
+}
+
+/// 键类型对齐证据（守卫 key_checks 同口径 + 审核加固）：键列 kind
+/// == 游标字段**实际输出**源列 kind；浮点键列有损舍入（B4）禁用；
+/// verbatim 表达式键输出类型不可证（R2）禁用；键绑定值构建/探测
+/// 期按 kind 复核。
+struct KeyCtx<'a> {
+    cursor: &'a Select,
+    cursor_table: &'a Table,
+    dim_table: &'a Table,
+}
+
+fn check_key_types(
+    keys: &[(Name, String)],
+    bind_map: &HashMap<&str, &BindSrc>,
+    kctx: &KeyCtx<'_>,
+    typed: &mut ResidualOk,
+) -> Option<()> {
+    for (col, ph) in keys {
         let field = match bind_map.get(ph.as_str()) {
             Some(BindSrc::Field { field, .. }) => field.to_ascii_lowercase(),
             _ => return None,
         };
-        let dim_kind = column_kind(&dim_table, col)?;
+        let dim_kind = column_kind(kctx.dim_table, col)?;
         if matches!(
             dim_kind.as_str(),
             "double" | "float" | "real" | "float4" | "float8"
         ) {
             return None;
         }
-        let src = cursor.source_of(&Name(field.clone()))?;
-        let cur_kind = column_kind(&cursor_table, src)?;
+        let src = super::verbatim::cursor_key_source(kctx.cursor, &Name(field))?;
+        let cur_kind = column_kind(kctx.cursor_table, &src)?;
         if dim_kind != cur_kind {
             return None;
         }
         typed.typed_binds.push((ph.clone(), dim_kind));
     }
-    // 投影源列必须存在于维度表：形态误解析（如 DISTINCT）在此拦截，
-    // 避免构建期绑定错误徒增一次失败查询。
-    for src in &sel.sources {
-        column_kind(&dim_table, src)?;
-    }
-    let mut spec = build_spec(sql, &sel, &keys, &residual, &typed.inv_phs);
-    spec.binds = binds.to_vec();
-    spec.typed_binds = typed.typed_binds;
-    spec.watch = watch_tables(&sel, cursor);
-    Some(spec)
+    Some(())
 }
 
 /// WHERE 顶层合取项切分：`BETWEEN a AND b` 的 AND 不属于合取边界。
@@ -318,7 +359,7 @@ fn key_conjunct(
 }
 
 /// 裸标识符（与 `Tokens::name` 同规则：字母/下划线开头，字母数字下划线续）。
-fn is_ident(w: &str) -> bool {
+pub(super) fn is_ident(w: &str) -> bool {
     let mut chars = w.chars();
     chars
         .next()

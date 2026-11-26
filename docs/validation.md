@@ -5802,6 +5802,30 @@ issue65 bench n=100000
 - 不声称守卫运行态拒绝路径（`entry_ok`/`RouteDiscriminatorNotTotal`）
   有专项性能用例——机制同路覆盖，全量测试绿；专属 benchmark 未建。
 - 预计算行/键上限（1M 行/200k 键）为保守工程值，超限静默降级原路径。
-- 构建失败恢复路径（ROLLBACK+BEGIN）沿用 `reset_session` 已知差异
-  口径：撤销上次 COMMIT 后的本段 DML——仅在"残余不可证形态漏网且
-  构建执行期出错"的复合场景触发，正常路径不可达。
+- 构建失败恢复（V57.4 的 ROLLBACK+BEGIN 方案）已在 V57.6 撤回：
+  它会回滚调用前未提交的用户写入。当前口径为残余 conversion-total
+  静态证明 + aborted 事务按 ENG 不变量 fail-loud。
+
+### V57.6 审核修复（PR#66 三轮，阻断项）
+
+第三轮外部审核复现 3 个阻断语义问题 + 验收矩阵缺口，逐项 TDD 修复：
+
+| 项 | 复现（修复前实测） | 修复 | 回归测试 |
+|---|---|---|---|
+| R1 残余非 total + 恢复回滚用户写入 | `a = b`（BIGINT vs DECIMAL(38,38)）跨类型比较：Z 行 `a=BIGINT_MAX` 使聚合预计算 cast 失败 → 事务 aborted → ROLLBACK+BEGIN 把循环前 `INSERT INTO audit VALUES (1)` 一并回滚（Off audit=[1]，Batch=[]） | 残余证明收紧为 conversion-total：两侧**声明类型严格相等**才放行，字面量/绑定须落在对侧无损域；构建错误若致事务 aborted 按 `EngineError::invariant(74)` fail-loud，禁止 ROLLBACK 用户事务 | `should_issue65_r1_mixed_type_residual_disables_and_preserves_writes`（Off/Batch 均 `KA`、audit 两侧均 [1]、Batch 无 ROLLBACK） |
+| R2 表达式游标键误用物理源列类型 | `SELECT security_id + 0.0 AS security_id`：键被证明为源列 BIGINT，运行期实为 Decimal → 全 MISS（Off=[KA,MISS,DUP]，Batch 全 MISS） | verbatim 游标逐项复核投影（`verbatim.rs`）：仅裸/限定列（可带 AS）可证源列；表达式投影整站禁用；探测 map 未命中/类型不相容**禁止合成 Missing**，一律 bypass 原 SQL | `should_issue65_r2_expression_cursor_key_disables_cache`（输出逐行一致） |
+| R3 例程/站点身份未参与匹配 | 外层 VARCHAR 键建成缓存后 CALL 内层同 SQL 文本 BIGINT 键例程 → 内层全 MISS | 站点身份（例程名+区域 PC）为 query 匹配一等键：线程本地例程作用域栈（`run_fallback`/`CallRoutine` 压栈），`FallbackExecutor` 仅服务栈顶==owner 的查询；Ready 命中前逐绑定 `runtime_ok` 复核键表示 | `should_issue65_r3_scope_key_representation_bypasses_cache`（内层 [K1,MISS,DUP] 与 Off 一致；B2 嵌套不变量测试保持绿） |
+
+验收矩阵补齐（`set_oriented_issue65_regression`，命名 `should_issue65_*`）：
+
+- 全 miss / 全 hit / 空游标（0 行 → 零查询零预计算）/ 重复 key /
+  多 lookup（双站点各恰 1 条 GROUP BY）/ 跨调用失效（call 两次中间
+  改数，第二次按新数据重建）；
+- 动态依赖禁用：循环内被修改变量参与查找、函数残余（`ABS(pri)`）
+  → 原形态 lookup 逐行 N 次；
+- trace 断言：B 面 `SqlExec` 事件**全量**文本+binds+顺序 Off/Batch
+  逐条一致（`should_issue65_trace_lookup_events_text_and_binds_identical`）。
+
+规模：`site.rs::analyze` 拆为 `analyze`/`classify_conjuncts`/
+`check_key_types`（≤60 行/函数）；verbatim 投影证明拆 `verbatim.rs`
+（129 行）——单文件均回到 §3 上限内。

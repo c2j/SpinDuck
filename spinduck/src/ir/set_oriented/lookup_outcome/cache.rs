@@ -40,12 +40,18 @@ pub(crate) struct FallbackExecutor<'a> {
     inner: &'a dyn SqlExecutor,
     prog: &'a IrProg,
     region: &'a CursorRegion,
+    /// 本执行器所属例程名（R3 站点身份一等键）：仅当
+    /// `current_scope()` 栈顶与之相等时才参与站点匹配——
+    /// 嵌套例程复用本执行器但作用域不同，一律 bypass。
+    owner: String,
     sites: Vec<SiteSlot>,
 }
 
 struct SiteSlot {
     /// IR SQL 原文（站点匹配键）。
     sql: String,
+    /// 站点身份（例程名@PC 列表）：写失效重证的 scope 输入。
+    scope: String,
     /// 站点分析输入（重证用）：`(占位符, BindSrc)` 原表。
     binds: Vec<(String, BindSrc)>,
     /// 失效监视表集合（小写；规格重建后刷新）。
@@ -89,6 +95,7 @@ pub(super) fn wrap<'a>(
     prog: &'a IrProg,
     region: &'a CursorRegion,
     specs: Vec<SiteSpec>,
+    routine: &str,
 ) -> Option<FallbackExecutor<'a>> {
     if specs.is_empty() {
         return None;
@@ -97,14 +104,17 @@ pub(super) fn wrap<'a>(
         inner: ex,
         prog,
         region,
+        owner: routine.to_string(),
         sites: specs
             .into_iter()
             .map(|spec| {
                 let sql = spec.sql.clone();
+                let scope = spec.scope.clone();
                 let binds = spec.binds.clone();
                 let watch = spec.watch.clone();
                 SiteSlot {
                     sql,
+                    scope,
                     binds,
                     watch,
                     cell: RefCell::new(SlotCell {
@@ -120,10 +130,30 @@ pub(super) fn wrap<'a>(
 
 impl SqlExecutor for FallbackExecutor<'_> {
     fn query(&self, sql: &str, binds: &BindMap) -> Result<RowStream, EngineError> {
+        // R3：例程身份是匹配一等键——嵌套例程经 run_with_catalog 复用
+        // 本执行器，栈顶例程名与 owner 不一致（或无例程上下文）一律
+        // bypass，绝不按 SQL 文本跨例程命中。
+        if super::current_scope().as_deref() != Some(self.owner.as_str()) {
+            return self.inner.query(sql, binds);
+        }
         let Some(slot) = self.sites.iter().find(|s| s.sql == sql) else {
             return self.inner.query(sql, binds);
         };
         self.ensure_spec(slot);
+        // 探测期类型相容复核（R2/R3）：键与残余 `$v_` 绑定值的
+        // SpinValue 变体+值域必须与列 kind 相容——表达式游标键、
+        // 嵌套例程不同键表示等一律 bypass 原路径，绝不合成 Missing。
+        let typed_ok = {
+            let cell = slot.cell.borrow();
+            cell.spec.as_ref().is_some_and(|spec| {
+                spec.typed_binds
+                    .iter()
+                    .all(|(ph, kind)| binds.get(ph).is_none_or(|v| residual::runtime_ok(v, kind)))
+            })
+        };
+        if !typed_ok {
+            return self.inner.query(sql, binds);
+        }
         let probe = {
             let cell = slot.cell.borrow();
             let Some(spec) = cell.spec.as_ref() else {
@@ -134,7 +164,7 @@ impl SqlExecutor for FallbackExecutor<'_> {
         let Some((key, inv)) = probe else {
             return self.inner.query(sql, binds);
         };
-        self.ensure_built(slot, binds, inv.clone());
+        self.ensure_built(slot, binds, inv.clone())?;
         let cell = slot.cell.borrow();
         let Some(spec) = cell.spec.as_ref() else {
             return self.inner.query(sql, binds);
@@ -173,20 +203,13 @@ impl FallbackExecutor<'_> {
         if !stale {
             return;
         }
-        let scope = slot
-            .cell
-            .borrow()
-            .spec
-            .as_ref()
-            .map(|s| s.scope.clone())
-            .unwrap_or_else(|| slot.sql.clone());
         let spec = site::analyze_one(
             self.prog,
             self.region,
             &slot.sql,
             &slot.binds,
             self.inner,
-            &scope,
+            &slot.scope,
         );
         let mut cell = slot.cell.borrow_mut();
         match spec {
@@ -201,13 +224,19 @@ impl FallbackExecutor<'_> {
         }
     }
 
-    /// 首个探测触发聚合预计算；失败/超限/类型复核不通过一律
-    /// `Disabled`（原路径接管）。
-    fn ensure_built(&self, slot: &SiteSlot, binds: &BindMap, inv: Vec<KeyPart>) {
+    /// 首个探测触发聚合预计算；类型复核/超限失败一律 `Disabled`
+    /// （原路径接管）；构建 SQL 执行期错误致事务 aborted 时按 ENG
+    /// 不变量 fail-loud（R1：禁止用 ROLLBACK 回滚用户未提交写入）。
+    fn ensure_built(
+        &self,
+        slot: &SiteSlot,
+        binds: &BindMap,
+        inv: Vec<KeyPart>,
+    ) -> Result<(), EngineError> {
         {
             let cell = slot.cell.borrow();
             if !matches!(cell.state, SlotState::Pending) {
-                return;
+                return Ok(());
             }
         }
         let spec = {
@@ -215,40 +244,49 @@ impl FallbackExecutor<'_> {
             cell.spec.clone()
         };
         let Some(spec) = spec else {
-            return;
+            return Ok(());
         };
-        let state = self.build(&spec, binds, inv);
+        let state = self.build(&spec, binds, inv)?;
         let mut cell = slot.cell.borrow_mut();
         if matches!(cell.state, SlotState::Pending) {
             cell.state = state;
         }
+        Ok(())
     }
 
     /// 聚合预计算：`GROUP BY` 键列一次扫表，逐键产出
     /// `Missing`（无组）/`Duplicate`（COUNT>1）/`ExactValue`（COUNT=1 投影）。
-    fn build(&self, spec: &SiteSpec, binds: &BindMap, inv: Vec<KeyPart>) -> SlotState {
-        // 运行期类型复核（B1/B2）：键与残余 `$v_` 绑定值的 SpinValue
-        // 变体必须与列 kind 相容——不相容禁用且**不发 SQL**（事务安全）。
+    /// 构建 SQL 报错分两类：prepare/binder 期错误事务仍健康 → 安全
+    /// `Disabled` 降级；执行期错误事务已 aborted → 按 ENG 不变量
+    /// fail-loud（R1：残余证明已收紧为 conversion-total，此路径
+    /// 构造上不可达；若未来实现回归也不得静默回滚用户写入）。
+    fn build(
+        &self,
+        spec: &SiteSpec,
+        binds: &BindMap,
+        inv: Vec<KeyPart>,
+    ) -> Result<SlotState, EngineError> {
+        // 运行期类型复核（B1/R1）：键与残余 `$v_` 绑定值的 SpinValue
+        // 变体+值域必须与列 kind 相容——不相容禁用且**不发 SQL**。
         for (ph, kind) in &spec.typed_binds {
             let ok = binds.get(ph).is_some_and(|v| residual::runtime_ok(v, kind));
             if !ok {
-                return SlotState::Disabled;
+                return Ok(SlotState::Disabled);
             }
         }
         let Some(subset) = bind_subset(binds, &spec.inv_phs) else {
-            return SlotState::Disabled;
+            return Ok(SlotState::Disabled);
         };
         let mut stream = match self.inner.query(&spec.build_sql, &subset) {
             Ok(s) => s,
             Err(_) => {
-                // B1：构建失败可能已把事务打入 aborted 态——先探
-                // 事务健康度；aborted 则 ROLLBACK+BEGIN 恢复后才允许
-                // 降级走原路径（与 reset_session 同一已知差异口径）。
                 if self.txn_aborted() {
-                    let _ = self.inner.execute("ROLLBACK", &BindMap::new());
-                    let _ = self.inner.execute("BEGIN TRANSACTION", &BindMap::new());
+                    return Err(EngineError::invariant(
+                        74,
+                        "lookup outcome build failed inside aborted transaction",
+                    ));
                 }
-                return SlotState::Disabled;
+                return Ok(SlotState::Disabled);
             }
         };
         let dims = spec.key_phs.len();
@@ -263,13 +301,13 @@ impl FallbackExecutor<'_> {
             }
             rows += chunk.len();
             if rows > MAX_BUILD_ROWS || !parse_chunk(&chunk, dims, width, &mut outcomes) {
-                return SlotState::Disabled;
+                return Ok(SlotState::Disabled);
             }
         }
         if outcomes.len() > MAX_KEYS {
-            return SlotState::Disabled;
+            return Ok(SlotState::Disabled);
         }
-        SlotState::Ready { outcomes, inv }
+        Ok(SlotState::Ready { outcomes, inv })
     }
 
     /// 事务健康度探测：`SELECT 1` 失败 = 事务已 aborted（构建错误

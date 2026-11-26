@@ -21,12 +21,44 @@
 mod cache;
 mod residual;
 mod site;
+mod verbatim;
 
 use crate::exec::SqlExecutor;
 use crate::ir::set_oriented::region::CursorRegion;
 use crate::ir::IrProg;
+use std::cell::RefCell;
 
 pub(crate) use cache::FallbackExecutor;
+
+thread_local! {
+    /// 当前执行例程名栈（R3 站点身份）：`run_fallback` 压栈本例程，
+    /// `CallRoutine` 压栈被调例程。嵌套例程经 `run_with_catalog` 复用
+    /// 调用方 `env.ex`，其查询会落到外层 `FallbackExecutor`——栈顶
+    /// 例程名与执行器 owner 不一致即 bypass，站点身份成为匹配一等键。
+    static ROUTINE_SCOPE: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// 例程作用域 RAII 守卫：Drop 时弹栈（异常路径同样恢复）。
+pub(crate) struct ScopeGuard;
+
+/// 压入例程名并返回守卫；与 `current_scope` 配对使用。
+pub(crate) fn push_scope(name: &str) -> ScopeGuard {
+    ROUTINE_SCOPE.with(|s| s.borrow_mut().push(name.to_string()));
+    ScopeGuard
+}
+
+impl Drop for ScopeGuard {
+    fn drop(&mut self) {
+        ROUTINE_SCOPE.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// 当前例程名（栈顶）；无例程上下文返回 `None`。
+pub(crate) fn current_scope() -> Option<String> {
+    ROUTINE_SCOPE.with(|s| s.borrow().last().cloned())
+}
 
 /// 单个可缓存 `SELECT INTO` 站点的预计算规格（`site` 分析产物，`cache` 消费）。
 #[derive(Debug, Clone)]
@@ -65,5 +97,5 @@ pub(crate) fn prepare<'a>(
     routine: &str,
 ) -> Option<FallbackExecutor<'a>> {
     let sites = site::collect(prog, region, ex, routine);
-    cache::wrap(ex, prog, region, sites)
+    cache::wrap(ex, prog, region, sites, routine)
 }
