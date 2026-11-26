@@ -31,18 +31,24 @@ pub(super) fn call(
         &callee_args,
         env.cat.sql_rules().implicit_assignment_loose,
     )?;
-    let out = run_with_catalog(
-        &routine.prog,
-        &mut callee,
-        env.ex,
-        &mut *env.sink,
-        env.cat,
-        env.depth + 1,
-        RunLimits {
-            budget: DEFAULT_STEP_BUDGET,
-            batch_commit: env.batch,
-        },
-    )?;
+    // issue #65 R3：压入被调例程作用域——调用方可能挂着
+    // `lookup_outcome::FallbackExecutor`，同 SQL 文本的站点查询
+    // 必须按例程身份区分，嵌套例程不得命中外层缓存。
+    let out = {
+        let _scope = crate::ir::set_oriented::lookup_outcome::push_scope(&routine.name);
+        run_with_catalog(
+            &routine.prog,
+            &mut callee,
+            env.ex,
+            &mut *env.sink,
+            env.cat,
+            env.depth + 1,
+            RunLimits {
+                budget: DEFAULT_STEP_BUDGET,
+                batch_commit: env.batch,
+            },
+        )
+    }?;
     // OUT/INOUT 写回：按参数序对应 out_targets（None = 丢弃）
     for (i, p) in routine.params.iter().enumerate() {
         if p.mode == ParamMode::In {

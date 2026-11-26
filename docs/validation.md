@@ -5711,3 +5711,145 @@ PR#62 devin 按评审任务（task_id=pr62-fix-001）完成三：
   1.3×（混合路径的段批写+异常行重放固有成本），供数据特征选型。
 - 探针报告：`golden/v4_loop_parallel_verify/reports/probe_run.log`
   （16/16，1451.50s）。
+
+## V57. issue #65：集合化回退逐键 lookup 缓存实证（2026-11-25）
+
+> 任务：`ISSUE65-TASK.md`（不入库）。分支 `tuning/spinduck-65`。
+
+### V57.1 机制落点
+
+- 新增 `src/ir/set_oriented/lookup_outcome/`：`site.rs` 计划期证据
+  （`shape::select` 形态 + 顶层合取项切分（BETWEEN 感知）+ 等值键
+  `BindSrc::Field` 归属区域记录 + `residual.rs` 残余全定义谓词证明
+  （审核 B1：比较/IS NULL/BETWEEN/IN + 布尔连接，操作数限列/字面量/
+  `$v_` 不变量绑定/NULL，逐对类型相容；算术等不可证形态整站禁用）+
+  `schema::load` 双端 kind 严格一致 + 浮点键列禁用（审核 B4）+
+  `lookup_cache::shape::recognize` 让位 + 别名保留（P1））；
+  `cache.rs` 区域级 `FallbackExecutor`（首个探测触发 `GROUP BY`+
+  `COUNT(*)`+`CASE WHEN COUNT(*)=1 THEN MAX(列)` 聚合预计算，distinct
+  键 ≤200k、构建行 ≤1M，超限/失败 `Disabled` 降级原路径）。
+- 接入点：`engine/set_oriented.rs` 的 `run_fallback`——计划期
+  `Skipped`（`LiveOutState` 等）、视图物化失败回退、守卫运行态拒绝
+  （`entry_ok`/`RouteDiscriminatorNotTotal`）四处原 `run_prog` 统一改走；
+  `run_prog` 本体委托 `run_prog_on(ex, …)`，无站点时与原路径逐字一致。
+- 探测键 = 键占位符 + 不变量占位符**全部**绑定值（审核 B2）；不变量
+  值与构建值不一致 → bypass 原路径；站点身份含例程名 + PC。
+- 失效：`execute` 按 `lookup_cache::mentioned` 监视表名（维度表+
+  游标源表）命中/回滚 → 站点 **SiteSpec 整体作废**，下次探测按当前
+  schema 重走 `site::analyze_one` 全证据链重证（审核 B3，不复用旧
+  proof）；`Disabled` 不复活，重证失败本轮禁用。
+- 构建失败运行期兜底（审核 B1）：先 `SELECT 1` 探事务健康度，已
+  aborted 则 `ROLLBACK`+`BEGIN` 恢复（与 `reset_session` 同一已知
+  差异口径）再降级原路径，绝不在死事务上继续执行。
+- 复用可见性：`lookup_cache::{mentioned, KeyPart::from_value}` 提为
+  `pub(crate)`（签名零变化）。
+
+### V57.2 四面实证（`set_oriented_issue65_repro`，语义断言零改动）
+
+| 面 | Off 内核 lookup | BatchAtomic 内核 lookup | 说明 |
+|---|---|---|---|
+| A（等值+日期区间） | 1 | 1 | `lookup_cache` 让位，行为不变 |
+| B（等值+数值区间） | 6 | **0 原形态 + 1 聚合** | #65 目标面，N→1 |
+| LIKE（负对照） | 6 | 6 | 非 total 形态保持原路径 |
+| Case2（Top-1 并列） | 0 | 0 | 守卫拒绝整段，与 Off 一致 |
+
+- B 面唯一允许的断言修改已落地：`lookup_calls` 6→0，另断言
+  `asset_kind` 相关 query 恰 1 条（GROUP BY/COUNT 聚合形态）。
+- trace `SqlExec` 逐行 6 条、INSERT/COMMIT 序列与 Off 逐字一致、
+  carryover/NULL/p_msg 语义全等（四测试全绿）。
+
+### V57.3 性能（release，`SPINDUCK_ISSUE65_ROWS=100000`）
+
+```
+issue65 bench n=100000
+  off:   24094 ms, kernel lookups=100000
+  batch: 11626 ms, kernel lookups=0
+```
+
+- 内核原形态 lookup N→1（0 原形态 + 1 次 GROUP BY 聚合扫描）；
+- 回退区域端到端耗时 **−51.7%**（24.1s→11.6s），超过 ≥30% 门槛；
+- 残余耗时为逐行解释器/INSERT/COMMIT 固有成本，非 lookup。
+
+### V57.4 审核修复（PR#66 二轮，`set_oriented_issue65_regression`）
+
+外部审核复现 4 个语义问题 + 2 个测试缺陷 + P1 项，逐项 TDD 修复：
+
+| 项 | 复现（修复前实测） | 修复 | 回归测试 |
+|---|---|---|---|
+| B1 预计算污染事务 | `pri*pri>0` 残余 + Z 行 `pri=BIGINT_MAX`：Batch 报 `KERNEL-0010 TransactionContext aborted` | 残余全定义谓词证明（算术整站禁用）+ 构建失败先探事务、aborted 则 ROLLBACK+BEGIN 恢复再降级 | `should_issue65_b1_arith_residual_never_reaches_build`（Off/Batch 均 `KA`） |
+| B2 缓存身份不完整 | 内层 `p_biz_date=20200101` 先建缓存，外层 `=20220601` 误命中 → 外层输出 `K2020`（应 `K2024`） | 探测键 = 键 + 不变量**全部**绑定值；不变量不一致 bypass；站点身份含例程名+PC | `should_issue65_b2_nested_routine_binds_isolated` |
+| B3 DDL 后旧 proof 复用 | 首次 lookup 前 `CREATE OR REPLACE TABLE` 把键列 VARCHAR→BIGINT：Batch 输出 `MISS`（应 `KA`） | 写失效丢弃整个 SiteSpec，重建重走 `schema::load` 全证据链 | `should_issue65_b3_ddl_rebuilds_site_proof` |
+| B4 DOUBLE 键有损舍入 | `1.0`/`1.0000004` 经 6 位小数折叠同键 | 键列含浮点类型（DOUBLE/FLOAT/REAL）整站禁用 | `should_issue65_b4_double_key_column_disables_cache`（原形态 lookup 保持逐行） |
+| T1 mark 时序 | `executes_mark` 在 `call` 后取 → `executes_since` 空==空恒真 | mark 移到 `call` 前（Off/Batch 两侧） | repro 两测试（语义序列断言恢复真实约束） |
+| T2 perf 硬门禁 | 仅记录无断言 | `off==n`、`batch==0` 原形态 + `asset_kind` 聚合恰 1、`batch_ms<=off_ms` 无条件；≥30% 由 `SPINDUCK_ISSUE65_GATE=1` 显式开启 | `set_oriented_issue65_perf` |
+| P1 别名站点 | `FROM t AS a` + `t.` 限定列：回退正确但缓存未生效（lookup×6） | build_sql 保留 `AS` 别名 | `should_issue65_alias_site_uses_cache`（lookup×0 + 聚合×1） |
+
+- clippy 门禁升级为 `cargo clippy --all-features --tests -- -D warnings`，
+  修复 `unused_mut`/`doc_lazy_continuation`/`useless_vec`/`complex type`。
+- 性能硬门禁运行方式：`SPINDUCK_ISSUE65_GATE=1 cargo test --release
+  --features cli --test set_oriented_issue65_perf`（issue 验收口径
+  release + `SPINDUCK_ISSUE65_ROWS=100000`；≥30% 断言仅在显式开启时
+  生效，隔离 CI 计时抖动）。
+
+### V57.5 不声称
+
+- 不声称残余谓词任意形态安全：残余合取项经全定义谓词证明（仅比较/
+  IS NULL/BETWEEN/IN + 布尔连接，操作数限列/字面量/`$v_` 不变量绑定/
+  NULL，逐对类型相容），其余形态一律整站禁用——不存在"理论次序差"
+  面（原表述撤回：B1 修复前算术残余确有实测差异，`pri*pri` 溢出
+  导致事务 aborted，见 V57.4）。键列类型不一致、浮点键列、游标
+  不可静态解析、视图表等一律不接管。
+- 不声称守卫运行态拒绝路径（`entry_ok`/`RouteDiscriminatorNotTotal`）
+  有专项性能用例——机制同路覆盖，全量测试绿；专属 benchmark 未建。
+- 预计算行/键上限（1M 行/200k 键）为保守工程值，超限静默降级原路径；
+  R4-3 后 build SQL 下推 `LIMIT MAX_KEYS+1`，物化上界即 200,001 行。
+- 排序规则面（V57.7）：仅二元安全 `default_collation`（空/C/POSIX/
+  BINARY）且维表/游标表 DDL 无 `COLLATE` 才接管；`SET`/`RESET`/
+  `PRAGMA` 触发全失效重证。非二元排序、列级 COLLATE 一律不接管。
+- `SELECT DISTINCT/ALL` 修饰符整站禁用（`shape::select` 不识别，
+  R4-2）；其他 SELECT 形态扩展（DISTINCT 支持、表达式键类型内核
+  证明）不在本 PR 范围。
+- 构建失败恢复（V57.4 的 ROLLBACK+BEGIN 方案）已在 V57.6 撤回：
+  它会回滚调用前未提交的用户写入。当前口径为残余 conversion-total
+  静态证明 + aborted 事务按 ENG 不变量 fail-loud。
+
+### V57.6 审核修复（PR#66 三轮，阻断项）
+
+第三轮外部审核复现 3 个阻断语义问题 + 验收矩阵缺口，逐项 TDD 修复：
+
+| 项 | 复现（修复前实测） | 修复 | 回归测试 |
+|---|---|---|---|
+| R1 残余非 total + 恢复回滚用户写入 | `a = b`（BIGINT vs DECIMAL(38,38)）跨类型比较：Z 行 `a=BIGINT_MAX` 使聚合预计算 cast 失败 → 事务 aborted → ROLLBACK+BEGIN 把循环前 `INSERT INTO audit VALUES (1)` 一并回滚（Off audit=[1]，Batch=[]） | 残余证明收紧为 conversion-total：两侧**声明类型严格相等**才放行，字面量/绑定须落在对侧无损域；构建错误若致事务 aborted 按 `EngineError::invariant(74)` fail-loud，禁止 ROLLBACK 用户事务 | `should_issue65_r1_mixed_type_residual_disables_and_preserves_writes`（Off/Batch 均 `KA`、audit 两侧均 [1]、Batch 无 ROLLBACK） |
+| R2 表达式游标键误用物理源列类型 | `SELECT security_id + 0.0 AS security_id`：键被证明为源列 BIGINT，运行期实为 Decimal → 全 MISS（Off=[KA,MISS,DUP]，Batch 全 MISS） | verbatim 游标逐项复核投影（`verbatim.rs`）：仅裸/限定列（可带 AS）可证源列；表达式投影整站禁用；探测 map 未命中/类型不相容**禁止合成 Missing**，一律 bypass 原 SQL | `should_issue65_r2_expression_cursor_key_disables_cache`（输出逐行一致） |
+| R3 例程/站点身份未参与匹配 | 外层 VARCHAR 键建成缓存后 CALL 内层同 SQL 文本 BIGINT 键例程 → 内层全 MISS | 站点匹配 = SQL 文本 + 例程作用域一等键：线程本地例程作用域栈（`run_fallback`/`CallRoutine` 压栈），`FallbackExecutor` 仅在栈顶例程名==owner 时按文本匹配站点（PC 列表仅诊断）；探测 map **命中**时合成 Missing/ExactValue/Duplicate，**未命中或类型不相容**才 bypass 原 SQL；Ready 命中前逐绑定 `runtime_ok` 复核键表示 | `should_issue65_r3_scope_key_representation_bypasses_cache`（内层 [K1,MISS,DUP] 与 Off 一致；B2 嵌套不变量测试保持绿） |
+
+验收矩阵补齐（`set_oriented_issue65_regression`，命名 `should_issue65_*`）：
+
+- 全 miss / 全 hit / 空游标（0 行 → 零查询零预计算）/ 重复 key /
+  多 lookup（双站点各恰 1 条 GROUP BY）/ 跨调用失效（call 两次中间
+  改数，第二次按新数据重建）；
+- 动态依赖禁用：循环内被修改变量参与查找、函数残余（`ABS(pri)`）
+  → 原形态 lookup 逐行 N 次；
+- trace 断言：B 面 `SqlExec` 事件**全量**文本+binds+顺序 Off/Batch
+  逐条一致（`should_issue65_trace_lookup_events_text_and_binds_identical`）。
+
+规模：`site.rs::analyze` 拆为 `analyze`/`classify_conjuncts`/
+`check_key_types`（≤60 行/函数）；verbatim 投影证明拆 `verbatim.rs`
+（129 行）——单文件均回到 §3 上限内。
+
+### V57.7 审核修复（PR#66 四轮，阻断项）
+
+第四轮外部审核复现 2 个阻断语义问题 + 1 个高优物化上界问题，逐项
+TDD 修复（回归测试先红后绿，`set_oriented_issue65_regression`）：
+
+| 项 | 复现（修复前实测） | 修复 | 回归测试 |
+|---|---|---|---|
+| R4-1 排序规则 case-folding | `SET default_collation='nocase'` 后 `'a'='A'` 为真：GROUP BY 把 `'a'`/`'A'` 折叠为一键，探测 map 却按精确值查 → Off=[KA,MISS] vs Batch=[MISS,MISS]；循环中 `EXECUTE IMMEDIATE 'SET ...'` 切换同样中招 | 准入证明（`admission.rs`）：会话 `default_collation` 必须二元安全（空/C/POSIX/BINARY），维表+游标表 DDL 不得含 `COLLATE`；`SET`/`RESET`/`PRAGMA` 与回滚同口径全失效，重证时复核。实测坑：`current_setting()` 被 `prepare_cached` prepare 期常量折叠、SET 后仍返回旧值——改用 `duckdb_settings()` 表函数（执行期取值） | `should_issue65_r4_collation_nocase_disables_cache`（nocase 下禁用缓存、输出逐行一致）；`should_issue65_r4_collation_change_mid_loop_reproves_and_disables`（循环中 SET → 失效重证 → nocase 下禁用） |
+| R4-2 `SELECT DISTINCT` 误解析 | `shape::select` 不识别 DISTINCT/ALL：`SELECT DISTINCT kind` 被解析为列 `distinct`+别名 `kind`，引号同名列可绕过投影证明 → Off=[KA] vs Batch=[WRONG] | 准入 token 检查：词法首词 SELECT、次词 distinct/all 即整站禁用（词法化失败同样保守拒绝） | `should_issue65_r4_distinct_projection_rejected`（带引号 `"distinct"` 列复现，输出逐行一致） |
+| R4-3 预计算无界物化 | `MAX_KEYS`/`MAX_BUILD_ROWS` 只在 `inner.query` 全量物化之后才判定——distinct 键超限前已物化全部结果行 | build SQL 下推 `LIMIT MAX_KEYS+1`：物化上界 200,001 行，超限由 `outcomes.len() > MAX_KEYS` 判 Disabled | 既有超限路径不变（构造性上界，未新增用例） |
+
+规模：`site.rs` 准入证明（形态修饰符/合取项切分/键识别/排序规则）
+拆 `admission.rs`（~250 行含单测），`site.rs` 回 §3 上限；测试夹具
+`tests/common/issue65.rs` 超 700 行上限，第三/四轮夹具拆
+`issue65_review.rs`（~390 行），`setup_case1_with` 与三个 DDL 常量
+改 `pub` 供跨文件引用。
