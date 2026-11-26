@@ -10,8 +10,11 @@
 
 #[path = "common/issue65.rs"]
 mod issue65;
+#[path = "common/issue65_review.rs"]
+mod issue65_review;
 
 use issue65::*;
+use issue65_review::*;
 use spinduck_core::ir::set_oriented::SetOrientedMode;
 use spinduck_core::value::SpinValue;
 
@@ -566,5 +569,85 @@ fn should_issue65_trace_lookup_events_text_and_binds_identical() {
             .iter()
             .any(|q| q.to_ascii_uppercase().contains("GROUP BY")),
         "Batch 应有恰一次 GROUP BY 预计算查询"
+    );
+}
+
+// ===== 第四轮阻断回归 =====
+
+#[test]
+fn should_issue65_r4_collation_nocase_disables_cache() {
+    // 审核复现：SET default_collation='nocase' 后 'a'='A' 为真，
+    // GROUP BY 把 'A'/'a' 折叠同组而探测 map 精确匹配 miss——
+    // 必须整站禁用，输出与 Off 一致（Off 下 'a' 命中 'A'→KA）。
+    let mut off = setup_collate();
+    off.eng
+        .ex
+        .execute("SET default_collation='nocase'", &Default::default())
+        .expect("set collation");
+    off.eng.call("issue65_collate", &[]).expect("off call");
+    let off_out = matrix_rows(&mut off);
+
+    let mut fx = setup_collate();
+    fx.eng
+        .ex
+        .execute("SET default_collation='nocase'", &Default::default())
+        .expect("set collation");
+    fx.eng.set_oriented = SetOrientedMode::BatchAtomic;
+    fx.eng.call("issue65_collate", &[]).expect("batch call");
+    assert_eq!(matrix_rows(&mut fx), off_out, "nocase 下输出与 Off 一致");
+    assert_eq!(
+        lookup_calls(&fx.queries),
+        2,
+        "非二元 collation 必须禁用缓存（逐行原路径）"
+    );
+}
+
+#[test]
+fn should_issue65_r4_collation_change_mid_loop_reproves_and_disables() {
+    // 例程内 EXECUTE IMMEDIATE 改会话排序规则：SET 必须使站点规格
+    // 作废重证，重证时 collation 复核失败 → 后续行走原路径，
+    // 输出与 Off 逐行一致。
+    let mut off = setup_collate_mid();
+    off.eng.call("issue65_collate_mid", &[]).expect("off call");
+    let off_out = matrix_rows(&mut off);
+
+    let mut fx = setup_collate_mid();
+    fx.eng.set_oriented = SetOrientedMode::BatchAtomic;
+    fx.eng.call("issue65_collate_mid", &[]).expect("batch call");
+    assert_eq!(
+        matrix_rows(&mut fx),
+        off_out,
+        "循环内改 collation 后输出与 Off 一致"
+    );
+    // 第一行（二进制期）可命中缓存；SET 后第二行必须回原路径——
+    // 原形态 lookup 至少 1 次（第二行），且输出正确即证无串值。
+    assert!(
+        lookup_calls(&fx.queries) >= 1,
+        "SET 后站点必须重证禁用，第二行走原路径"
+    );
+}
+
+#[test]
+fn should_issue65_r4_distinct_projection_rejected() {
+    // 审核复现：`SELECT DISTINCT kind` 被误解析为列 distinct+别名
+    // kind，存在同名引号列 "distinct" 时聚合投影 WRONG——必须
+    // 显式拒绝 DISTINCT/ALL，输出与 Off 一致（KA,KA）。
+    let mut off = setup_distinct();
+    off.eng.call("issue65_distinct", &[]).expect("off call");
+    let off_out = matrix_rows(&mut off);
+    assert_eq!(
+        off_out.iter().map(|r| r[2].clone()).collect::<Vec<_>>(),
+        vec![s("KA"), s("KA")],
+        "Off 参考：DISTINCT 单行命中 KA"
+    );
+
+    let mut fx = setup_distinct();
+    fx.eng.set_oriented = SetOrientedMode::BatchAtomic;
+    fx.eng.call("issue65_distinct", &[]).expect("batch call");
+    assert_eq!(matrix_rows(&mut fx), off_out, "DISTINCT 站点必须禁用");
+    assert_eq!(
+        lookup_calls(&fx.queries),
+        2,
+        "DISTINCT/ALL 投影必须整站禁用（逐行原路径）"
     );
 }

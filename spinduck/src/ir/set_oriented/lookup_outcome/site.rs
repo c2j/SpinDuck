@@ -7,6 +7,7 @@
 
 use super::super::schema::{self, Table};
 use super::super::shape::{self, Name, Select};
+use super::admission;
 use super::residual::{self, ResidualCtx, ResidualOk};
 use super::SiteSpec;
 use crate::exec::SqlExecutor;
@@ -182,6 +183,12 @@ struct Conjuncts {
 
 /// 单站点证据链：形态 → 合取项分类 → 类型对齐 → 聚合 SQL 生成。
 fn analyze(sql: &str, binds: &[(String, BindSrc)], ctx: &mut SiteCtx<'_>) -> Option<SiteSpec> {
+    // R4-2：shape::select 不识别 DISTINCT/ALL 修饰符（`SELECT DISTINCT k`
+    // 会被误解析为列 `distinct`+别名 `k`），同名引号列可绕过投影
+    // 证明——按 token 显式拒绝，整站禁用。
+    if admission::select_has_modifier(sql) {
+        return None;
+    }
     let sel = shape::select(sql).ok()?;
     if sel.filter.as_deref().is_some_and(shape::filter_has_tail) {
         return None;
@@ -191,6 +198,12 @@ fn analyze(sql: &str, binds: &[(String, BindSrc)], ctx: &mut SiteCtx<'_>) -> Opt
     let dim_table = load_table(ctx.ex, &mut ctx.tables, &sel.table)?;
     let cursor = ctx.cursor?;
     let cursor_table = load_table(ctx.ex, &mut ctx.tables, &cursor.table)?;
+    // R4-1：非二元排序规则下 GROUP BY 键折叠与探测 map 精确匹配
+    // 口径不一致（'a' vs 'A'）——会话 default_collation 与列级
+    // COLLATE 任一不可证即禁用。
+    if !admission::collation_safe(ctx.ex, &[&sel.table, &cursor.table]) {
+        return None;
+    }
     let rctx = ResidualCtx {
         bind_map: &bind_map,
         written_vars: ctx.written_vars,
@@ -232,8 +245,8 @@ fn classify_conjuncts(
     rctx: &ResidualCtx<'_>,
     out: &mut Conjuncts,
 ) -> Option<()> {
-    for conj in split_conjuncts(sel.filter.as_deref().unwrap_or("")) {
-        match key_conjunct(&conj, rctx.bind_map, region, sel) {
+    for conj in admission::split_conjuncts(sel.filter.as_deref().unwrap_or("")) {
+        match admission::key_conjunct(&conj, rctx.bind_map, region, sel) {
             Some((col, ph, rec, field)) => {
                 out.keys.push((col, ph.clone()));
                 out.key_fields.push((rec, field));
@@ -285,77 +298,6 @@ fn check_key_types(
         typed.typed_binds.push((ph.clone(), dim_kind));
     }
     Some(())
-}
-
-/// WHERE 顶层合取项切分：`BETWEEN a AND b` 的 AND 不属于合取边界。
-fn split_conjuncts(filter: &str) -> Vec<Vec<String>> {
-    let Some(t) = shape::Tokens::new(filter) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut cur: Vec<String> = Vec::new();
-    let mut depth = 0usize;
-    let mut between_open = false;
-    for w in t.words() {
-        match w.as_str() {
-            "(" => depth += 1,
-            ")" => depth = depth.saturating_sub(1),
-            "between" if depth == 0 => between_open = true,
-            "and" if depth == 0 => {
-                if between_open {
-                    between_open = false;
-                } else {
-                    out.push(std::mem::take(&mut cur));
-                    continue;
-                }
-            }
-            _ => {}
-        }
-        cur.push(w.clone());
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
-/// 等值合取项 → (维度列, 占位符, 记录变量, 字段名)；非键形态返回 None。
-/// 限定符必须是表名或别名，否则原查询本身不可证，按非键处理（残余侧
-/// 会因字段绑定拒绝整站点）。
-fn key_conjunct(
-    conj: &[String],
-    bind_map: &HashMap<&str, &BindSrc>,
-    region: &CursorRegion,
-    sel: &Select,
-) -> Option<(Name, String, VarName, String)> {
-    let (col, ph, qual) = match conj {
-        [c, eq, p] if eq == "=" => (c, p, None),
-        [q, dot, c, eq, p] if dot == "." && eq == "=" => (c, p, Some(q)),
-        [p, eq, q, dot, c] if eq == "=" && dot == "." => (c, p, Some(q)),
-        _ => return None,
-    };
-    let (col, ph) = if bind_map.contains_key(ph.as_str()) && is_ident(col) {
-        (col, ph)
-    } else if bind_map.contains_key(col.as_str()) && is_ident(ph) {
-        (ph, col)
-    } else {
-        return None;
-    };
-    if let Some(q) = qual {
-        let ok = q == &sel.table.0 || sel.alias.as_ref().is_some_and(|a| &a.0 == q);
-        if !ok {
-            return None;
-        }
-    }
-    match bind_map.get(ph.as_str()) {
-        Some(BindSrc::Field { rec, field }) if rec == &region.record => Some((
-            Name(col.clone()),
-            ph.clone(),
-            rec.clone(),
-            field.to_ascii_lowercase(),
-        )),
-        _ => None,
-    }
 }
 
 /// 裸标识符（与 `Tokens::name` 同规则：字母/下划线开头，字母数字下划线续）。
@@ -432,6 +374,9 @@ fn build_spec(
         let dims = keys.iter().map(|(c, _)| c.sql()).collect::<Vec<_>>();
         build.push_str(&format!(" GROUP BY {}", dims.join(", ")));
     }
+    // R4-3：`inner.query` 全量物化结果——LIMIT MAX_KEYS+1 是超限
+    // 哨兵，把物化上界下推到 SQL 层（distinct 键 >200k → Disabled）。
+    build.push_str(&format!(" LIMIT {}", super::MAX_KEYS + 1));
     SiteSpec {
         sql: sql.to_string(),
         binds: Vec::new(),
@@ -442,97 +387,5 @@ fn build_spec(
         typed_binds: Vec::new(),
         schema: sel.columns.iter().map(|c| c.0.clone()).collect(),
         scope: String::new(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn words(s: &str) -> Vec<String> {
-        split_conjuncts(s)
-            .into_iter()
-            .map(|c| c.join(" "))
-            .collect()
-    }
-
-    #[test]
-    fn should_split_top_level_and_but_keep_between_range() {
-        assert_eq!(
-            words("a = 1 and pri between 1 and 9 and b > 2"),
-            vec!["a = 1", "pri between 1 and 9", "b > 2"]
-        );
-    }
-
-    #[test]
-    fn should_keep_or_and_parens_inside_single_conjunct() {
-        assert_eq!(
-            words("(a = 1 or a = 2) and b = 3"),
-            vec!["( a = 1 or a = 2 )", "b = 3"]
-        );
-    }
-
-    #[test]
-    fn should_handle_not_between_and_multiple_ranges() {
-        assert_eq!(
-            words("x not between 1 and 2 and y between 3 and 4"),
-            vec!["x not between 1 and 2", "y between 3 and 4"]
-        );
-    }
-
-    #[test]
-    fn should_classify_field_equality_as_key_and_var_equality_as_residual() {
-        let record = VarName("r".into());
-        let sel = Select {
-            table: Name("t".into()),
-            alias: None,
-            columns: vec![Name("k".into())],
-            sources: vec![Name("k".into())],
-            filter: None,
-            verbatim: None,
-        };
-        let binds = [
-            (
-                "$v_r__a".to_string(),
-                BindSrc::Field {
-                    rec: record.clone(),
-                    field: "a".into(),
-                },
-            ),
-            ("$v_x".to_string(), BindSrc::Var(VarName("x".into()))),
-        ];
-        let bind_map: HashMap<&str, &BindSrc> =
-            binds.iter().map(|(p, s)| (p.as_str(), s)).collect();
-        let region = CursorRegion {
-            open_pc: 0,
-            fetch_pc: 0,
-            close_pc: 0,
-            cursor: VarName("c".into()),
-            record: record.clone(),
-        };
-        // 字段等值 → 键
-        let hit = key_conjunct(
-            &["a".into(), "=".into(), "$v_r__a".into()],
-            &bind_map,
-            &region,
-            &sel,
-        );
-        assert!(hit.is_some(), "field equality should be a key");
-        // 变量等值 → 非键（残余侧按不变量谓词处理）
-        let miss = key_conjunct(
-            &["a".into(), "=".into(), "$v_x".into()],
-            &bind_map,
-            &region,
-            &sel,
-        );
-        assert!(miss.is_none(), "var equality is not a row-variant key");
-        // 反向书写同样识别
-        let rev = key_conjunct(
-            &["$v_r__a".into(), "=".into(), "a".into()],
-            &bind_map,
-            &region,
-            &sel,
-        );
-        assert!(rev.is_some(), "reversed equality should be a key");
     }
 }

@@ -18,6 +18,7 @@
 //! 绑定含 NULL、探测不变量值与构建值不一致（嵌套例程）或 distinct
 //! key 超上限时 bypass/禁用走原路径。
 
+mod admission;
 mod cache;
 mod residual;
 mod site;
@@ -29,6 +30,11 @@ use crate::ir::IrProg;
 use std::cell::RefCell;
 
 pub(crate) use cache::FallbackExecutor;
+
+/// distinct 键上限（issue 建议值 200k）：预计算 SQL 下推
+/// `LIMIT MAX_KEYS+1` 作超限哨兵（R4-3：`inner.query` 全量物化，
+/// 不加 LIMIT 则上限只约束 map 构建、不约束结果物化）。
+const MAX_KEYS: usize = 200_000;
 
 thread_local! {
     /// 当前执行例程名栈（R3 站点身份）：`run_fallback` 压栈本例程，

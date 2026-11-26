@@ -5801,7 +5801,14 @@ issue65 bench n=100000
   不可静态解析、视图表等一律不接管。
 - 不声称守卫运行态拒绝路径（`entry_ok`/`RouteDiscriminatorNotTotal`）
   有专项性能用例——机制同路覆盖，全量测试绿；专属 benchmark 未建。
-- 预计算行/键上限（1M 行/200k 键）为保守工程值，超限静默降级原路径。
+- 预计算行/键上限（1M 行/200k 键）为保守工程值，超限静默降级原路径；
+  R4-3 后 build SQL 下推 `LIMIT MAX_KEYS+1`，物化上界即 200,001 行。
+- 排序规则面（V57.7）：仅二元安全 `default_collation`（空/C/POSIX/
+  BINARY）且维表/游标表 DDL 无 `COLLATE` 才接管；`SET`/`RESET`/
+  `PRAGMA` 触发全失效重证。非二元排序、列级 COLLATE 一律不接管。
+- `SELECT DISTINCT/ALL` 修饰符整站禁用（`shape::select` 不识别，
+  R4-2）；其他 SELECT 形态扩展（DISTINCT 支持、表达式键类型内核
+  证明）不在本 PR 范围。
 - 构建失败恢复（V57.4 的 ROLLBACK+BEGIN 方案）已在 V57.6 撤回：
   它会回滚调用前未提交的用户写入。当前口径为残余 conversion-total
   静态证明 + aborted 事务按 ENG 不变量 fail-loud。
@@ -5814,7 +5821,7 @@ issue65 bench n=100000
 |---|---|---|---|
 | R1 残余非 total + 恢复回滚用户写入 | `a = b`（BIGINT vs DECIMAL(38,38)）跨类型比较：Z 行 `a=BIGINT_MAX` 使聚合预计算 cast 失败 → 事务 aborted → ROLLBACK+BEGIN 把循环前 `INSERT INTO audit VALUES (1)` 一并回滚（Off audit=[1]，Batch=[]） | 残余证明收紧为 conversion-total：两侧**声明类型严格相等**才放行，字面量/绑定须落在对侧无损域；构建错误若致事务 aborted 按 `EngineError::invariant(74)` fail-loud，禁止 ROLLBACK 用户事务 | `should_issue65_r1_mixed_type_residual_disables_and_preserves_writes`（Off/Batch 均 `KA`、audit 两侧均 [1]、Batch 无 ROLLBACK） |
 | R2 表达式游标键误用物理源列类型 | `SELECT security_id + 0.0 AS security_id`：键被证明为源列 BIGINT，运行期实为 Decimal → 全 MISS（Off=[KA,MISS,DUP]，Batch 全 MISS） | verbatim 游标逐项复核投影（`verbatim.rs`）：仅裸/限定列（可带 AS）可证源列；表达式投影整站禁用；探测 map 未命中/类型不相容**禁止合成 Missing**，一律 bypass 原 SQL | `should_issue65_r2_expression_cursor_key_disables_cache`（输出逐行一致） |
-| R3 例程/站点身份未参与匹配 | 外层 VARCHAR 键建成缓存后 CALL 内层同 SQL 文本 BIGINT 键例程 → 内层全 MISS | 站点身份（例程名+区域 PC）为 query 匹配一等键：线程本地例程作用域栈（`run_fallback`/`CallRoutine` 压栈），`FallbackExecutor` 仅服务栈顶==owner 的查询；Ready 命中前逐绑定 `runtime_ok` 复核键表示 | `should_issue65_r3_scope_key_representation_bypasses_cache`（内层 [K1,MISS,DUP] 与 Off 一致；B2 嵌套不变量测试保持绿） |
+| R3 例程/站点身份未参与匹配 | 外层 VARCHAR 键建成缓存后 CALL 内层同 SQL 文本 BIGINT 键例程 → 内层全 MISS | 站点匹配 = SQL 文本 + 例程作用域一等键：线程本地例程作用域栈（`run_fallback`/`CallRoutine` 压栈），`FallbackExecutor` 仅在栈顶例程名==owner 时按文本匹配站点（PC 列表仅诊断）；探测 map **命中**时合成 Missing/ExactValue/Duplicate，**未命中或类型不相容**才 bypass 原 SQL；Ready 命中前逐绑定 `runtime_ok` 复核键表示 | `should_issue65_r3_scope_key_representation_bypasses_cache`（内层 [K1,MISS,DUP] 与 Off 一致；B2 嵌套不变量测试保持绿） |
 
 验收矩阵补齐（`set_oriented_issue65_regression`，命名 `should_issue65_*`）：
 
@@ -5829,3 +5836,20 @@ issue65 bench n=100000
 规模：`site.rs::analyze` 拆为 `analyze`/`classify_conjuncts`/
 `check_key_types`（≤60 行/函数）；verbatim 投影证明拆 `verbatim.rs`
 （129 行）——单文件均回到 §3 上限内。
+
+### V57.7 审核修复（PR#66 四轮，阻断项）
+
+第四轮外部审核复现 2 个阻断语义问题 + 1 个高优物化上界问题，逐项
+TDD 修复（回归测试先红后绿，`set_oriented_issue65_regression`）：
+
+| 项 | 复现（修复前实测） | 修复 | 回归测试 |
+|---|---|---|---|
+| R4-1 排序规则 case-folding | `SET default_collation='nocase'` 后 `'a'='A'` 为真：GROUP BY 把 `'a'`/`'A'` 折叠为一键，探测 map 却按精确值查 → Off=[KA,MISS] vs Batch=[MISS,MISS]；循环中 `EXECUTE IMMEDIATE 'SET ...'` 切换同样中招 | 准入证明（`admission.rs`）：会话 `default_collation` 必须二元安全（空/C/POSIX/BINARY），维表+游标表 DDL 不得含 `COLLATE`；`SET`/`RESET`/`PRAGMA` 与回滚同口径全失效，重证时复核。实测坑：`current_setting()` 被 `prepare_cached` prepare 期常量折叠、SET 后仍返回旧值——改用 `duckdb_settings()` 表函数（执行期取值） | `should_issue65_r4_collation_nocase_disables_cache`（nocase 下禁用缓存、输出逐行一致）；`should_issue65_r4_collation_change_mid_loop_reproves_and_disables`（循环中 SET → 失效重证 → nocase 下禁用） |
+| R4-2 `SELECT DISTINCT` 误解析 | `shape::select` 不识别 DISTINCT/ALL：`SELECT DISTINCT kind` 被解析为列 `distinct`+别名 `kind`，引号同名列可绕过投影证明 → Off=[KA] vs Batch=[WRONG] | 准入 token 检查：词法首词 SELECT、次词 distinct/all 即整站禁用（词法化失败同样保守拒绝） | `should_issue65_r4_distinct_projection_rejected`（带引号 `"distinct"` 列复现，输出逐行一致） |
+| R4-3 预计算无界物化 | `MAX_KEYS`/`MAX_BUILD_ROWS` 只在 `inner.query` 全量物化之后才判定——distinct 键超限前已物化全部结果行 | build SQL 下推 `LIMIT MAX_KEYS+1`：物化上界 200,001 行，超限由 `outcomes.len() > MAX_KEYS` 判 Disabled | 既有超限路径不变（构造性上界，未新增用例） |
+
+规模：`site.rs` 准入证明（形态修饰符/合取项切分/键识别/排序规则）
+拆 `admission.rs`（~250 行含单测），`site.rs` 回 §3 上限；测试夹具
+`tests/common/issue65.rs` 超 700 行上限，第三/四轮夹具拆
+`issue65_review.rs`（~390 行），`setup_case1_with` 与三个 DDL 常量
+改 `pub` 供跨文件引用。

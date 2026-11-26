@@ -9,16 +9,18 @@
 //! 缓存只服务本次回退 `RunSpan`，句柄随调用结束丢弃。
 //!
 //! 审核修复口径：
-//! - B1：构建 SQL 报错先探事务健康度；已 aborted 则 ROLLBACK+BEGIN
-//!   恢复（与 `interp::flow::reset_session` 同一已知差异口径——上次
-//!   COMMIT 后的本段 DML 一并撤销），绝不在死事务上继续原 SQL。
+//! - B1/R1：残余证明已收紧为 conversion-total，构建错误致事务
+//!   aborted 属不可达状态——按 ENG 不变量 fail-loud，禁止用
+//!   ROLLBACK 回滚用户未提交写入做缓存降级。
 //! - B2：探测键 = 键占位符 + 不变量占位符的全部绑定值；不变量值与
 //!   构建值不一致（嵌套例程同文本不同实参）→ bypass 原路径。
 //! - B3：写/DDL 命中监视表 → `spec` 置空待重证，重建走
 //!   `site::analyze_one` 当前 schema 全证据链，旧 proof 不复用。
+//! - R4：SET/RESET/PRAGMA 会话态变更与回滚同口径全失效重证；
+//!   预计算 SQL 下推 `LIMIT MAX_KEYS+1` 约束物化上界。
 
 use super::site;
-use super::{residual, SiteSpec};
+use super::{residual, SiteSpec, MAX_KEYS};
 use crate::error::EngineError;
 use crate::exec::{is_rollback_stmt, BindMap, ExecOutcome, RowStream, SqlExecutor};
 use crate::ir::set_oriented::region::CursorRegion;
@@ -30,8 +32,6 @@ use std::collections::HashMap;
 
 /// 聚合预计算行数上限（防止无界物化；超限禁用该站点走原路径）。
 const MAX_BUILD_ROWS: usize = 1_000_000;
-/// distinct 键上限（issue 建议值 200k）。
-const MAX_KEYS: usize = 200_000;
 /// 预计算行拉取分块。
 const FETCH_CHUNK: usize = 8192;
 
@@ -327,7 +327,9 @@ impl FallbackExecutor<'_> {
         }) {
             return;
         }
-        let names = if is_rollback_stmt(sql) {
+        // R4-1：SET/RESET/PRAGMA 会话态变更（如 default_collation）
+        // 与回滚同口径全失效——下次探测重证时 collation 复核把关。
+        let names = if is_rollback_stmt(sql) || is_setting_stmt(sql) {
             None
         } else {
             mentioned(sql)
@@ -352,6 +354,20 @@ impl FallbackExecutor<'_> {
             }
         }
     }
+}
+
+/// 会话态变更判定（R4-1）：前导注释剥离后首关键字为
+/// `SET`/`RESET`/`PRAGMA`——可能改变 `default_collation` 等
+/// 排序规则会话态，站点规格必须作废重证（重证含 collation 复核）。
+fn is_setting_stmt(sql: &str) -> bool {
+    crate::exec::strip_leading_comments(sql)
+        .split_whitespace()
+        .next()
+        .is_some_and(|w| {
+            w.eq_ignore_ascii_case("set")
+                || w.eq_ignore_ascii_case("reset")
+                || w.eq_ignore_ascii_case("pragma")
+        })
 }
 
 /// 探测键：全部绑定值 = 键占位符 + 不变量占位符（B2）；返回
