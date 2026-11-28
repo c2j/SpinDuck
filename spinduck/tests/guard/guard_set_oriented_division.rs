@@ -1,8 +1,10 @@
 //! PL 除法与原生 SQL 除零的语义边界守护（V2 设计 §4.5 第 3 项 / §6.2）。
 //!
 //! 锁定 Off 基线：原生 SQL `/` 除零产生 inf/nan（VARCHAR 合法落库、DECIMAL
-//! 转换报错），PL IR 除法整数截断、NULL 传播、非空除零抛 BIZ-0124 并回滚
-//! 先前写入。优化器在证明义务补齐前必须整段跳过且逐行结果/错误逐字一致——
+//! 转换报错），PL IR 整数除法按 GaussDB A 模式 float8 语义产出 15 位有效
+//! 数字（`1/2` = 0.5、`9007199254740993/1` = 9007199254740990，2026-11-28
+//! openGauss 5.0.0 实测）、NULL 传播、非空除零抛 BIZ-0124 并回滚先前写入。
+//! 优化器在证明义务补齐前必须整段跳过且逐行结果/错误逐字一致——
 //! 未来的坏行过滤守卫不得删除合法的 inf/nan 行，也不得把 PL 除零守卫
 //! 误套到原生 SQL 表达式上。
 #![cfg(feature = "native")]
@@ -99,16 +101,19 @@ fn should_fail_native_sql_division_into_decimal_target() {
 }
 
 #[test]
-fn should_truncate_pl_integer_division_and_propagate_null() {
+fn should_divide_pl_integers_like_gaussdb_float8_and_propagate_null() {
     let mut eng = engine("CREATE TABLE target_rows(val VARCHAR)");
     seed(&eng, "(1, 2), (9007199254740993, 1), (NULL, 0)");
     eng.register(PL_DIV).unwrap();
     eng.call("copy_pl", &[]).unwrap();
+    // GaussDB A 模式实测（openGauss 5.0.0）：整数 `/` 走 float8，赋给 NUMBER
+    // 时按 DBL_DIG=15 位有效数字固化——`.5` 与 `9007199254740990`。本仓显示
+    // 口径补前导零（norm 同样把 `.5` 归一为 `0.5`），数值逐字对齐。
     assert_eq!(
         rows(&eng),
         vec![
-            vec![SpinValue::Str("0".into())],
-            vec![SpinValue::Str("9007199254740993".into())],
+            vec![SpinValue::Str("0.5".into())],
+            vec![SpinValue::Str("9007199254740990".into())],
             vec![SpinValue::Null],
         ]
     );

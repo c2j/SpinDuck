@@ -7,6 +7,11 @@ use crate::value::SpinValue;
 pub(super) fn arith(op: &BinOp, l: &SpinValue, r: &SpinValue) -> Result<SpinValue, EngineError> {
     use SpinValue as V;
     if let (V::Int(x), V::Int(y)) = (l, r) {
+        // GaussDB A 模式：整数 `/` 按 float8 计算（15 位有效数字），其余
+        // 整数运算仍是 i64 精确语义（2026-11-28 openGauss 5.0.0 实测）。
+        if *op == BinOp::Div {
+            return div_int_as_float8(*x, *y);
+        }
         return apply_i(op, *x, *y).map(V::Int);
     }
     // 字符串数值解析为真实 (unscaled, scale)——不得虚拟定标（回归守护：'1.5'+1）
@@ -37,26 +42,92 @@ pub(super) fn arith(op: &BinOp, l: &SpinValue, r: &SpinValue) -> Result<SpinValu
             }
             (a.checked_mul(b).ok_or_else(overflow)?, scale)
         }
-        BinOp::Div => {
-            if b == 0 {
-                return Err(EngineError::business(124, "division by zero"));
-            }
-            // value = (a/10^sa) / (b/10^sb)；以 scale S 表示：
-            // u = a·10^(sb+S-sa) / b（指数为负时把 10^|k| 移到分母）
-            let scale = sa.max(sb);
-            let shift = sb as i32 + scale as i32 - sa as i32;
-            let (num, den) = if shift >= 0 {
-                let p = pow10(shift as u8).ok_or_else(overflow)?;
-                (a.checked_mul(p).ok_or_else(overflow)?, b)
-            } else {
-                let p = pow10((-shift) as u8).ok_or_else(overflow)?;
-                (a, b.checked_mul(p).ok_or_else(overflow)?)
-            };
-            (num / den, scale)
-        }
+        BinOp::Div => return div_dec(a, sa, b, sb),
         _ => return Err(EngineError::invariant(30, "not arithmetic")),
     };
     Ok(V::Decimal(out, 38, scale))
+}
+
+/// DECIMAL 除法：结果小数位按 PostgreSQL `select_div_scale`（与 GaussDB
+/// A 模式 numeric/numeric 同源），商按 half-away-from-zero 舍入。
+/// 除零与整数路径同报 BIZ-124。
+fn div_dec(a: i128, sa: u8, b: i128, sb: u8) -> Result<SpinValue, EngineError> {
+    let overflow = || EngineError::business(112, "numeric overflow");
+    if b == 0 {
+        return Err(EngineError::business(124, "division by zero"));
+    }
+    let scale = select_div_scale(a, sa, b, sb)?;
+    // value = (a/10^sa) / (b/10^sb)；以 scale S 表示：
+    // u = a·10^(sb+S-sa) / b（指数为负时把 10^|k| 移到分母）
+    let shift = sb as i32 + scale as i32 - sa as i32;
+    let (num, den) = if shift >= 0 {
+        let p = pow10(shift as u8).ok_or_else(overflow)?;
+        (a.checked_mul(p).ok_or_else(overflow)?, b)
+    } else {
+        let p = pow10((-shift) as u8).ok_or_else(overflow)?;
+        (a, b.checked_mul(p).ok_or_else(overflow)?)
+    };
+    let q = div_round_half_away(num, den)?;
+    Ok(SpinValue::Decimal(q, 38, scale))
+}
+
+/// `select_div_scale`（numeric.c）：商的小数位先保证 `NUMERIC_MIN_SIG_DIGITS=16`
+/// 位有效数字（`16 - qweight×DEC_DIGITS=4`），再不得小于任一操作数的显示
+/// 小数位；PG 上限 1000，本仓 i128 定标上界 38，超出显式报错（不得静默截断）。
+fn select_div_scale(a: i128, sa: u8, b: i128, sb: u8) -> Result<u8, EngineError> {
+    let (w1, f1) = weight_first_digit(a, sa);
+    let (w2, f2) = weight_first_digit(b, sb);
+    // 首位数字相等时无法断定大小，PG 按商降一档处理
+    let mut qweight = w1 - w2;
+    if f1 <= f2 {
+        qweight -= 1;
+    }
+    let rscale = (16 - qweight * 4).max(sa as i32).max(sb as i32).max(0);
+    if rscale > 38 {
+        return Err(EngineError::business(112, "numeric overflow"));
+    }
+    Ok(rscale as u8)
+}
+
+/// 操作数在基 10000 下的（权重, 首位数字），即 numeric.c 里归一化后的
+/// `weight` / `firstdigit`：value = a×10^-scale，十进制首权 dec = 位数-1-scale，
+/// base-10000 权 = dec 向下取整除 4，首位组 = dec mod 4 + 1 位有效数字。
+fn weight_first_digit(a: i128, scale: u8) -> (i32, u32) {
+    if a == 0 {
+        return (0, 0);
+    }
+    let n = a.unsigned_abs();
+    let mut digits = 0u32;
+    let mut t = n;
+    while t > 0 {
+        digits += 1;
+        t /= 10;
+    }
+    let dec = digits as i32 - 1 - scale as i32;
+    let weight = dec.div_euclid(4);
+    let group = dec.rem_euclid(4) + 1;
+    let group = group as u32;
+    let first = if group <= digits {
+        n / 10u128.pow(digits - group)
+    } else {
+        // 纯小数有效位不足首位组：右侧补零（0.00001 → 首位组 1000）
+        n * 10u128.pow(group - digits)
+    };
+    (weight, first as u32)
+}
+
+/// 商按 half-away-from-zero 舍入（div_var 的 round 口径：余数×2 ≥ 除数则进位）。
+fn div_round_half_away(num: i128, den: i128) -> Result<i128, EngineError> {
+    let neg = (num < 0) != (den < 0);
+    let n = num.unsigned_abs();
+    let d = den.unsigned_abs();
+    let mut q = n / d;
+    // 用 u128 比较 `2r ≥ d`，避免 r×2 溢出
+    if n % d >= d - (n % d) {
+        q += 1;
+    }
+    let q = i128::try_from(q).map_err(|_| EngineError::business(112, "numeric overflow"))?;
+    Ok(if neg { -q } else { q })
 }
 
 /// 10^n（n ≤ 38，i128 上界内）；超出返回 None。
@@ -69,6 +140,58 @@ pub(super) fn pow10(n: u8) -> Option<i128> {
         r = r.checked_mul(10)?;
     }
     Some(r)
+}
+
+/// 整数除法按 GaussDB A 模式的 float8 语义求值：先以 f64 计算，再按
+/// `DBL_DIG=15` 位有效数字固化为 DECIMAL（`1/2` → 0.5、
+/// `9007199254740993/1` → 9007199254740990）。除零与 DECIMAL 路径同报
+/// BIZ-124，不得静默返回 0 或 inf。
+fn div_int_as_float8(x: i64, y: i64) -> Result<SpinValue, EngineError> {
+    if y == 0 {
+        return Err(EngineError::business(124, "division by zero"));
+    }
+    // `{:.14e}` = 1 位整数 + 14 位小数 = 15 位有效数字，与 C
+    // `printf("%.15g")` / float8_numeric 的舍入口径一致。
+    let text = format!("{:.14e}", x as f64 / y as f64);
+    decimal_from_sig15(&text)
+}
+
+/// 把 `[-]d.dddddddddddddde±N`（15 位有效数字）解析成真实定标的 DECIMAL；
+/// 去掉尾零以复现 float8 → NUMBER 的规范形态（0.5 而非 0.500000000000000）。
+fn decimal_from_sig15(text: &str) -> Result<SpinValue, EngineError> {
+    let invalid = || EngineError::invariant(30, "invalid float8 decimal");
+    let (mantissa, exp) = text.split_once('e').ok_or_else(invalid)?;
+    let exp: i32 = exp.parse().map_err(|_| invalid())?;
+    let neg = mantissa.starts_with('-');
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return Err(invalid());
+    }
+    let mut unscaled: i128 = digits.parse().map_err(|_| invalid())?;
+    if neg {
+        unscaled = -unscaled;
+    }
+    // digits 共 15 位：value = digits × 10^(exp - 14)
+    let mut scale = 14 - exp;
+    if scale < 0 {
+        let p =
+            pow10((-scale) as u8).ok_or_else(|| EngineError::business(112, "numeric overflow"))?;
+        unscaled = unscaled
+            .checked_mul(p)
+            .ok_or_else(|| EngineError::business(112, "numeric overflow"))?;
+        scale = 0;
+    }
+    while scale > 0 && unscaled % 10 == 0 {
+        unscaled /= 10;
+        scale -= 1;
+    }
+    if unscaled == 0 {
+        scale = 0;
+    } else if scale > 38 {
+        // i128 定标上界：宁可显式报错，不得静默截断（AGENTS §5）
+        return Err(EngineError::business(112, "numeric overflow"));
+    }
+    Ok(SpinValue::Decimal(unscaled, 38, scale as u8))
 }
 
 /// 整数路径：除零与 DECIMAL 路径同报 ZERO_DIVIDE（BIZ-124），不得防御性返 0。

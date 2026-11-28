@@ -1,0 +1,7 @@
+-- SELECT c_customer_sk, increaseinwebspending(c_customer_sk) AS inc FROM customer ORDER BY c_customer_sk
+[exit 1]
+[KERNEL-0010] Catalog Error: Scalar Function with name increaseinwebspending does not exist!
+Did you mean "__internal_decompress_integral_bigint"?
+
+LINE 1: SELECT c_customer_sk, increaseinwebspending(c_customer_sk) AS inc FROM customer...
+                              ^

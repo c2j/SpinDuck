@@ -1,0 +1,50 @@
+===== off =====
+$ call --plan <project>/.spinduck/plan/prc_stair_t0.toml --db <project>/local.duckdb
+[exit 0]
+CALL prc_stair_t0 OK
+-- dump[0]: SELECT * FROM result_stair ORDER BY k, cost
+{
+  "schema": ["k", "tag", "cost"],
+  "rows": [
+    ["1", "x", "90.0000"],
+    ["1", "x", "100.0000"],
+    ["2", "x", "45.0000"],
+    ["2", "x", "50.0000"],
+    ["3", "x", "200.0000"]
+  ]
+}
+
+===== batch-atomic =====
+$ call --plan <project>/.spinduck/plan/prc_stair_t0.toml --db <project>/local.duckdb --set-oriented=batch-atomic
+[exit 0]
+SET_ORIENTED prc_stair_t0 converted
+CALL prc_stair_t0 OK
+-- dump[0]: SELECT * FROM result_stair ORDER BY k, cost
+{
+  "schema": ["k", "tag", "cost"],
+  "rows": [
+    ["1", "x", "90.0000"],
+    ["1", "x", "100.0000"],
+    ["2", "x", "45.0000"],
+    ["2", "x", "50.0000"],
+    ["3", "x", "200.0000"]
+  ]
+}
+
+===== strict =====
+$ call --plan <project>/.spinduck/plan/prc_stair_t0.toml --db <project>/local.duckdb --set-oriented=strict
+[exit 0]
+SET_ORIENTED prc_stair_t0 skipped reason=UnprovenRollbackScope
+CALL prc_stair_t0 OK
+-- dump[0]: SELECT * FROM result_stair ORDER BY k, cost
+{
+  "schema": ["k", "tag", "cost"],
+  "rows": [
+    ["1", "x", "90.0000"],
+    ["1", "x", "100.0000"],
+    ["2", "x", "45.0000"],
+    ["2", "x", "50.0000"],
+    ["3", "x", "200.0000"]
+  ]
+}
+

@@ -1,0 +1,276 @@
+plan: ./.spinduck/plan/prc_stair_p0s.toml (updated)
+plan: target=prc_stair_p0s routines=1 tables=1 missing=0
+REF table:partsupplier read <- prc_stair_p0s @ sql/routines/p0_staircase.sql:18
+REF table:result_stair write <- prc_stair_p0s @ sql/routines/p0_staircase.sql:26
+plan: ./.spinduck/plan/prc_stair_p0r.toml (updated)
+plan: target=prc_stair_p0r routines=1 tables=1 missing=0
+REF table:partsupplier read <- prc_stair_p0r @ sql/routines/p0_staircase.sql:40
+REF table:result_stair write <- prc_stair_p0r @ sql/routines/p0_staircase.sql:47
+plan: ./.spinduck/plan/prc_stair_p0r2.toml (updated)
+plan: target=prc_stair_p0r2 routines=1 tables=1 missing=0
+REF routine:fnc_tag_simple call <- prc_stair_p0r2 @ sql/routines/p0_staircase.sql:0
+REF table:partsupplier read <- prc_stair_p0r2 @ sql/routines/p0_staircase.sql:61
+REF table:result_stair write <- prc_stair_p0r2 @ sql/routines/p0_staircase.sql:68
+plan: ./.spinduck/plan/prc_stair_p0f.toml (updated)
+plan: target=prc_stair_p0f routines=1 tables=1 missing=0
+REF table:result_stair write <- prc_stair_p0f @ sql/routines/p0_staircase.sql:84
+plan: ./.spinduck/plan/prc_stair_p0f2.toml (updated)
+plan: target=prc_stair_p0f2 routines=1 tables=1 missing=0
+REF routine:fnc_tag_simple call <- prc_stair_p0f2 @ sql/routines/p0_staircase.sql:0
+REF table:result_stair write <- prc_stair_p0f2 @ sql/routines/p0_staircase.sql:98
+plan: ./.spinduck/plan/prc_stair_t0.toml (updated)
+plan: target=prc_stair_t0 routines=1 tables=1 missing=0
+REF table:result_stair write <- prc_stair_t0 @ sql/routines/t0_canonical.sql:27
+plan: ./.spinduck/plan/prc_stair_t0null.toml (updated)
+plan: target=prc_stair_t0null routines=1 tables=1 missing=0
+REF table:result_stair write <- prc_stair_t0null @ sql/routines/t0_canonical.sql:46
+plan: ./.spinduck/plan/prc_stair_t0s.toml (updated)
+plan: target=prc_stair_t0s routines=1 tables=1 missing=0
+REF table:partsupplier read <- prc_stair_t0s @ sql/routines/t0_canonical.sql:63
+REF table:result_stair write <- prc_stair_t0s @ sql/routines/t0_canonical.sql:71
+plan: ./.spinduck/plan/prc_stair_t0r.toml (updated)
+plan: target=prc_stair_t0r routines=1 tables=1 missing=0
+REF table:partsupplier read <- prc_stair_t0r @ sql/routines/t0_canonical.sql:90
+REF table:result_stair write <- prc_stair_t0r @ sql/routines/t0_canonical.sql:97
+plan: ./.spinduck/plan/prc_stair_t0rf.toml (updated)
+plan: target=prc_stair_t0rf routines=1 tables=1 missing=1
+MISS relation:c <- prc_stair_t0rf
+REF table:c type <- prc_stair_t0rf @ sql/routines/t0_canonical.sql:116
+REF table:partsupplier read <- prc_stair_t0rf @ sql/routines/t0_canonical.sql:116
+REF table:result_stair write <- prc_stair_t0rf @ sql/routines/t0_canonical.sql:123
+plan: ./.spinduck/plan/prc_stair_t2.toml (updated)
+plan: target=prc_stair_t2 routines=1 tables=1 missing=0
+REF table:result_stair write <- prc_stair_t2 @ sql/routines/t0_canonical.sql:144
+plan: ./.spinduck/plan/prc_stair_t2b.toml (updated)
+plan: target=prc_stair_t2b routines=1 tables=1 missing=0
+REF table:result_stair write <- prc_stair_t2b @ sql/routines/t0_canonical.sql:169
+plan: ./.spinduck/plan/prc_stair_t2c.toml (updated)
+plan: target=prc_stair_t2c routines=1 tables=1 missing=0
+REF table:result_stair write <- prc_stair_t2c @ sql/routines/t0_canonical.sql:192
+plan: ./.spinduck/plan/prc_stair_t2d.toml (updated)
+plan: target=prc_stair_t2d routines=1 tables=1 missing=0
+REF table:result_stair write <- prc_stair_t2d @ sql/routines/t0_canonical.sql:216
+plan: ./.spinduck/plan/prc_stair_t2e.toml (updated)
+plan: target=prc_stair_t2e routines=1 tables=1 missing=0
+REF table:result_stair write <- prc_stair_t2e @ sql/routines/t0_canonical.sql:428
+REF table:supplier read <- prc_stair_t2e @ sql/routines/t0_canonical.sql:434
+REF table:supplier type <- prc_stair_t2e @ sql/routines/t0_canonical.sql:425
+plan: ./.spinduck/plan/prc_stair_t3.toml (updated)
+plan: target=prc_stair_t3 routines=1 tables=1 missing=0
+REF table:result_stair write <- prc_stair_t3 @ sql/routines/t0_canonical.sql:240
+plan: ./.spinduck/plan/prc_stair_t7.toml (updated)
+plan: target=prc_stair_t7 routines=2 tables=1 missing=0
+REF routine:fnc_tag_simple call <- prc_stair_t7 @ sql/routines/t0_canonical.sql:0
+REF table:result_stair write <- prc_stair_t7 @ sql/routines/t0_canonical.sql:260
+plan: ./.spinduck/plan/prc_stair_t8.toml (updated)
+plan: target=prc_stair_t8 routines=1 tables=1 missing=0
+REF table:result_stair write <- prc_stair_t8 @ sql/routines/t0_canonical.sql:280
+REF table:supplier read <- prc_stair_t8 @ sql/routines/t0_canonical.sql:286
+REF table:supplier type <- prc_stair_t8 @ sql/routines/t0_canonical.sql:277
+plan: ./.spinduck/plan/prc_stair_t8b.toml (updated)
+plan: target=prc_stair_t8b routines=1 tables=1 missing=0
+REF table:result_stair write <- prc_stair_t8b @ sql/routines/t0_canonical.sql:399
+REF table:supplier read <- prc_stair_t8b @ sql/routines/t0_canonical.sql:405
+REF table:supplier type <- prc_stair_t8b @ sql/routines/t0_canonical.sql:396
+plan: ./.spinduck/plan/prc_stair_t8n.toml (updated)
+plan: target=prc_stair_t8n routines=1 tables=1 missing=0
+REF table:result_stair write <- prc_stair_t8n @ sql/routines/t0_canonical.sql:309
+REF table:supplier read <- prc_stair_t8n @ sql/routines/t0_canonical.sql:314
+REF table:supplier type <- prc_stair_t8n @ sql/routines/t0_canonical.sql:306
+plan: ./.spinduck/plan/prc_stair_t9.toml (updated)
+plan: target=prc_stair_t9 routines=1 tables=1 missing=0
+REF table:result_stair write <- prc_stair_t9 @ sql/routines/t0_canonical.sql:332
+REF table:supplier write <- prc_stair_t9 @ sql/routines/t0_canonical.sql:344
+plan: ./.spinduck/plan/prc_stair_t10.toml (updated)
+plan: target=prc_stair_t10 routines=1 tables=1 missing=0
+REF table:result_stair write <- prc_stair_t10 @ sql/routines/t0_canonical.sql:354
+plan: ./.spinduck/plan/prc_stair_t4.toml (updated)
+plan: target=prc_stair_t4 routines=1 tables=1 missing=0
+REF table:result_stair write <- prc_stair_t4 @ sql/routines/t0_canonical.sql:374
+plan: ./.spinduck/plan/caller_dummy.toml (updated)
+plan: target=caller_dummy routines=1 tables=1 missing=0
+REF table:dst_rows write <- caller_dummy @ sql/routines/t2f_repo_fixture.sql:44
+REF table:seat_para read <- caller_dummy @ sql/routines/t2f_repo_fixture.sql:17
+REF table:sys_dummy read <- caller_dummy @ sql/routines/t2f_repo_fixture.sql:33
+plan: ./.spinduck/plan/fnc_min_cost_supp.toml (updated)
+plan: target=fnc_min_cost_supp routines=1 tables=1 missing=0
+REF table:partsupplier read <- fnc_min_cost_supp @ sql/routines/a1_aggify_mincostsupp.sql:7
+REF table:supplier read <- fnc_min_cost_supp @ sql/routines/a1_aggify_mincostsupp.sql:7
+plan: ./.spinduck/plan/prc_aggify_a1.toml (updated)
+plan: target=prc_aggify_a1 routines=1 tables=1 missing=0
+REF routine:fnc_min_cost_supp call <- prc_aggify_a1 @ sql/routines/a1_aggify_mincostsupp.sql:0
+REF table:partsupplier read <- fnc_min_cost_supp @ sql/routines/a1_aggify_mincostsupp.sql:7
+REF table:result_min_supp write <- prc_aggify_a1 @ sql/routines/a1_aggify_mincostsupp.sql:34
+REF table:supplier read <- fnc_min_cost_supp @ sql/routines/a1_aggify_mincostsupp.sql:7
+plan: ./.spinduck/plan/fnc_cum_roi.toml (updated)
+plan: target=fnc_cum_roi routines=1 tables=1 missing=0
+REF table:monthly_investments read <- fnc_cum_roi @ sql/routines/a2_aggify_cumroi.sql:5
+plan: ./.spinduck/plan/prc_aggify_a2.toml (updated)
+plan: target=prc_aggify_a2 routines=1 tables=1 missing=0
+REF routine:fnc_cum_roi call <- prc_aggify_a2 @ sql/routines/a2_aggify_cumroi.sql:0
+REF table:monthly_investments read <- fnc_cum_roi @ sql/routines/a2_aggify_cumroi.sql:5
+REF table:result_cum_roi write <- prc_aggify_a2 @ sql/routines/a2_aggify_cumroi.sql:28
+plan: ./.spinduck/plan/prc_aggify_a3.toml (updated)
+plan: target=prc_aggify_a3 routines=1 tables=1 missing=0
+REF table:result_running write <- prc_aggify_a3 @ sql/routines/a3_aggify_order_state.sql:18
+REF table:txns read <- prc_aggify_a3 @ sql/routines/a3_aggify_order_state.sql:7
+plan: ./.spinduck/plan/prc_aggify_a4.toml (updated)
+plan: target=prc_aggify_a4 routines=1 tables=1 missing=0
+REF table:partsupplier read <- prc_aggify_a4 @ sql/routines/a4_aggify_nested_cursor.sql:7
+REF table:result_nested write <- prc_aggify_a4 @ sql/routines/a4_aggify_nested_cursor.sql:17
+plan: ./.spinduck/plan/prc_aggify_a5.toml (updated)
+plan: target=prc_aggify_a5 routines=1 tables=1 missing=0
+REF table:result_seq write <- prc_aggify_a5 @ sql/routines/a5_aggify_iterative_for.sql:9
+plan: ./.spinduck/plan/prc_aggify_a6.toml (updated)
+plan: target=prc_aggify_a6 routines=1 tables=1 missing=0
+REF table:part read <- prc_aggify_a6 @ sql/routines/a6_aggify_stage_table.sql:7
+REF table:result_from_tmp write <- prc_aggify_a6 @ sql/routines/a6_aggify_stage_table.sql:14
+REF table:stage_agg read <- prc_aggify_a6 @ sql/routines/a6_aggify_stage_table.sql:15
+REF table:stage_agg write <- prc_aggify_a6 @ sql/routines/a6_aggify_stage_table.sql:15
+plan: ./.spinduck/plan/total_price.toml (updated)
+plan: target=total_price routines=1 tables=1 missing=0
+REF table:customer_prefs read <- total_price @ sql/routines/b1_froid_total_price.sql:35
+REF table:orders read <- total_price @ sql/routines/b1_froid_total_price.sql:31
+REF table:xchg read <- xchg_rate @ sql/routines/b1_froid_total_price.sql:15
+REF routine:xchg_rate call <- total_price @ sql/routines/b1_froid_total_price.sql:0
+plan: ./.spinduck/plan/prc_froid_b1.toml (updated)
+plan: target=prc_froid_b1 routines=1 tables=1 missing=0
+REF table:customer_prefs read <- total_price @ sql/routines/b1_froid_total_price.sql:35
+REF table:orders read <- total_price @ sql/routines/b1_froid_total_price.sql:31
+REF table:result_total write <- prc_froid_b1 @ sql/routines/b1_froid_total_price.sql:64
+REF routine:total_price call <- prc_froid_b1 @ sql/routines/b1_froid_total_price.sql:0
+REF table:xchg read <- xchg_rate @ sql/routines/b1_froid_total_price.sql:15
+REF routine:xchg_rate call <- total_price @ sql/routines/b1_froid_total_price.sql:0
+plan: ./.spinduck/plan/prc_froid_b1s.toml (updated)
+plan: target=prc_froid_b1s routines=1 tables=1 missing=0
+REF table:customer read <- prc_froid_b1s @ sql/routines/b1_froid_total_price.sql:54
+REF table:customer_prefs read <- total_price @ sql/routines/b1_froid_total_price.sql:35
+REF table:orders read <- total_price @ sql/routines/b1_froid_total_price.sql:31
+REF table:result_total write <- prc_froid_b1s @ sql/routines/b1_froid_total_price.sql:52
+REF routine:total_price call <- prc_froid_b1s @ sql/routines/b1_froid_total_price.sql:0
+REF table:xchg read <- xchg_rate @ sql/routines/b1_froid_total_price.sql:15
+REF routine:xchg_rate call <- total_price @ sql/routines/b1_froid_total_price.sql:0
+plan: ./.spinduck/plan/getmanufact_complex_r.toml (updated)
+plan: target=getmanufact_complex_r routines=1 tables=1 missing=0
+REF table:catalog_sales_history read <- getmanufact_complex_r @ sql/routines/c1_cidr24_prism_getmanufact.sql:16
+REF table:date_dim read <- getmanufact_complex_r @ sql/routines/c1_cidr24_prism_getmanufact.sql:15
+REF table:item read <- getmanufact_complex_r @ sql/routines/c1_cidr24_prism_getmanufact.sql:18
+REF table:store_sales_history read <- getmanufact_complex_r @ sql/routines/c1_cidr24_prism_getmanufact.sql:15
+plan: ./.spinduck/plan/prc_cidr24_c1.toml (updated)
+plan: target=prc_cidr24_c1 routines=1 tables=1 missing=0
+REF table:catalog_sales_history read <- getmanufact_complex_r @ sql/routines/c1_cidr24_prism_getmanufact.sql:16
+REF table:date_dim read <- getmanufact_complex_r @ sql/routines/c1_cidr24_prism_getmanufact.sql:15
+REF routine:getmanufact_complex_r call <- prc_cidr24_c1 @ sql/routines/c1_cidr24_prism_getmanufact.sql:0
+REF table:item read <- getmanufact_complex_r @ sql/routines/c1_cidr24_prism_getmanufact.sql:18
+REF table:result_manufact write <- prc_cidr24_c1 @ sql/routines/c1_cidr24_prism_getmanufact.sql:34
+REF table:store_sales_history read <- getmanufact_complex_r @ sql/routines/c1_cidr24_prism_getmanufact.sql:15
+plan: ./.spinduck/plan/getmanufact_complex.toml (updated)
+plan: target=getmanufact_complex routines=1 tables=1 missing=0
+REF table:catalog_sales_history read <- getmanufact_complex @ sql/routines/procbench/Sudf_20b_GetManufactComplex.sql:14
+REF table:date_dim read <- getmanufact_complex @ sql/routines/procbench/Sudf_20b_GetManufactComplex.sql:13
+REF table:item read <- getmanufact_complex @ sql/routines/procbench/Sudf_20b_GetManufactComplex.sql:16
+REF table:store_sales_history read <- getmanufact_complex @ sql/routines/procbench/Sudf_20b_GetManufactComplex.sql:13
+plan: ./.spinduck/plan/walk.toml (updated)
+plan: target=walk routines=1 tables=1 missing=0
+REF table:actions read <- walk @ sql/routines/e1_hirn_grust_walk.sql:34
+REF table:policy read <- walk @ sql/routines/e1_hirn_grust_walk.sql:22
+REF table:states read <- walk @ sql/routines/e1_hirn_grust_walk.sql:22
+REF table:sys_dummy read <- walk @ sql/routines/e1_hirn_grust_walk.sql:29
+plan: ./.spinduck/plan/prc_hirn_e1.toml (updated)
+plan: target=prc_hirn_e1 routines=1 tables=1 missing=0
+REF table:actions read <- walk @ sql/routines/e1_hirn_grust_walk.sql:34
+REF table:policy read <- walk @ sql/routines/e1_hirn_grust_walk.sql:22
+REF table:result_walk write <- prc_hirn_e1 @ sql/routines/e1_hirn_grust_walk.sql:63
+REF table:states read <- walk @ sql/routines/e1_hirn_grust_walk.sql:22
+REF table:sys_dummy read <- walk @ sql/routines/e1_hirn_grust_walk.sql:29
+REF routine:walk call <- prc_hirn_e1 @ sql/routines/e1_hirn_grust_walk.sql:0
+plan: ./.spinduck/plan/maxreturnclass_r.toml (updated)
+plan: target=maxreturnclass_r routines=1 tables=1 missing=0
+REF table:catalog_returns read <- maxreturnclass_r @ sql/routines/procbench/d1_maxReturnClass_adapted.sql:6
+REF table:item read <- maxreturnclass_r @ sql/routines/procbench/d1_maxReturnClass_adapted.sql:6
+plan: ./.spinduck/plan/maxreturnclass.toml (updated)
+plan: target=maxreturnclass routines=1 tables=1 missing=0
+REF table:catalog_returns read <- maxreturnclass @ sql/routines/procbench/sudf_8_maxReturnClass.sql:5
+REF table:item read <- maxreturnclass @ sql/routines/procbench/sudf_8_maxReturnClass.sql:5
+plan: ./.spinduck/plan/activatepromocat.toml (updated)
+plan: target=activatepromocat routines=1 tables=1 missing=0
+REF table:best_promos_catalog read <- activatepromocat @ sql/routines/procbench/d2_activatePromoCat_adapted.sql:6
+REF table:promotion write <- activatepromocat @ sql/routines/procbench/d2_activatePromoCat_adapted.sql:17
+plan: ./.spinduck/plan/custtotalloss.toml (updated)
+plan: target=custtotalloss routines=1 tables=1 missing=1
+MISS routine:dbms_sql.return_result <- custtotalloss
+REF table:catalog_returns read <- custtotalloss @ sql/routines/procbench/proc62_totalCustLoss.sql:5
+REF table:catalog_sales read <- custtotalloss @ sql/routines/procbench/proc62_totalCustLoss.sql:32
+REF table:reason read <- custtotalloss @ sql/routines/procbench/proc62_totalCustLoss.sql:18
+REF table:web_returns read <- custtotalloss @ sql/routines/procbench/proc62_totalCustLoss.sql:5
+REF table:web_sales read <- custtotalloss @ sql/routines/procbench/proc62_totalCustLoss.sql:23
+plan: ./.spinduck/plan/increaseinwebspending.toml (updated)
+plan: target=increaseinwebspending routines=1 tables=1 missing=0
+REF table:date_dim read <- increaseinwebspending @ sql/routines/procbench/sudf_12_increaseInWebSpending.sql:18
+REF table:web_sales_history read <- increaseinwebspending @ sql/routines/procbench/sudf_12_increaseInWebSpending.sql:18
+plan: ./.spinduck/plan/prc_xfile_call.toml (updated)
+plan: target=prc_xfile_call routines=2 tables=1 missing=0
+REF table:result_xfile write <- prc_xfile_call @ sql/routines/a0_xfile_call.sql:11
+REF table:xchg read <- xchg_rate @ sql/routines/b1_froid_total_price.sql:15
+REF routine:xchg_rate call <- prc_xfile_call @ sql/routines/a0_xfile_call.sql:0
+plan: ./.spinduck/plan/prc_xcol_capture.toml (updated)
+plan: target=prc_xcol_capture routines=1 tables=1 missing=0
+REF table:result_seq write <- prc_xcol_capture @ sql/routines/x2_column_name_capture.sql:8
+plan: ./.spinduck/plan/prc_dbridge_filter.toml (updated)
+plan: target=prc_dbridge_filter routines=1 tables=1 missing=0
+REF table:result_unfinished write <- prc_dbridge_filter @ sql/routines/d09_dbridge.sql:11
+plan: ./.spinduck/plan/prc_dbridge_exists.toml (updated)
+plan: target=prc_dbridge_exists routines=1 tables=1 missing=0
+REF routine:fnc_dbridge_exists call <- prc_dbridge_exists @ sql/routines/d09_dbridge.sql:0
+REF table:project read <- fnc_dbridge_exists @ sql/routines/d09_dbridge.sql:25
+REF table:result_exists write <- prc_dbridge_exists @ sql/routines/d09_dbridge.sql:38
+plan: ./.spinduck/plan/prc_qbs_getroleuser.toml (updated)
+plan: target=prc_qbs_getroleuser routines=1 tables=1 missing=0
+REF table:result_role_user write <- prc_qbs_getroleuser @ sql/routines/q10_qbs.sql:9
+plan: ./.spinduck/plan/prc_sloth_dashboard.toml (updated)
+plan: target=prc_sloth_dashboard routines=1 tables=1 missing=0
+REF table:encounter read <- prc_sloth_dashboard @ sql/routines/s11_sloth.sql:20
+REF table:patient read <- prc_sloth_dashboard @ sql/routines/s11_sloth.sql:16
+REF table:patient type <- prc_sloth_dashboard @ sql/routines/s11_sloth.sql:6
+REF table:result_dashboard write <- prc_sloth_dashboard @ sql/routines/s11_sloth.sql:12
+REF table:visit read <- prc_sloth_dashboard @ sql/routines/s11_sloth.sql:24
+plan: ./.spinduck/plan/fnc_num_div_int.toml (updated)
+plan: target=fnc_num_div_int routines=1 tables=0 missing=0
+plan: ./.spinduck/plan/fnc_num_div_expr.toml (updated)
+plan: target=fnc_num_div_expr routines=1 tables=0 missing=0
+plan: ./.spinduck/plan/fnc_num_div_dec.toml (updated)
+plan: target=fnc_num_div_dec routines=1 tables=0 missing=0
+plan: ./.spinduck/plan/fnc_num_div_small.toml (updated)
+plan: target=fnc_num_div_small routines=1 tables=0 missing=0
+plan: ./.spinduck/plan/fnc_num_mod_assign.toml (updated)
+plan: target=fnc_num_mod_assign routines=1 tables=0 missing=0
+plan: ./.spinduck/plan/fnc_num_mod_return.toml (updated)
+plan: target=fnc_num_mod_return routines=1 tables=0 missing=0
+plan: ./.spinduck/plan/fnc_num_mod_sql.toml (updated)
+plan: target=fnc_num_mod_sql routines=1 tables=0 missing=0
+plan: ./.spinduck/plan/fnc_num_mod_literal.toml (updated)
+plan: target=fnc_num_mod_literal routines=1 tables=0 missing=0
+FAIL sql/routines/a0_xfile_call.sql  [KERNEL-0011] duckdb prepare: Catalog Error: Scalar Function with name xchg_rate does not exist!
+Did you mean "chr"?
+
+LINE 1: ... result_xfile ( fx_from , rate ) values ( $v_r__from_cur , xchg_rate ( $v_r__from_cur , 'EUR' ) )
+                                                                      ^
+FAIL sql/routines/p0_staircase.sql  [KERNEL-0011] duckdb prepare: Catalog Error: Scalar Function with name fnc_tag_simple does not exist!
+Did you mean "can_cast_implicitly"?
+
+LINE 1: ... result_stair ( k , tag , cost ) values ( $v_r__ps_partkey , fnc_tag_simple ( $v_r__ps_supplycost ) , $v_r__ps_supplycost...
+                                                                        ^
+FAIL sql/routines/procbench/Sudf_20b_GetManufactComplex.sql  [KERNEL-0011] duckdb prepare: Parser Error: syntax error at or near "$"
+
+LINE 1: SELECT i_manufact FROM $v_item WHERE i_item_sk = $v_item
+                               ^
+FAIL sql/routines/procbench/sudf_8_maxReturnClass.sql  [KERNEL-0011] duckdb prepare: Parser Error: syntax error at or near "("
+
+LINE 1: SELECT i_class, count(i_class) AS CAST(NULL AS DECIMAL) FROM catalog_returns, item WHERE i_item_sk...
+                                              ^
+FAIL sql/routines/x2_column_name_capture.sql  [KERNEL-0011] duckdb prepare: Parser Error: syntax error at or near "$"
+
+LINE 1: insert into result_seq ( $v_i , sq ) values ( $v_i , $v_i * $v_i )
+                                 ^
+FAIL sql/routines/x4b_mod_literal.sql  [ENG-0022] statement not yet supported in M2 compiler: Sql("MOD 3")
+compile: entries=59 missing=2 failed=6 dynamic=0

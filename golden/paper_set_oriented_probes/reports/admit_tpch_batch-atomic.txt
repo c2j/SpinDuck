@@ -1,0 +1,15 @@
+admit: targets=14 converted=0 conditional=0 skipped=14 conservative=0 static-only=0 unchecked=0 native=on
+ADMIT service_level skipped reason=UnsupportedControlFlow
+ADMIT prc_goto_service skipped reason=UnresolvedFnSite
+ADMIT prc_goto_ship skipped reason=UnresolvedFnSite
+ADMIT long_distance skipped reason=UnsupportedControlFlow
+ADMIT prc_goto_global skipped reason=UnresolvedFnSite
+ADMIT prc_goto_late skipped reason=UnsupportedControlFlow
+ADMIT prc_goto_late_b skipped reason=UnsupportedControlFlow
+ADMIT goto_margin skipped reason=UnsupportedControlFlow
+ADMIT prc_goto_margin skipped reason=UnsupportedCall
+ADMIT prc_goto_savings skipped reason=UnsupportedCall
+ADMIT discount_taxprice skipped reason=UnsupportedControlFlow
+ADMIT prc_froid_q3 skipped reason=UnresolvedFnSite
+ADMIT prc_prism_hoist skipped reason=UnsupportedControlFlow
+ADMIT prc_dual_one skipped reason=UnsupportedControlFlow

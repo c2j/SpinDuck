@@ -1,0 +1,5 @@
+spinduck=spinduck 0.4.0
+git_head=229c039aedc8fdbdfa9a68b902cf62329c6ed206
+git_dirty_src=3
+date=2026-11-28T03:14:01Z
+projects=main,tpch

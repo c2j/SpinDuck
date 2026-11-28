@@ -1,0 +1,47 @@
+===== off =====
+$ call --plan <project>/.spinduck/plan/caller_dummy.toml --db <project>/local.duckdb null
+[exit 0]
+OUT p_o_succeed = 0
+-- dump[0]: SELECT security_id, yj, tag FROM dst_rows ORDER BY tag, security_id
+{
+  "schema": ["security_id", "yj", "tag"],
+  "rows": [
+    ["S1", "30.000000", "a"],
+    ["S2", "45.045000", "b"],
+    ["S3", "0.000000", "c"],
+    ["S4", "0.000000", "d"]
+  ]
+}
+
+===== batch-atomic =====
+$ call --plan <project>/.spinduck/plan/caller_dummy.toml --db <project>/local.duckdb --set-oriented=batch-atomic null
+[exit 0]
+SET_ORIENTED caller_dummy converted
+OUT p_o_succeed = 0
+-- dump[0]: SELECT security_id, yj, tag FROM dst_rows ORDER BY tag, security_id
+{
+  "schema": ["security_id", "yj", "tag"],
+  "rows": [
+    ["S1", "30.000000", "a"],
+    ["S2", "45.045000", "b"],
+    ["S3", "0.000000", "c"],
+    ["S4", "0.000000", "d"]
+  ]
+}
+
+===== strict =====
+$ call --plan <project>/.spinduck/plan/caller_dummy.toml --db <project>/local.duckdb --set-oriented=strict null
+[exit 0]
+SET_ORIENTED caller_dummy skipped reason=UnsupportedControlFlow
+OUT p_o_succeed = 0
+-- dump[0]: SELECT security_id, yj, tag FROM dst_rows ORDER BY tag, security_id
+{
+  "schema": ["security_id", "yj", "tag"],
+  "rows": [
+    ["S1", "30.000000", "a"],
+    ["S2", "45.045000", "b"],
+    ["S3", "0.000000", "c"],
+    ["S4", "0.000000", "d"]
+  ]
+}
+

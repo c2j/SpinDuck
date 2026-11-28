@@ -1,0 +1,44 @@
+===== off =====
+$ call --plan <project>/.spinduck/plan/prc_xfile_call.toml --db <project>/local.duckdb
+[exit 1]
+[KERNEL-0010] Catalog Error: Scalar Function with name xchg_rate does not exist!
+Did you mean "chr"?
+
+LINE 1: ... result_xfile ( fx_from , rate ) values ( $v_r__from_cur , xchg_rate ( $v_r__from_cur , 'EUR' ) )
+                                                                      ^
+-- dump[0]: SELECT * FROM result_xfile ORDER BY fx_from
+{
+  "schema": ["fx_from", "rate"],
+  "rows": []
+}
+
+===== batch-atomic =====
+$ call --plan <project>/.spinduck/plan/prc_xfile_call.toml --db <project>/local.duckdb --set-oriented=batch-atomic
+[exit 1]
+SET_ORIENTED prc_xfile_call skipped reason=UnsupportedWrite
+[KERNEL-0010] Catalog Error: Scalar Function with name xchg_rate does not exist!
+Did you mean "chr"?
+
+LINE 1: ... result_xfile ( fx_from , rate ) values ( $v_r__from_cur , xchg_rate ( $v_r__from_cur , 'EUR' ) )
+                                                                      ^
+-- dump[0]: SELECT * FROM result_xfile ORDER BY fx_from
+{
+  "schema": ["fx_from", "rate"],
+  "rows": []
+}
+
+===== strict =====
+$ call --plan <project>/.spinduck/plan/prc_xfile_call.toml --db <project>/local.duckdb --set-oriented=strict
+[exit 1]
+SET_ORIENTED prc_xfile_call skipped reason=UnsupportedWrite
+[KERNEL-0010] Catalog Error: Scalar Function with name xchg_rate does not exist!
+Did you mean "chr"?
+
+LINE 1: ... result_xfile ( fx_from , rate ) values ( $v_r__from_cur , xchg_rate ( $v_r__from_cur , 'EUR' ) )
+                                                                      ^
+-- dump[0]: SELECT * FROM result_xfile ORDER BY fx_from
+{
+  "schema": ["fx_from", "rate"],
+  "rows": []
+}
+

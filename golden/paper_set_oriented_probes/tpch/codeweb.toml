@@ -1,0 +1,9 @@
+[project]
+name = "cw"
+
+[analysis]
+paths = ["sql/"]
+
+[store]
+path = ".codeweb/store.bincode"
+format = "bincode"
