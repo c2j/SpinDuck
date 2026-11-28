@@ -12,7 +12,7 @@
 2. **集合化这一层，论文与基准的案例 0 个可转换。** 79 个探针里 batch-atomic 下 `Converted` 6 个，
    全是定标探针和仓库自己的测试夹具；`compile --admit` 的总账是 main `targets=58 converted=6`、
    tpch `targets=14 converted=0`。strict 模式下两个工程都是 0。
-3. **只要 Off 能跑通，集合化（含回退）就没有出现结果不一致。** 77 个例程探针里 63 个逐值相等，
+3. **只要 Off 能跑通，集合化（含回退）就没有出现结果不一致。** 78 个例程探针里 64 个逐值相等，
    其余是 Off 自身报错、两种模式退出码一致（含中缀 MOD 4 例——2026-11-28 起编译期显式拒绝）。
 4. **论文案例带来了一份不依赖 Off 自身的参照，于是第一次能评价 Off 对不对。** 10 个带参照的探针
    全部一致（其中 3 个的参照是**论文作者写的 SQL**，另有 1 个是论文给出的改写结果，其余 6 个是我
@@ -29,9 +29,9 @@
 
 ## 1. 方法
 
-两个工程、79 个探针（77 个例程调用 + 2 个查询通道）：
+两个工程、80 个探针（78 个例程调用 + 2 个查询通道）：
 
-- **main**（64 个）：手工种子。定标阶梯、Froid 图 1、Aggify、CIDR 2024 / PRISM 的 `getManufact`、
+- **main**（65 个）：手工种子。定标阶梯、Froid 图 1、Aggify、CIDR 2024 / PRISM 的 `getManufact`、
   Hirn & Grust 的 `walk()`、DBridge / QBS / Sloth 的模式、SQL-ProcBench 逐字例程、引擎侧探针。
 - **tpch**（15 个）：SQL 生成的 TPC-H 形状数据（8000 张订单、24000 行明细）。Hirn & Grust 案例集里
   基于 TPC-H 的函数、Froid §11.1 的 TPC-H 谓词 UDF、PRISM 的谓词提升场景。
@@ -196,10 +196,13 @@ AST 无痕迹，只能在词元层检出，见 `src/gate/dialect.rs`）：
 字面量上的中缀 `MOD`（`RETURN 7 MOD 3;`）此前经 `ENG-0022` 拒绝，现统一为 `BIZ-0126`
 （编译失败的行为不变，错误码与参照语义对齐）；X4.lit 是预期失败的对照探针。
 
-**`%` 取余（已支持）**：参照 `%` 可用（`7 % 3` = 1、`-7 % 3` = -1、`7.5 % 2` = 1.5、
-`-7.5 % 2` = -1.5，符号随被除数），本仓此前对 PL 表达式里的 `%` 报 `ENG-0027`。
-新增 `BinOp::Mod`：整数走 i64 rem、DECIMAL 走定标后 rem（小数位取操作数较大者），
-除零与 `/` 同报 BIZ-0124；SQL 通道 `%` 原生透传内核（X4.pct：PASS）。
+**`%` 取余（已支持，含零模）**：参照 `%` 可用且 **`MOD(n, 0) = n`**（openGauss 5.0.0 实测：
+`7 % 0` = 7、`7.5 % 0` = 7.5、`-7 % 0` = -7、`0 % 0` = 0、`mod(7,0)` = 7、`mod(0,0)` = 0、
+PL 无异常；`7 % NULL` = NULL），本仓此前对 PL 表达式里的 `%` 报 `ENG-0027`。
+新增 `BinOp::Mod`：整数走 i64 rem（`i64::MIN % -1` 特判 0）、DECIMAL 定标后 rem
+（小数位取操作数较大者，符号随被除数），零模返回被除数；SQL 通道经
+`[patterns] mod_zero_returns_dividend` 改写 `CASE WHEN b = 0 THEN a ELSE a % b END`
+（静态语句与 PL FuncCall prepared 同口径；X4.pct / X4.pct0：PASS）。
 
 ### 5.2 名字解析：没区分 SQL 标识符的位置
 
@@ -265,7 +268,7 @@ AST 无痕迹，只能在词元层检出，见 `src/gate/dialect.rs`）：
 | 内容 | 位置 |
 |---|---|
 | 汇总数字 | `reports/summary.txt` |
-| 差距矩阵（79 个探针） | `reports/matrix.tsv` |
+| 差距矩阵（80 个探针） | `reports/matrix.tsv` |
 | 编译期判定（两个工程、两种模式） | `reports/admit_*.txt` |
 | SQL-ProcBench 整体解析体检 | `reports/sqlprocbench_compile.txt` |
 | DuckDB 机制实测（项目钉住的内核） | `reports/duckdb_mechanisms.txt` |

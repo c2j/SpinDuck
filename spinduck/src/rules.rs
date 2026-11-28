@@ -47,6 +47,9 @@ pub struct RuleRegistry {
     /// `[patterns] concat_null_as_empty`：A 模式文本拼接（NULL 视作空串）→ 内核 `concat(…)`
     /// （DuckDB 的 `||` 传播 NULL，与基线实测 `'A' || NULL = 'A'` 相反）
     pub patterns_concat_null_as_empty: bool,
+    /// `[patterns] mod_zero_returns_dividend`：A 模式 `MOD(n, 0) = n`（Oracle 语义）
+    /// → `CASE WHEN b = 0 THEN a ELSE mod(a, b) END`（DuckDB 的 `%`/mod() 零除得 NULL）
+    pub patterns_mod_zero_returns_dividend: bool,
     /// `[dates.formats]`：Oracle 整串日期格式 → strftime 格式。
     /// 映射表本体在 `sql::oracle_format_to_strftime`（逐令牌变换，覆盖语料全部格式），
     /// 本字段登记语料事实并做漂移守护（`should_keep_seed_date_formats_in_sync_with_strftime_mapper`）；
@@ -83,6 +86,7 @@ impl RuleRegistry {
             patterns_sequence_nextval: true,
             patterns_oracle_outer_join: true,
             patterns_concat_null_as_empty: true,
+            patterns_mod_zero_returns_dividend: true,
             date_formats: BTreeMap::new(),
             target_duckdb: String::new(),
             probe_duckdb: String::new(),
@@ -169,6 +173,9 @@ impl RuleRegistry {
             if let Some(b) = p.get("concat_null_as_empty").and_then(|x| x.as_bool()) {
                 reg.patterns_concat_null_as_empty = b;
             }
+            if let Some(b) = p.get("mod_zero_returns_dividend").and_then(|x| x.as_bool()) {
+                reg.patterns_mod_zero_returns_dividend = b;
+            }
         }
         reg.date_formats = date_formats_of(&v);
         Ok(reg)
@@ -219,6 +226,9 @@ impl RuleRegistry {
             }
             if let Some(b) = p.get("concat_null_as_empty").and_then(|x| x.as_bool()) {
                 self.patterns_concat_null_as_empty = b;
+            }
+            if let Some(b) = p.get("mod_zero_returns_dividend").and_then(|x| x.as_bool()) {
+                self.patterns_mod_zero_returns_dividend = b;
             }
         }
         for (k, val) in date_formats_of(&v) {
@@ -403,12 +413,13 @@ BINARY_DOUBLE = "DOUBLE"
                 "sequence_nextval" => reg.patterns_sequence_nextval,
                 "oracle_outer_join" => reg.patterns_oracle_outer_join,
                 "concat_null_as_empty" => reg.patterns_concat_null_as_empty,
+                "mod_zero_returns_dividend" => reg.patterns_mod_zero_returns_dividend,
                 other => panic!("未接线的 [patterns] 布尔键: {other}"),
             };
             assert_eq!(field, seed_val, "[patterns] {k} 与规则字段漂移");
             wired += 1;
         }
-        assert_eq!(wired, 5, "种子 [patterns] 布尔键数量变化：必须同步接线");
+        assert_eq!(wired, 6, "种子 [patterns] 布尔键数量变化：必须同步接线");
     }
 
     #[test]

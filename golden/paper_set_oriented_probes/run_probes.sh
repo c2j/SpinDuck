@@ -376,11 +376,17 @@ for raw in probes:
         rc_o, msg_o = query(oracle, opath)
         oracle_text = open(opath, encoding="utf-8").read().strip() if rc_o == 0 and os.path.exists(opath) else msg_o
         row["off_vs_oracle"] = "EQ" if rc_o == 0 and same(off_paths[0] if off_paths else None, opath) else "DIFF"
-    # 期望：函数调用的 RETURN 值与清单里手写的期望
+    # 期望：函数调用的 RETURN 值与清单里手写的期望；`[ENG|BIZ|KERNEL-####]`
+    # 形态的期望 = 编译/运行期显式拒绝（退出码非 0 且输出含该错误码）
     row["off_vs_expect"] = "n/a"
     if expect.strip():
-        got = return_value(so) if rc_off == 0 else None
-        row["off_vs_expect"] = "PASS" if got is not None and close(got, expect) else f"FAIL({got if got is not None else 'no value'})"
+        mcode = re.match(r"^\[(?:ENG|BIZ|KERNEL)-\d+\]", expect.strip())
+        if mcode:
+            hit = rc_off != 0 and mcode.group(0) in ev_off
+            row["off_vs_expect"] = "PASS" if hit else f"FAIL(want {mcode.group(0)})"
+        else:
+            got = return_value(so) if rc_off == 0 else None
+            row["off_vs_expect"] = "PASS" if got is not None and close(got, expect) else f"FAIL({got if got is not None else 'no value'})"
     row["note"] = re.sub(r"\s+", " ", so.strip() if rc_off else off_out)[:110]
     rows.append(row)
     # 每个探针一份合并明细（命令、退出码、stdout/stderr、结果快照、参照）。

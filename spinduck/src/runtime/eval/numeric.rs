@@ -43,15 +43,16 @@ pub(super) fn arith(op: &BinOp, l: &SpinValue, r: &SpinValue) -> Result<SpinValu
             (a.checked_mul(b).ok_or_else(overflow)?, scale)
         }
         BinOp::Mod => {
-            // GaussDB A 模式实测：小数位取操作数较大者（7.5 % 2 = 1.5），
-            // 符号随被除数（Rust rem 同口径）；除零与 `/` 同报 BIZ-124
-            if b == 0 {
-                return Err(EngineError::business(124, "division by zero"));
-            }
+            // GaussDB A 模式（Oracle 语义）实测：小数位取操作数较大者
+            // （7.5 % 2 = 1.5），符号随被除数（Rust rem 同口径）；
+            // MOD(n, 0) = n——零模返回对齐定标后的被除数，不报除零
             let scale = sa.max(sb);
             let a2 = pow10(scale - sa)
                 .and_then(|p| a.checked_mul(p))
                 .ok_or_else(overflow)?;
+            if b == 0 {
+                return Ok(V::Decimal(a2, 38, scale));
+            }
             let b2 = pow10(scale - sb)
                 .and_then(|p| b.checked_mul(p))
                 .ok_or_else(overflow)?;
@@ -219,9 +220,11 @@ pub(super) fn apply_i(op: &BinOp, x: i64, y: i64) -> Result<i64, EngineError> {
         BinOp::Mul => x.checked_mul(y).ok_or_else(overflow),
         BinOp::Div if y == 0 => Err(EngineError::business(124, "division by zero")),
         BinOp::Div => Ok(x / y),
-        // GaussDB A 模式：`%` 符号随被除数（-7 % 3 = -1），Rust rem 同口径；
-        // y == 0 与 i64::MIN % -1 都使 checked_rem 返回 None
-        BinOp::Mod if y == 0 => Err(EngineError::business(124, "division by zero")),
+        // GaussDB A 模式（Oracle 语义）实测：MOD(n, 0) = n（返回被除数，不报
+        // 除零，0 % 0 = 0 自然成立）；int8 % -1 = 0（内核特判防 i64::MIN 溢出）；
+        // 符号随被除数（-7 % 3 = -1，Rust rem 同口径）。BIZ-124 只保留给 `/ 0`
+        BinOp::Mod if y == 0 => Ok(x),
+        BinOp::Mod if y == -1 => Ok(0),
         BinOp::Mod => x.checked_rem(y).ok_or_else(overflow),
         _ => Err(EngineError::invariant(30, "not arithmetic")),
     }

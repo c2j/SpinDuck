@@ -38,5 +38,14 @@ BEGIN
 END;
 /
 
+-- % 零模（参照实测：MOD(n, 0) = n，返回被除数而非除零）
+CREATE OR REPLACE FUNCTION fnc_num_pct0 RETURN NUMBER IS
+  x  NUMBER;
+BEGIN
+  x := 7 % 0;
+  RETURN x;
+END;
+/
+
 -- 字面量上的中缀 MOD（不带括号）——与其它中缀 MOD 形态一样预期编译失败（BIZ-0126），
 -- 因注册失败会连累同文件其它函数，所以单独成文件，见 x4b_mod_literal.sql。

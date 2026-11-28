@@ -107,7 +107,14 @@ pub fn strip_update_alias(text: &str) -> String {
 /// TO_NUMBER(x) → CAST(x AS DECIMAL(38,6))
 /// TO_CHAR(x,'fmt') → strftime(<x|strptime(d,fmt_in)>, fmt_out)
 pub fn apply_ast_transforms(text: &str) -> Result<String, EngineError> {
-    let names = ["DECODE", "TO_NUMBER", "TO_CHAR", "TO_DATE", "INTERVALTONUM"];
+    let names = [
+        "DECODE",
+        "TO_NUMBER",
+        "TO_CHAR",
+        "TO_DATE",
+        "INTERVALTONUM",
+        "MOD",
+    ];
     let mut t = text.to_string();
     loop {
         let calls = find_innermost_calls(&t, &names);
@@ -150,6 +157,20 @@ pub fn apply_ast_transforms(text: &str) -> Result<String, EngineError> {
                     "strptime({}, '{}')",
                     args[0],
                     requote(&oracle_format_to_strftime(&unquote(&args[1])))
+                )
+            }
+            "MOD" => {
+                // A 模式 MOD(n, 0) = n（Oracle 语义，openGauss 实测）：DuckDB 零模
+                // 得 NULL，零守卫改写（V59.1；与 [patterns] mod_zero_returns_dividend
+                // 同口径，此处覆盖 PL FuncCall/SqlFn 的 prepared 标量 SQL）。
+                // ELSE 用 `%` 运算符而非 mod()：本函数是循环变换，产物含 mod( 会
+                // 让 innermost 查找永不收敛（V59.1 首版实测挂死）
+                if args.len() != 2 {
+                    return Err(EngineError::business(133, "MOD requires 2 arguments"));
+                }
+                format!(
+                    "CASE WHEN {} = 0 THEN {} ELSE {} % {} END",
+                    args[1], args[0], args[0], args[1]
                 )
             }
             "INTERVALTONUM" => {

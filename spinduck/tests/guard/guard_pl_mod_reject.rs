@@ -14,13 +14,21 @@
 //! （X4.mod / X4.modsql / X4.retmod / X4.lit）全部覆盖。
 #![cfg(feature = "native")]
 
-use spinduck_core::{DuckExecutor, Engine, RuleRegistry, SpinValue};
+use spinduck_core::{BindMap, DuckExecutor, Engine, RuleRegistry, SpinValue};
 
 fn engine() -> Engine {
-    Engine::new(
+    let eng = Engine::new(
         Box::new(DuckExecutor::open_in_memory().unwrap()),
         RuleRegistry::default(),
-    )
+    );
+    // modsql 形态的静态 SQL 探针需要 sys_dummy（引擎内建伪表）
+    eng.ex
+        .execute("CREATE TABLE sys_dummy(dummy VARCHAR)", &BindMap::new())
+        .unwrap();
+    eng.ex
+        .execute("INSERT INTO sys_dummy VALUES ('X')", &BindMap::new())
+        .unwrap();
+    eng
 }
 
 /// 用 `v := <expr>; RETURN v` 求值（与 guard_runtime_division_gaussdb 同口径）。
@@ -136,16 +144,59 @@ fn should_modulo_decimals_like_gaussdb_percent() {
 }
 
 #[test]
-fn should_raise_biz_0124_on_percent_zero_divisor() {
+fn should_return_dividend_on_zero_modulus_like_gaussdb() {
+    // 参照实测（openGauss 5.0.0 A 模式）：MOD(n, 0) = n（Oracle 语义，返回被除数
+    // 而非报除零）；`7 % null` = NULL（既有 NULL 传播覆盖）。
     let mut eng = engine();
-    let sql = "CREATE OR REPLACE FUNCTION f_z RETURN NUMBER IS \
-         BEGIN RETURN 7 % 0; END;";
+    assert_eq!(eval(&mut eng, "7 % 0"), SpinValue::Int(7));
+    assert_eq!(eval(&mut eng, "-7 % 0"), SpinValue::Int(-7));
+    assert_eq!(eval(&mut eng, "0 % 0"), SpinValue::Int(0));
+    assert_eq!(eval(&mut eng, "7.5 % 0"), SpinValue::Decimal(75, 38, 1));
+    assert_eq!(eval(&mut eng, "mod(7, 0)"), SpinValue::Int(7));
+    assert_eq!(eval(&mut eng, "mod(0, 0)"), SpinValue::Int(0));
+}
+
+#[test]
+fn should_return_dividend_on_zero_modulus_in_static_sql() {
+    // SQL 通道同语义：内核 `%`/mod() 零除得 NULL，须改写为 CASE WHEN（V59.1）
+    let mut eng = engine();
+    let sql = "CREATE OR REPLACE FUNCTION f_sz RETURN NUMBER IS \
+         v NUMBER; BEGIN SELECT 7 % 0 INTO v FROM sys_dummy; RETURN v; END;";
     eng.register(sql).unwrap();
-    let error = eng.call("f_z", &[]).unwrap_err();
-    assert_eq!(error.code.0, "BIZ-0124");
-    assert!(
-        error.message.contains("division by zero"),
-        "{}",
-        error.message
+    assert_eq!(
+        eng.call("f_sz", &[]).unwrap().return_value,
+        Some(SpinValue::Int(7))
+    );
+    let sql = "CREATE OR REPLACE FUNCTION f_sm RETURN NUMBER IS \
+         v NUMBER; BEGIN SELECT mod(7, 0) INTO v FROM sys_dummy; RETURN v; END;";
+    eng.register(sql).unwrap();
+    assert_eq!(
+        eng.call("f_sm", &[]).unwrap().return_value,
+        Some(SpinValue::Int(7))
+    );
+}
+
+#[test]
+fn should_return_zero_for_int_min_mod_minus_one() {
+    // 参照实测：int8 % -1 = 0（内核特判防溢出）；本仓 i64::MIN % -1 曾报 BIZ-112
+    let mut eng = engine();
+    let sql = "CREATE OR REPLACE FUNCTION f_mm RETURN NUMBER IS \
+         v NUMBER; x NUMBER; BEGIN \
+         v := -9223372036854775807 - 1; x := v % -1; RETURN x; END;";
+    eng.register(sql).unwrap();
+    assert_eq!(
+        eng.call("f_mm", &[]).unwrap().return_value,
+        Some(SpinValue::Int(0))
+    );
+}
+
+#[test]
+fn should_reject_infix_mod_with_unary_plus_operand() {
+    // 参照实测 `7 mod +3` 是语法错误（一元 + 不是值起始），与 `-` 同口径
+    let mut eng = engine();
+    assert_rejected(
+        &mut eng,
+        "CREATE OR REPLACE FUNCTION f6 RETURN NUMBER IS \
+         x NUMBER; BEGIN x := 7 mod +3; RETURN x; END;",
     );
 }

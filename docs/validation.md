@@ -5968,3 +5968,33 @@ IR 层无从检出，拒绝点只能在词元层。
 ① 内联链式除法（本仓 …334 vs 参照 …33，钉现状）；② 整数槽直赋除法（0.5 vs 0，钉现状）；
 ③ `rscale>38` 显式 BIZ-112 vs 参照按 38 位出值（fail-loud，登记分歧）；④ SQL 通道显示位宽
 （DuckDB shortest vs %.15g，转换区支持除法形状时暴露）；⑤ 设计 §3.3 已加下沉下线注记（V58）。
+
+### V59.1 复审修正：MOD(n, 0) = n（Oracle 语义）+ 三项非阻断（2026-11-28）
+
+#68 复审（PR #69 二轮）复现 1 个阻断 + 3 个非阻断，逐项实测核实后修复：
+
+| 项 | 参照实测（openGauss 5.0.0 A 模式） | 本仓修复前 | 修复 |
+|---|---|---|---|
+| 阻断：零模 | `7 % 0`=7、`7.5 % 0`=7.5、`-7 % 0`=-7、`0 % 0`=0、`mod(7,0)`=7、`mod(0,0)`=0、PL `n := 7 % 0`=7 无异常、`7 % null`=NULL（MOD(n,0)=n） | 三条路径全错：apply_i/arith DECIMAL 报 BIZ-0124；SQL 通道零模得 NULL | `MOD(n,0)=n`：apply_i 与 DECIMAL 路径零模返回对齐定标的被除数；SQL 通道新增 `[patterns] mod_zero_returns_dividend`（`CASE WHEN b = 0 THEN a ELSE a % b END`，静态语句与 PL FuncCall prepared 同口径，`apply_ast_transforms` MOD 分支）。BIZ-0124 只保留给 `/ 0` |
+| 非阻断 1：`i64::MIN % -1` | = 0（int8 % -1 内核特判防溢出） | BIZ-112（checked_rem 溢出） | apply_i 特判 `y == -1 → 0` |
+| 非阻断 2：`7 mod +3` | 语法错误（一元 + 不是值起始） | 词元扫描放行（有损解析静默） | dialect.rs starts_value 补 `Token::Plus` |
+| 非阻断 3：期望列不对账 | — | probes.tsv `[BIZ-0126]` 期望记 FAIL(no value) | run_probes.sh off_vs_expect 支持 `[ENG|BIZ|KERNEL-####]` 期望形态（退出码非 0 且输出含错误码 = PASS） |
+
+实测坑（两条，都进了实现注释）：
+
+1. **patterns 产物含 `mod(` 会让 rewrite_sql 挂死**：`rewrite_sql` 在 patterns 之后跑
+   `apply_ast_transforms`（MOD 是变换名），首版 ELSE 用 `mod(a, b)` → innermost 查找
+   每轮都命中新产物 → 不收敛。修正：改写产物 ELSE 用 `%` 运算符，不含 `mod(`。
+2. **递归终止性**：mod_zero.rs 的主元内层递归只进**严格更小的子文本**（调用实参/括号体/
+   CASE 体），实参区间不含右括号词元；全流重扫会造成互递归栈溢出（首版实测 SIGABRT）。
+
+守护测试 diff（guard_pl_mod_reject.rs，本轮新建文件、非人类既有）：
+
+- `should_raise_biz_0124_on_percent_zero_divisor` 删除，改为
+  `should_return_dividend_on_zero_modulus_like_gaussdb`（7/-7/0/7.5 零模返回被除数 +
+  mod(7,0)/mod(0,0) 函数形式）；新增 SQL 通道零模 2 例（静态语句改写后返回 7）、
+  `i64::MIN % -1` 例、`7 mod +3` 拒绝例；测试引擎补 sys_dummy。
+- 新增单测 mod_zero.rs 8 例（中缀/调用/非零语义/链折叠/嵌套/字符串/LIKE 通配/NULL 形态）。
+
+探针：新增 X4.pct0（`7 % 0` = 7）；X4.mod/retmod/modsql/lit 保持 `[BIZ-0126]` 拒绝且
+期望列按错误码对账（非阻断 3）。

@@ -252,6 +252,8 @@ plan: ./.spinduck/plan/fnc_num_mod_literal.toml (updated)
 plan: target=fnc_num_mod_literal routines=1 tables=0 missing=0
 plan: ./.spinduck/plan/fnc_num_pct.toml (updated)
 plan: target=fnc_num_pct routines=1 tables=0 missing=0
+plan: ./.spinduck/plan/fnc_num_pct0.toml (updated)
+plan: target=fnc_num_pct0 routines=1 tables=0 missing=0
 FAIL sql/routines/a0_xfile_call.sql  [KERNEL-0011] duckdb prepare: Catalog Error: Scalar Function with name xchg_rate does not exist!
 Did you mean "chr"?
 
@@ -278,4 +280,4 @@ FAIL sql/routines/x4b_mod_literal.sql  [BIZ-0126] infix MOD is a syntax error in
 FAIL sql/routines/x4c_mod_assign.sql  [BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead) at line 8, column 14
 FAIL sql/routines/x4d_mod_return.sql  [BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead) at line 6, column 16
 FAIL sql/routines/x4e_mod_sql.sql  [BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead) at line 6, column 15
-compile: entries=60 missing=2 failed=9 dynamic=0
+compile: entries=61 missing=2 failed=9 dynamic=0

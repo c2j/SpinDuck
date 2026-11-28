@@ -63,3 +63,4 @@ X4.retmod	call	fnc_num_mod_return				引擎数值语义（非论文）	RETURN (v
 X4.modsql	call	fnc_num_mod_sql				引擎数值语义（非论文）	SELECT 7 MOD 3 INTO v FROM sys_dummy；参照是语法错误，2026-11-28 起编译期显式拒绝		[BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead)
 X4.lit	call	fnc_num_mod_literal				引擎数值语义（非论文）	RETURN 7 MOD 3（字面量上的中缀取余）；预期编译失败，2026-11-28 起统一为 BIZ-0126（原 ENG-0022）		[BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead)
 X4.pct	call	fnc_num_pct				引擎数值语义（非论文）	PL 表达式 7 % 3；2026-11-28 起按参照实测支持（参照 = 1，符号随被除数）		1
+X4.pct0	call	fnc_num_pct0				引擎数值语义（非论文）	PL 表达式 7 % 0；参照 MOD(n, 0) = n（V59.1 复审修正：返回被除数而非除零）		7

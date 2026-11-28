@@ -49,6 +49,7 @@ fn is_value_operand(t: &Token) -> bool {
 }
 
 /// 值起始词元（出现在 MOD 右侧说明 MOD 处于运算符位而非别名/函数名位）。
+/// 含 `+`/`-`：参照 `7 mod +3` 与 `7 mod -3` 都是语法错误（一元符号不算别名起点）。
 fn starts_value(t: &Token) -> bool {
     matches!(
         t,
@@ -59,6 +60,7 @@ fn starts_value(t: &Token) -> bool {
             | Token::Param(_)
             | Token::LParen
             | Token::Minus
+            | Token::Plus
     )
 }
 

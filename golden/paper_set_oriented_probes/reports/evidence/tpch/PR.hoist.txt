@@ -1,7 +1,7 @@
 ===== off =====
 $ call --plan <project>/.spinduck/plan/prc_prism_hoist.toml --db <project>/local.duckdb
 [exit 1]
-[KERNEL-0010] Conversion Error: invalid date field format: "Date32(8040)", expected format is (YYYY-MM-DD) when casting from source column sd_a0
+[KERNEL-0010] Conversion Error: invalid date field format: "Date32(8093)", expected format is (YYYY-MM-DD) when casting from source column sd_a0
 
 LINE 1: ... l . l_orderkey <= 2000 and (SELECT sd_v FROM sd_fn0 WHERE sd_a0 IS NOT DISTINCT FROM (l . l_shipdate) AND sd_a1 IS...
                                                                       ^
@@ -15,7 +15,7 @@ LINE 1: ... l . l_orderkey <= 2000 and (SELECT sd_v FROM sd_fn0 WHERE sd_a0 IS N
 $ call --plan <project>/.spinduck/plan/prc_prism_hoist.toml --db <project>/local.duckdb --set-oriented=batch-atomic
 [exit 1]
 SET_ORIENTED prc_prism_hoist skipped reason=UnsupportedControlFlow
-[KERNEL-0010] Conversion Error: invalid date field format: "Date32(8060)", expected format is (YYYY-MM-DD) when casting from source column sd_a0
+[KERNEL-0010] Conversion Error: invalid date field format: "Date32(8040)", expected format is (YYYY-MM-DD) when casting from source column sd_a0
 
 LINE 1: ... l . l_orderkey <= 2000 and (SELECT sd_v FROM sd_fn0 WHERE sd_a0 IS NOT DISTINCT FROM (l . l_shipdate) AND sd_a1 IS...
                                                                       ^
@@ -29,7 +29,7 @@ LINE 1: ... l . l_orderkey <= 2000 and (SELECT sd_v FROM sd_fn0 WHERE sd_a0 IS N
 $ call --plan <project>/.spinduck/plan/prc_prism_hoist.toml --db <project>/local.duckdb --set-oriented=strict
 [exit 1]
 SET_ORIENTED prc_prism_hoist skipped reason=UnsupportedControlFlow
-[KERNEL-0010] Conversion Error: invalid date field format: "Date32(8047)", expected format is (YYYY-MM-DD) when casting from source column sd_a0
+[KERNEL-0010] Conversion Error: invalid date field format: "Date32(8040)", expected format is (YYYY-MM-DD) when casting from source column sd_a0
 
 LINE 1: ... l . l_orderkey <= 2000 and (SELECT sd_v FROM sd_fn0 WHERE sd_a0 IS NOT DISTINCT FROM (l . l_shipdate) AND sd_a1 IS...
                                                                       ^
