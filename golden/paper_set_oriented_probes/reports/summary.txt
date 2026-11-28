@@ -1,21 +1,21 @@
 [main] probes=65 call=63 query=2
 [main] converted_ba=6 [T0 T0.r T0.rf T8b T10 T2.f]
 [main] skipped_ba=57 UnsupportedControlFlow=40 UnsupportedWrite=6 UnresolvedFnSite=6 UnprovenWriteCompleteness=3 (no line)=2
-[main] off_vs_ba_eq=54 of 63
-[main] off_err=11 [B1.q:ERR(1) C0.fn:ERR(1) D0.fn:ERR(1) D3:ERR(1) D5.q:ERR(1) X1.plan:ERR(1) X2:ERR(1) X4.mod:ERR(1) X4.retmod:ERR(1) X4.modsql:ERR(1) X4.lit:ERR(1)]
+[main] off_vs_ba_eq=57 of 63
+[main] off_err=8 [B1.q:ERR(1) D3:ERR(1) D5.q:ERR(1) X1.plan:ERR(1) X4.mod:ERR(1) X4.retmod:ERR(1) X4.modsql:ERR(1) X4.lit:ERR(1)]
 [main] off_vs_oracle={'EQ': 3}
 [main] off_vs_expect={'PASS': 12}
 [tpch] probes=15 call=15 query=0
 [tpch] converted_ba=0 []
 [tpch] skipped_ba=15 UnsupportedControlFlow=7 UnresolvedFnSite=4 UnsupportedCall=2 (no line)=2
-[tpch] off_vs_ba_eq=10 of 15
-[tpch] off_err=5 [G.late:ERR(1) G.margin.fn:ERR(1) FR.d:ERR(1) PR.hoist:ERR(1) X.dual:ERR(1)]
-[tpch] off_vs_oracle={'EQ': 7}
+[tpch] off_vs_ba_eq=13 of 15
+[tpch] off_err=2 [FR.d:ERR(1) X.dual:ERR(1)]
+[tpch] off_vs_oracle={'EQ': 8}
 [tpch] off_vs_expect={'PASS': 2}
 [all] probes=80 call=78 query=2
 [all] converted_ba=6 [T0 T0.r T0.rf T8b T10 T2.f]
 [all] skipped_ba=72 UnsupportedControlFlow=47 UnresolvedFnSite=10 UnsupportedWrite=6 (no line)=4 UnprovenWriteCompleteness=3 UnsupportedCall=2
-[all] off_vs_ba_eq=64 of 78
-[all] off_err=16 [B1.q:ERR(1) C0.fn:ERR(1) D0.fn:ERR(1) D3:ERR(1) D5.q:ERR(1) X1.plan:ERR(1) X2:ERR(1) X4.mod:ERR(1) X4.retmod:ERR(1) X4.modsql:ERR(1) X4.lit:ERR(1) G.late:ERR(1) G.margin.fn:ERR(1) FR.d:ERR(1) PR.hoist:ERR(1) X.dual:ERR(1)]
-[all] off_vs_oracle={'EQ': 10}
+[all] off_vs_ba_eq=70 of 78
+[all] off_err=10 [B1.q:ERR(1) D3:ERR(1) D5.q:ERR(1) X1.plan:ERR(1) X4.mod:ERR(1) X4.retmod:ERR(1) X4.modsql:ERR(1) X4.lit:ERR(1) FR.d:ERR(1) X.dual:ERR(1)]
+[all] off_vs_oracle={'EQ': 11}
 [all] off_vs_expect={'PASS': 14}

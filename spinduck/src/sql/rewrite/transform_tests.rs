@@ -165,3 +165,11 @@ fn should_convert_oracle_format_tokens() {
         "%Y%m%d%H%M%S"
     );
 }
+
+#[test]
+fn should_reject_single_argument_mod_with_biz_0133() {
+    // `mod(a)` 单实参：ast.rs MOD 变换要求 2 实参 → BIZ-0133 显式拒绝；
+    // 与中缀 MOD 的 BIZ-0126（gate/dialect.rs 词元扫描）分属不同拒绝点
+    let err = apply_ast_transforms("SELECT mod(v) INTO x FROM t").unwrap_err();
+    assert_eq!(err.code.0, "BIZ-0133", "{}", err.message);
+}

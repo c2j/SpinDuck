@@ -5998,3 +5998,126 @@ IR 层无从检出，拒绝点只能在词元层。
 
 探针：新增 X4.pct0（`7 % 0` = 7）；X4.mod/retmod/modsql/lit 保持 `[BIZ-0126]` 拒绝且
 期望列按错误码对账（非阻断 3）。
+
+## V60. SQL 域名字位置保护 + DATE 绑定 ISO 序列化（2026-11-28，PR #70，stacked on #69）
+
+第三轮任务（接手 WIP 并按 TDD 补齐验证；探针 G.late / C0 / D0 / X2 / D1 /
+G.margin.fn / PR.hoist 的守护版）。
+
+### 参照实测（openGauss 5.0.0 A 模式）
+
+- 表别名遮蔽：`FROM supplier s` 与 `FOR s IN` 同名 s——该句 SQL 里的 s
+  （表名/别名/限定前缀）按别名执行；INSERT 的 `s.field` 无 FROM 域，名字归
+  外层循环记录（G.late = TPC-H Q21 形态）。
+- 参数名=表名（C0/sudf_20b）、列别名=局部变量（D0/sudf_8、D1）、INSERT 列
+  清单列名=循环变量（X2）：SQL 域与 PL 域同名互不干扰。
+- DATE：`d > v_od`、`d = v_od` 与键集翻页 `d > v_od OR (d = v_od AND k > v_ok)`
+  按日期值执行（G.margin.fn / PR.hoist 形态）；PL `v_od + 1` 参照=次日。
+
+### 实现
+
+- **名字解析两遍**（`sql/rewrite/tokens.rs`；`rewrite_tokens` 与
+  `rewrite_tokens_with_rules` 共用 `SqlNameGuard`）：
+  - 第一遍 `collect_sql_names`：FROM 域内表别名收集（`FROM t x` /
+    `FROM t AS x` / 逗号连接 / JOIN），别名=**整句遮蔽**外层 PL 名
+    （限定前缀在 select 列表先于 FROM 出现，必须预收集）；表名**不登记**
+    ——裸表名在表达式里是整行结构体（C0 守护实测）。
+  - 第二遍位置保护：FROM/JOIN/UPDATE/INTO 之后的表名 Protect；`AS` 后
+    **单 Ident 窗口** Protect（窗口只被 Ident/QuotedIdent 消费——
+    `CAST(x AS DECIMAL)` 等类型 Keyword 终结窗口，注释穿透；首版缺陷：
+    Keyword 不消费窗口会把 `CASE r.security_id` 的记录变量 `r` 误保护，
+    set_oriented_dummy Off 基线曾因此 0 行）；`INTO 表名 (` 的列清单
+    括号域深度抑制（X2；仅认紧跟表名的 `(`——SELECT..INTO/FETCH..INTO
+    不误挂；限定名 `.ident` 链 `into_chain` 与注释穿透）；**括号帧栈**
+    区分查询域/表达式域（`(` 后 SELECT/WITH 为查询帧，帧内 FROM 才算
+    子句 FROM——`SUBSTRING(… FROM …)`、`IS NOT DISTINCT FROM`、EXTRACT
+    函数语法 FROM 不误入，否则表达式括号组被整体跳过、组内 PL 变量
+    失去替换 → fn-site KERNEL-0010）；派生表 `(SELECT …)` 组内**正常
+    扫描**、组内 PL 变量仍替换（整体跳过会让 `FROM (SELECT … = p_x)`
+    绑定失败）；注释/提示对守卫状态透明。
+- **DATE 绑定**（`sql/exec_native.rs`）：fetch 侧 `ValueRef::Date32` →
+  ISO `YYYY-MM-DD` 文本（Hinnant civil_from_days 算法，无新依赖）；
+  绑定回内核时与 DATE 列比较走文本→DATE 隐式转换。修复前 Debug 落成
+  `Date32(8058)` 文本 → KERNEL-0010 invalid date field format。
+  Timestamp 仍 Debug 文本（登记未支持，见下）。
+
+### 已知缺口登记
+
+- PL 侧 DATE 算术 `v_od + 1`：参照=次日；本仓 DATE 以 ISO 文本承载、
+  算术未支持——ISO 文本进算术器按非数字字面量**显式拒绝（BIZ-0112）**，
+  守护 `should_reject_date_arithmetic_loudly_until_supported`；参照次日
+  语义登记为未支持项，不做静默文本算术。
+- Timestamp 绑定仍 Debug 文本（同 DATE 修复前形态），遇 Timestamp 绑定
+  比较时暴露，登记待办。
+
+### 守护与探针证据
+
+- `tests/guard/guard_sql_name_resolution.rs`（9 例）：G.late（别名遮蔽）/
+  C0（参数名=表名）/ D0（列别名=变量）/ X2（INSERT 列清单）/ D1 /
+  G.margin.fn+PR.hoist（DATE 键集翻页）/ SUBSTRING FROM /
+  IS NOT DISTINCT FROM / CAST…AS Keyword 回归。
+- 探针复跑（`run_probes.sh`）：`converted_ba=6` 不回退；
+  C0.fn/D0.fn/X2/G.service(.fn)/G.ship/G.global(.fn) KERNEL-0011→ok；
+  **G.late/G.margin.fn/PR.hoist ERR→OK**；off_err 16→10（余下均为预期
+  拒绝/已知缺口：BIZ-0126×4、ENG-0026、X.dual、query 通道 UDF、
+  dbms_sql）；oracle EQ 10→**11/11 全 EQ**；off_vs_expect 全 PASS；
+  6 份已解决缺口 evidence 文件移除。
+- 全量门禁：fmt / clippy -D warnings / `cargo test --features cli`
+  全绿（75 套件，lib 797）。
+
+## V61. PR #69 三轮复审修复：MOD 拒绝边界补全 + 零模改写单次求值线性化（2026-11-28，stacked on #68）
+
+外部复审在 `879f4b7` 发现 2 阻断（我方独立复现确认并评论 PR），修复
+提交 `620cdd6`：
+
+### 阻断 1：中缀 MOD 拒绝边界不完整
+
+- 复现：`SELECT 7 mod null INTO v` / `SELECT null mod 3 INTO v` 登记成功
+  且静默返回 NULL；`RETURN 7 mod null` / `v := 'x' mod 3` 落 ENG-0022
+  （错码）；仅 `cast(7 as integer) mod 3` 正确 BIZ-0126。
+- 根因：`gate/dialect.rs` 的 `is_value_operand`/`starts_value` 词元类
+  覆盖不全（缺 NULL/TRUE/FALSE/CASE/CURRENT_DATE 等 Keyword、字符串、
+  运算符形态）；ogsql-parser 对这些形态同样有损解析，不能指望后续
+  解析报错。
+- 修复：值操作数/值起始补全全部可开始/结束值表达式的词元形态
+  （Keyword/字符串/运算符/原子词元），统一收敛 BIZ-0126；保留合法
+  尾随别名（`SELECT 7 mod FROM t`、`SELECT 7 mod,`）与 GROUP/ORDER
+  等子句关键字豁免。
+
+### 阻断 2：零模改写副作用双求值 + 指数膨胀
+
+- 复现：`mod_zero.rs::fold` 与 `ast.rs` MOD 分支把 acc/b 文本各复制
+  两份——易变操作数（nextval/random/UDF）求值两次（序列游标推进两次、
+  余数取第二次值）；长链 2^k 膨胀（16 操作数 89B→1,179,874B）。
+- 修复：弃用文本双份复制，改**标量子查询操作数绑定**
+  `(SELECT CASE WHEN b=0 THEN a ELSE a%b END FROM (SELECT a,b) t)`——
+  操作数各出现一次，CASE 只引用别名：单次求值、链式线性、NULL 传播
+  语义不变；不引入内核 UDF，DuckDB API 边界（AGENTS §1）不动。
+
+### 守护与探针证据
+
+- `guard_pl_mod_reject.rs` 17→19：`should_evaluate_volatile_mod_operand_once`
+  （`%` 与 `mod()` 两形态 nextval 后 currval=1，修复前余数取第二次值、
+  游标推进两次）、`should_fold_zero_mod_chain_in_static_sql`、
+  `should_keep_long_chain_rewrite_linear`（16 操作数改写输出 <20KB，
+  修复前 1,179,874B）、MOD null/字符串/CASE/关键字操作数拒绝族 +
+  尾随别名放行；`dialect.rs` 单测 10；模块头注释更正（`x % 0` 返回
+  被除数，非报除零）。
+- nit 补齐：`mod(a)` 单实参 → BIZ-0133（ast.rs "MOD requires 2
+  arguments"），单测 `should_reject_single_argument_mod_with_biz_0133`；
+  `rules.rs`/`rewrite-rules.toml`/`patterns.rs` 注释 ELSE 口径更正为
+  `a % b` 实际形态。
+- 探针复跑：X4 四例 BIZ-0126、X4.pct/pct0 PASS、`converted_ba=6`、
+  FR.q3 oracle=EQ，matrix/summary 与基线一致。
+- 全量门禁：fmt / clippy -D warnings / `cargo test --features cli`
+  全绿（797 lib + 全部集成）；`cargo audit` 按 CI 豁免清单通过。
+
+### 已知约束登记
+
+1. **依赖 DuckDB 对 FROM 派生表外层列引用的非标准宽容**：绑定形态
+   `(SELECT … FROM (SELECT acc AS a, b AS b) t)` 的内层 `SELECT acc, b`
+   可引用外层查询列——标准 SQL 需 LATERAL，实测 DuckDB 1.5.5 接受。
+   内核 pin 1.5.5，升级走 V6 门禁复评。
+2. **聚合上下文 fail-loud**：`mod(sum(x), …)` / 无 FROM 聚合实参经
+   绑定形态后，内层 `SELECT sum(x)` 无 FROM → 列未绑定，内核报错
+   （fail-loud，非静默错误值）。

@@ -62,7 +62,8 @@ pub fn apply_text_patterns(sql_text: &str, rules: &RuleRegistry) -> Result<Strin
         text = super::rewrite_concat(&text);
     }
     // A 模式 `MOD(n, 0) = n`（Oracle 语义，openGauss 实测），DuckDB 零模得 NULL
-    // → `CASE WHEN b = 0 THEN a ELSE mod(a, b) END`；口径见 validation V59.1
+    // → 操作数绑定的 `CASE WHEN b = 0 THEN a ELSE a % b END` 标量子查询；
+    // 口径见 validation V59.1（ELSE 用 `%`：产物含 `mod(` 会让变换循环不收敛）
     if rules.patterns_mod_zero_returns_dividend {
         text = super::rewrite_mod_zero(&text);
     }
