@@ -1,4 +1,4 @@
-admit: targets=58 converted=6 conditional=0 skipped=52 conservative=0 static-only=0 unchecked=0 native=on
+admit: targets=57 converted=6 conditional=0 skipped=51 conservative=0 static-only=0 unchecked=0 native=on
 ADMIT prc_stair_p0s skipped reason=UnsupportedControlFlow
 ADMIT prc_stair_p0r skipped reason=UnsupportedWrite
 ADMIT prc_stair_p0r2 skipped reason=UnsupportedWrite
@@ -83,6 +83,5 @@ ADMIT fnc_num_div_int skipped reason=UnsupportedControlFlow
 ADMIT fnc_num_div_expr skipped reason=UnsupportedControlFlow
 ADMIT fnc_num_div_dec skipped reason=UnsupportedControlFlow
 ADMIT fnc_num_div_small skipped reason=UnsupportedControlFlow
-ADMIT fnc_num_mod_assign skipped reason=UnsupportedControlFlow
-ADMIT fnc_num_mod_return skipped reason=UnsupportedControlFlow
-ADMIT fnc_num_mod_sql skipped reason=UnsupportedControlFlow
+ADMIT fnc_num_pct skipped reason=UnsupportedControlFlow
+ADMIT fnc_num_pct0 skipped reason=UnsupportedControlFlow

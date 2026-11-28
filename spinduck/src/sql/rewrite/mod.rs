@@ -7,6 +7,7 @@
 
 mod ast;
 mod concat;
+mod mod_zero;
 mod scan;
 mod split;
 mod tokens;
@@ -18,6 +19,7 @@ mod transform_tests;
 
 pub use ast::{apply_ast_transforms, oracle_format_to_strftime, strip_update_alias};
 pub use concat::rewrite_concat;
+pub use mod_zero::rewrite_mod_zero;
 pub use tokens::{
     rewrite_tokens, rewrite_tokens_with_rules, SqlBindSrc, SqlUnit, VarRestore, VarScope,
 };

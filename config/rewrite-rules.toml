@@ -124,6 +124,16 @@ oracle_outer_join = true
 # 实现只做局部文本替换（不回解析整句），无法识别的操作数形态原样交内核。
 # 探针 spinduck/src/sql/rewrite/concat.rs::tests::should_rewrite_concat_of_column_and_literal_to_concat_call
 concat_null_as_empty = true
+# 状态：verified —— A 模式 `MOD(n, 0) = n`（Oracle 语义；openGauss 5.0.0 实测
+# `7 % 0` = 7、`7.5 % 0` = 7.5、`-7 % 0` = -7、`0 % 0` = 0、`mod(7,0)` = 7、
+# `mod(0,0)` = 0、PL `n := 7 % 0` = 7 无异常；`7 % NULL` = NULL）。DuckDB 的
+# `%`/mod() 零除得 NULL，不改写即静默分歧。改写为 `CASE WHEN b = 0 THEN a
+# ELSE mod(a, b) END`（`%` 链左结合嵌套折叠）；NULL 传播由 CASE 条件保持。
+# 覆盖静态 SQL 语句与 PL FuncCall 的 prepared 标量 SQL；PL 表达式求值在
+# numeric.rs 单独对齐（V59.1）。语义损失：非零除数路径 CASE 条件开销可忽略，
+# 无值域损失；`/ 0` 不在本条（A 模式除零报错，保持内核口径）。
+# 探针 spinduck/src/sql/rewrite/mod_zero.rs::tests::should_rewrite_infix_percent_zero_guard
+mod_zero_returns_dividend = true
 
 # ── 隐式类型转换（解释器与改写器共用）────────────────────────────
 [implicit]

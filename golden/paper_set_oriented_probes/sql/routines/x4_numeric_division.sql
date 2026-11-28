@@ -1,6 +1,8 @@
--- 探针 X4 —— PL 表达式里的除法与取余（非论文案例，是引擎的数值语义缺口；由探针 G.savings 的参照比对不一致引出）。
--- Oracle 的 NUMBER 语义：/ 永远返回带小数的 NUMBER，10 / 3 = 3.3333…，1 / 100.0 = 0.01，(1 - 2/3) * 100 = 33.3333…；
--- MOD 既是函数也是中缀运算符，7 MOD 3 = 1。探针清单里的期望值按这个语义手写。
+-- 探针 X4 —— PL 表达式里的除法与取余（非论文案例，由探针 G.savings 的参照比对不一致引出）。
+-- GaussDB A 模式实测（2026-11-28 openGauss 5.0.0 容器）：/ 永远返回带小数的 NUMBER，
+-- 10 / 3 = 3.3333…，1 / 100.0 = 0.01，(1 - 2/3) * 100 = 33.3333…；% 是取余运算符
+-- （7 % 3 = 1，符号随被除数）；中缀 MOD 是语法错误（含 MOD( 形态），mod(a,b) 函数形式可用。
+-- 除法 4 例已按实测修复；中缀 MOD 4 例自 2026-11-28 起编译期显式拒绝（BIZ-0126）。
 CREATE OR REPLACE FUNCTION fnc_num_div_int RETURN NUMBER IS
 BEGIN
   RETURN 10 / 3;
@@ -27,33 +29,23 @@ BEGIN
 END;
 /
 
--- 中缀 MOD 在赋值语句里
-CREATE OR REPLACE FUNCTION fnc_num_mod_assign RETURN NUMBER IS
-  v  NUMBER := 7;
+-- % 取余运算符（参照实测：7 % 3 = 1）
+CREATE OR REPLACE FUNCTION fnc_num_pct RETURN NUMBER IS
   x  NUMBER;
 BEGIN
-  x := (v MOD 3);
+  x := 7 % 3;
   RETURN x;
 END;
 /
 
--- 中缀 MOD 在 RETURN 语句里
-CREATE OR REPLACE FUNCTION fnc_num_mod_return RETURN NUMBER IS
-  v  NUMBER := 7;
+-- % 零模（参照实测：MOD(n, 0) = n，返回被除数而非除零）
+CREATE OR REPLACE FUNCTION fnc_num_pct0 RETURN NUMBER IS
+  x  NUMBER;
 BEGIN
-  RETURN (v MOD 3);
+  x := 7 % 0;
+  RETURN x;
 END;
 /
 
--- 中缀 MOD 经由 SQL 语句
-CREATE OR REPLACE FUNCTION fnc_num_mod_sql RETURN NUMBER IS
-  v  NUMBER;
-BEGIN
-  SELECT 7 MOD 3
-    INTO v
-    FROM sys_dummy;
-  RETURN v;
-END;
-/
-
--- 字面量上的中缀 MOD（不带括号）——这一条预期连编译都过不了，所以单独成文件，见 x4b_mod_literal.sql。
+-- 字面量上的中缀 MOD（不带括号）——与其它中缀 MOD 形态一样预期编译失败（BIZ-0126），
+-- 因注册失败会连累同文件其它函数，所以单独成文件，见 x4b_mod_literal.sql。

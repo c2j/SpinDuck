@@ -4,7 +4,10 @@ main	sql/routines/p0_staircase.sql	KERNEL-0011
 main	sql/routines/procbench/Sudf_20b_GetManufactComplex.sql	KERNEL-0011
 main	sql/routines/procbench/sudf_8_maxReturnClass.sql	KERNEL-0011
 main	sql/routines/x2_column_name_capture.sql	KERNEL-0011
-main	sql/routines/x4b_mod_literal.sql	ENG-0022
+main	sql/routines/x4b_mod_literal.sql	BIZ-0126
+main	sql/routines/x4c_mod_assign.sql	BIZ-0126
+main	sql/routines/x4d_mod_return.sql	BIZ-0126
+main	sql/routines/x4e_mod_sql.sql	BIZ-0126
 main	MISS(计划闭包缺件)	custtotalloss
 main	MISS(计划闭包缺件)	prc_stair_t0rf
 tpch	sql/routines/f11_froid_tpch_dates.sql	ENG-0026

@@ -61,6 +61,11 @@ pub fn apply_text_patterns(sql_text: &str, rules: &RuleRegistry) -> Result<Strin
     if rules.patterns_concat_null_as_empty && text.contains("||") {
         text = super::rewrite_concat(&text);
     }
+    // A 模式 `MOD(n, 0) = n`（Oracle 语义，openGauss 实测），DuckDB 零模得 NULL
+    // → `CASE WHEN b = 0 THEN a ELSE mod(a, b) END`；口径见 validation V59.1
+    if rules.patterns_mod_zero_returns_dividend {
+        text = super::rewrite_mod_zero(&text);
+    }
     Ok(text)
 }
 

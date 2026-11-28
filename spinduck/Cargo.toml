@@ -125,6 +125,10 @@ name = "guard_hirn_grust_savings"
 path = "tests/guard/guard_hirn_grust_savings.rs"
 
 [[test]]
+name = "guard_pl_mod_reject"
+path = "tests/guard/guard_pl_mod_reject.rs"
+
+[[test]]
 name = "guard_set_oriented_expr"
 path = "tests/guard/guard_set_oriented_expr.rs"
 

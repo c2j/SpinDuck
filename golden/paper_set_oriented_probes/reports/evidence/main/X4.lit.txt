@@ -1,7 +1,7 @@
 ===== off =====
 $ call --plan <project>/.spinduck/plan/fnc_num_mod_literal.toml --db <project>/local.duckdb
 [exit 1]
-[ENG-0022] statement not yet supported in M2 compiler: Sql("MOD 3")
+[BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead) at line 6, column 15
 
 ===== batch-atomic =====
 $ call --plan <project>/.spinduck/plan/fnc_num_mod_literal.toml --db <project>/local.duckdb --set-oriented=batch-atomic
@@ -14,4 +14,4 @@ $ call --plan <project>/.spinduck/plan/fnc_num_mod_literal.toml --db <project>/l
 [ENG-0022] statement not yet supported in M2 compiler: Sql("MOD 3")
 
 ===== expect =====
-1
+[BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead)

@@ -85,6 +85,7 @@ fn bin_op_sql(op: BinOp) -> &'static str {
         BinOp::Sub => "-",
         BinOp::Mul => "*",
         BinOp::Div => "/",
+        BinOp::Mod => "%",
         BinOp::Concat => "||",
         BinOp::Eq => "=",
         BinOp::Ne => "<>",

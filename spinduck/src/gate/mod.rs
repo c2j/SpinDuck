@@ -5,6 +5,7 @@
 
 pub mod check;
 pub mod columns;
+pub mod dialect;
 pub mod pipeline;
 pub mod prepare;
 pub mod schema;

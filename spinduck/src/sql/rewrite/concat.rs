@@ -83,7 +83,7 @@ fn collect_chain(
     }
 }
 
-fn slice(text: &str, toks: &[TokenWithSpan], from: usize, to: usize) -> String {
+pub(super) fn slice(text: &str, toks: &[TokenWithSpan], from: usize, to: usize) -> String {
     let start = toks[from].span.start;
     let end = toks.get(to - 1).map_or(text.len(), |t| t.span.end);
     text[start..end].to_string()
@@ -98,12 +98,12 @@ fn is_concat(tws: Option<&TokenWithSpan>) -> bool {
 }
 
 /// 关键字在原文里的大写文本（不依赖 Keyword 枚举的变体命名）。
-fn word(text: &str, tws: &TokenWithSpan) -> String {
+pub(super) fn word(text: &str, tws: &TokenWithSpan) -> String {
     text[tws.span.start..tws.span.end].to_ascii_uppercase()
 }
 
 /// 从 `i` 起解析一个主元表达式，返回其后一个 token 下标；形态不认识则返回 None。
-fn primary_end(text: &str, toks: &[TokenWithSpan], i: usize) -> Option<usize> {
+pub(super) fn primary_end(text: &str, toks: &[TokenWithSpan], i: usize) -> Option<usize> {
     let tws = toks.get(i)?;
     let j = match &tws.token {
         Token::Integer(_)
@@ -179,7 +179,7 @@ fn maybe_typecast(toks: &[TokenWithSpan], mut j: usize) -> Option<usize> {
 }
 
 /// 括号配对：`open` 处为 `(`，返回匹配 `)` 的**后一个**下标。
-fn match_paren(toks: &[TokenWithSpan], open: usize) -> Option<usize> {
+pub(super) fn match_paren(toks: &[TokenWithSpan], open: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut k = open;
     while k < toks.len() {
@@ -217,7 +217,7 @@ fn match_case_end(text: &str, toks: &[TokenWithSpan], start: usize) -> Option<us
 }
 
 /// 原文切片替换（与 `patterns.rs` 同口径；区间须升序不重叠）。
-fn splice(text: &str, spans: &[Span]) -> String {
+pub(super) fn splice(text: &str, spans: &[Span]) -> String {
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0usize;
     for (s, e, rep) in spans {
