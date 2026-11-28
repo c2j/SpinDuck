@@ -1,5 +1,5 @@
 spinduck=spinduck 0.4.0
-git_head=879f4b764e8d97674020b3acb35a0bdc7a7b9452
-git_dirty_src=3
-date=2026-11-28T09:23:09Z
+git_head=620cdd65f3a68195de5b15c60ecb9137aec04bfc
+git_dirty_src=2
+date=2026-11-28T09:55:00Z
 projects=main,tpch

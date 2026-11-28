@@ -107,8 +107,13 @@ impl DuckExecutor {
             ValueRef::Decimal(d) => SpinValue::Decimal(d.value(), 38, d.scale()), // width 不回传，按 38 承载
             ValueRef::Text(t) => SpinValue::Str(String::from_utf8_lossy(t).into_owned()),
             ValueRef::Blob(b) => SpinValue::Blob(b.to_vec()),
+            // DATE 按显示串落 Str（ISO YYYY-MM-DD）：绑定回内核时与 DATE 列
+            // 比较走文本→DATE 隐式转换（V60；此前 Debug 落成 "Date32(8058)"
+            // 文本 → KERNEL-0010 invalid date field format）
+            ValueRef::Date32(days) => SpinValue::Str(days_to_iso(days)),
             other => {
-                // Timestamp/Date 等：按显示串落 Str（coerce 在赋值侧宽松转换）
+                // Timestamp 等其余类型：按显示串落 Str（coerce 在赋值侧宽松转换）；
+                // Timestamp 仍是 Debug 文本（未支持，登记 V60）
                 SpinValue::Str(format!("{other:?}"))
             }
         }
@@ -120,6 +125,22 @@ impl DuckExecutor {
             .map(|(k, v)| (k.trim_start_matches('$').to_string(), Self::to_duck(v)))
             .collect()
     }
+}
+
+/// 天数（自 1970-01-01）→ ISO 日期串。Hinnant civil_from_days 算法
+/// （公有领域公式）；不引入 chrono 依赖（AGENTS §Ask first）。
+fn days_to_iso(days: i32) -> String {
+    let z = days as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 impl SqlExecutor for DuckExecutor {

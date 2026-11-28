@@ -76,12 +76,8 @@ REF table:dual read <- fnc_dual_one @ sql/routines/x3_dual.sql:8
 REF routine:fnc_dual_one call <- prc_dual_one @ sql/routines/x3_dual.sql:0
 REF table:result_dual write <- prc_dual_one @ sql/routines/x3_dual.sql:17
 FAIL sql/routines/f11_froid_tpch_dates.sql  [ENG-0026] PL expression not yet supported in M2 evaluator: TypeCast { expr: PlVariable([Ident { value: "p_stdatechar", quote_style: None }]), type_name: Date, default: None, format: None }
-FAIL sql/routines/g01_goto_tpch.sql  [KERNEL-0011] duckdb prepare: Parser Error: syntax error at or near "$"
-
-LINE 1: SELECT $v_s__s_suppkey, $v_s__s_name FROM supplier AS $v_s, nation AS n WHERE $v_s__s_nationkey = n.n_nationkey...
-                                                              ^
 FAIL sql/routines/x3_dual.sql  [KERNEL-0011] duckdb prepare: Parser Error: syntax error at or near ")"
 
 LINE 1: ... result_dual ( n ) values ( (SELECT sd_v FROM sd_fn0 WHERE ) )
                                                                       ^
-compile: entries=15 missing=0 failed=3 dynamic=0
+compile: entries=15 missing=0 failed=2 dynamic=0

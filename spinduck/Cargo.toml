@@ -129,6 +129,10 @@ name = "guard_pl_mod_reject"
 path = "tests/guard/guard_pl_mod_reject.rs"
 
 [[test]]
+name = "guard_sql_name_resolution"
+path = "tests/guard/guard_sql_name_resolution.rs"
+
+[[test]]
 name = "guard_set_oriented_expr"
 path = "tests/guard/guard_set_oriented_expr.rs"
 

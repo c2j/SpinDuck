@@ -264,20 +264,8 @@ Did you mean "can_cast_implicitly"?
 
 LINE 1: ... result_stair ( k , tag , cost ) values ( $v_r__ps_partkey , fnc_tag_simple ( $v_r__ps_supplycost ) , $v_r__ps_supplycost...
                                                                         ^
-FAIL sql/routines/procbench/Sudf_20b_GetManufactComplex.sql  [KERNEL-0011] duckdb prepare: Parser Error: syntax error at or near "$"
-
-LINE 1: SELECT i_manufact FROM $v_item WHERE i_item_sk = $v_item
-                               ^
-FAIL sql/routines/procbench/sudf_8_maxReturnClass.sql  [KERNEL-0011] duckdb prepare: Parser Error: syntax error at or near "("
-
-LINE 1: SELECT i_class, count(i_class) AS CAST(NULL AS DECIMAL) FROM catalog_returns, item WHERE i_item_sk...
-                                              ^
-FAIL sql/routines/x2_column_name_capture.sql  [KERNEL-0011] duckdb prepare: Parser Error: syntax error at or near "$"
-
-LINE 1: insert into result_seq ( $v_i , sq ) values ( $v_i , $v_i * $v_i )
-                                 ^
 FAIL sql/routines/x4b_mod_literal.sql  [BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead) at line 6, column 15
 FAIL sql/routines/x4c_mod_assign.sql  [BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead) at line 8, column 14
 FAIL sql/routines/x4d_mod_return.sql  [BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead) at line 6, column 16
 FAIL sql/routines/x4e_mod_sql.sql  [BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead) at line 6, column 15
-compile: entries=61 missing=2 failed=9 dynamic=0
+compile: entries=61 missing=2 failed=6 dynamic=0
