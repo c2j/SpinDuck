@@ -306,6 +306,7 @@ pub(crate) fn binop(op: &str) -> Result<BinOp, EngineError> {
         "-" => BinOp::Sub,
         "*" => BinOp::Mul,
         "/" => BinOp::Div,
+        "%" => BinOp::Mod,
         "||" => BinOp::Concat,
         "=" => BinOp::Eq,
         "<>" | "!=" => BinOp::Ne,

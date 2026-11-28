@@ -202,10 +202,13 @@ for line in log.splitlines():
         compile_fail.setdefault(m.group(1), []).append(m.group(2))
 
 def registrable(f):
-    """项目态体检里因解析/编译错误（ENG-*）失败的文件注册不了，不能进 --file 回退的文件清单；
+    """项目态体检里因解析/编译错误（ENG-*）或编译期方言拒绝（BIZ-0126 中缀
+    MOD，2026-11-28 起）失败的文件注册不了，不能进 --file 回退的文件清单；
     仅因体检 gate 2B 的 prepare 失败（KERNEL-*）的文件可以注册。"""
     codes = compile_fail.get(f, [])
-    return not codes or not all(c.startswith("ENG-") for c in codes)
+    return not codes or not all(
+        c.startswith("ENG-") or c == "BIZ-0126" for c in codes
+    )
 
 routine_files = [f for f in routine_files if registrable(f)]
 miss = set(re.findall(r"MISS \w+:[\w.]+ <- (\w+)", log))

@@ -1,6 +1,6 @@
 # 论文探针差距报告
 
-> 被测：`spinduck 0.4.0`，`git_head=229c039` + 本地修复「PL 除法 float8 语义」（§5.1，未提交），2026-11-28 复跑。
+> 被测：`spinduck 0.4.0`，分支 `fix/infix-mod-reject`（= #68 之上叠加「中缀 MOD 显式拒绝 + % 取余」，未提交），2026-11-28 复跑。
 > 复现：`bash run_probes.sh`（约 3 分钟）；原始产物在 `reports/`，汇总数字在 `reports/summary.txt`。
 > 面向决策的汇总版（含逐篇论文的可行性与价值评估）：`docs/performance-optimization/docs/spinduck-set-oriented-gap-report.md`。
 > 口径见 [README.md](README.md)——**等价性基准是 Off 自己**，没有 GaussDB 参照侧；Off 本身对不对另看参照列与期望列。
@@ -9,28 +9,29 @@
 
 1. **解析层不是差距。** 公开基准 SQL-ProcBench 的 79 个 PL/SQL 文件，71 个能被 SpinDuck 编译
    （存过 44/45、标量 UDF 21/21、触发器 6/6）。
-2. **集合化这一层，论文与基准的案例 0 个可转换。** 78 个探针里 batch-atomic 下 `Converted` 6 个，
+2. **集合化这一层，论文与基准的案例 0 个可转换。** 79 个探针里 batch-atomic 下 `Converted` 6 个，
    全是定标探针和仓库自己的测试夹具；`compile --admit` 的总账是 main `targets=58 converted=6`、
    tpch `targets=14 converted=0`。strict 模式下两个工程都是 0。
-3. **只要 Off 能跑通，集合化（含回退）就没有出现结果不一致。** 76 个例程探针里 65 个逐值相等，
-   其余 11 个是 Off 自身报错、两种模式退出码一致。
+3. **只要 Off 能跑通，集合化（含回退）就没有出现结果不一致。** 77 个例程探针里 63 个逐值相等，
+   其余是 Off 自身报错、两种模式退出码一致（含中缀 MOD 4 例——2026-11-28 起编译期显式拒绝）。
 4. **论文案例带来了一份不依赖 Off 自身的参照，于是第一次能评价 Off 对不对。** 10 个带参照的探针
    全部一致（其中 3 个的参照是**论文作者写的 SQL**，另有 1 个是论文给出的改写结果，其余 6 个是我
    手写的等价 SQL）——除法语义修复后，`G.savings` 的占比也从 3.14 对齐到 3.135917。手写期望里
-   仍是失败的是**中缀 `MOD` 静默返回 NULL / 无返回值**（§5.1，未修）。这比集合化的问题更要紧。
+   的中缀 `MOD`（原静默 NULL / 无返回值）2026-11-28 起改为**编译期显式拒绝**（BIZ-0126），
+   与参照「语法错误」对齐；`%` 取余按参照实测支持（X4.pct：`7 % 3` = 1）。
 5. **论文案例还暴露出 5 处新的引擎缺口**（§5）：表别名被当成循环记录变量、DATE 型变量绑定进 SQL 后
    变成 `Date32(n)` 文本、PL 表达式里的类型转换不支持、带 OUT 参数的过程不能在区域里调用。
-   加上上一轮的 8 处（其中除法 4 处已修复、`DUAL` 一条经参照核实不是缺口），引擎侧未修缺口
-   一共 9 处。
+   加上上一轮的 8 处（其中除法 4 处、中缀 MOD 3 处已转显式拒绝/修复，`DUAL` 一条经参照核实不是
+   缺口），引擎侧未修缺口一共 6 处。
 6. **可转换形状的边界没有变化**（§2）：INSERT 必须套在跳行异常块里；不能有 NULL 字面量；
    循环内 IF 赋值只在夹具那一种组合下被接受；标量 FETCH、跨迭代累计、嵌套游标、每行 UPDATE、
    循环里逐行调函数各自单独致命。
 
 ## 1. 方法
 
-两个工程、78 个探针（76 个例程调用 + 2 个查询通道）：
+两个工程、79 个探针（77 个例程调用 + 2 个查询通道）：
 
-- **main**（63 个）：手工种子。定标阶梯、Froid 图 1、Aggify、CIDR 2024 / PRISM 的 `getManufact`、
+- **main**（64 个）：手工种子。定标阶梯、Froid 图 1、Aggify、CIDR 2024 / PRISM 的 `getManufact`、
   Hirn & Grust 的 `walk()`、DBridge / QBS / Sloth 的模式、SQL-ProcBench 逐字例程、引擎侧探针。
 - **tpch**（15 个）：SQL 生成的 TPC-H 形状数据（8000 张订单、24000 行明细）。Hirn & Grust 案例集里
   基于 TPC-H 的函数、Froid §11.1 的 TPC-H 谓词 UDF、PRISM 的谓词提升场景。
@@ -158,16 +159,17 @@ batch-atomic 下的判定。「参照」「期望」两列评价的是 Off，不
 解析过了不等于能跑：45 个存过里 21 个用 `SYS_REFCURSOR` + `dbms_sql.return_result` 返回结果集，
 后者目前是未支持例程，缺件即红。
 
-## 5. 引擎侧缺口（未修 9 处；除法 4 处已于 2026-11-28 修复）
+## 5. 引擎侧缺口（未修 6 处；除法 4 处 + 中缀 MOD 3 处已于 2026-11-28 修复/显式拒绝）
 
 每条都有入库证据（`reports/evidence/`、`reports/compile_*.log`）。上一轮报告里的 8 处是第 5.2 节的
 前三条加 5.4 节；其余由本轮的论文案例暴露。§5.1 的除法 4 处已修复并纳入守护测试
-（`tests/guard/guard_runtime_division_gaussdb.rs`）；`DUAL` 一条经参照实例核实**不是缺口**
+（`tests/guard/guard_runtime_division_gaussdb.rs`）；中缀 MOD 3 处已转编译期显式拒绝（BIZ-0126，
+`tests/guard/guard_pl_mod_reject.rs`）；`DUAL` 一条经参照实例核实**不是缺口**
 （GaussDB A 模式同样没有 `DUAL`，只有 `sys_dummy`），已从清单移除。
 
-### 5.1 求值层：PL 除法已修复；中缀 MOD 仍在
+### 5.1 求值层：PL 除法与中缀 MOD 已对齐参照（2026-11-28）
 
-**已修复（2026-11-28）**：PL 表达式里的整数除法与定标不符 GaussDB A 模式语义。已在参照实例
+**除法（已修复）**：PL 表达式里的整数除法与定标不符 GaussDB A 模式语义。已在参照实例
 （openGauss 5.0.0 容器）实测对齐——整数 `/` 走 float8（15 位有效数字），DECIMAL `/` 走
 PostgreSQL `select_div_scale`；修复落在 `runtime/eval/numeric.rs`，期望矩阵入守护测试
 （`tests/guard/guard_runtime_division_gaussdb.rs`），G.savings 案例的守护版在
@@ -180,17 +182,24 @@ PostgreSQL `select_div_scale`；修复落在 `runtime/eval/numeric.rs`，期望�
 | 上两条的合成 | `(1 - 2 / 3) * 100` → `100` | 33.3333333333333 | X4.expr |
 | 真实函数里的占比 | `goto_savings` 的节省比例 3.14 | 3.135917 | G.savings |
 
-**未修**：中缀 `MOD` 在 GaussDB 的 SQL 与 PL 里**都是语法错误**，SpinDuck 却静默吃掉——
-这不是算错，是「该拒绝却静默」：
+**中缀 MOD（已转显式拒绝）**：中缀 `MOD` 在参照的 SQL 与 PL 里**都是语法错误**
+（含 `7 MOD (3)`），SpinDuck 却静默吃掉——不是算错，是「该拒绝却静默」。
+2026-11-28 起在词元层显式拒绝（BIZ-0126；ogsql-parser 对这些形态是有损解析、
+AST 无痕迹，只能在词元层检出，见 `src/gate/dialect.rs`）：
 
-| 现象 | SpinDuck | 参照（openGauss 5.0.0 实测） | 探针 |
+| 现象（拒绝前） | 拒绝前 | 参照（openGauss 5.0.0 实测） | 探针 |
 |---|---|---|---|
-| 赋值语句里的中缀 `MOD` | `x := (v MOD 3)` → `NULL` | 语法错误（`MOD(7,3)` 函数形式才是取余） | X4.mod |
+| 赋值语句里的中缀 `MOD` | `x := (v MOD 3)` → `NULL` | 语法错误（`mod(7,3)` 函数形式才是取余） | X4.mod |
 | 经由 SQL 的中缀 `MOD` | `SELECT 7 MOD 3 INTO v` → `NULL` | 语法错误 | X4.modsql |
 | RETURN 里的中缀 `MOD` | `RETURN (v MOD 3)` → **没有返回值**（只打印 `CALL f OK`） | 语法错误 | X4.retmod |
 
-字面量上的中缀 `MOD`（`RETURN 7 MOD 3;`）编译期 `ENG-0022` 拒绝——与参照的「语法错误」一致，
-X4.lit 是预期失败的对照探针。
+字面量上的中缀 `MOD`（`RETURN 7 MOD 3;`）此前经 `ENG-0022` 拒绝，现统一为 `BIZ-0126`
+（编译失败的行为不变，错误码与参照语义对齐）；X4.lit 是预期失败的对照探针。
+
+**`%` 取余（已支持）**：参照 `%` 可用（`7 % 3` = 1、`-7 % 3` = -1、`7.5 % 2` = 1.5、
+`-7.5 % 2` = -1.5，符号随被除数），本仓此前对 PL 表达式里的 `%` 报 `ENG-0027`。
+新增 `BinOp::Mod`：整数走 i64 rem、DECIMAL 走定标后 rem（小数位取操作数较大者），
+除零与 `/` 同报 BIZ-0124；SQL 通道 `%` 原生透传内核（X4.pct：PASS）。
 
 ### 5.2 名字解析：没区分 SQL 标识符的位置
 
@@ -256,7 +265,7 @@ X4.lit 是预期失败的对照探针。
 | 内容 | 位置 |
 |---|---|
 | 汇总数字 | `reports/summary.txt` |
-| 差距矩阵（78 个探针） | `reports/matrix.tsv` |
+| 差距矩阵（79 个探针） | `reports/matrix.tsv` |
 | 编译期判定（两个工程、两种模式） | `reports/admit_*.txt` |
 | SQL-ProcBench 整体解析体检 | `reports/sqlprocbench_compile.txt` |
 | DuckDB 机制实测（项目钉住的内核） | `reports/duckdb_mechanisms.txt` |

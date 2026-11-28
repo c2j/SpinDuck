@@ -102,3 +102,31 @@ fn should_apply_select_div_scale_like_gaussdb_numeric() {
         assert_eq!(eval(&mut eng, expr), want, "{expr}");
     }
 }
+
+/// 已知差距①（复审 2026-11-28 登记，勿「顺手修复」）：**内联链式**除法里，
+/// 本仓把每个除法结果先固化为 15 位有效数字的 DECIMAL 再相加（…334），
+/// 参照全程 float8、输出时才 %.15g（`2/3 + 2/3` = 1.33333333333333）。
+/// 根因是无 float8 值域；经 NUMBER 变量中转的链式（`a := 2/3; b := 2/3;
+/// a + b`）参照同样得 …334，与本仓一致——只有内联形态分歧。
+#[test]
+fn should_pin_inline_chained_division_sum_as_known_gap() {
+    let mut eng = engine();
+    assert_eq!(
+        eval(&mut eng, "2 / 3 + 2 / 3"),
+        SpinValue::Decimal(1333333333333334, 38, 15)
+    );
+}
+
+/// 已知差距②（复审 2026-11-28 登记，勿「顺手修复」）：整数槽直赋除法，
+/// 参照 `v INTEGER := 1/2` 得 0（float8 → int 截断固化），本仓保留 0.5
+/// （INTEGER 声明槽不固化类型，var_types 仅 VARCHAR 强转）——同根因
+/// （无 float8 值域 + 变量槽无数值类型收敛）。
+#[test]
+fn should_pin_integer_slot_direct_assignment_division_as_known_gap() {
+    let mut eng = engine();
+    let sql = "CREATE OR REPLACE FUNCTION f_int_slot RETURN INTEGER IS \
+         v INTEGER; BEGIN v := 1 / 2; RETURN v; END;";
+    eng.register(sql).unwrap();
+    let r = eng.call("f_int_slot", &[]).unwrap();
+    assert_eq!(r.return_value, Some(SpinValue::Decimal(5, 38, 1)));
+}

@@ -1,7 +1,7 @@
 ===== off =====
 $ call --plan <project>/.spinduck/plan/fnc_num_mod_return.toml --db <project>/local.duckdb
-[exit 0]
-CALL fnc_num_mod_return OK
+[exit 1]
+[BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead) at line 6, column 16
 
 ===== batch-atomic =====
 $ call --plan <project>/.spinduck/plan/fnc_num_mod_return.toml --db <project>/local.duckdb --set-oriented=batch-atomic
@@ -16,4 +16,4 @@ SET_ORIENTED fnc_num_mod_return skipped reason=UnsupportedControlFlow
 CALL fnc_num_mod_return OK
 
 ===== expect =====
-1
+[BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead)

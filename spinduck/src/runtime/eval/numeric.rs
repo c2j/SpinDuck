@@ -42,6 +42,21 @@ pub(super) fn arith(op: &BinOp, l: &SpinValue, r: &SpinValue) -> Result<SpinValu
             }
             (a.checked_mul(b).ok_or_else(overflow)?, scale)
         }
+        BinOp::Mod => {
+            // GaussDB A 模式实测：小数位取操作数较大者（7.5 % 2 = 1.5），
+            // 符号随被除数（Rust rem 同口径）；除零与 `/` 同报 BIZ-124
+            if b == 0 {
+                return Err(EngineError::business(124, "division by zero"));
+            }
+            let scale = sa.max(sb);
+            let a2 = pow10(scale - sa)
+                .and_then(|p| a.checked_mul(p))
+                .ok_or_else(overflow)?;
+            let b2 = pow10(scale - sb)
+                .and_then(|p| b.checked_mul(p))
+                .ok_or_else(overflow)?;
+            (a2.checked_rem(b2).ok_or_else(overflow)?, scale)
+        }
         BinOp::Div => return div_dec(a, sa, b, sb),
         _ => return Err(EngineError::invariant(30, "not arithmetic")),
     };
@@ -204,6 +219,10 @@ pub(super) fn apply_i(op: &BinOp, x: i64, y: i64) -> Result<i64, EngineError> {
         BinOp::Mul => x.checked_mul(y).ok_or_else(overflow),
         BinOp::Div if y == 0 => Err(EngineError::business(124, "division by zero")),
         BinOp::Div => Ok(x / y),
+        // GaussDB A 模式：`%` 符号随被除数（-7 % 3 = -1），Rust rem 同口径；
+        // y == 0 与 i64::MIN % -1 都使 checked_rem 返回 None
+        BinOp::Mod if y == 0 => Err(EngineError::business(124, "division by zero")),
+        BinOp::Mod => x.checked_rem(y).ok_or_else(overflow),
         _ => Err(EngineError::invariant(30, "not arithmetic")),
     }
 }

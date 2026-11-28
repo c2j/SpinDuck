@@ -58,7 +58,8 @@ X4.int	call	fnc_num_div_int				引擎数值语义（非论文）	PL 表达式 10
 X4.expr	call	fnc_num_div_expr				引擎数值语义（非论文）	PL 表达式 (1 - 2 / 3) * 100；期望按 Oracle NUMBER 语义手写		33.333333
 X4.dec	call	fnc_num_div_dec	1 3			引擎数值语义（非论文）	PL 表达式 p_a / p_b（NUMBER 形参 1 / 3）；期望按 Oracle NUMBER 语义手写		0.333333
 X4.small	call	fnc_num_div_small				引擎数值语义（非论文）	PL 表达式 x := 1 / 100.0；期望按 Oracle NUMBER 语义手写		0.01
-X4.mod	call	fnc_num_mod_assign				引擎数值语义（非论文）	PL 赋值语句里的中缀取余 x := (v MOD 3)（v = 7）；期望 1		1
-X4.retmod	call	fnc_num_mod_return				引擎数值语义（非论文）	RETURN (v MOD 3)（v = 7）；期望 1		1
-X4.modsql	call	fnc_num_mod_sql				引擎数值语义（非论文）	SELECT 7 MOD 3 INTO v FROM sys_dummy；期望 1		1
-X4.lit	call	fnc_num_mod_literal				引擎数值语义（非论文）	RETURN 7 MOD 3（字面量上的中缀取余）；预期编译失败 ENG-0022		1
+X4.mod	call	fnc_num_mod_assign				引擎数值语义（非论文）	PL 赋值语句里的中缀取余 x := (v MOD 3)（v = 7）；参照是语法错误，2026-11-28 起编译期显式拒绝		[BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead)
+X4.retmod	call	fnc_num_mod_return				引擎数值语义（非论文）	RETURN (v MOD 3)（v = 7）；参照是语法错误，2026-11-28 起编译期显式拒绝		[BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead)
+X4.modsql	call	fnc_num_mod_sql				引擎数值语义（非论文）	SELECT 7 MOD 3 INTO v FROM sys_dummy；参照是语法错误，2026-11-28 起编译期显式拒绝		[BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead)
+X4.lit	call	fnc_num_mod_literal				引擎数值语义（非论文）	RETURN 7 MOD 3（字面量上的中缀取余）；预期编译失败，2026-11-28 起统一为 BIZ-0126（原 ENG-0022）		[BIZ-0126] infix MOD is a syntax error in GaussDB (use mod(a, b) instead)
+X4.pct	call	fnc_num_pct				引擎数值语义（非论文）	PL 表达式 7 % 3；2026-11-28 起按参照实测支持（参照 = 1，符号随被除数）		1

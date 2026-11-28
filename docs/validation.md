@@ -5917,3 +5917,54 @@ TDD 修复（回归测试先红后绿，`set_oriented_issue65_regression`）：
   `G.savings` 参照比对转 EQ（10/10 EQ）；余下失败仅中缀 `MOD` 3 例
   （X4.mod/modsql 静默 NULL、X4.retmod 无返回值——未修，应显式拒绝）。
 - 详见 `golden/paper_set_oriented_probes/reports/summary.txt` 与 REPORT.md §5.1。
+
+## V59. 中缀 MOD 显式拒绝 + `%` 取余对齐参照（2026-11-28，stacked on #68）
+
+### 参照实测（openGauss 5.0.0 容器，A 模式）
+
+- 中缀 `MOD`：SQL 与 PL 里都是语法错误——`7 mod 3`（at or near "3"）、`x := (v MOD 3)`
+  （at or near "MOD"）、`7 MOD (3)` 与 `7 MOD(3)`（at or near "("）全报错；
+  尾随 `mod`（`SELECT 7 mod FROM sys_dummy` → 7）是别名不报错；`mod (7,3)` 函数形式可用。
+- `%`：`7 % 3` = 1、`-7 % 3` = -1、`7.5 % 2` = 1.5、`-7.5 % 2` = -1.5（符号随被除数）。
+- 复核 #68 复审两条主张：`v INTEGER := 1/2` 参照 = 0（float8 → int 截断固化）；
+  内联 `2/3 + 2/3` 参照 = 1.33333333333333（全程 float8），**经 NUMBER 变量中转的链式参照
+  = 1.333333333333334 与本仓一致**——链式分歧仅限内联形态。
+
+### 解析层事实（ogsql-parser，公共 API，行为问题只记录）
+
+中缀 MOD 是**有损解析**：`x := (v MOD 3)` / `RETURN (v MOD 3)` 的语句被整体丢弃（AST 无痕迹）、
+`SELECT 7 MOD 3 INTO v` 丢成 `SELECT 7`、`RETURN 7 MOD 3` 拆成 `RETURN 7` + SQL 语句 `"MOD 3"`。
+IR 层无从检出，拒绝点只能在词元层。
+
+### 实现（先红后绿）
+
+- **BIZ-0126（新增错误码，挂探针）**：`gate/dialect.rs` 词元扫描——值操作数（Ident/Integer/
+  Float/RParen）紧邻裸 `MOD`（大小写不敏感、QuotedIdent 不算）且后随值起始词元
+  （Ident/QuotedIdent/Integer/Float/Param/LParen/Minus）即编译期拒绝；注释（Comment/Hint）
+  跳过不误伤。挂点在 `engine.rs::register_named_uncached` tokenize 之后（全部 CLI 路径
+  compile/call/--file/--plan 都经此）。四个历史形态 X4.mod/modsql/retmod/lit 统一 BIZ-0126
+  （lit 原 ENG-0022，编译失败行为不变、错误码与参照对齐）。
+- **`%`（`BinOp::Mod` 新变体）**：Int 走 `i64::checked_rem`（除零 BIZ-0124，与 `/` 同码）；
+  DECIMAL 定标到 max(scale) 后 rem（`7.5 % 2` = 1.5，符号随被除数）；SQL 通道 `%` 原生透传
+  内核不动。穷尽 match 补三处：`cli/explain.rs` op_text、`sql/render.rs` bin_op_sql（渲染 `%`）、
+  `copy/inline.rs` inline_safe（Mod 与 Mul/Div 同为 false，无写汇证明）。
+- 探针资产：x4c/d/e 三个 MOD 例程拆独立文件（预期编译失败会连累同文件注册，x4b 先例）；
+  `probes.tsv` X4.mod/modsql/retmod/lit 期望改 `[BIZ-0126]`，新增 X4.pct；
+  `run_probes.sh::registrable` 过滤口径补 BIZ-0126（否则编译拒绝文件混进 `--file` 回退清单，
+  连累 T0.rf/X1.ord——首跑实测踩中并已修复）。
+
+### 守护与探针证据
+
+- `tests/guard/guard_pl_mod_reject.rs`（10 测试）：4 形态拒绝 + `MOD (3)` 拒绝 + 注释/字符串
+  不误伤 + `mod()` 函数形式保持可用 + `%` 整数/小数/符号/除零 5 例。
+- `tests/guard/guard_runtime_division_gaussdb.rs` 增两条钉现状（已知差距①②，注释标明勿顺手修复）：
+  内联链式 `2/3+2/3` = …334、`v INTEGER := 1/2` = 0.5（参照 0）。
+- 探针复跑：X4.mod/retmod/modsql/lit 全部 `off=ERR(1)`（编译拒绝）；X4.pct PASS；
+  `converted_ba=6` 与等价性基线恢复（首跑回归已定位并修复，见上）。
+- 全量门禁：fmt / clippy -D warnings / `cargo test --features cli` 74 目标全绿。
+
+### 已知差距登记（#68 复审非阻断 5 项，详见 gap report §6.4）
+
+① 内联链式除法（本仓 …334 vs 参照 …33，钉现状）；② 整数槽直赋除法（0.5 vs 0，钉现状）；
+③ `rscale>38` 显式 BIZ-112 vs 参照按 38 位出值（fail-loud，登记分歧）；④ SQL 通道显示位宽
+（DuckDB shortest vs %.15g，转换区支持除法形状时暴露）；⑤ 设计 §3.3 已加下沉下线注记（V58）。

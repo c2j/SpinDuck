@@ -303,6 +303,7 @@ pub(crate) fn eval_bin(op: BinOp, l: &SpinValue, r: &SpinValue) -> Result<SpinVa
             | BinOp::Sub
             | BinOp::Mul
             | BinOp::Div
+            | BinOp::Mod
             | BinOp::Eq
             | BinOp::Ne
             | BinOp::Lt
@@ -319,7 +320,7 @@ pub(crate) fn eval_bin(op: BinOp, l: &SpinValue, r: &SpinValue) -> Result<SpinVa
         // sql::rewrite::concat（'a' || b → concat('a', b)）。
         BinOp::Concat if matches!((l, r), (V::Null, V::Null)) => Ok(V::Null),
         BinOp::Concat => Ok(V::Str(format!("{}{}", l.as_str_loose(), r.as_str_loose()))),
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => arith(&op, l, r),
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => arith(&op, l, r),
         BinOp::Eq => Ok(V::Bool(compare(&op, l, r)?)),
         // compare() 内部已按传入运算符求值；Ne 只能对 Eq 结果取反，
         // 否则 `<>` 会被双重取反（回归守护见 tests/ir_expr_forms.rs）

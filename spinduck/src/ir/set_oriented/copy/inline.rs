@@ -316,7 +316,7 @@ fn inline_safe(e: &crate::ir::IrExpr) -> bool {
             BinOp::Add | BinOp::Sub => {
                 (date_expr(l) && num_leaf(r)) || (*op == BinOp::Add && num_leaf(l) && date_expr(r))
             }
-            BinOp::Mul | BinOp::Div => false,
+            BinOp::Mul | BinOp::Div | BinOp::Mod => false,
         },
         IrExpr::Case {
             operand,

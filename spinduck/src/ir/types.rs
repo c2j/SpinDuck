@@ -128,6 +128,9 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    /// `%` 取余（GaussDB A 模式实测：符号随被除数，`-7 % 3` = -1、
+    /// `7.5 % 2` = 1.5；除零与 `/` 同报 BIZ-0124）。
+    Mod,
     Concat,
     Eq,
     Ne,
