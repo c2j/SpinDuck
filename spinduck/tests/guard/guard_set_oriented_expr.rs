@@ -250,10 +250,12 @@ fn should_preserve_valid_null_rows_for_round_null_div_bad_divisor() {
 }
 
 #[test]
-fn should_sink_pl_integer_division_with_pl_zero_guard() {
-    // 设计 §4.5 第 3 项情形 A + §4.6：PL `v := r.a / r.b` 下沉为精确整数
-    // 除法 `//`（禁浮点/TRUNC），PL 除零守卫 (a) IS NULL OR (b) IS NULL
-    // OR (b) <> 0 复现 BIZ-0124 跳行；NULL/0 合法保留。
+fn should_skip_batch_atomic_pl_division_sinking_until_float8_proof() {
+    // 设计 §4.5 情形 A 已按 GaussDB 实测下线（2026-11-28 openGauss 5.0.0）：
+    // PL 整数 `/` 是 float8 语义（15 位有效数字，写整型列四舍五入），
+    // `//` 整数除法改写与之不等价——证明义务补齐前 BatchAtomic 必须整段
+    // 跳过，且 Off 基线与参照库逐字一致（1 / 9007199254740990 / NULL，
+    // (7,0) 除零 trap 跳行）。
     let sql = "CREATE PROCEDURE copy_pl IS v NUMBER; BEGIN \
         FOR r IN SELECT a, b FROM source_rows LOOP \
         BEGIN v := r.a / r.b; INSERT INTO target_rows(val) VALUES (v); COMMIT; \
@@ -268,8 +270,8 @@ fn should_sink_pl_integer_division_with_pl_zero_guard() {
     let mut baseline = setup();
     baseline.call("copy_pl", &[]).unwrap();
     let expected = vec![
-        vec![SpinValue::Int(0)],
-        vec![SpinValue::Int(9007199254740993)],
+        vec![SpinValue::Int(1)],
+        vec![SpinValue::Int(9007199254740990)],
         vec![SpinValue::Null],
     ];
     assert_eq!(rows(&baseline), expected);
@@ -278,13 +280,11 @@ fn should_sink_pl_integer_division_with_pl_zero_guard() {
     eng.set_oriented = SetOrientedMode::BatchAtomic;
     eng.call("copy_pl", &[]).unwrap();
     assert_eq!(rows(&eng), expected);
-    assert!(
-        matches!(
-            eng.set_oriented_reports()[0].status,
-            Status::Converted { .. }
-        ),
-        "{:?}",
-        eng.set_oriented_reports()[0]
+    assert_eq!(
+        eng.set_oriented_reports()[0].status,
+        Status::Skipped {
+            reason: SkipReason::UnsupportedControlFlow
+        }
     );
 }
 

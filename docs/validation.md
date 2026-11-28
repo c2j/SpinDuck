@@ -5853,3 +5853,67 @@ TDD 修复（回归测试先红后绿，`set_oriented_issue65_regression`）：
 `tests/common/issue65.rs` 超 700 行上限，第三/四轮夹具拆
 `issue65_review.rs`（~390 行），`setup_case1_with` 与三个 DDL 常量
 改 `pub` 供跨文件引用。
+
+## V58. PL 除法对齐 GaussDB（float8 / select_div_scale）+ 除法下沉下线实证（2026-11-28）
+
+### 参照实测（openGauss 5.0.0 容器，A 模式，127.0.0.1:5433）
+
+- SQL 层：`10/3` → `3.33333333333333`（double precision 显示 15 位有效数字）、
+  `1/100.0` → `.01000000000000000000`、`7 % 3` → `1`、中缀 `7 MOD 3` 在 SQL 与
+  PL 里**都是语法错误**（`MOD(7,3)` 函数形式 = 1）、除零报 `division by zero`
+  且回滚（0 行）、`DUAL` 不存在（内建伪表 `sys_dummy`）。
+- PL 层：`v := 1/2` → `.5`、`v := 10/3` → `3.33333333333333`、
+  `a NUMBER:=10; b NUMBER:=3; a/b` → `3.3333333333333333`、
+  `v := 9007199254740993/1` → `9007199254740990`、`v := 6/3` → `2`、
+  `v := -1/3` → `-.333333333333333`。
+- 定性结论：整数 `/` 走 **float8**（写入 NUMBER 时按 `DBL_DIG=15` 位有效数字
+  固化，`2^53+1/1` 的 …993 因此变 …990）；NUMBER/NUMBER 走 PostgreSQL
+  `select_div_scale`（`NUMERIC_MIN_SIG_DIGITS=16`、`DEC_DIGITS=4`：
+  1/3→20 位、100/3→16 位、123456/3→12 位、1234567890123/3→8 位、
+  1e-5/3→24 位、2/3 末位 half-away 进位）。
+
+### 修复（`runtime/eval/numeric.rs`，TDD 先红后绿）
+
+- `Int/Int` 除法：f64 求值后按 15 位有效数字固化（`format!("{:.14e}")` 与
+  `printf("%.15g")`/`float8_numeric` 同舍入口径），产出 `Decimal` 并去尾零；
+  除零仍 BIZ-124。`+ - *` 保持 i64 精确语义。
+- `BinOp::Div` 的 DECIMAL 路径：`select_div_scale` 定标（基 10000 的
+  weight/firstdigit 口径）+ half-away-from-zero 舍入（`2r ≥ d` 用 u128 比较
+  防溢出）；rscale > 38 显式 BIZ-112，不静默截断。
+- SQL 通道（DuckDB 内核）不动。
+
+### 守护测试（新增 `tests/guard/`）
+
+- `guard_runtime_division_gaussdb.rs`：GaussDB 实测矩阵——`Int/Int` 5 例
+  （1/2、2/3、6/3、-1/3、9007199254740993/1）+ DECIMAL 11 例（含
+  `select_div_scale` 采样点与 `1/2.0` 混合类型），断言 `Decimal` 精确元组。
+- `guard_hirn_grust_savings.rs`：探针 G.savings 的守护版（例程与参照 SQL 逐字
+  移植、数据缩小为确定性夹具）——解释器逐行与手写等价 SQL 在同一内存内核上
+  `ROUND(pct, 6)` 逐值一致；修复前该案例 3.14 ≠ 3.135917（探针包 REPORT §5.1）。
+
+### 人类守护测试期望变更（PR 单独标注，需评审）
+
+- `guard_set_oriented_division.rs`：`should_truncate_pl_integer_division_and_
+  propagate_null` → `should_divide_pl_integers_like_gaussdb_float8_and_propagate_
+  null`，期望 `0`/`9007199254740993` → `0.5`/`9007199254740990`（模块头注释
+  同步；`norm` 把 GaussDB 的 `.5` 与 `0.5` 归一为同值）。
+
+### 连带：PL 整数除法集合化下沉下线
+
+- 下沉改写 `(a // b)`（整数除法）的前提「PL 整数除法 = 精确整数除法」被参照
+  推翻：`0.5` 下沉得 `0`、`9007199254740993/1` 下沉得 `…993`，与 Off 不再逐字
+  一致。`SinkOp::Div` 在 `sink_projection` 类型检查之后整段拒绝
+  （`UnsupportedControlFlow`），删除 `expr::pl_division`。
+- `guard_set_oriented_expr.rs`：`should_sink_pl_integer_division_with_pl_zero_
+  guard` → `should_skip_batch_atomic_pl_division_sinking_until_float8_proof`
+  （BatchAtomic `Converted` → `Skipped`；基线行值按 GaussDB 实测——BIGINT
+  目标四舍五入 `1`/`9007199254740990`/`NULL`，`(7,0)` 除零 trap 跳行）。
+  Strict / DOUBLE 源 / VARCHAR 槽三个用例的拒因与行为不变（拒绝点在既有
+  类型检查之后，未前移）。
+
+### 探针复跑（修复后二进制）
+
+- `off_vs_expect`：除法 4 例（X4.int/expr/dec/small）全部 PASS；
+  `G.savings` 参照比对转 EQ（10/10 EQ）；余下失败仅中缀 `MOD` 3 例
+  （X4.mod/modsql 静默 NULL、X4.retmod 无返回值——未修，应显式拒绝）。
+- 详见 `golden/paper_set_oriented_probes/reports/summary.txt` 与 REPORT.md §5.1。

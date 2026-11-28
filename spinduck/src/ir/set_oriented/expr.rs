@@ -85,26 +85,6 @@ pub(super) fn at_write_sink(expr: String, to: &Column) -> GuardedExpr {
     }
 }
 
-/// PL 整数除法下沉（设计 §4.5 情形 A / §4.6）：精确 `//`（禁浮点/TRUNC），
-/// PL 除零守卫复现 BIZ-0124 跳行；NULL/0 因 NULL 传播合法保留。
-pub(super) fn pl_division(lhs_field: &str, rhs_field: &str, to: &Column) -> GuardedExpr {
-    let a = format!("sd_cur.{}", Name(lhs_field.to_string()).sql());
-    let b = format!("sd_cur.{}", Name(rhs_field.to_string()).sql());
-    let expr = format!("({a} // {b})");
-    let zero = format!("({a}) IS NULL OR ({b}) IS NULL OR ({b}) <> 0");
-    let ty = to.kind.to_ascii_uppercase();
-    let cast = format!("{expr} IS NULL OR TRY_CAST({expr} AS {ty}) IS NOT NULL");
-    let mut guard = format!("({zero}) AND ({cast})");
-    if !to.nullable {
-        guard = format!("{expr} IS NOT NULL AND ({guard})");
-    }
-    GuardedExpr {
-        expr,
-        guard,
-        kernel_guard: String::new(),
-    }
-}
-
 struct Parser<'a> {
     t: &'a mut Tokens,
     binds: &'a [(String, BindSrc)],

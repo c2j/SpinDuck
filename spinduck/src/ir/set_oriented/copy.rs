@@ -678,7 +678,11 @@ fn sink_projection(
         }
     }
     Ok(match op {
-        SinkOp::Div => expr::pl_division(lhs, rhs, to),
+        // GaussDB A 模式实测（2026-11-28 openGauss 5.0.0）：PL 整数 `/` 按
+        // float8 语义求值（15 位有效数字），`//` 与之不等价（0.5 → 0、
+        // 9007199254740993/1 → …993）。证明义务补齐前整段跳过
+        // （AGENTS §4.3；设计 §4.5 情形 A 的整数除法前提已作废）。
+        SinkOp::Div => return Err(SkipReason::UnsupportedControlFlow),
         SinkOp::Concat => expr::pl_concat(lhs, rhs, to),
     })
 }
