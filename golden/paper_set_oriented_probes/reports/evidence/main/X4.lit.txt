@@ -1,0 +1,17 @@
+===== off =====
+$ call --plan <project>/.spinduck/plan/fnc_num_mod_literal.toml --db <project>/local.duckdb
+[exit 1]
+[ENG-0022] statement not yet supported in M2 compiler: Sql("MOD 3")
+
+===== batch-atomic =====
+$ call --plan <project>/.spinduck/plan/fnc_num_mod_literal.toml --db <project>/local.duckdb --set-oriented=batch-atomic
+[exit 1]
+[ENG-0022] statement not yet supported in M2 compiler: Sql("MOD 3")
+
+===== strict =====
+$ call --plan <project>/.spinduck/plan/fnc_num_mod_literal.toml --db <project>/local.duckdb --set-oriented=strict
+[exit 1]
+[ENG-0022] statement not yet supported in M2 compiler: Sql("MOD 3")
+
+===== expect =====
+1

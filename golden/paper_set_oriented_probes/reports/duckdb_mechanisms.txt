@@ -1,0 +1,22 @@
+# DuckDB 机制实测：spinduck query（项目钉住的内核）逐条执行；OK 给结果，ERR 给内核首行报错
+# CLI: spinduck 0.4.0
+OK   TRY(expr)：把运行期转换错误转成 NULL
+       {   "schema": ["x", "v"],   "rows": [     ["7", "7"],     ["x", null],     [null, null]   ] }
+OK   TRY + COALESCE 哨兵：能否区分「出错」与「本来就是 NULL」
+       {   "schema": ["x", "is_err"],   "rows": [     ["7", "false"],     ["x", "true"],     [null, "true"]   ] }
+ERR  (DO NOT THROW expr) 写法
+       [KERNEL-0010] Parser Error: syntax error at or near "DO"
+OK   last_value(v IGNORE NULLS) OVER (…)
+       {   "schema": ["rn", "v", "carry"],   "rows": [     ["1", "a", null],     ["2", null, "a"],     ["3", null, "a"],     ["4", "b", "a"]   ] }
+ERR  last_value(v) IGNORE NULLS OVER (…) 写法
+       [KERNEL-0010] Parser Error: syntax error at or near "IGNORE"
+OK   lag(v IGNORE NULLS) OVER (…)
+       {   "schema": ["rn", "carry"],   "rows": [     ["1", null],     ["2", "a"],     ["4", "a"]   ] }
+OK   窗口 SUM（运行累计）
+       {   "schema": ["rn", "v", "running"],   "rows": [     ["1", "10", "10"],     ["2", "20", "30"],     ["3", "5", "35"]   ] }
+OK   WITH RECURSIVE … USING KEY 配 UNION ALL
+       {   "schema": ["k", "n"],   "rows": [     ["0", "1"],     ["1", "2"]   ] }
+OK   WITH RECURSIVE … USING KEY 配 UNION
+       {   "schema": ["k", "n", "payload"],   "rows": [     ["0", "1", "9"],     ["1", "2", "8"],     ["2", "3", "7"]   ] }
+OK   递归 CTE 用布尔标志列终止（Hirn & Grust 编译模板里 rec? 列的写法）
+       {   "schema": ["n"],   "rows": [     ["4"]   ] }

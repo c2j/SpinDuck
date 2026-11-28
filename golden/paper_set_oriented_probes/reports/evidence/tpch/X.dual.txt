@@ -1,0 +1,33 @@
+===== off =====
+$ call --plan <project>/.spinduck/plan/prc_dual_one.toml --db <project>/local.duckdb
+[exit 1]
+MISS relation:dual <- fnc_dual_one
+call: target=prc_dual_one missing=1 未执行（design D5 缺件即红）
+-- dump[0]: SELECT n FROM result_dual
+{
+  "schema": ["n"],
+  "rows": []
+}
+
+===== batch-atomic =====
+$ call --plan <project>/.spinduck/plan/prc_dual_one.toml --db <project>/local.duckdb --set-oriented=batch-atomic
+[exit 1]
+MISS relation:dual <- fnc_dual_one
+call: target=prc_dual_one missing=1 未执行（design D5 缺件即红）
+-- dump[0]: SELECT n FROM result_dual
+{
+  "schema": ["n"],
+  "rows": []
+}
+
+===== strict =====
+$ call --plan <project>/.spinduck/plan/prc_dual_one.toml --db <project>/local.duckdb --set-oriented=strict
+[exit 1]
+MISS relation:dual <- fnc_dual_one
+call: target=prc_dual_one missing=1 未执行（design D5 缺件即红）
+-- dump[0]: SELECT n FROM result_dual
+{
+  "schema": ["n"],
+  "rows": []
+}
+

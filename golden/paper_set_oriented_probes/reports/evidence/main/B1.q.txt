@@ -1,0 +1,7 @@
+-- SELECT c_custkey, c_name, fnc_total_price(c_custkey) AS total_txt FROM customer ORDER BY c_custkey
+[exit 1]
+[KERNEL-0010] Catalog Error: Scalar Function with name fnc_total_price does not exist!
+Did you mean "fnc_tag_simple"?
+
+LINE 1: SELECT c_custkey, c_name, fnc_total_price(c_custkey) AS total_txt FROM customer ORDER...
+                                  ^

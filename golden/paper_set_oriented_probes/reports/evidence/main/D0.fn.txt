@@ -1,0 +1,26 @@
+===== off =====
+$ call --plan <project>/.spinduck/plan/maxreturnclass.toml --db <project>/local.duckdb
+[exit 1]
+[KERNEL-0010] Parser Error: syntax error at or near "$"
+
+LINE 1: SELECT i_class, count(i_class) AS $v_cnt FROM catalog_returns, item WHERE i_item_sk = cr_item_sk...
+                                          ^
+
+===== batch-atomic =====
+$ call --plan <project>/.spinduck/plan/maxreturnclass.toml --db <project>/local.duckdb --set-oriented=batch-atomic
+[exit 1]
+SET_ORIENTED maxReturnClass skipped reason=UnsupportedControlFlow
+[KERNEL-0010] Parser Error: syntax error at or near "$"
+
+LINE 1: SELECT i_class, count(i_class) AS $v_cnt FROM catalog_returns, item WHERE i_item_sk = cr_item_sk...
+                                          ^
+
+===== strict =====
+$ call --plan <project>/.spinduck/plan/maxreturnclass.toml --db <project>/local.duckdb --set-oriented=strict
+[exit 1]
+SET_ORIENTED maxReturnClass skipped reason=UnsupportedControlFlow
+[KERNEL-0010] Parser Error: syntax error at or near "$"
+
+LINE 1: SELECT i_class, count(i_class) AS $v_cnt FROM catalog_returns, item WHERE i_item_sk = cr_item_sk...
+                                          ^
+

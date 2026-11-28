@@ -1,0 +1,15 @@
+===== off =====
+$ call --plan <project>/.spinduck/plan/q3conditions.toml --db <project>/local.duckdb BUILDING null null
+[exit 1]
+[ENG-0026] PL expression not yet supported in M2 evaluator: TypeCast { expr: PlVariable([Ident { value: "p_stdatechar", quote_style: None }]), type_name: Date, default: None, format: None }
+
+===== batch-atomic =====
+$ call --plan <project>/.spinduck/plan/q3conditions.toml --db <project>/local.duckdb --set-oriented=batch-atomic BUILDING null null
+[exit 1]
+[ENG-0026] PL expression not yet supported in M2 evaluator: TypeCast { expr: PlVariable([Ident { value: "p_stdatechar", quote_style: None }]), type_name: Date, default: None, format: None }
+
+===== strict =====
+$ call --plan <project>/.spinduck/plan/q3conditions.toml --db <project>/local.duckdb --set-oriented=strict BUILDING null null
+[exit 1]
+[ENG-0026] PL expression not yet supported in M2 evaluator: TypeCast { expr: PlVariable([Ident { value: "p_stdatechar", quote_style: None }]), type_name: Date, default: None, format: None }
+

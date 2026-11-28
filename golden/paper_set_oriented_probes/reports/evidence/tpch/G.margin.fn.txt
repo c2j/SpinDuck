@@ -1,0 +1,17 @@
+===== off =====
+$ call --plan <project>/.spinduck/plan/goto_margin.toml --db <project>/local.duckdb 1 null null null
+[exit 1]
+[KERNEL-0010] Conversion Error: invalid date field format: "Date32(8058)", expected format is (YYYY-MM-DD)
+
+===== batch-atomic =====
+$ call --plan <project>/.spinduck/plan/goto_margin.toml --db <project>/local.duckdb --set-oriented=batch-atomic 1 null null null
+[exit 1]
+SET_ORIENTED goto_margin skipped reason=UnsupportedControlFlow
+[KERNEL-0010] Conversion Error: invalid date field format: "Date32(8058)", expected format is (YYYY-MM-DD)
+
+===== strict =====
+$ call --plan <project>/.spinduck/plan/goto_margin.toml --db <project>/local.duckdb --set-oriented=strict 1 null null null
+[exit 1]
+SET_ORIENTED goto_margin skipped reason=UnsupportedControlFlow
+[KERNEL-0010] Conversion Error: invalid date field format: "Date32(8058)", expected format is (YYYY-MM-DD)
+

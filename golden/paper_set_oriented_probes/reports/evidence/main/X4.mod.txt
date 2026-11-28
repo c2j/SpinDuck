@@ -1,0 +1,19 @@
+===== off =====
+$ call --plan <project>/.spinduck/plan/fnc_num_mod_assign.toml --db <project>/local.duckdb
+[exit 0]
+RETURN NULL
+
+===== batch-atomic =====
+$ call --plan <project>/.spinduck/plan/fnc_num_mod_assign.toml --db <project>/local.duckdb --set-oriented=batch-atomic
+[exit 0]
+SET_ORIENTED fnc_num_mod_assign skipped reason=UnsupportedControlFlow
+RETURN NULL
+
+===== strict =====
+$ call --plan <project>/.spinduck/plan/fnc_num_mod_assign.toml --db <project>/local.duckdb --set-oriented=strict
+[exit 0]
+SET_ORIENTED fnc_num_mod_assign skipped reason=UnsupportedControlFlow
+RETURN NULL
+
+===== expect =====
+1

@@ -1,0 +1,64 @@
+id	kind	routine	args	reset	dump	paper	shape	oracle	expect
+P0.s	call	prc_stair_p0s			SELECT * FROM result_stair ORDER BY k, cost	定标：非规范基底（无跳行 trap）	标量 FETCH INTO v1, v2；只有一条 INSERT		
+P0.r	call	prc_stair_p0r			SELECT * FROM result_stair ORDER BY k, cost	定标：非规范基底（无跳行 trap）	记录 FETCH INTO r；只有一条 INSERT（含 NULL 字面量）		
+P0.r2	call	prc_stair_p0r2			SELECT * FROM result_stair ORDER BY k, cost	定标：非规范基底（无跳行 trap）	记录 FETCH INTO r；只有一条 INSERT（无 NULL 字面量）		
+P0.f	call	prc_stair_p0f			SELECT * FROM result_stair ORDER BY k, cost	定标：非规范基底（无跳行 trap）	FOR-IN 游标；只有一条 INSERT（含 NULL 字面量）		
+P0.f2	call	prc_stair_p0f2			SELECT * FROM result_stair ORDER BY k, cost	定标：非规范基底（无跳行 trap）	FOR-IN 游标；只有一条 INSERT（无 NULL 字面量）		
+T0	call	prc_stair_t0			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	基底：FOR-IN + 跳行 trap 内一条 INSERT（阳性对照）		
+T0.null	call	prc_stair_t0null			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	基底，INSERT 的字符串字面量换成 NULL 字面量		
+T0.s	call	prc_stair_t0s			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	基底，游标改标量 FETCH INTO v1, v2		
+T0.r	call	prc_stair_t0r			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	基底，游标改记录 FETCH INTO r		
+T0.rf	call	prc_stair_t0rf			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	同 T0.r，但记录变量写在游标声明之前（前向引用）		
+T2	call	prc_stair_t2			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	+ 循环内 IF/ELSE 给局部变量赋值（每轮必赋）		
+T2b	call	prc_stair_t2b			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	+ 循环内 IF … THEN 赋值 END IF（无 ELSE，变量只有声明期初值）		
+T2c	call	prc_stair_t2c			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	+ 循环内先赋值、再 IF … THEN 覆写（字符串）		
+T2d	call	prc_stair_t2d			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	+ 循环内先赋值、再 IF … THEN 覆写（数值运算）		
+T2e	call	prc_stair_t2e			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	+ 点查数值列后再 IF … THEN 数值乘法覆写（byfund 区域 0 的算术覆写门形态）		
+T3	call	prc_stair_t3			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	+ 跨迭代累计（结果依赖游标顺序）		
+T7	call	prc_stair_t7			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	+ INSERT 里调用单 RETURN 纯表达式函数		
+T8	call	prc_stair_t8			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	+ 每行一次点查 SELECT INTO，带 WHEN OTHERS 兜底		
+T8b	call	prc_stair_t8b			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	+ 每行一次点查数值列（带 WHEN OTHERS 兜底），查表值直接写入		
+T8n	call	prc_stair_t8n			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	+ 每行一次点查 SELECT INTO，不带异常块		
+T9	call	prc_stair_t9		UPDATE supplier SET s_acctbal = CASE s_suppkey WHEN 1 THEN 1000 WHEN 2 THEN 2000 ELSE 3000 END	SELECT * FROM result_stair ORDER BY k, cost ;; SELECT s_suppkey, s_acctbal FROM supplier ORDER BY s_suppkey	定标：规范基底（trap 内 INSERT）	+ INSERT 后每行一次按主键 UPDATE 另一张表		
+T10	call	prc_stair_t10			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	+ INSERT 后每行一次 COMMIT		
+T4	call	prc_stair_t4			SELECT * FROM result_stair ORDER BY k, cost	定标：规范基底（trap 内 INSERT）	嵌套：外层游标逐个 part，内层相关游标逐条记录后 INSERT		
+T2.f	call	caller_dummy	null	DELETE FROM dst_rows	SELECT security_id, yj, tag FROM dst_rows ORDER BY tag, security_id	仓库夹具 tests/set_oriented_dummy.rs caller()（逐字）	byfund c_get_data 同型：四次带兜底的维表查找 + sys_dummy CASE 折叠 + IF 数值覆写 + trap 内 INSERT		
+A1.fn	call	fnc_min_cost_supp	2 0			Aggify 2004.05378 图 1	游标循环做带下界的最小值选择；输出标量 RETURN；不写库		
+A1.drv	call	prc_aggify_a1	0		SELECT * FROM result_min_supp ORDER BY p_partkey	Aggify 2004.05378 图 1	游标循环里逐行调用「带游标循环的函数」后 INSERT		
+A2.fn	call	fnc_cum_roi	'INV1' '202401'			Aggify 2004.05378 图 2	游标循环连乘累计；输出标量 RETURN；不写库		
+A2.drv	call	prc_aggify_a2	'202401'		SELECT * FROM result_cum_roi ORDER BY investor	Aggify 2004.05378 图 2	游标循环里逐行调用「连乘累计函数」后 INSERT		
+A3	call	prc_aggify_a3			SELECT * FROM result_running ORDER BY tx_id	Aggify 2004.05378 §6.1/§7	跨迭代携带状态（运行余额，换组清零）；结果依赖游标顺序；逐行 INSERT		
+A4	call	prc_aggify_a4			SELECT * FROM result_nested ORDER BY p_partkey	Aggify 2004.05378 §6.3.1	嵌套游标循环；内层无写只累加；外层写库		
+A5	call	prc_aggify_a5	7		SELECT * FROM result_seq ORDER BY i	Aggify 2004.05378 §8.2	计数型 FOR 循环（无游标）；逐个 INSERT		
+A6	call	prc_aggify_a6			SELECT * FROM result_from_tmp ORDER BY k ;; SELECT * FROM stage_agg ORDER BY k, v	Aggify 2004.05378 §4	循环体写中间表；循环后的语句读中间表（读己所写）		
+B1.fn	call	total_price	2			Froid 1712.00498 图 1（逐字）	Froid 图 1 total_price：局部变量 + 聚合赋值 + 查表赋值 + IF/ELSE + 嵌套调用 xchg_rate；客户 2 的偏好货币是 EUR（走换算分支）		
+B1.drv	call	prc_froid_b1			SELECT * FROM result_total ORDER BY c_custkey	Froid 1712.00498 图 1（逐字）	游标循环里逐行调用多语句标量 UDF 后 INSERT		
+B1.s	call	prc_froid_b1s			SELECT * FROM result_total ORDER BY c_custkey	Froid 1712.00498 §2.1 的调用查询（逐字）	例程内单条 INSERT … SELECT 调用多语句标量 UDF（无游标循环）		
+B1.q	sql				SELECT c_custkey, c_name, fnc_total_price(c_custkey) AS total_txt FROM customer ORDER BY c_custkey	Froid 1712.00498 §2.1 的调用查询（逐字）	论文原场景：查询语句里直接调用标量 UDF		
+C1.fn	call	getmanufact_complex_r	1			CIDR 2024 图 2 / PRISM 图 1 / SQL-ProcBench sudf_20b（仅改参数名）	两次相关 COUNT 子查询 + IF/ELSE + RETURN		
+C1.drv	call	prc_cidr24_c1			SELECT * FROM result_manufact ORDER BY ws_item_sk	CIDR 2024 图 2 / PRISM 图 1	游标循环里逐行调用 getManufact 后 INSERT		
+C0.fn	call	getmanufact_complex	1			SQL-ProcBench sudf_20b（逐字）	同 C1.fn；预期过不了项目态编译（参数名与表名 item 同名）		
+E1.fn	call	walk	1 1 -1 10			Hirn & Grust 1909.03291 图 3 / 案例集 markov	数据依赖步长的 FOR 循环（1..max_steps），每步三次查表（含窗口函数），提前 RETURN；取自论文配套仓库 markov/markov-pl.sql		1
+E1.drv	call	prc_hirn_e1			SELECT start_state, success_at, failure_at, max_steps, steps FROM result_walk ORDER BY max_steps, start_state	Hirn & Grust 1909.03291 图 3 / 案例集 markov	规范基底里逐行调用 walk()		
+D1.fn	call	maxreturnclass_r				SQL-ProcBench sudf_8（仅改列别名）	游标循环求 argmax；输出标量 RETURN；不写库		
+D0.fn	call	maxreturnclass				SQL-ProcBench sudf_8（逐字）	同 D1.fn；预期过不了项目态编译（列别名 cnt 与局部变量同名）		
+D2.drv	call	activatepromocat		UPDATE promotion SET p_end_date_sk = 2451114, p_discount_active = 'N'	SELECT * FROM promotion ORDER BY p_promo_sk	SQL-ProcBench proc21（游标源改表）	游标循环 + 按主键逐行 UPDATE		
+D3	call	custtotalloss	'Faulty item'			SQL-ProcBench proc62（逐字）	两段游标循环；每行 SELECT INTO + 累加；结果经 REF CURSOR 返回		
+D5.fn	call	increaseinwebspending	1			SQL-ProcBench sudf_12（逐字）	两次 SUM 子查询 + IF/ELSE + 多个 RETURN		
+D5.q	sql				SELECT c_customer_sk, increaseinwebspending(c_customer_sk) AS inc FROM customer ORDER BY c_customer_sk	SQL-ProcBench sudf_12	基准自带的调用查询：查询语句里直接调用标量 UDF		
+X1.plan	call	prc_xfile_call			SELECT * FROM result_xfile ORDER BY fx_from	引擎计划面（非论文）	跨文件裸名函数调用；--plan 把入口文件排在最前		
+X1.ord	call-ordered	prc_xfile_call			SELECT * FROM result_xfile ORDER BY fx_from	引擎计划面（非论文）	同一例程；--file 且被调方文件先注册		
+X2	call	prc_xcol_capture	5		SELECT * FROM result_seq ORDER BY i	引擎名字解析（非论文）	循环变量 i 与结果表列名 i 同名（INSERT 列清单被替换成变量）		
+E1.fn0	call	walk	3 100 -100 0			Hirn & Grust 1909.03291 图 3 / 案例集 markov	同 E1.fn；max_steps = 0，循环一次不走		0
+D09.filter	call	prc_dbridge_filter			SELECT project_id FROM result_unfinished ORDER BY project_id	DBridge 2017（SIGMOD 演示）图 1	应用侧循环内过滤 → 库侧游标循环里 IF 再 INSERT；论文改写成 WHERE isFinished <> 1	SELECT project_id FROM project WHERE is_finished <> 1 ORDER BY project_id	
+D09.exists	call	prc_dbridge_exists			SELECT n FROM result_exists ORDER BY 1	DBridge 2017（SIGMOD 演示）§2.1	用循环判断元组是否存在；论文改写成 EXISTS	SELECT CASE WHEN EXISTS (SELECT 1 FROM project WHERE project_id = t.i) THEN 1 ELSE 0 END AS n FROM generate_series(1, 5) t(i) ORDER BY 1	
+Q10	call	prc_qbs_getroleuser			SELECT user_id, role_id, user_name, role_name FROM result_role_user ORDER BY 1, 2	QBS 2013（PLDI）图 1	嵌套循环写的连接（两层游标 + 等值 IF + INSERT）；论文综合出的查询见图 3	SELECT user_id, role_id, user_name, role_name FROM oracle_qbs_roleuser ORDER BY 1, 2	
+S11	call	prc_sloth_dashboard			SELECT * FROM result_dashboard ORDER BY patient_id	Sloth 2014（SIGMOD）图 1	四个先后执行的点查（无循环）；论文把它们合成一次数据库往返		
+X4.int	call	fnc_num_div_int				引擎数值语义（非论文）	PL 表达式 10 / 3；期望按 Oracle NUMBER 语义手写		3.333333
+X4.expr	call	fnc_num_div_expr				引擎数值语义（非论文）	PL 表达式 (1 - 2 / 3) * 100；期望按 Oracle NUMBER 语义手写		33.333333
+X4.dec	call	fnc_num_div_dec	1 3			引擎数值语义（非论文）	PL 表达式 p_a / p_b（NUMBER 形参 1 / 3）；期望按 Oracle NUMBER 语义手写		0.333333
+X4.small	call	fnc_num_div_small				引擎数值语义（非论文）	PL 表达式 x := 1 / 100.0；期望按 Oracle NUMBER 语义手写		0.01
+X4.mod	call	fnc_num_mod_assign				引擎数值语义（非论文）	PL 赋值语句里的中缀取余 x := (v MOD 3)（v = 7）；期望 1		1
+X4.retmod	call	fnc_num_mod_return				引擎数值语义（非论文）	RETURN (v MOD 3)（v = 7）；期望 1		1
+X4.modsql	call	fnc_num_mod_sql				引擎数值语义（非论文）	SELECT 7 MOD 3 INTO v FROM sys_dummy；期望 1		1
+X4.lit	call	fnc_num_mod_literal				引擎数值语义（非论文）	RETURN 7 MOD 3（字面量上的中缀取余）；预期编译失败 ENG-0022		1

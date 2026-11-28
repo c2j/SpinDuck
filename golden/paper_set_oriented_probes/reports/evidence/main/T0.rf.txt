@@ -1,0 +1,50 @@
+===== off =====
+$ call --db <project>/local.duckdb '--file ×24' --file sql/routines/a0_xfile_call.sql --file sql/routines/a1_aggify_mincostsupp.sql --file sql/routines/a2_aggify_cumroi.sql --file sql/routines/a3_aggify_order_state.sql --file sql/routines/a4_aggify_nested_cursor.sql --file sql/routines/a5_aggify_iterative_for.sql --file sql/routines/a6_aggify_stage_table.sql --file sql/routines/b1_froid_total_price.sql --file sql/routines/c1_cidr24_prism_getmanufact.sql --file sql/routines/d09_dbridge.sql --file sql/routines/e1_hirn_grust_walk.sql --file sql/routines/p0_staircase.sql --file sql/routines/q10_qbs.sql --file sql/routines/s11_sloth.sql --file sql/routines/t2f_repo_fixture.sql --file sql/routines/x2_column_name_capture.sql --file sql/routines/x4_numeric_division.sql --file sql/routines/procbench/Sudf_20b_GetManufactComplex.sql --file sql/routines/procbench/d1_maxReturnClass_adapted.sql --file sql/routines/procbench/d2_activatePromoCat_adapted.sql --file sql/routines/procbench/proc62_totalCustLoss.sql --file sql/routines/procbench/sudf_12_increaseInWebSpending.sql --file sql/routines/procbench/sudf_8_maxReturnClass.sql --file sql/routines/t0_canonical.sql prc_stair_t0rf
+[exit 0]
+CALL prc_stair_t0rf OK
+-- dump[0]: SELECT * FROM result_stair ORDER BY k, cost
+{
+  "schema": ["k", "tag", "cost"],
+  "rows": [
+    ["1", "x", "90.0000"],
+    ["1", "x", "100.0000"],
+    ["2", "x", "45.0000"],
+    ["2", "x", "50.0000"],
+    ["3", "x", "200.0000"]
+  ]
+}
+
+===== batch-atomic =====
+$ call --db <project>/local.duckdb '--file ×24' --file sql/routines/a0_xfile_call.sql --file sql/routines/a1_aggify_mincostsupp.sql --file sql/routines/a2_aggify_cumroi.sql --file sql/routines/a3_aggify_order_state.sql --file sql/routines/a4_aggify_nested_cursor.sql --file sql/routines/a5_aggify_iterative_for.sql --file sql/routines/a6_aggify_stage_table.sql --file sql/routines/b1_froid_total_price.sql --file sql/routines/c1_cidr24_prism_getmanufact.sql --file sql/routines/d09_dbridge.sql --file sql/routines/e1_hirn_grust_walk.sql --file sql/routines/p0_staircase.sql --file sql/routines/q10_qbs.sql --file sql/routines/s11_sloth.sql --file sql/routines/t2f_repo_fixture.sql --file sql/routines/x2_column_name_capture.sql --file sql/routines/x4_numeric_division.sql --file sql/routines/procbench/Sudf_20b_GetManufactComplex.sql --file sql/routines/procbench/d1_maxReturnClass_adapted.sql --file sql/routines/procbench/d2_activatePromoCat_adapted.sql --file sql/routines/procbench/proc62_totalCustLoss.sql --file sql/routines/procbench/sudf_12_increaseInWebSpending.sql --file sql/routines/procbench/sudf_8_maxReturnClass.sql --file sql/routines/t0_canonical.sql prc_stair_t0rf --set-oriented=batch-atomic
+[exit 0]
+SET_ORIENTED prc_stair_t0rf converted
+CALL prc_stair_t0rf OK
+-- dump[0]: SELECT * FROM result_stair ORDER BY k, cost
+{
+  "schema": ["k", "tag", "cost"],
+  "rows": [
+    ["1", "x", "90.0000"],
+    ["1", "x", "100.0000"],
+    ["2", "x", "45.0000"],
+    ["2", "x", "50.0000"],
+    ["3", "x", "200.0000"]
+  ]
+}
+
+===== strict =====
+$ call --db <project>/local.duckdb '--file ×24' --file sql/routines/a0_xfile_call.sql --file sql/routines/a1_aggify_mincostsupp.sql --file sql/routines/a2_aggify_cumroi.sql --file sql/routines/a3_aggify_order_state.sql --file sql/routines/a4_aggify_nested_cursor.sql --file sql/routines/a5_aggify_iterative_for.sql --file sql/routines/a6_aggify_stage_table.sql --file sql/routines/b1_froid_total_price.sql --file sql/routines/c1_cidr24_prism_getmanufact.sql --file sql/routines/d09_dbridge.sql --file sql/routines/e1_hirn_grust_walk.sql --file sql/routines/p0_staircase.sql --file sql/routines/q10_qbs.sql --file sql/routines/s11_sloth.sql --file sql/routines/t2f_repo_fixture.sql --file sql/routines/x2_column_name_capture.sql --file sql/routines/x4_numeric_division.sql --file sql/routines/procbench/Sudf_20b_GetManufactComplex.sql --file sql/routines/procbench/d1_maxReturnClass_adapted.sql --file sql/routines/procbench/d2_activatePromoCat_adapted.sql --file sql/routines/procbench/proc62_totalCustLoss.sql --file sql/routines/procbench/sudf_12_increaseInWebSpending.sql --file sql/routines/procbench/sudf_8_maxReturnClass.sql --file sql/routines/t0_canonical.sql prc_stair_t0rf --set-oriented=strict
+[exit 0]
+SET_ORIENTED prc_stair_t0rf skipped reason=UnprovenRollbackScope
+CALL prc_stair_t0rf OK
+-- dump[0]: SELECT * FROM result_stair ORDER BY k, cost
+{
+  "schema": ["k", "tag", "cost"],
+  "rows": [
+    ["1", "x", "90.0000"],
+    ["1", "x", "100.0000"],
+    ["2", "x", "45.0000"],
+    ["2", "x", "50.0000"],
+    ["3", "x", "200.0000"]
+  ]
+}
+

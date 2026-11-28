@@ -1,0 +1,88 @@
+admit: targets=58 converted=6 conditional=0 skipped=52 conservative=0 static-only=0 unchecked=0 native=on
+ADMIT prc_stair_p0s skipped reason=UnsupportedControlFlow
+ADMIT prc_stair_p0r skipped reason=UnsupportedWrite
+ADMIT prc_stair_p0r2 skipped reason=UnsupportedWrite
+ADMIT prc_stair_p0f skipped reason=UnsupportedWrite
+ADMIT prc_stair_p0f2 skipped reason=UnsupportedWrite
+ADMIT prc_stair_t0 converted
+ADMIT   guard=sys-dummy checked=compile state=passed object=sys_dummy expect="恰 1 行"
+ADMIT   guard=drift checked=compile state=passed object=partsupplier expect="列集/限定名与生成期证据一致"
+ADMIT   guard=drift checked=compile state=passed object=result_stair expect="列集/限定名与生成期证据一致"
+ADMIT   guard=snapshot checked=compile state=passed expect="与编译期快照一致"
+ADMIT prc_stair_t0null skipped reason=UnprovenWriteCompleteness
+ADMIT prc_stair_t0s skipped reason=UnsupportedControlFlow
+ADMIT prc_stair_t0r converted
+ADMIT   guard=sys-dummy checked=compile state=passed object=sys_dummy expect="恰 1 行"
+ADMIT   guard=drift checked=compile state=passed object=partsupplier expect="列集/限定名与生成期证据一致"
+ADMIT   guard=drift checked=compile state=passed object=result_stair expect="列集/限定名与生成期证据一致"
+ADMIT   guard=snapshot checked=compile state=passed expect="与编译期快照一致"
+ADMIT prc_stair_t0rf converted
+ADMIT   guard=sys-dummy checked=compile state=passed object=sys_dummy expect="恰 1 行"
+ADMIT   guard=drift checked=compile state=passed object=partsupplier expect="列集/限定名与生成期证据一致"
+ADMIT   guard=drift checked=compile state=passed object=result_stair expect="列集/限定名与生成期证据一致"
+ADMIT   guard=snapshot checked=compile state=passed expect="与编译期快照一致"
+ADMIT prc_stair_t2 skipped reason=UnsupportedControlFlow
+ADMIT prc_stair_t2b skipped reason=UnsupportedControlFlow
+ADMIT prc_stair_t2c skipped reason=UnsupportedControlFlow
+ADMIT prc_stair_t2d skipped reason=UnsupportedControlFlow
+ADMIT prc_stair_t2e skipped reason=UnsupportedControlFlow
+ADMIT prc_stair_t3 skipped reason=UnsupportedControlFlow
+ADMIT prc_stair_t7 skipped reason=UnprovenWriteCompleteness
+ADMIT prc_stair_t8 skipped reason=UnprovenWriteCompleteness
+ADMIT prc_stair_t8b converted
+ADMIT   guard=sys-dummy checked=compile state=passed object=sys_dummy expect="恰 1 行"
+ADMIT   guard=drift checked=compile state=passed object=partsupplier expect="列集/限定名与生成期证据一致"
+ADMIT   guard=drift checked=compile state=passed object=result_stair expect="列集/限定名与生成期证据一致"
+ADMIT   guard=drift checked=compile state=passed object=supplier expect="列集/限定名与生成期证据一致"
+ADMIT   guard=snapshot checked=compile state=passed expect="与编译期快照一致"
+ADMIT prc_stair_t8n skipped reason=UnsupportedControlFlow
+ADMIT prc_stair_t9 skipped reason=UnsupportedWrite
+ADMIT prc_stair_t10 converted
+ADMIT   guard=sys-dummy checked=compile state=passed object=sys_dummy expect="恰 1 行"
+ADMIT   guard=drift checked=compile state=passed object=partsupplier expect="列集/限定名与生成期证据一致"
+ADMIT   guard=drift checked=compile state=passed object=result_stair expect="列集/限定名与生成期证据一致"
+ADMIT   guard=snapshot checked=compile state=passed expect="与编译期快照一致"
+ADMIT prc_stair_t4 skipped reason=UnsupportedControlFlow
+ADMIT caller_dummy converted
+ADMIT   guard=sys-dummy checked=compile state=passed object=sys_dummy expect="恰 1 行"
+ADMIT   guard=drift checked=compile state=passed object=cur_rows expect="列集/限定名与生成期证据一致"
+ADMIT   guard=drift checked=compile state=passed object=dst_rows expect="列集/限定名与生成期证据一致"
+ADMIT   guard=drift checked=compile state=passed object=seat_para expect="列集/限定名与生成期证据一致"
+ADMIT   guard=drift checked=compile state=passed object=seat_para expect="列集/限定名与生成期证据一致"
+ADMIT   guard=drift checked=compile state=passed object=seat_para expect="列集/限定名与生成期证据一致"
+ADMIT   guard=drift checked=compile state=passed object=seat_para expect="列集/限定名与生成期证据一致"
+ADMIT   guard=snapshot checked=compile state=passed expect="与编译期快照一致"
+ADMIT fnc_min_cost_supp skipped reason=UnsupportedControlFlow
+ADMIT prc_aggify_a1 skipped reason=UnresolvedFnSite
+ADMIT fnc_cum_roi skipped reason=UnsupportedControlFlow
+ADMIT prc_aggify_a2 skipped reason=UnresolvedFnSite
+ADMIT prc_aggify_a3 skipped reason=UnsupportedControlFlow
+ADMIT prc_aggify_a4 skipped reason=UnsupportedControlFlow
+ADMIT prc_aggify_a5 skipped reason=UnsupportedControlFlow
+ADMIT prc_aggify_a6 skipped reason=UnsupportedControlFlow
+ADMIT total_price skipped reason=UnsupportedControlFlow
+ADMIT prc_froid_b1 skipped reason=UnresolvedFnSite
+ADMIT prc_froid_b1s skipped reason=UnsupportedControlFlow
+ADMIT getmanufact_complex_r skipped reason=UnsupportedControlFlow
+ADMIT prc_cidr24_c1 skipped reason=UnresolvedFnSite
+ADMIT getmanufact_complex skipped reason=UnsupportedControlFlow
+ADMIT walk skipped reason=UnsupportedControlFlow
+ADMIT prc_hirn_e1 skipped reason=UnresolvedFnSite
+ADMIT maxreturnclass_r skipped reason=UnsupportedControlFlow
+ADMIT maxreturnclass skipped reason=UnsupportedControlFlow
+ADMIT activatepromocat skipped reason=UnsupportedControlFlow
+ADMIT custtotalloss skipped reason=UnsupportedControlFlow
+ADMIT increaseinwebspending skipped reason=UnsupportedControlFlow
+ADMIT prc_xfile_call skipped reason=UnsupportedWrite
+ADMIT prc_xcol_capture skipped reason=UnsupportedControlFlow
+ADMIT prc_dbridge_filter skipped reason=UnsupportedControlFlow
+ADMIT prc_dbridge_exists skipped reason=UnsupportedControlFlow
+ADMIT prc_qbs_getroleuser skipped reason=UnsupportedControlFlow
+ADMIT prc_sloth_dashboard skipped reason=UnsupportedControlFlow
+ADMIT fnc_num_div_int skipped reason=UnsupportedControlFlow
+ADMIT fnc_num_div_expr skipped reason=UnsupportedControlFlow
+ADMIT fnc_num_div_dec skipped reason=UnsupportedControlFlow
+ADMIT fnc_num_div_small skipped reason=UnsupportedControlFlow
+ADMIT fnc_num_mod_assign skipped reason=UnsupportedControlFlow
+ADMIT fnc_num_mod_return skipped reason=UnsupportedControlFlow
+ADMIT fnc_num_mod_sql skipped reason=UnsupportedControlFlow

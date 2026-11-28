@@ -1,0 +1,16 @@
+# 论文探针·TPC-H 工程声明（§12.1 项目模式）。与主工程（上一级目录）是两个独立工程：
+# 本工程用 TPC-H 形状的表（orders、lineitem…），承载基于 TPC-H 的论文案例
+# （Hirn & Grust 案例集、Froid §11 谓词 UDF、PRISM 谓词提升）。
+# 入口不写在 [[entry]] 里：独立例程用可重复的 --entry <裸名>（同主工程）。
+[project]
+name = "paper_set_oriented_probes_tpch"
+kernel = "1.5.5"
+
+[paths]
+ddl = "sql/ddl"
+routines = "sql/routines"
+rules = ["rules/spinduck-rules.toml"]
+home = ".spinduck"
+
+[engine]
+threads = 4

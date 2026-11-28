@@ -1,0 +1,85 @@
+# spinduck compile <SQL-ProcBench>/src/PLSQL —— 解析层体检（不执行）
+# 源: https://github.com/microsoft/SQL-ProcBench （main，2026-11-27）；CLI: spinduck 0.4.0
+OK   Scalar UDFs/Sudf_20b_GetManufactComplex.sql  routines=1
+OK   Scalar UDFs/sudf_11_getRandomChar.sql  routines=1
+OK   Scalar UDFs/sudf_12_increaseInWebSpending.sql  routines=1
+OK   Scalar UDFs/sudf_13_maxPurchaseChannel.sql  routines=1
+OK   Scalar UDFs/sudf_15_incomebandOfMaxBuy.sql  routines=1
+OK   Scalar UDFs/sudf_16_promoVsNoPromo.sql  routines=1
+OK   Scalar UDFs/sudf_17_preferredChannel_wrtCount.sql  routines=1
+OK   Scalar UDFs/sudf_18_preferredChannel_wrtExpenditure.sql  routines=1
+OK   Scalar UDFs/sudf_1_totalLargePurchases.sql  routines=1
+OK   Scalar UDFs/sudf_20a_GetManufactSimple.sql  routines=1
+OK   Scalar UDFs/sudf_2_maxPromoChannel.sql  routines=1
+OK   Scalar UDFs/sudf_3a_maxRetReasonWeb.sql  routines=1
+OK   Scalar UDFs/sudf_3b_maxRetReasonCat.sql  routines=1
+OK   Scalar UDFs/sudf_3c_maxRetReasonStore.sql  routines=1
+OK   Scalar UDFs/sudf_4_getRandomInt.sql  routines=1
+OK   Scalar UDFs/sudf_5_MorEveRatio.sql  routines=1
+OK   Scalar UDFs/sudf_6_totalDiscount.sql  routines=1
+OK   Scalar UDFs/sudf_7_profitableManager.sql  routines=1
+OK   Scalar UDFs/sudf_8_maxReturnClass.sql  routines=1
+OK   Scalar UDFs/sudf_9a_correlation_wealthShipCost_catalog.sql  routines=1
+OK   Scalar UDFs/sudf_9b_correlation_wealthShipCost_web.sql  routines=1
+OK   Stored Procedures/proc10_remove_item.sql  routines=1
+OK   Stored Procedures/proc11_repeatedShoppers.sql  routines=1
+OK   Stored Procedures/proc12_returnReason_highlyEducated.sql  routines=1
+OK   Stored Procedures/proc13_returnReason_lessEducated.sql  routines=1
+OK   Stored Procedures/proc14_salePerBrandCatalog.sql  routines=1
+OK   Stored Procedures/proc15_salePerBrandStore.sql  routines=1
+OK   Stored Procedures/proc16_salePerBrandWeb.sql  routines=1
+OK   Stored Procedures/proc17_saleShoppers.sql  routines=1
+OK   Stored Procedures/proc18_updateItemPrice.sql  routines=1
+OK   Stored Procedures/proc19_updateWebUrl.sql  routines=1
+OK   Stored Procedures/proc1_custDemoSaleInfo.sql  routines=1
+OK   Stored Procedures/proc21_activatePromoCat.sql  routines=1
+OK   Stored Procedures/proc22_activatePromoStore.sql  routines=1
+OK   Stored Procedures/proc23_activatePromoWeb.sql  routines=1
+OK   Stored Procedures/proc24_CreateRandmString.sql  routines=1
+OK   Stored Procedures/proc25_delCatPage.sql  routines=1
+FAIL Stored Procedures/proc26_getReturnReason.sql  [ENG-0022] statement not yet supported in M2 compiler: VariableSet(Spanned { node: VariableSetStatement { local: false, session: false, global: false, name: "nocount", value: [ColumnRef([Ident { value: "on", quote_style: None }])] }, span: Some(SourceSpan { start: SourceLocation { line: 7, column: 5, offset: 130 }, end: SourceLocation { line: 7, column: 16, offset: 141 } }) })
+OK   Stored Procedures/proc27_getStoreByManager.sql  routines=1
+OK   Stored Procedures/proc28_insertCallCenter.sql  routines=1
+OK   Stored Procedures/proc29_insertNewShipCarrier.sql  routines=1
+OK   Stored Procedures/proc2_excessReturn_web.sql  routines=1
+OK   Stored Procedures/proc30_lossByEdcated-Risky.sql  routines=1
+OK   Stored Procedures/proc31_maxSaleElectronicsMonth.sql  routines=1
+OK   Stored Procedures/proc32_maxSaleJewelryMonth.sql  routines=1
+OK   Stored Procedures/proc33_newCatalogPage.sql  routines=1
+OK   Stored Procedures/proc34_newPromotion.sql  routines=1
+OK   Stored Procedures/proc35_newStore.sql  routines=1
+OK   Stored Procedures/proc36_newWarehouse.sql  routines=1
+OK   Stored Procedures/proc37_procesStoreReturn.sql  routines=1
+OK   Stored Procedures/proc3_excessReturnCustInfo.sql  routines=1
+OK   Stored Procedures/proc44_cusWithIncomeInRange.sql  routines=1
+OK   Stored Procedures/proc45_moreOnlineThanStore.sql  routines=1
+OK   Stored Procedures/proc46_processReturn.sql  routines=1
+OK   Stored Procedures/proc4_getCustomerInfo.sql  routines=1
+OK   Stored Procedures/proc52_catalogOrderCancellation.sql  routines=1
+OK   Stored Procedures/proc57_webOrderCancellation.sql  routines=1
+OK   Stored Procedures/proc58_getShipMode.sql  routines=1
+OK   Stored Procedures/proc59_newCatSale.sql  routines=1
+OK   Stored Procedures/proc5_getImmigrantCust.sql  routines=1
+OK   Stored Procedures/proc60_newStoreSale.sql  routines=1
+OK   Stored Procedures/proc61_newWebSale.sql  routines=1
+OK   Stored Procedures/proc62_totalCustLoss.sql  routines=1
+OK   Stored Procedures/proc6_getNativeCust.sql  routines=1
+OK   Stored Procedures/proc7_lowIncomeCustWithHighPurchase.sql  routines=1
+OK   Stored Procedures/proc9_popularWP.sql  routines=1
+FAIL Table Valued UDFs/TVF2_highReturnReason.sql  [ENG-0026] PL expression not yet supported in M2 evaluator: Like { expr: PlVariable([Ident { value: "reason_desc", quote_style: None }]), pattern: Literal(String("%price%")), escape: None, negated: false, case_insensitive: false }
+FAIL Table Valued UDFs/TVF3_maxProfitStates.sql  [ENG-0071] BULK COLLECT / RETURNING INTO / INTO TABLE is not supported
+FAIL Table Valued UDFs/TVF4a_bestPromoWeb.sql  [ENG-0071] BULK COLLECT / RETURNING INTO / INTO TABLE is not supported
+FAIL Table Valued UDFs/TVF4b_bestPromoCatalog.sql  [ENG-0071] BULK COLLECT / RETURNING INTO / INTO TABLE is not supported
+FAIL Table Valued UDFs/TVF4c_bestPromoStore.sql  [ENG-0071] BULK COLLECT / RETURNING INTO / INTO TABLE is not supported
+FAIL Table Valued UDFs/TVF6_bestStoreForCategories.sql  [ENG-0022] statement not yet supported in M2 compiler: Sql("catTable . extend")
+FAIL Table Valued UDFs/TVF7_profitMonitoring.sql  [ENG-0022] statement not yet supported in M2 compiler: Sql("profitTable . extend")
+OK   Triggers/trigger1_afterInsertdate.sql  routines=0
+OK   Triggers/trigger2_afterUpdateCA.sql  routines=0
+OK   Triggers/trigger3_afterUpdate_promo.sql  routines=0
+OK   Triggers/trigger4_upDelItem.sql  routines=0
+OK   Triggers/trigger5_afterdelCatPage.sql  routines=0
+OK   Triggers/trigger6_afterDelCust.sql  routines=0
+summary: files=79 ok=71 failed=8 routines=65
+reason ENG-0071 x4
+reason ENG-0022 x3
+reason ENG-0026 x1

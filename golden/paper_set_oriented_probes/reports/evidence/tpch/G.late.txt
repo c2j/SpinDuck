@@ -1,0 +1,38 @@
+===== off =====
+$ call --plan <project>/.spinduck/plan/prc_goto_late.toml --db <project>/local.duckdb
+[exit 1]
+[ENG-0044] bind record s undefined at runtime
+-- dump[0]: SELECT 1
+{
+  "schema": ["1"],
+  "rows": [
+    ["1"]
+  ]
+}
+
+===== batch-atomic =====
+$ call --plan <project>/.spinduck/plan/prc_goto_late.toml --db <project>/local.duckdb --set-oriented=batch-atomic
+[exit 1]
+SET_ORIENTED prc_goto_late skipped reason=UnsupportedControlFlow
+[ENG-0044] bind record s undefined at runtime
+-- dump[0]: SELECT 1
+{
+  "schema": ["1"],
+  "rows": [
+    ["1"]
+  ]
+}
+
+===== strict =====
+$ call --plan <project>/.spinduck/plan/prc_goto_late.toml --db <project>/local.duckdb --set-oriented=strict
+[exit 1]
+SET_ORIENTED prc_goto_late skipped reason=UnsupportedControlFlow
+[ENG-0044] bind record s undefined at runtime
+-- dump[0]: SELECT 1
+{
+  "schema": ["1"],
+  "rows": [
+    ["1"]
+  ]
+}
+

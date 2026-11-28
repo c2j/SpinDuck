@@ -1,0 +1,87 @@
+plan: ./.spinduck/plan/service_level.toml (updated)
+plan: target=service_level routines=1 tables=1 missing=0
+REF table:orders read <- service_level @ sql/routines/g01_goto_tpch.sql:18
+plan: ./.spinduck/plan/prc_goto_service.toml (updated)
+plan: target=prc_goto_service routines=1 tables=1 missing=0
+REF table:orders read <- service_level @ sql/routines/g01_goto_tpch.sql:18
+REF table:result_goto_service write <- prc_goto_service @ sql/routines/g01_goto_tpch.sql:354
+REF routine:service_level call <- prc_goto_service @ sql/routines/g01_goto_tpch.sql:0
+plan: ./.spinduck/plan/prc_goto_ship.toml (updated)
+plan: target=prc_goto_ship routines=1 tables=1 missing=0
+REF table:lineitem read <- preferred_shipmode @ sql/routines/g01_goto_tpch.sql:41
+REF table:orders read <- preferred_shipmode @ sql/routines/g01_goto_tpch.sql:41
+REF routine:preferred_shipmode call <- prc_goto_ship @ sql/routines/g01_goto_tpch.sql:0
+REF table:result_goto_ship write <- prc_goto_ship @ sql/routines/g01_goto_tpch.sql:371
+plan: ./.spinduck/plan/long_distance.toml (updated)
+plan: target=long_distance routines=1 tables=1 missing=0
+REF table:lineitem read <- long_distance @ sql/routines/g01_goto_tpch.sql:73
+REF table:nation read <- long_distance @ sql/routines/g01_goto_tpch.sql:73
+REF table:supplier read <- long_distance @ sql/routines/g01_goto_tpch.sql:73
+plan: ./.spinduck/plan/prc_goto_global.toml (updated)
+plan: target=prc_goto_global routines=1 tables=1 missing=0
+REF table:lineitem read <- long_distance @ sql/routines/g01_goto_tpch.sql:73
+REF routine:long_distance call <- prc_goto_global @ sql/routines/g01_goto_tpch.sql:0
+REF table:nation read <- long_distance @ sql/routines/g01_goto_tpch.sql:73
+REF table:result_goto_global write <- prc_goto_global @ sql/routines/g01_goto_tpch.sql:388
+REF table:supplier read <- long_distance @ sql/routines/g01_goto_tpch.sql:73
+plan: ./.spinduck/plan/prc_goto_late.toml (updated)
+plan: target=prc_goto_late routines=1 tables=1 missing=0
+REF table:lineitem read <- order_kept_waiting @ sql/routines/g01_goto_tpch.sql:95
+REF routine:order_kept_waiting call <- prc_goto_late @ sql/routines/g01_goto_tpch.sql:0
+REF table:result_goto_late write <- prc_goto_late @ sql/routines/g01_goto_tpch.sql:407
+plan: ./.spinduck/plan/prc_goto_late_b.toml (updated)
+plan: target=prc_goto_late_b routines=1 tables=1 missing=0
+REF table:lineitem read <- order_kept_waiting @ sql/routines/g01_goto_tpch.sql:95
+REF routine:order_kept_waiting call <- prc_goto_late_b @ sql/routines/g01_goto_tpch.sql:0
+REF table:result_goto_late write <- prc_goto_late_b @ sql/routines/g01_goto_tpch.sql:483
+plan: ./.spinduck/plan/goto_margin.toml (updated)
+plan: target=goto_margin routines=1 tables=1 missing=0
+REF table:lineitem read <- goto_margin @ sql/routines/g01_goto_tpch.sql:143
+REF table:orders read <- goto_margin @ sql/routines/g01_goto_tpch.sql:143
+plan: ./.spinduck/plan/prc_goto_margin.toml (updated)
+plan: target=prc_goto_margin routines=1 tables=1 missing=0
+REF routine:goto_margin_r call <- prc_goto_margin @ sql/routines/g01_goto_tpch.sql:0
+REF table:lineitem read <- goto_margin_r @ sql/routines/g01_goto_tpch.sql:296
+REF table:orders read <- goto_margin_r @ sql/routines/g01_goto_tpch.sql:296
+REF table:result_goto_margin write <- prc_goto_margin @ sql/routines/g01_goto_tpch.sql:437
+plan: ./.spinduck/plan/prc_goto_savings.toml (updated)
+plan: target=prc_goto_savings routines=1 tables=1 missing=0
+REF routine:goto_savings call <- prc_goto_savings @ sql/routines/g01_goto_tpch.sql:0
+REF table:lineitem read <- goto_savings @ sql/routines/g01_goto_tpch.sql:229
+REF table:orders read <- goto_savings @ sql/routines/g01_goto_tpch.sql:220
+REF table:partsupp read <- goto_savings @ sql/routines/g01_goto_tpch.sql:241
+REF table:result_goto_savings write <- prc_goto_savings @ sql/routines/g01_goto_tpch.sql:457
+plan: ./.spinduck/plan/q3conditions.toml (updated)
+plan: target=q3conditions routines=1 tables=0 missing=0
+plan: ./.spinduck/plan/discount_taxprice.toml (updated)
+plan: target=discount_taxprice routines=1 tables=0 missing=0
+REF routine:discount_price call <- discount_taxprice @ sql/routines/f11_froid_tpch.sql:0
+plan: ./.spinduck/plan/prc_froid_q3.toml (updated)
+plan: target=prc_froid_q3 routines=2 tables=1 missing=0
+REF routine:discount_price call <- discount_taxprice @ sql/routines/f11_froid_tpch.sql:0
+REF routine:discount_taxprice call <- prc_froid_q3 @ sql/routines/f11_froid_tpch_dates_adapted.sql:0
+REF routine:q3conditions_r call <- prc_froid_q3 @ sql/routines/f11_froid_tpch_dates_adapted.sql:0
+REF table:result_q3 write <- prc_froid_q3 @ sql/routines/f11_froid_tpch_dates_adapted.sql:59
+REF table:sys_dummy read <- check_date_r @ sql/routines/f11_froid_tpch_dates_adapted.sql:26
+REF table:sys_dummy read <- is_shipped_before_r @ sql/routines/f11_froid_tpch_dates_adapted.sql:12
+plan: ./.spinduck/plan/prc_prism_hoist.toml (updated)
+plan: target=prc_prism_hoist routines=1 tables=1 missing=0
+REF routine:is_shipped_before_r call <- prc_prism_hoist @ sql/routines/f11_froid_tpch_dates_adapted.sql:0
+REF table:lineitem read <- prc_prism_hoist @ sql/routines/f11_froid_tpch_dates_adapted.sql:90
+REF table:result_prism_hoist write <- prc_prism_hoist @ sql/routines/f11_froid_tpch_dates_adapted.sql:88
+REF table:sys_dummy read <- is_shipped_before_r @ sql/routines/f11_froid_tpch_dates_adapted.sql:12
+plan: ./.spinduck/plan/prc_dual_one.toml (updated)
+plan: target=prc_dual_one routines=1 tables=1 missing=0
+REF table:dual read <- fnc_dual_one @ sql/routines/x3_dual.sql:8
+REF routine:fnc_dual_one call <- prc_dual_one @ sql/routines/x3_dual.sql:0
+REF table:result_dual write <- prc_dual_one @ sql/routines/x3_dual.sql:17
+FAIL sql/routines/f11_froid_tpch_dates.sql  [ENG-0026] PL expression not yet supported in M2 evaluator: TypeCast { expr: PlVariable([Ident { value: "p_stdatechar", quote_style: None }]), type_name: Date, default: None, format: None }
+FAIL sql/routines/g01_goto_tpch.sql  [KERNEL-0011] duckdb prepare: Parser Error: syntax error at or near "$"
+
+LINE 1: SELECT $v_s__s_suppkey, $v_s__s_name FROM supplier AS $v_s, nation AS n WHERE $v_s__s_nationkey = n.n_nationkey...
+                                                              ^
+FAIL sql/routines/x3_dual.sql  [KERNEL-0011] duckdb prepare: Parser Error: syntax error at or near ")"
+
+LINE 1: ... result_dual ( n ) values ( (SELECT sd_v FROM sd_fn0 WHERE ) )
+                                                                      ^
+compile: entries=15 missing=0 failed=3 dynamic=0

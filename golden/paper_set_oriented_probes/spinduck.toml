@@ -1,0 +1,18 @@
+# 论文探针项目声明（§12.1 项目模式）。只供 run_probes.sh 与 compile --admit 使用；
+# 不在 spinduck/tests/cases_native.rs、golden_gauss.rs 的显式清单里，CI 不会自动执行。
+#
+# 入口不写在 [[entry]] 里：本包的例程都是独立例程（无包），而 [[entry]] 要求
+# package.procedure 形态的全名；独立例程用可重复的 --entry <裸名> 传给 compile
+# （docs/design-compile.md §150）。入口清单见 probes.tsv。
+[project]
+name = "paper_set_oriented_probes"
+kernel = "1.5.5"
+
+[paths]
+ddl = "sql/ddl"                    # 表源码
+routines = "sql/routines"          # 论文案例例程 + procbench/ 逐字拷贝
+rules = ["rules/spinduck-rules.toml"]
+home = ".spinduck"                 # 开发态 SPINDUCK_HOME（gitignore）
+
+[engine]
+threads = 4

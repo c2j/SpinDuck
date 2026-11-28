@@ -1,0 +1,21 @@
+[main] probes=63 call=61 query=2
+[main] converted_ba=6 [T0 T0.r T0.rf T8b T10 T2.f]
+[main] skipped_ba=55 UnsupportedControlFlow=38 UnsupportedWrite=6 UnresolvedFnSite=6 UnprovenWriteCompleteness=3 (no line)=2
+[main] off_vs_ba_eq=55 of 61
+[main] off_err=8 [B1.q:ERR(1) C0.fn:ERR(1) D0.fn:ERR(1) D3:ERR(1) D5.q:ERR(1) X1.plan:ERR(1) X2:ERR(1) X4.lit:ERR(1)]
+[main] off_vs_oracle={'EQ': 3}
+[main] off_vs_expect={'PASS': 6, 'FAIL(NULL)': 2, 'FAIL(no value)': 2}
+[tpch] probes=15 call=15 query=0
+[tpch] converted_ba=0 []
+[tpch] skipped_ba=15 UnsupportedControlFlow=7 UnresolvedFnSite=4 UnsupportedCall=2 (no line)=2
+[tpch] off_vs_ba_eq=10 of 15
+[tpch] off_err=5 [G.late:ERR(1) G.margin.fn:ERR(1) FR.d:ERR(1) PR.hoist:ERR(1) X.dual:ERR(1)]
+[tpch] off_vs_oracle={'EQ': 7}
+[tpch] off_vs_expect={'PASS': 2}
+[all] probes=78 call=76 query=2
+[all] converted_ba=6 [T0 T0.r T0.rf T8b T10 T2.f]
+[all] skipped_ba=70 UnsupportedControlFlow=45 UnresolvedFnSite=10 UnsupportedWrite=6 (no line)=4 UnprovenWriteCompleteness=3 UnsupportedCall=2
+[all] off_vs_ba_eq=65 of 76
+[all] off_err=13 [B1.q:ERR(1) C0.fn:ERR(1) D0.fn:ERR(1) D3:ERR(1) D5.q:ERR(1) X1.plan:ERR(1) X2:ERR(1) X4.lit:ERR(1) G.late:ERR(1) G.margin.fn:ERR(1) FR.d:ERR(1) PR.hoist:ERR(1) X.dual:ERR(1)]
+[all] off_vs_oracle={'EQ': 10}
+[all] off_vs_expect={'PASS': 8, 'FAIL(NULL)': 2, 'FAIL(no value)': 2}
