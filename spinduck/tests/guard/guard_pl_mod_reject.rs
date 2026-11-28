@@ -4,7 +4,8 @@
 //! - 中缀 `MOD` 在 SQL 与 PL 里**都是语法错误**——含 `7 MOD (3)`、`7 MOD(3)`；
 //!   尾随 `mod`（`SELECT 7 mod FROM t`）是别名不报错；`mod(a, b)` 函数形式可用。
 //! - `%` 运算符可用：`7 % 3` = 1、`-7 % 3` = -1（符号随被除数）、
-//!   `7.5 % 2` = 1.5、`-7.5 % 2` = -1.5；`x % 0` 报除零。
+//!   `7.5 % 2` = 1.5、`-7.5 % 2` = -1.5；`x % 0` 返回被除数（GaussDB 不报除零，
+//!   由 `mod_zero` 改写在 SQL 层实现 `CASE WHEN b=0 THEN a ELSE a % b END`）。
 //!
 //! SpinDuck 的解析层（ogsql-parser，公共 API，行为问题只记录）对中缀 MOD
 //! 是**有损解析**：`x := (v MOD 3)` 与 `RETURN (v MOD 3)` 的语句被整体丢弃、
@@ -107,6 +108,68 @@ fn should_reject_infix_mod_before_parenthesized_operand() {
 }
 
 #[test]
+fn should_reject_infix_mod_with_null_operands() {
+    // 三轮复审阻断 1：`7 mod null` / `null mod 3` 曾登记成功并静默返回 NULL
+    // （NULL 是 Keyword 词元，旧词元类未覆盖）——统一收敛 BIZ-0126。
+    let mut eng = engine();
+    assert_rejected(
+        &mut eng,
+        "CREATE OR REPLACE FUNCTION f_n1 RETURN NUMBER IS \
+         x NUMBER; BEGIN x := 7 mod null; RETURN x; END;",
+    );
+    assert_rejected(
+        &mut eng,
+        "CREATE OR REPLACE FUNCTION f_n2 RETURN NUMBER IS \
+         v NUMBER; BEGIN SELECT 7 mod null INTO v FROM sys_dummy; RETURN v; END;",
+    );
+    assert_rejected(
+        &mut eng,
+        "CREATE OR REPLACE FUNCTION f_n3 RETURN NUMBER IS \
+         x NUMBER; BEGIN x := null mod 3; RETURN x; END;",
+    );
+}
+
+#[test]
+fn should_reject_infix_mod_with_string_operand() {
+    // 三轮复审阻断 1：`'x' mod 3` 曾落 ENG-0022（错码）——字符串是值词元。
+    let mut eng = engine();
+    assert_rejected(
+        &mut eng,
+        "CREATE OR REPLACE FUNCTION f_s1 RETURN NUMBER IS \
+         x NUMBER; BEGIN x := 'x' mod 3; RETURN x; END;",
+    );
+}
+
+#[test]
+fn should_reject_infix_mod_with_keyword_value_operands() {
+    // 三轮复审阻断 1：CASE/关键字值形态同样是值表达式边界。
+    let mut eng = engine();
+    assert_rejected(
+        &mut eng,
+        "CREATE OR REPLACE FUNCTION f_k1 RETURN NUMBER IS \
+         x NUMBER; BEGIN x := 7 mod case when 1 = 1 then 2 else 3 end; RETURN x; END;",
+    );
+    assert_rejected(
+        &mut eng,
+        "CREATE OR REPLACE FUNCTION f_k2 RETURN NUMBER IS \
+         x NUMBER; BEGIN x := 7 mod current_date; RETURN x; END;",
+    );
+}
+
+#[test]
+fn should_keep_trailing_mod_alias_working() {
+    // `SELECT 7 mod INTO v`：mod 是列别名（参照合法）——不得误伤。
+    let mut eng = engine();
+    let sql = "CREATE OR REPLACE FUNCTION f_a1 RETURN NUMBER IS \
+         v NUMBER; BEGIN SELECT 7 mod INTO v FROM sys_dummy; RETURN v; END;";
+    eng.register(sql).unwrap();
+    assert_eq!(
+        eng.call("f_a1", &[]).unwrap().return_value,
+        Some(SpinValue::Int(7))
+    );
+}
+
+#[test]
 fn should_ignore_mod_in_comments_and_strings() {
     // 注释与字符串字面量里的 MOD 不误伤；语句本身合法（mod 函数形式 + 字符串）
     let mut eng = engine();
@@ -187,6 +250,58 @@ fn should_return_zero_for_int_min_mod_minus_one() {
     assert_eq!(
         eng.call("f_mm", &[]).unwrap().return_value,
         Some(SpinValue::Int(0))
+    );
+}
+
+#[test]
+fn should_evaluate_volatile_mod_operand_once() {
+    // 三轮复审阻断 2：旧改写把 acc/b 文本各复制两份，`nextval` 被求值两次
+    // （序列游标推进两次、余数取第二次值）。操作数绑定形态下只出现一次。
+    let mut eng = engine();
+    eng.ex
+        .execute("CREATE SEQUENCE seq_mod_guard", &BindMap::new())
+        .unwrap();
+    eng.ex
+        .execute("CREATE SEQUENCE seq_mod_guard_fn", &BindMap::new())
+        .unwrap();
+    let sql = "CREATE OR REPLACE FUNCTION f_nv RETURN NUMBER IS \
+         v NUMBER; BEGIN SELECT 7 % nextval('seq_mod_guard') INTO v FROM sys_dummy; RETURN v; END;";
+    eng.register(sql).unwrap();
+    // nextval 首值 1：7 % 1 = 0；若被求值两次则余数取第二次值且游标推进两次
+    assert_eq!(
+        eng.call("f_nv", &[]).unwrap().return_value,
+        Some(SpinValue::Int(0))
+    );
+    let mut s = eng
+        .ex
+        .query("SELECT currval('seq_mod_guard')", &BindMap::new())
+        .unwrap();
+    assert_eq!(s.fetch_many(1)[0][0], SpinValue::Int(1));
+    // mod() 函数形式同口径
+    let sql = "CREATE OR REPLACE FUNCTION f_nvm RETURN NUMBER IS \
+         v NUMBER; BEGIN SELECT mod(7, nextval('seq_mod_guard_fn')) INTO v FROM sys_dummy; RETURN v; END;";
+    eng.register(sql).unwrap();
+    assert_eq!(
+        eng.call("f_nvm", &[]).unwrap().return_value,
+        Some(SpinValue::Int(0))
+    );
+    let mut s = eng
+        .ex
+        .query("SELECT currval('seq_mod_guard_fn')", &BindMap::new())
+        .unwrap();
+    assert_eq!(s.fetch_many(1)[0][0], SpinValue::Int(1));
+}
+
+#[test]
+fn should_fold_zero_mod_chain_in_static_sql() {
+    // 嵌套链 `1 % 0 % 5 % 0`：((1%0)=1) %5=1，末位零模返回被除数 → 1
+    let mut eng = engine();
+    let sql = "CREATE OR REPLACE FUNCTION f_ch RETURN NUMBER IS \
+         v NUMBER; BEGIN SELECT 1 % 0 % 5 % 0 INTO v FROM sys_dummy; RETURN v; END;";
+    eng.register(sql).unwrap();
+    assert_eq!(
+        eng.call("f_ch", &[]).unwrap().return_value,
+        Some(SpinValue::Int(1))
     );
 }
 

@@ -3,9 +3,11 @@
 //! openGauss 5.0.0（A 模式）实测：`7 % 0` = 7、`7.5 % 0` = 7.5、`-7 % 0` = -7、
 //! `0 % 0` = 0、`mod(7,0)` = 7、`mod(0,0)` = 0、PL `n := 7 % 0` = 7 无异常；
 //! `7 % NULL` = NULL。DuckDB（项目内核）的 `%` / `mod()` 零除得 NULL，不改写即
-//! 静默分歧。改写为 `CASE WHEN b = 0 THEN a ELSE a % b END`：零模返回被除数，
-//! 非零走内核 `%`；`b = NULL` 时 CASE 条件非真 → ELSE 分支得 NULL，NULL 传播
-//! 保持。BIZ-0124 只保留给 `/ 0`（PL `/` 除零仍报错，V58 口径不变）。
+//! 静默分歧。改写为操作数绑定的零模守卫：每层
+//! `(SELECT CASE WHEN b = 0 THEN a ELSE a % b END FROM (SELECT a, b) t)`，
+//! 操作数只出现一次——零模返回被除数，非零走内核 `%`；`b = NULL` 时 CASE
+//! 条件非真 → ELSE 分支得 NULL，NULL 传播保持。BIZ-0124 只保留给 `/ 0`
+//! （PL `/` 除零仍报错，V58 口径不变）。
 //!
 //! 改写产物**不含 `mod(` 调用**（ELSE 用 `%` 运算符）：`rewrite_sql` 在
 //! patterns 之后还跑 `apply_ast_transforms`（MOD 是其变换名之一），产物含
@@ -204,13 +206,21 @@ fn range_rewritten(text: &str, toks: &[TokenWithSpan], from: usize, to: usize) -
     rewrite_mod_zero(&slice(text, toks, from, to))
 }
 
-/// `(a % b % c)` 左结合折成嵌套零模守卫（产物不含 `mod(`，见模块头注释）：
-/// `CASE WHEN c = 0 THEN CASE WHEN b = 0 THEN a ELSE a % b END
-///  ELSE CASE WHEN b = 0 THEN a ELSE a % b END % c END`。
+/// `(a % b % c)` 左结合折成嵌套零模守卫（产物不含 `mod(`，见模块头注释）。
+///
+/// 每层用标量子查询把操作数绑定到派生表列：`acc`/`b` 各出现一次，
+/// CASE 只引用别名——易变操作数（nextval/random/UDF）只求值一次，
+/// 链式输出规模线性（旧实现文本双份复制 → 2^k 膨胀 + 副作用双求值，
+/// 三轮复审阻断 2）。语义与 `CASE WHEN b = 0 THEN a ELSE a % b END` 等价：
+/// `_b` 为 NULL 时条件非真走 ELSE，`_a % _b` 得 NULL，NULL 传播不变。
 fn fold(operands: &[String]) -> String {
     let mut acc = operands[0].clone();
     for b in &operands[1..] {
-        acc = format!("CASE WHEN {b} = 0 THEN {acc} ELSE {acc} % {b} END");
+        acc = format!(
+            "(SELECT CASE WHEN __sp_mod_b = 0 THEN __sp_mod_a \
+             ELSE __sp_mod_a % __sp_mod_b END \
+             FROM (SELECT {acc} AS __sp_mod_a, {b} AS __sp_mod_b) AS __sp_mod_t)"
+        );
     }
     acc
 }
@@ -243,11 +253,20 @@ fn split_top_level_commas(toks: &[TokenWithSpan], from: usize, to: usize) -> Vec
 mod tests {
     use super::*;
 
+    /// 单层绑定形态（fold 输出），测试期望复用同一拼装避免长串漂移。
+    fn bound(a: &str, b: &str) -> String {
+        format!(
+            "(SELECT CASE WHEN __sp_mod_b = 0 THEN __sp_mod_a \
+             ELSE __sp_mod_a % __sp_mod_b END \
+             FROM (SELECT {a} AS __sp_mod_a, {b} AS __sp_mod_b) AS __sp_mod_t)"
+        )
+    }
+
     #[test]
     fn should_rewrite_infix_percent_zero_guard() {
         assert_eq!(
             rewrite_mod_zero("SELECT 7 % 0"),
-            "SELECT CASE WHEN 0 = 0 THEN 7 ELSE 7 % 0 END"
+            format!("SELECT {}", bound("7", "0"))
         );
     }
 
@@ -255,7 +274,7 @@ mod tests {
     fn should_rewrite_mod_call() {
         assert_eq!(
             rewrite_mod_zero("SELECT mod(7, 0)"),
-            "SELECT CASE WHEN 0 = 0 THEN 7 ELSE 7 % 0 END"
+            format!("SELECT {}", bound("7", "0"))
         );
     }
 
@@ -264,27 +283,22 @@ mod tests {
         // 非零除数：CASE 条件不命中 → ELSE 分支，值语义不变
         assert_eq!(
             rewrite_mod_zero("SELECT 7 % 3"),
-            "SELECT CASE WHEN 3 = 0 THEN 7 ELSE 7 % 3 END"
+            format!("SELECT {}", bound("7", "3"))
         );
     }
 
     #[test]
     fn should_fold_chains_left_associative() {
+        // ((a % b) % c)：内层先绑定，外层把内层整体作为左操作数再绑定一次
+        let inner = bound("a", "b");
         let got = rewrite_mod_zero("SELECT a % b % c");
-        assert_eq!(
-            got,
-            "SELECT CASE WHEN c = 0 THEN CASE WHEN b = 0 THEN a ELSE a % b END \
-             ELSE CASE WHEN b = 0 THEN a ELSE a % b END % c END"
-        );
+        assert_eq!(got, format!("SELECT {}", bound(&inner, "c")));
     }
 
     #[test]
     fn should_rewrite_nested_mod_inside_call_args() {
         let got = rewrite_mod_zero("SELECT abs(mod(x, 0)) FROM t");
-        assert_eq!(
-            got,
-            "SELECT abs(CASE WHEN 0 = 0 THEN x ELSE x % 0 END) FROM t"
-        );
+        assert_eq!(got, format!("SELECT abs({}) FROM t", bound("x", "0")));
     }
 
     #[test]
@@ -305,7 +319,7 @@ mod tests {
         // NULL 除数：CASE 条件非真 → ELSE 分支 NULL 传播（内核 % 对 NULL 得 NULL）
         assert_eq!(
             rewrite_mod_zero("SELECT 7 % NULL"),
-            "SELECT CASE WHEN NULL = 0 THEN 7 ELSE 7 % NULL END"
+            format!("SELECT {}", bound("7", "NULL"))
         );
     }
 
@@ -315,7 +329,7 @@ mod tests {
         // 被当成一元前缀吞进左操作数（FR.q3 首跑实测）
         assert_eq!(
             rewrite_mod_zero("SELECT 1 + (a * b) % 1000 FROM t"),
-            "SELECT 1 + CASE WHEN 1000 = 0 THEN (a * b) ELSE (a * b) % 1000 END FROM t"
+            format!("SELECT 1 + {} FROM t", bound("(a * b)", "1000"))
         );
     }
 
@@ -323,10 +337,22 @@ mod tests {
     fn should_handle_nested_percent_group_in_arithmetic() {
         let got = rewrite_mod_zero("SELECT (1 + (a * 7) % 1000) % 5 = 1 FROM t");
         assert!(
-            got.contains("(1 + CASE WHEN 1000 = 0 THEN (a * 7) ELSE (a * 7) % 1000 END)"),
+            got.contains(&format!("(1 + {})", bound("(a * 7)", "1000"))),
             "{got}"
         );
-        assert!(got.contains("CASE WHEN 5 = 0 THEN"), "{got}");
+        assert!(got.contains("__sp_mod_b = 0"), "{got}");
+    }
+
+    #[test]
+    fn should_keep_long_chain_rewrite_linear() {
+        // 三轮复审阻断 2：16 操作数旧实现 acc/b 双份复制 → 2^k 膨胀（89B→1.24MB）。
+        // 操作数绑定形态每层只加常数包装，输出规模线性。
+        let expr = (1..=16)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(" % ");
+        let got = rewrite_mod_zero(&format!("SELECT {expr}"));
+        assert!(got.len() < 20_000, "len={}", got.len());
     }
 
     #[test]
@@ -334,7 +360,7 @@ mod tests {
         // 行首/运算符后的 `-` 是一元：`-7 % 3` 的左操作数是 -7
         assert_eq!(
             rewrite_mod_zero("SELECT -7 % 3"),
-            "SELECT CASE WHEN 3 = 0 THEN -7 ELSE -7 % 3 END"
+            format!("SELECT {}", bound("-7", "3"))
         );
     }
 }

@@ -164,13 +164,17 @@ pub fn apply_ast_transforms(text: &str) -> Result<String, EngineError> {
                 // 得 NULL，零守卫改写（V59.1；与 [patterns] mod_zero_returns_dividend
                 // 同口径，此处覆盖 PL FuncCall/SqlFn 的 prepared 标量 SQL）。
                 // ELSE 用 `%` 运算符而非 mod()：本函数是循环变换，产物含 mod( 会
-                // 让 innermost 查找永不收敛（V59.1 首版实测挂死）
+                // 让 innermost 查找永不收敛（V59.1 首版实测挂死）。
+                // 操作数经标量子查询绑定（与 mod_zero::fold 同形）：acc/b 各出现
+                // 一次，易变操作数不双求值、链式输出线性（阻断 2）。
                 if args.len() != 2 {
                     return Err(EngineError::business(133, "MOD requires 2 arguments"));
                 }
                 format!(
-                    "CASE WHEN {} = 0 THEN {} ELSE {} % {} END",
-                    args[1], args[0], args[0], args[1]
+                    "(SELECT CASE WHEN __sp_mod_b = 0 THEN __sp_mod_a \
+                     ELSE __sp_mod_a % __sp_mod_b END \
+                     FROM (SELECT {} AS __sp_mod_a, {} AS __sp_mod_b) AS __sp_mod_t)",
+                    args[0], args[1]
                 )
             }
             "INTERVALTONUM" => {
