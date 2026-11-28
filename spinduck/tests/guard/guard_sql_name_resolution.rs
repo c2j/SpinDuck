@@ -7,7 +7,8 @@
 //!   是外层循环记录的字段访问（无 FROM 域，名字仍归 PL）。
 //! - DATE 变量按日期值参与 SQL 比较与绑定（`d > v_od`、`d = v_od`、键集翻页）；
 //!   PL 算术 `v_od + 1` 参照为次日（本仓 DATE 以 ISO 文本承载，算术未支持——
-//!   显式 BIZ-125 拒绝并登记，不做静默文本算术）。
+//!   显式拒绝并登记（现为 BIZ-0112：ISO 文本进算术器按非数字字面量拒绝），
+//!   不做静默文本算术）。
 //!
 //! 修复前形态：变量替换不感知标识符位置——表别名/表名/INSERT 列清单被替换成
 //! `$v_*`（FROM supplier AS $v_s → 运行期 ENG-0044）；DATE 绑定值是
@@ -282,7 +283,7 @@ fn should_bind_variable_inside_substring_from() {
 }
 
 /// 缺口 2 边界（显式登记）：PL 侧 DATE 算术 `v_od + 1` 参照为次日，本仓 DATE
-/// 以 ISO 文本承载、算术未支持——必须显式报错（BIZ-125），不得静默文本算术。
+/// 以 ISO 文本承载、算术未支持——必须显式报错（BIZ-0112），不得静默文本算术。
 #[test]
 fn should_reject_date_arithmetic_loudly_until_supported() {
     let ddl = [

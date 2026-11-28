@@ -48,7 +48,9 @@ pub struct RuleRegistry {
     /// （DuckDB 的 `||` 传播 NULL，与基线实测 `'A' || NULL = 'A'` 相反）
     pub patterns_concat_null_as_empty: bool,
     /// `[patterns] mod_zero_returns_dividend`：A 模式 `MOD(n, 0) = n`（Oracle 语义）
-    /// → `CASE WHEN b = 0 THEN a ELSE mod(a, b) END`（DuckDB 的 `%`/mod() 零除得 NULL）
+    /// → 操作数绑定的 `CASE WHEN b = 0 THEN a ELSE a % b END` 标量子查询
+    /// （ELSE 用 `%` 而非 `mod()`：产物含 `mod(` 会让变换循环不收敛，V59.1；
+    /// DuckDB 的 `%`/mod() 零除得 NULL）
     pub patterns_mod_zero_returns_dividend: bool,
     /// `[dates.formats]`：Oracle 整串日期格式 → strftime 格式。
     /// 映射表本体在 `sql::oracle_format_to_strftime`（逐令牌变换，覆盖语料全部格式），
